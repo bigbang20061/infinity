@@ -1,0 +1,28 @@
+[package]
+name = "server"
+description = "Infinity emulator: proxy/sol node the client connects to"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "infinity-server"
+path = "src/main.rs"
+
+[dependencies]
+marshal = { path = "../marshal" }
+anyhow.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+flate2 = "1"
+base64 = "0.22"
+bytes = "1"
+h2 = "0.4"
+http = "1"
+prost = "0.13"
+prost-types = "0.13"
+prost-reflect = "0.14"
+quick-xml = { version = "0.37", features = ["async-tokio"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }

@@ -1,0 +1,69 @@
+name: infinity
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: infinity
+      POSTGRES_PASSWORD: infinity
+      POSTGRES_DB: infinity
+    command: ["postgres", "-c", "maintenance_work_mem=1GB", "-c", "max_wal_size=4GB", "-c", "shared_buffers=512MB"]
+    shm_size: 1g
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # A fresh (empty) pgdata volume is filled from the per-table dumps in db/<schema>/
+      # on first start; see scripts/db-init.sh. Delete the volume to import again.
+      - ./db:/db:ro
+      - ./scripts/db-init.sh:/docker-entrypoint-initdb.d/10-db-init.sh:ro
+    healthcheck:
+      # Over TCP: during the first-start import Postgres only listens on its socket.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U infinity -d infinity"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      # The first-start import takes a few minutes.
+      start_period: 30m
+
+  server:
+    build: .
+    image: infinity-rust:latest
+    environment:
+      DATABASE_URL: postgres://infinity:infinity@db/infinity
+      RUST_LOG: ${RUST_LOG:-info,infinity_server=debug}
+      # Pilots in space per solar system before stargate jumps queue; 0 = no limit.
+      SYSTEM_CAPACITY: ${SYSTEM_CAPACITY:-0}
+    command: ["infinity-server"]
+    ports:
+      - "26000:26000" # machoNet (game client)
+      - "5222:5222"   # chat (XMPP)
+      - "26001:26001" # image server
+      - "26002:26002" # public gateway (gRPC)
+      - "80:80"       # content CDN (flatbuffer checkpoints)
+    volumes:
+      - images:/data/images
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # One-shot, only to rebuild the SDE schemas from a client's static data instead of the
+  # dumps in db/: docker compose run --rm sde-import
+  sde-import:
+    build: .
+    image: infinity-rust:latest
+    profiles: ["tools"]
+    environment:
+      DATABASE_URL: postgres://infinity:infinity@db/infinity
+    volumes:
+      - ./sde:/sde:ro
+      - ./db:/db:ro
+    command: ["sde-import", "--sde", "/sde", "--typed-sql", "/db/sde_typed.sql", "--jobs", "6"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  images:

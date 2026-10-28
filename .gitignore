@@ -1,0 +1,14 @@
+# Build output
+/target/
+
+# Derived from the local CCP client install -- never commit
+/sde/
+/client/
+
+# Upstream checkouts (clone separately, see README)
+/carbonengine/
+/crates/server/proto/*.desc
+
+# Dev
+/logs/
+/tools/

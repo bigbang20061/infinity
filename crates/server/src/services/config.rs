@@ -1,0 +1,138 @@
+//! `config` service: the server side of the client's cfg Recordsets
+//! (eve/common/script/sys/eveCfg.py). Multi-fetchers return `(header, rows)`.
+
+use super::{Call, CallError, CallResult};
+use crate::client::{short, Client};
+use marshal::Value;
+use tracing::warn;
+
+/// const.typeCharacterGallente etc. are all in groupCharacter; any one serves for player owners.
+const TYPE_CHARACTER: i64 = 1373;
+const TYPE_CORPORATION: i64 = 2;
+const TYPE_FACTION: i64 = 30;
+
+fn db_err(e: tokio_postgres::Error) -> CallError {
+    CallError::Internal(e.into())
+}
+
+fn ids(v: Option<&Value>) -> Vec<i64> {
+    match v {
+        Some(Value::Int(i)) => vec![*i],
+        Some(v) => v.items().map(|it| it.iter().filter_map(|x| x.as_int()).collect()).unwrap_or_default(),
+        None => vec![],
+    }
+}
+
+fn header(cols: &[&str]) -> Value {
+    Value::list(cols.iter().map(|c| Value::str(*c)))
+}
+
+pub async fn owners(c: &Client, ids: &[i64]) -> Result<Value, CallError> {
+    let rows = c
+        .db
+        .client
+        .query(
+            "SELECT character_id, name, $2::bigint, gender_id, NULL::bigint FROM game.characters WHERE character_id = ANY($1::bigint[])
+             UNION ALL SELECT corporation_id, name, $3::bigint, 0, NULL FROM sde.crp_npc_corporations WHERE corporation_id = ANY($1::bigint[])
+             UNION ALL SELECT corporation_id, name, $3::bigint, 0, NULL FROM game.corporations WHERE corporation_id = ANY($1::bigint[])
+             UNION ALL SELECT character_id, data->'name'->>'en', $2::bigint, (data->>'gender')::boolean::int, (data->>'nameID')::bigint
+                       FROM sde.npc_characters WHERE character_id = ANY($1::bigint[])
+             UNION ALL SELECT faction_id, name, $4::bigint, 0, NULL FROM sde.chr_factions WHERE faction_id = ANY($1::bigint[])",
+            &[&ids, &TYPE_CHARACTER, &TYPE_CORPORATION, &TYPE_FACTION],
+        )
+        .await
+        .map_err(db_err)?;
+    let data = rows
+        .iter()
+        .map(|r| {
+            Value::list([
+                Value::Int(r.get::<_, i64>(0)),
+                Value::unicode(r.get::<_, Option<String>>(1).unwrap_or_default()),
+                Value::Int(r.get(2)),
+                Value::Int(r.get::<_, Option<i32>>(3).unwrap_or(0) as i64),
+                r.get::<_, Option<i64>>(4).map(Value::Int).unwrap_or(Value::None),
+            ])
+        })
+        .collect();
+    Ok(Value::tuple([header(&["ownerID", "ownerName", "typeID", "gender", "ownerNameID"]), Value::List(data)]))
+}
+
+async fn locations(c: &Client, ids: &[i64]) -> Result<Value, CallError> {
+    // Static map objects resolve locally on the client; the server answers for
+    // anything else it knows (stations by name, player items such as ships).
+    let rows = c
+        .db
+        .client
+        .query(
+            "SELECT item_id, COALESCE(i.name, t.name), NULL::bigint, 0::float8, 0::float8, 0::float8 FROM game.items i
+                 LEFT JOIN sde.inv_types t USING (type_id) WHERE item_id = ANY($1::bigint[])
+             UNION ALL SELECT solar_system_id::bigint, name, solar_system_id::bigint, x, y, z FROM sde.map_solar_systems WHERE solar_system_id = ANY($1::bigint[])",
+            &[&ids],
+        )
+        .await
+        .map_err(db_err)?;
+    let data = rows
+        .iter()
+        .map(|r| {
+            Value::list([
+                Value::Int(r.get(0)),
+                Value::unicode(r.get::<_, Option<String>>(1).unwrap_or_default()),
+                r.get::<_, Option<i64>>(2).map(Value::Int).unwrap_or(Value::None),
+                Value::Float(r.get(3)),
+                Value::Float(r.get(4)),
+                Value::Float(r.get(5)),
+                Value::None,
+            ])
+        })
+        .collect();
+    // The client files these into cfg.evelocations positionally with its own descriptor
+    // (eveCfg.GetLocationRowDescriptor), so the columns must match it exactly.
+    Ok(Value::tuple([header(&["locationID", "locationName", "solarSystemID", "x", "y", "z", "locationNameID"]), Value::List(data)]))
+}
+
+async fn tickers(c: &Client, ids: &[i64]) -> Result<Value, CallError> {
+    let rows = c
+        .db
+        .client
+        .query(
+            "SELECT corporation_id::bigint, ticker FROM sde.crp_npc_corporations WHERE corporation_id = ANY($1::bigint[])
+             UNION ALL SELECT corporation_id, ticker FROM game.corporations WHERE corporation_id = ANY($1::bigint[])",
+            &[&ids],
+        )
+        .await
+        .map_err(db_err)?;
+    let data = rows
+        .iter()
+        .map(|r| {
+            let mut row = vec![Value::Int(r.get(0)), Value::str(r.get::<_, Option<String>>(1).unwrap_or_default())];
+            row.extend(std::iter::repeat_n(Value::None, 6));
+            Value::List(row)
+        })
+        .collect();
+    Ok(Value::tuple([
+        header(&["corporationID", "tickerName", "shape1", "shape2", "shape3", "color1", "color2", "color3"]),
+        Value::List(data),
+    ]))
+}
+
+pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
+    let keys = ids(call.args.first());
+    match call.method {
+        "GetMultiOwnersEx" | "GetOwnersEx" => owners(c, &keys).await,
+        "GetMultiLocationsEx" | "GetLocationsEx" => locations(c, &keys).await,
+        "GetMultiCorpTickerNamesEx" | "GetCorpTickerNamesEx" => tickers(c, &keys).await,
+        "GetMultiAllianceShortNamesEx" | "GetAllianceShortNamesEx" => {
+            Ok(Value::tuple([header(&["allianceID", "shortName"]), Value::list([])]))
+        }
+        _ => {
+            warn!(
+                user = c.login.user_id,
+                "UNHANDLED config::{} args={} kwargs={}",
+                call.method,
+                short(&marshal::Value::Tuple(call.args.to_vec())),
+                short(call.kwargs)
+            );
+            Ok(Value::None)
+        }
+    }
+}

@@ -1,0 +1,8 @@
+[package]
+name = "blue-patch"
+description = "Patch the Infinity client's blue.dll so edited manifest files (start.ini) pass verification"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
