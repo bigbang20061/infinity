@@ -22,7 +22,7 @@
 use super::{keyval, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
 use crate::services::charsel::FLAG_HANGAR;
-use crate::space::{now_tick, Ball, MODE_STOP, V3};
+use crate::space::{now_ms, Ball, MODE_STOP, V3};
 use marshal::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -545,7 +545,7 @@ async fn ready(c: &Client, m: &Mission, agent: &Agent) -> Result<bool, CallError
         return Ok(false);
     }
     Ok(match m.kind {
-        Kind::Kill => objective_done(c, m),
+        Kind::Kill => objective_done(c, m).await,
         Kind::Talk => true,
         Kind::Courier | Kind::Trade => match m.cargo {
             Some(cargo) => has_goods(c, agent.station_id, cargo).await?,
@@ -710,7 +710,7 @@ async fn ensure_site(c: &mut Client, m: &Mission) -> Result<(), CallError> {
         .and_then(|r| r.get::<_, Option<i64>>(0))
         .unwrap_or(GENERIC_NPC_CORP);
     let level = agent(m.agent_id).map(|a| a.level).unwrap_or(1);
-    let tick = now_tick();
+    let tick = now_ms();
     let mut spawned = Vec::new();
     for class in spawn_classes(level) {
         let fits: Vec<&tokio_postgres::Row> = rows.iter().filter(|r| group_has_class(&r.get::<_, String>(1), class)).collect();
@@ -745,7 +745,7 @@ async fn ensure_site(c: &mut Client, m: &Mission) -> Result<(), CallError> {
             massive: true,
             warp: None,
             warp_factor: 0,
-            last_tick: tick,
+            last_ms: tick,
             cloak: 0,
             cloak_until: 0,
             health: [1.0; 3],
@@ -765,16 +765,16 @@ async fn ensure_site(c: &mut Client, m: &Mission) -> Result<(), CallError> {
 fn despawn(c: &Client, char_id: i64, agent_id: i64) {
     if let Some((system, npcs)) = sites().lock().unwrap().remove(&(char_id, agent_id)) {
         for id in npcs {
-            c.world.remove_ball(system, id);
+            c.world.post(system, move |s| { s.remove_ball(id); });
         }
     }
 }
 
 /// Is the mission's objective done: its site spawned and every NPC there gone?
-fn objective_done(c: &Client, m: &Mission) -> bool {
+async fn objective_done(c: &Client, m: &Mission) -> bool {
     let me = c.session.int("charid").unwrap_or(0);
     let Some((system, npcs)) = sites().lock().unwrap().get(&(me, m.agent_id)).cloned() else { return false };
-    let any_remaining = c.world.read(system, |s| npcs.iter().any(|id| s.contains(*id))).unwrap_or(false);
+    let any_remaining = c.world.with(system, move |s| npcs.iter().any(|id| s.contains(*id))).await.unwrap_or(false);
     m.state == STATE_ACCEPTED && !any_remaining
 }
 
@@ -830,7 +830,7 @@ async fn agent_location(c: &Client, agent_id: i64) -> Result<Value, CallError> {
 /// (agentDialogueUtil._ProcessObjectiveEntry: 'agent', 'transport', 'fetch').
 async fn objective_info(c: &Client, m: &Mission) -> Result<Value, CallError> {
     if m.kind == Kind::Kill {
-        return Ok(kill_objective_info(c, m));
+        return Ok(kill_objective_info(c, m).await);
     }
     let hand_in = m.hand_in_agent();
     let mut objectives = vec![];
@@ -890,8 +890,8 @@ async fn objective_info(c: &Client, m: &Mission) -> Result<Value, CallError> {
     ]))
 }
 
-fn kill_objective_info(c: &Client, m: &Mission) -> Value {
-    let done = objective_done(c, m);
+async fn kill_objective_info(c: &Client, m: &Mission) -> Value {
+    let done = objective_done(c, m).await;
     let mut dungeon = vec![
         ("dungeonID", Value::Int(m.dungeon_id as i64)),
         ("optional", Value::Bool(false)),
@@ -1203,7 +1203,7 @@ async fn warp_to_location(c: &mut Client, agent: &Agent, call: &Call<'_>) -> Cal
             if here != Some(system) {
                 return Ok(Value::None);
             }
-            let radius = c.world.read(system, |s| s.ball(station).map(|b| b.radius as f64)).flatten().unwrap_or(5000.0);
+            let radius = c.world.with(system, move |s| s.ball(station).map(|b| b.radius as f64)).await.flatten().unwrap_or(5000.0);
             super::ship::warp_to(c, Some((pos, radius)), pos, range)
         }
         _ => Ok(Value::None),
@@ -1213,12 +1213,13 @@ async fn warp_to_location(c: &mut Client, agent: &Agent, call: &Call<'_>) -> Cal
 // ---------------------------------------------------------------- mission tracker
 
 /// Is the pilot's ship at the mission site?
-fn at_site(c: &Client, m: &Mission) -> bool {
+async fn at_site(c: &Client, m: &Mission) -> bool {
     let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) else { return false };
     if system != m.system_id {
         return false;
     }
-    c.world.read(system, |s| s.ball(ship).is_some_and(|b| (0..3).map(|i| (b.pos[i] - m.pos[i]).powi(2)).sum::<f64>().sqrt() < SITE_RADIUS)).unwrap_or(false)
+    let pos = m.pos;
+    c.world.with(system, move |s| s.ball(ship).is_some_and(|b| (0..3).map(|i| (b.pos[i] - pos[i]).powi(2)).sum::<f64>().sqrt() < SITE_RADIUS)).await.unwrap_or(false)
 }
 
 /// The steps of a kill mission, as missionObjectiveData objective items (strings).
@@ -1227,15 +1228,15 @@ fn tracker_objectives(m: &Mission) -> [Vec<String>; 3] {
 }
 
 /// The step the pilot is on, or None before the mission is accepted.
-fn tracker_current(c: &Client, m: &Mission) -> Option<Vec<String>> {
+async fn tracker_current(c: &Client, m: &Mission) -> Option<Vec<String>> {
     // Only kill missions have a site to steer to; the rest show "read the journal".
     if m.state != STATE_ACCEPTED || m.kind != Kind::Kill {
         return None;
     }
     let [travel, destroy, complete] = tracker_objectives(m);
-    Some(if objective_done(c, m) {
+    Some(if objective_done(c, m).await {
         complete
-    } else if at_site(c, m) {
+    } else if at_site(c, m).await {
         destroy
     } else {
         travel
@@ -1254,12 +1255,18 @@ async fn tracker(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         Err(e) => return Some(Err(e)),
     };
     Some(Ok(match call.method {
-        "GetMissionInfoItems" => current.and_then(|m| tracker_current(c, &m)).map(strings).unwrap_or(Value::None),
+        "GetMissionInfoItems" => match current {
+            Some(m) => tracker_current(c, &m).await.map(strings).unwrap_or(Value::None),
+            None => Value::None,
+        },
         "GetAllMissionObjectives" => match current {
             Some(m) if m.state == STATE_ACCEPTED && m.kind == Kind::Kill => Value::list(tracker_objectives(&m).into_iter().map(strings)),
             _ => Value::list([]),
         },
-        "IsInActiveDungeonID" => Value::Bool(current.is_some_and(|m| at_site(c, &m))),
+        "IsInActiveDungeonID" => Value::Bool(match current {
+            Some(m) => at_site(c, &m).await,
+            None => false,
+        }),
         // UpdateAllMissions(agentIDs): answered with OnMissionsUpdated.
         "UpdateAllMissions" => {
             let agents: Vec<i64> = match call.args.first() {
@@ -1269,7 +1276,8 @@ async fn tracker(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             let mut updates = vec![];
             for agent_id in agents {
                 let info = match mission_with(c, agent_id).await {
-                    Ok(m) => m.and_then(|m| tracker_current(c, &m)).map(strings).unwrap_or(Value::None),
+                    Ok(Some(m)) => tracker_current(c, &m).await.map(strings).unwrap_or(Value::None),
+                    Ok(None) => Value::None,
                     Err(e) => return Some(Err(e)),
                 };
                 updates.push(Value::dict([("agentID", Value::Int(agent_id)), ("info", info)]));

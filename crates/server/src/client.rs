@@ -195,7 +195,7 @@ impl Client {
             self.world.unregister_pilot(char_id);
         }
         if let (Some(system), Some(ship)) = (self.session.int("solarsystemid"), self.session.int("shipid")) {
-            if let Some(b) = self.world.remove_ball(system, ship) {
+            if let Some(b) = self.world.remove_ball(system, ship).await {
                 self.db
                     .client
                     .execute("UPDATE game.items SET x = $2, y = $3, z = $4 WHERE item_id = $1", &[&ship, &b.pos[0], &b.pos[1], &b.pos[2]])

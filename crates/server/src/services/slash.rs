@@ -70,7 +70,7 @@ async fn tr(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
     }
     let here = c.session.int("solarsystemid").unwrap_or(0);
     // Something in this system's ballpark.
-    if let Some((ball_pos, radius)) = c.world.read(here, |s| s.ball(id).map(|b| (b.pos, b.radius))).flatten() {
+    if let Some((ball_pos, radius)) = c.world.with(here, move |s| s.ball(id).map(|b| (b.pos, b.radius))).await.flatten() {
         let pos = [ball_pos[0] + radius as f64 + 5000.0, ball_pos[1], ball_pos[2]];
         super::ship::teleport(c, here, pos).await?;
         return Ok(format!("teleported to {id}"));
@@ -119,7 +119,7 @@ async fn tr(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
     if let Some(r) = at {
         let system: i64 = r.get(0);
         let pos = [r.get::<_, f64>(1) + 5000.0, r.get(2), r.get(3)];
-        let live = c.world.read(system, |s| s.pilot_ball(id).or_else(|| s.ball(id)).map(|b| b.pos)).flatten();
+        let live = c.world.with(system, move |s| s.pilot_ball(id).or_else(|| s.ball(id)).map(|b| b.pos)).await.flatten();
         let pos = live.map(|p| [p[0] + 5000.0, p[1], p[2]]).unwrap_or(pos);
         super::ship::teleport(c, system, pos).await?;
         return Ok(format!("teleported to {id} in {system}"));

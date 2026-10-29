@@ -17,6 +17,8 @@
 //! and repair themselves; a pilot's ship can be destroyed. Active modules apply their effects
 //! (hardeners through fit, propulsion speed via destiny, repairers each cycle), and a kill
 //! pays the NPC's bounty and leaves a wreck with loot.
+//! NPC AI and missile impact timers run in separate tasks; space state is accessed
+//! through per-system actor messages, while weapon and database work stays outside.
 
 use super::dogma::load_items;
 use super::inventory::notify_item_change;
@@ -24,7 +26,7 @@ use super::fit::{Fit, Key};
 use super::{Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
 use crate::db::Db;
-use crate::space::{event, now_tick, Ball, NotifyTx, World, MODE_MISSILE, MODE_ORBIT, MODE_STOP, MODE_WARP, V3};
+use crate::space::{event, now_ms, now_tick, Ball, NotifyTx, World, MODE_MISSILE, MODE_ORBIT, MODE_STOP, MODE_WARP, V3};
 use marshal::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -204,7 +206,8 @@ fn targets_of(char_id: i64) -> Vec<i64> {
 /// `OnTarget('add', targetID)`.
 async fn add_target(c: &mut Client, target: i64) -> CallResult {
     let Some(cx) = ctx(c) else { return Err(user_error("TargetingAttemptCancelled", vec![])) };
-    let Some((ship, t)) = cx.world.read(cx.system_id, |s| Some((s.ball(cx.ship_id)?.clone(), s.ball(target)?.clone()))).flatten() else {
+    let ship_id = cx.ship_id;
+    let Some((ship, t)) = cx.world.with(cx.system_id, move |s| Some((s.ball(ship_id)?.clone(), s.ball(target)?.clone()))).await.flatten() else {
         return Err(user_error("TargetingAttemptCancelled", vec![]));
     };
     let fit = Fit::load(&cx.db, cx.char_id, cx.ship_id).await?;
@@ -236,7 +239,7 @@ async fn add_target(c: &mut Client, target: i64) -> CallResult {
             let mut st = state();
             st.locking.get(&(cx.char_id, target)) == Some(&attempt) && st.locking.remove(&(cx.char_id, target)).is_some()
         };
-        let present = cx.world.read(cx.system_id, |s| s.contains(target)).unwrap_or(false);
+        let present = cx.world.with(cx.system_id, move |s| s.contains(target)).await.unwrap_or(false);
         if still_wanted && present {
             state().targets.entry(cx.char_id).or_default().insert(target);
             cx.notify("OnTarget", vec![Value::str("add"), Value::Int(target)]);
@@ -796,7 +799,7 @@ async fn damage_npc(db: &Db, world: &World, system: i64, target: i64, raw: [f64;
     let dealt = absorb(&mut hp.now, &hp.resonance, raw);
     if hp.now[2] <= 0.0 && (hp.max[2] > 0.0 || hp.now.iter().all(|v| *v <= 0.0)) {
         info!("ball {target} (type {}) destroyed", ball.type_id);
-        world.destroy_ball(system, target);
+        world.destroy_ball(system, target).await;
         forget_target(world, target);
         {
             let mut st = state();
@@ -848,7 +851,7 @@ async fn damage_player(db: &Db, world: &World, system: i64, ship: i64, char_id: 
     world.notify_pilot(char_id, "OnModuleAttributeChanges", vec![Value::List(changes)]);
     if cond.now[2] <= 0.0 {
         info!("ship {ship} of {char_id} destroyed");
-        destroy_player_ship(world, system, ship, char_id);
+        destroy_player_ship(world, system, ship, char_id).await;
     } else {
         let health = [0, 1, 2].map(|i| if max[i] > 0.0 { (cond.now[i] / max[i]).clamp(0.0, 1.0) } else { 0.0 });
         state().condition.insert(ship, cond);
@@ -859,9 +862,9 @@ async fn damage_player(db: &Db, world: &World, system: i64, ship: i64, char_id: 
 
 /// A player's ship explodes: its pilot is told to eject (`__ship_destroyed`, handled by
 /// the pilot's connection). Also how CONCORD ends a criminal.
-pub(super) fn destroy_player_ship(world: &World, system: i64, ship: i64, char_id: i64) {
+pub(super) async fn destroy_player_ship(world: &World, system: i64, ship: i64, char_id: i64) {
     state().condition.remove(&ship);
-    if let Some(b) = world.destroy_ball(system, ship) {
+    if let Some(b) = world.destroy_ball(system, ship).await {
         forget_target(world, ship);
         world.notify_pilot(char_id, "__ship_destroyed", vec![Value::Int(ship), Value::Float(b.pos[0]), Value::Float(b.pos[1]), Value::Float(b.pos[2])]);
     }
@@ -1004,7 +1007,7 @@ async fn reward_kill(db: &Db, world: &World, system: i64, npc: &Ball, killer: Op
         massive: true,
         warp: None,
         warp_factor: 0,
-        last_tick: now_tick(),
+        last_ms: now_ms(),
         cloak: 0,
         cloak_until: 0,
         health: [1.0; 3],
@@ -1060,7 +1063,7 @@ fn repair_kind(effect: &str) -> Option<(usize, i32)> {
 async fn apply_propulsion(cx: &Ctx) {
     let Ok(fit) = Fit::load(&cx.db, cx.char_id, cx.ship_id).await else { return };
     let (speed, mass) = (fit.value(Key::Ship, ATTR_MISSILE_VELOCITY), fit.value(Key::Ship, ATTR_MASS));
-    cx.world.command(cx.system_id, cx.ship_id, |b, t, _| {
+    cx.world.command(cx.system_id, cx.ship_id, move |b, t, _| {
         b.max_vel = speed as f32;
         b.mass = mass;
         vec![
@@ -1219,7 +1222,8 @@ fn report_hit(world: &World, shooter: i64, target: i64, shooter_pilot: Option<i6
 
 /// One turret shot at `target`, with the fitted module's and its charge's effective attributes.
 async fn fire_turret(cx: &Ctx, fit: &Fit, module: &Module, target: i64) -> Result<(), CallError> {
-    let Some((ship, t)) = cx.world.read(cx.system_id, |s| Some((s.ball(cx.ship_id)?.clone(), s.ball(target)?.clone()))).flatten() else { return Ok(()) };
+    let ship_id = cx.ship_id;
+    let Some((ship, t)) = cx.world.with(cx.system_id, move |s| Some((s.ball(ship_id)?.clone(), s.ball(target)?.clone()))).await.flatten() else { return Ok(()) };
     let (m, ch) = (Key::Module(module.id), Key::Charge(module.id));
     let gap = (dist(ship.pos, t.pos) - t.radius as f64 - ship.radius as f64).max(0.0);
     let multiplier = turret_roll(gap, fit.value(m, ATTR_MAX_RANGE), fit.value(m, ATTR_FALLOFF));
@@ -1275,7 +1279,7 @@ async fn launch_missile(db: Db, world: Arc<World>, system: i64, from: Ball, targ
         massive: false,
         warp: None,
         warp_factor: 0,
-        last_tick: now_tick(),
+        last_ms: now_ms(),
         cloak: 0,
         cloak_until: 0,
         health: [1.0; 3],
@@ -1288,9 +1292,10 @@ async fn launch_missile(db: Db, world: Arc<World>, system: i64, from: Ball, targ
     let distance = dist(from.pos, target.pos);
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs_f64((distance / m.velocity.max(1.0)).clamp(0.5, 30.0))).await;
-        world.destroy_ball(system, missile_id);
+        world.destroy_ball(system, missile_id).await;
         let reached = distance <= m.flight_range + 2_000.0;
-        let present = world.read(system, |s| s.contains(target.id)).unwrap_or(false);
+        let target_id = target.id;
+        let present = world.with(system, move |s| s.contains(target_id)).await.unwrap_or(false);
         let (dealt, quality) = if reached && present {
             let application = (signature / m.aoe_cloud.max(1.0)).min(1.0);
             (damage(&db, &world, system, target.id, target.char_id, m.raw.map(|d| d * application), m.attacker).await.unwrap_or(0.0), 3)
@@ -1303,7 +1308,8 @@ async fn launch_missile(db: Db, world: Arc<World>, system: i64, from: Ball, targ
 }
 
 async fn fire_missile(cx: &Ctx, fit: &Fit, module: &Module, charge: i32, target: i64) -> Result<(), CallError> {
-    let Some((ship, t)) = cx.world.read(cx.system_id, |s| Some((s.ball(cx.ship_id)?.clone(), s.ball(target)?.clone()))).flatten() else { return Ok(()) };
+    let ship_id = cx.ship_id;
+    let Some((ship, t)) = cx.world.with(cx.system_id, move |s| Some((s.ball(ship_id)?.clone(), s.ball(target)?.clone()))).await.flatten() else { return Ok(()) };
     let ch = Key::Charge(module.id);
     let velocity = fit.value(ch, ATTR_MISSILE_VELOCITY).max(1.0);
     let missile = Missile {
@@ -1478,11 +1484,12 @@ async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
         let Some(t) = target.filter(|t| targets_of(cx.char_id).contains(t)) else {
             return Err(user_error("DeniedActivateTargetNotPresent", vec![]));
         };
-        let (in_warp, own_type, present, victim) = cx.world.read(cx.system_id, |s| {
-            let ship = s.ball(cx.ship_id);
+        let ship_id = cx.ship_id;
+        let (in_warp, own_type, present, victim) = cx.world.with(cx.system_id, move |s| {
+            let ship = s.ball(ship_id);
             let target = s.ball(t);
             (ship.is_some_and(|b| b.mode == MODE_WARP), ship.map(|b| b.type_id).unwrap_or(0), target.is_some(), target.and_then(|b| b.char_id))
-        }).unwrap_or((false, 0, false, None));
+        }).await.unwrap_or((false, 0, false, None));
         if in_warp {
             return Err(user_error("DeniedActivateInWarp", vec![]));
         }
@@ -1504,9 +1511,10 @@ async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
         if !super::mining::is_rock(t) {
             return Err(user_error("CustomNotify", vec![("notify", Value::unicode("只能对小行星、冰矿或气云使用采矿设备。"))]));
         }
-        let gap = cx.world.read(cx.system_id, |s| {
-            s.ball(cx.ship_id).zip(s.ball(t)).map(|(a, b)| dist(a.pos, b.pos) - a.radius as f64 - b.radius as f64)
-        }).flatten();
+        let ship_id = cx.ship_id;
+        let gap = cx.world.with(cx.system_id, move |s| {
+            s.ball(ship_id).zip(s.ball(t)).map(|(a, b)| dist(a.pos, b.pos) - a.radius as f64 - b.radius as f64)
+        }).await.flatten();
         let fit = Fit::load(&cx.db, cx.char_id, cx.ship_id).await?;
         let range = fit.value(Key::Module(item_id), ATTR_MAX_RANGE);
         if gap.is_none_or(|g| g > range) {
@@ -1671,20 +1679,22 @@ async fn npc_ai(db: &Db, world: &Arc<World>, system: i64, id: i64, type_id: i32,
         }
         // Pilots this NPC fights: its mission runner (or everyone) and anyone who has shot it.
         let enemies: HashSet<i64> = state().aggressors.get(&id).cloned().unwrap_or_default().into_iter().chain(owner).collect();
-        let hostile = |ch: i64| owner == Some(HOSTILE_TO_ALL) || enemies.contains(&ch);
-        let Some((me, victim, nearest)) = world.read(system, |s| {
+        let aggro_range = stats.aggro_range;
+        let current_target = target;
+        let Some((me, victim, nearest)) = world.with(system, move |s| {
+            let hostile = |ch: i64| owner == Some(HOSTILE_TO_ALL) || enemies.contains(&ch);
             let me = s.ball(id)?;
-            let victim = target.and_then(|(ship, _, _)| s.ball(ship))
-                .filter(|b| b.cloak == 0 && dist(b.pos, me.pos) < stats.aggro_range * 2.0);
+            let victim = current_target.and_then(|(ship, _, _)| s.ball(ship))
+                .filter(|b| b.cloak == 0 && dist(b.pos, me.pos) < aggro_range * 2.0);
             let nearest = if victim.is_none() {
                 s.pilots()
-                    .filter(|b| b.char_id.is_some_and(hostile) && b.cloak == 0 && b.mode != MODE_WARP && dist(b.pos, me.pos) <= stats.aggro_range)
+                    .filter(|b| b.char_id.is_some_and(hostile) && b.cloak == 0 && b.mode != MODE_WARP && dist(b.pos, me.pos) <= aggro_range)
                     .min_by(|a, b| dist(a.pos, me.pos).partial_cmp(&dist(b.pos, me.pos)).unwrap_or(std::cmp::Ordering::Equal))
             } else {
                 None
             };
             Some((me.clone(), victim.cloned(), nearest.cloned()))
-        }).flatten() else { return Ok(()) };
+        }).await.flatten() else { return Ok(()) };
         npc_repair(world, system, id, &stats, &mut next_repair);
         // Keep the current target while it is around, else take the nearest visible pilot.
         let current = target.filter(|_| victim.is_some());
@@ -1700,7 +1710,7 @@ async fn npc_ai(db: &Db, world: &Arc<World>, system: i64, id: i64, type_id: i32,
             }
             if let Some(b) = nearest {
                 let (ship, pilot, orbit) = (b.id, b.char_id.unwrap_or(0), stats.fly_range);
-                world.command(system, id, |b, t, _| {
+                world.command(system, id, move |b, t, _| {
                     b.mode = MODE_ORBIT;
                     b.follow_id = ship;
                     b.follow_range = orbit as f32;

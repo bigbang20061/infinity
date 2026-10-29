@@ -140,8 +140,8 @@ async fn shift_security(db: &Db, world: &World, char_id: i64, fraction: f64, tow
 }
 
 /// Pilots in space in a system.
-fn pilots_in(world: &World, system: i64) -> Vec<i64> {
-    world.read(system, |s| s.pilots().filter_map(|b| b.char_id).collect()).unwrap_or_default()
+async fn pilots_in(world: &World, system: i64) -> Vec<i64> {
+    world.with(system, move |s| s.pilots().filter_map(|b| b.char_id).collect()).await.unwrap_or_default()
 }
 
 fn timer(state: i64, until: Option<i64>) -> Value {
@@ -214,7 +214,7 @@ pub async fn aggress(db: &Db, world: &Arc<World>, system: i64, attacker: i64, at
     shift_security(db, world, attacker, AGGRESSION_PENALTY, -10.0).await?;
     info!("crimewatch: {attacker} committed a criminal act against {victim} in {system} (security {system_sec:.1})");
     if became_criminal {
-        for pilot in pilots_in(world, system) {
+        for pilot in pilots_in(world, system).await {
             world.notify_pilot(pilot, "OnSystemCriminalFlagUpdates", vec![Value::list([]), Value::list([]), Value::list([Value::Int(attacker)])]);
         }
         clear_flag_later(db.clone(), world.clone(), attacker, until);
@@ -246,7 +246,7 @@ fn clear_flag_later(db: Db, world: Arc<World>, char_id: i64, until: i64) {
             }
         };
         if let Some(system) = system {
-            for pilot in pilots_in(&world, system) {
+            for pilot in pilots_in(&world, system).await {
                 world.notify_pilot(pilot, "OnSystemCriminalFlagUpdates", vec![Value::list([Value::Int(char_id)]), Value::list([]), Value::list([])]);
             }
         }
@@ -259,7 +259,7 @@ fn dispatch_concord(world: Arc<World>, system: i64, criminal: i64, security: f64
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
         state().concord.remove(&criminal);
-        let ship = world.read(system, |s| s.pilot_ball(criminal).map(|b| b.id)).flatten();
+        let ship = world.with(system, move |s| s.pilot_ball(criminal).map(|b| b.id)).await.flatten();
         if let Some(ship) = ship {
             info!("crimewatch: CONCORD destroyed ship {ship} of {criminal} in {system}");
             world.notify_pilot(
@@ -267,7 +267,7 @@ fn dispatch_concord(world: Arc<World>, system: i64, criminal: i64, security: f64
                 "OnRemoteMessage",
                 vec![Value::str("CustomNotify"), Value::dict([("notify", Value::unicode("统合部因你的犯罪行为摧毁了你的舰船。"))])],
             );
-            super::combat::destroy_player_ship(&world, system, ship, criminal);
+            super::combat::destroy_player_ship(&world, system, ship, criminal).await;
         }
     });
 }
@@ -379,8 +379,12 @@ pub async fn npc_killed(db: &Db, world: &World, char_id: i64) -> Result<(), Call
 
 
 /// `GetClientStates` -> (combat timers, engagements, (criminals, suspects) in the system, safety level).
-fn client_states(c: &Client) -> Value {
+async fn client_states(c: &Client) -> Value {
     let me = c.session.int("charid").unwrap_or(0);
+    let here: HashSet<i64> = match c.session.int("solarsystemid") {
+        Some(system) => pilots_in(&c.world, system).await.into_iter().collect(),
+        None => HashSet::new(),
+    };
     let now = filetime_now();
     let st = state();
     let pilot = st.pilots.get(&me);
@@ -396,7 +400,6 @@ fn client_states(c: &Client) -> Value {
         timer(DISAPPROVAL_IDLE, None),
     ]);
     let engagements = Value::Dict(st.engagements.iter().filter(|((a, _), until)| *a == me && **until > now).map(|((_, b), until)| (Value::Int(*b), Value::Int(*until))).collect());
-    let here: HashSet<i64> = c.session.int("solarsystemid").map(|s| pilots_in(&c.world, s).into_iter().collect()).unwrap_or_default();
     let criminals: Vec<Value> = st.pilots.iter().filter(|(ch, p)| p.criminal_until > now && here.contains(ch)).map(|(ch, _)| Value::Int(*ch)).collect();
     Value::tuple([timers, engagements, Value::tuple([Value::List(criminals), Value::list([])]), Value::Int(SAFETY_LEVEL_FULL)])
 }
@@ -453,7 +456,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     let int = |i: usize| call.args.get(i).and_then(|v| v.as_int());
     let me = c.session.int("charid").unwrap_or(0);
     Some(match (call.service, call.method) {
-        ("crimewatch", "GetClientStates") => Ok(client_states(c)),
+        ("crimewatch", "GetClientStates") => Ok(client_states(c).await),
         ("crimewatch", "GetMySecurityStatus") => security_status(&c.db, c.session.int("charid").unwrap_or(0)).await.map(Value::Float),
         ("crimewatch", "GetCharacterSecurityStatus") => security_status(&c.db, int(0).unwrap_or(0)).await.map(Value::Float),
         ("crimewatch", "GetSecurityStatusTransactions") => Ok(Value::list([])),

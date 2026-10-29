@@ -24,7 +24,7 @@
 use super::{keyval, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
 use crate::db::Db;
-use crate::space::{now_tick, Ball, World, MODE_RIGID, MODE_STOP, V3};
+use crate::space::{now_ms, Ball, World, MODE_RIGID, MODE_STOP, V3};
 use marshal::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -834,7 +834,7 @@ async fn ensure_static_exit(db: &Db, world: &World, system: i64) -> Result<(), C
         st.sites.insert(here.id, here.clone());
         st.sites.insert(there.id, there.clone());
     }
-    broadcast_sites(world, system, std::slice::from_ref(&here), &[]);
+    broadcast_sites(world, system, std::slice::from_ref(&here), &[]).await;
     Ok(())
 }
 
@@ -1030,8 +1030,8 @@ fn full_state(system: i64) -> Value {
 }
 
 /// Tell every pilot in `system` about sites that came or went.
-fn broadcast_sites(world: &World, system: i64, added: &[Site], removed: &[Site]) {
-    let pilots: Vec<i64> = world.read(system, |s| s.pilots().filter_map(|b| b.char_id).collect()).unwrap_or_default();
+async fn broadcast_sites(world: &World, system: i64, added: &[Site], removed: &[Site]) {
+    let pilots: Vec<i64> = world.with(system, |s| s.pilots().filter_map(|b| b.char_id).collect()).await.unwrap_or_default();
     for (kind, event, info) in [
         (Kind::Anomaly, "OnSignalTrackerAnomalyUpdate", anomaly_info as fn(&Site) -> Value),
         (Kind::Signature, "OnSignalTrackerSignatureUpdate", signature_info),
@@ -1333,7 +1333,7 @@ async fn cone_scan(c: &mut Client, call: &Call<'_>) -> CallResult {
     let n = |i: usize| call.args.get(i).and_then(|v| v.as_float()).unwrap_or(0.0);
     let (angle, range, dir) = (n(0), n(1), [n(2), n(3), n(4)]);
     let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) else { return Ok(Value::list([])) };
-    let Some(hits) = c.world.read(system, |s| {
+    let Some(hits) = c.world.with(system, move |s| {
         let me = s.ball(ship)?;
         let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt().max(1e-9);
         let half = (angle / 2.0).min(std::f64::consts::PI);
@@ -1354,7 +1354,7 @@ async fn cone_scan(c: &mut Client, call: &Call<'_>) -> CallResult {
             hits.push((b.id, b.type_id));
         }
         Some(hits)
-    }).flatten() else { return Ok(Value::list([])) };
+    }).await.flatten() else { return Ok(Value::list([])) };
     let types: Vec<i32> = hits.iter().map(|h| h.1).collect::<HashSet<_>>().into_iter().collect();
     let groups: HashMap<i32, i64> = c
         .db
@@ -1451,7 +1451,7 @@ async fn spawn_rats(c: &mut Client, system: i64, center: V3, faction: i64, group
         .map_err(db_err)?
         .and_then(|r| r.get::<_, Option<i64>>(0))
         .unwrap_or(1000127);
-    let tick = now_tick();
+    let ms = now_ms();
     let mut spawned = vec![];
     for group in groups {
         let Some(r) = c
@@ -1495,7 +1495,7 @@ async fn spawn_rats(c: &mut Client, system: i64, center: V3, faction: i64, group
             massive: true,
             warp: None,
             warp_factor: 0,
-            last_tick: tick,
+            last_ms: ms,
             cloak: 0,
             cloak_until: 0,
             health: [1.0; 3],
@@ -1556,9 +1556,11 @@ pub async fn belt_rats(c: &mut Client, system: i64, belt: i64, center: V3) -> Re
     info!(user = c.login.user_id, "belt {belt} in {system}: spawned {} rats", spawned.len());
     let world = c.world.clone();
     tokio::spawn(async move {
+        let spawned: Arc<[i64]> = spawned.into();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            if !world.read(system, |s| spawned.iter().any(|id| s.contains(*id))).unwrap_or(false) {
+            let spawned = Arc::clone(&spawned);
+            if !world.with(system, move |s| spawned.iter().any(|id| s.contains(*id))).await.unwrap_or(false) {
                 break;
             }
         }
@@ -1578,9 +1580,11 @@ pub(super) fn err_text(e: CallError) -> String {
 /// Once a combat site's NPCs are all gone it is done: it lingers briefly, then a new site
 /// of the same kind appears elsewhere in the system.
 async fn watch_site(db: Db, world: Arc<World>, site_id: i64, system: i64, npcs: Vec<i64>) {
+    let npcs: Arc<[i64]> = npcs.into();
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        if !world.read(system, |s| npcs.iter().any(|id| s.contains(*id))).unwrap_or(false) {
+        let npcs = Arc::clone(&npcs);
+        if !world.with(system, move |s| npcs.iter().any(|id| s.contains(*id))).await.unwrap_or(false) {
             break;
         }
     }
@@ -1598,7 +1602,7 @@ async fn replace_site(db: &Db, world: &World, site_id: i64) -> Result<(), CallEr
     info!("site {} in {system} done", old.target);
     delete_site(db, site_id).await?;
     for id in old.containers.iter().flatten() {
-        world.remove_ball(system, *id);
+        world.remove_ball(system, *id).await;
         db.client.execute("DELETE FROM game.items WHERE location_id = $1 OR item_id = $1", &[id]).await.map_err(db_err)?;
     }
     let info = system_info(db, system).await?;
@@ -1614,7 +1618,7 @@ async fn replace_site(db: &Db, world: &World, site_id: i64) -> Result<(), CallEr
         save_site(db, s).await?;
         state().sites.insert(s.id, s.clone());
     }
-    broadcast_sites(world, system, new.as_slice(), std::slice::from_ref(&old));
+    broadcast_sites(world, system, new.as_slice(), std::slice::from_ref(&old)).await;
     Ok(())
 }
 
@@ -1672,7 +1676,7 @@ fn wormhole_ball(s: &Site, w: &Wormhole) -> Ball {
         massive: false,
         warp: None,
         warp_factor: 0,
-        last_tick: now_tick(),
+        last_ms: now_ms(),
         cloak: 0,
         cloak_until: 0,
         health: [1.0; 3],
@@ -1766,10 +1770,10 @@ async fn wormhole_jump(c: &mut Client, wormhole_id: i64) -> CallResult {
     let Some((site, w)) = state().sites.get(&wormhole_id).and_then(|s| s.wormhole.clone().map(|w| (s.clone(), w))) else {
         return Err(notify_err("这个虫洞已经坍塌了。"));
     };
-    let Some((gap, mass)) = c.world.read(system, |s| {
+    let Some((gap, mass)) = c.world.with(system, move |s| {
         let (me, hole) = (s.ball(ship)?, s.ball(wormhole_id)?);
         Some((dist(me.pos, hole.pos) - hole.radius as f64 - me.radius as f64, me.mass))
-    }).flatten() else { return Ok(Value::None) };
+    }).await.flatten() else { return Ok(Value::None) };
     if gap > WORMHOLE_JUMP_RANGE {
         return Err(CallError::User { msg: "NotCloseEnoughToJump".into(), dict: vec![("maxdist".into(), Value::Int(WORMHOLE_JUMP_RANGE as i64))] });
     }
@@ -1809,7 +1813,7 @@ async fn wormhole_jump(c: &mut Client, wormhole_id: i64) -> CallResult {
             persist(&c.db, id).await?;
             let Some((s, wh)) = state().sites.get(&id).and_then(|s| s.wormhole.clone().map(|w| (s.clone(), w))) else { continue };
             if s.in_space {
-                world.remove_ball(s.system, s.id);
+                world.remove_ball(s.system, s.id).await;
                 let _ = world.add_ship(s.system, wormhole_ball(&s, &wh)).await;
             }
         }
@@ -1825,9 +1829,9 @@ async fn collapse(db: &Db, world: &World, site_id: i64) -> Result<(), CallError>
         let Some(s) = state().sites.remove(&id) else { continue };
         info!("wormhole {} in {} collapsed", s.target, s.system);
         if s.in_space {
-            world.destroy_ball(s.system, s.id);
+            world.destroy_ball(s.system, s.id).await;
         }
-        broadcast_sites(world, s.system, &[], &[s]);
+        broadcast_sites(world, s.system, &[], &[s]).await;
     }
     Ok(())
 }
@@ -1896,7 +1900,7 @@ fn container_ball(id: i64, type_id: i32, pos: V3, radius: f32, security_state: i
         massive: true,
         warp: None,
         warp_factor: 0,
-        last_tick: now_tick(),
+        last_ms: now_ms(),
         cloak: 0,
         cloak_until: 0,
         health: [1.0; 3],
@@ -2022,7 +2026,7 @@ pub(super) fn container_locked(container: i64) -> bool {
 
 /// Show a container as secure (0), being hacked (1) or hacked (2).
 pub(super) async fn set_container_state(world: &World, system: i64, container: i64, security_state: i64) {
-    let Some(mut ball) = world.remove_ball(system, container) else { return };
+    let Some(mut ball) = world.remove_ball(system, container).await else { return };
     ball.slim = vec![("hackingSecurityState", Value::Int(security_state))];
     let _ = world.add_ship(system, ball).await;
 }

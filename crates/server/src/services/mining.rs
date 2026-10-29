@@ -21,7 +21,7 @@ use super::fit::{Fit, Key};
 use super::{keyval, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
 use crate::db::Db;
-use crate::space::{now_tick, Ball, NotifyTx, World, MODE_RIGID, V3};
+use crate::space::{now_ms, Ball, NotifyTx, World, MODE_RIGID, V3};
 use marshal::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -167,7 +167,7 @@ fn rock_ball(id: i64, type_id: i32, pos: V3, radius: f32) -> Ball {
         massive: true,
         warp: None,
         warp_factor: 0,
-        last_tick: now_tick(),
+        last_ms: now_ms(),
         cloak: 0,
         cloak_until: 0,
         health: [1.0; 3],
@@ -322,7 +322,7 @@ fn schedule_regrow(db: Db, world: Arc<World>, system: i64, belt: i64, center: V3
 /// A rock is gone: out of space and the database; an emptied belt starts growing back.
 async fn exhaust(db: &Db, world: &Arc<World>, id: i64) -> Result<(), CallError> {
     let Some(rock) = state().rocks.remove(&id) else { return Ok(()) };
-    world.remove_ball(rock.system, id);
+    world.remove_ball(rock.system, id).await;
     db.client.execute("DELETE FROM game.asteroids WHERE asteroid_id = $1", &[&id]).await.map_err(db_err)?;
     let field_empty = !state().rocks.values().any(|r| r.field == rock.field);
     if !field_empty {
@@ -409,12 +409,12 @@ fn tell(notify: &NotifyTx, text: &str) {
 #[allow(clippy::too_many_arguments)]
 pub async fn extract(db: &Db, world: &Arc<World>, notify: &NotifyTx, char_id: i64, ship: i64, system: i64, fit: &Fit, module: i64, target: i64) -> Result<bool, CallError> {
     let Some(rock) = state().rocks.get(&target).cloned() else { return Ok(false) };
-    let Some((gap, pilots)) = world.read(system, |s| {
+    let Some((gap, pilots)) = world.with(system, move |s| {
         let (me, it) = (s.ball(ship)?, s.ball(target)?);
         let gap = dist(me.pos, it.pos) - me.radius as f64 - it.radius as f64;
         let pilots: Vec<i64> = s.pilots().filter_map(|b| b.char_id.filter(|c| *c != char_id)).collect();
         Some((gap, pilots))
-    }).flatten() else { return Ok(false) };
+    }).await.flatten() else { return Ok(false) };
     if gap > fit.value(Key::Module(module), ATTR_MAX_RANGE) {
         tell(notify, "目标超出了采矿设备的范围。");
         return Ok(false);
@@ -488,10 +488,10 @@ pub async fn extract(db: &Db, world: &Arc<World>, notify: &NotifyTx, char_id: i6
 }
 
 /// miningScanMgr.perform_scan() -> [(asteroidID, typeID, quantity)] within reach.
-fn perform_scan(c: &Client) -> Value {
+async fn perform_scan(c: &Client) -> Value {
     let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) else { return Value::None };
     let rocks: Vec<(i64, i32, i64)> = state().rocks.iter().filter(|(_, r)| r.system == system).map(|(id, r)| (*id, r.type_id, r.quantity)).collect();
-    c.world.read(system, |s| {
+    c.world.with(system, move |s| {
         let me = s.ball(ship)?;
         Some(Value::List(
             rocks
@@ -500,7 +500,7 @@ fn perform_scan(c: &Client) -> Value {
                 .map(|(id, type_id, quantity)| Value::tuple([Value::Int(id), Value::Int(type_id as i64), Value::Int(quantity)]))
                 .collect(),
         ))
-    }).flatten().unwrap_or(Value::None)
+    }).await.flatten().unwrap_or(Value::None)
 }
 
 // ---------------------------------------------------------------- reprocessing
@@ -672,7 +672,7 @@ async fn reprocessing(c: &mut Client, call: &Call<'_>) -> CallResult {
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     match (call.service, call.method) {
-        ("miningScanMgr", "perform_scan") => Some(Ok(perform_scan(c))),
+        ("miningScanMgr", "perform_scan") => Some(Ok(perform_scan(c).await)),
         ("reprocessingSvc", _) if call.bound => Some(reprocessing(c, call).await),
         _ => None,
     }
