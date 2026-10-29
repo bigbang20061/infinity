@@ -9,7 +9,8 @@
 //!
 //! Celestials come from the SDE; dynamic balls stay in memory. Each system
 //! owns an actor with a 100 ms tick and closure messages. Destiny stamps remain
-//! whole seconds. NPC brains and persistent position snapshots are not supported here.
+//! whole seconds. NPC decisions and spawn groups live in the actor; combat effects
+//! run on a per-system worker. Persistent position snapshots are not supported.
 
 use crate::db::Db;
 use anyhow::Result;
@@ -21,6 +22,8 @@ use tracing::info;
 
 mod actor;
 mod system;
+mod npc;
+pub use npc::{HOSTILE_TO_ALL, NpcAction, NpcBrain, NpcConfig, NpcEffects, NpcFuture};
 pub use system::System;
 use actor::SystemHandle;
 

@@ -4,9 +4,10 @@
 //! The live server's dungeon layouts never shipped with the client, so a site is a point
 //! off a planet tied to one of the build's dungeons for its name, faction and difficulty.
 //! Combat sites fill with that faction's NPCs when first warped to and are replaced
-//! elsewhere once cleared. Data and relic sites hold hackable containers (services/hacking)
-//! with loot. A wormhole leads to a random system of its target class, where a K162 leads
-//! back; both ends share one mass budget and lifetime.
+//! elsewhere after their spawn group clears and the site lingers briefly. Data and relic
+//! sites hold hackable containers (services/hacking) with loot. A wormhole leads to a
+//! random system of its target class, where a K162 leads back; both ends share one mass
+//! budget and lifetime.
 //!
 //! Sites are generated per system on first visit and stored in game.exploration_sites;
 //! memory holds the systems loaded since startup. Wormholes and spawned containers are put
@@ -804,7 +805,7 @@ async fn ensure_loaded(db: &Db, world: &Arc<World>, system: i64) -> Result<(), C
             // A mined field's rocks come back with the system's (services/mining); its
             // watch resumes.
             (Some(rocks), Some(_)) => {
-                tokio::spawn(watch_site(db.clone(), world.clone(), s.id, system, rocks.clone()));
+                track_site_clearance(db.clone(), world.clone(), s.id, system, rocks.clone());
             }
             (Some(containers), None) => restore_containers(db, world, s, containers).await?,
             _ => {}
@@ -1411,7 +1412,7 @@ fn sleeper_groups(difficulty: i64) -> [&'static str; 3] {
     }
 }
 
-/// Spawn a combat site's NPCs (once) and watch for it being cleared.
+/// Spawn a combat site's NPCs (once) and register its clearance callback.
 async fn spawn_site_npcs(c: &mut Client, site: &Site) -> Result<(), CallError> {
     let faction = site.faction.unwrap_or(500010);
     let sleepers = faction == 500021 && site.name_id.is_some() && site.archetype == Some(24) && site.strength_attr == STRENGTH_ALL && {
@@ -1436,8 +1437,23 @@ async fn spawn_site_npcs(c: &mut Client, site: &Site) -> Result<(), CallError> {
     if let Some(s) = state().sites.get_mut(&site.id) {
         s.npcs = Some(spawned.clone());
     }
-    tokio::spawn(watch_site(c.db.clone(), c.world.clone(), site.id, site.system, spawned));
+    track_site_clearance(c.db.clone(), c.world.clone(), site.id, site.system, spawned);
     Ok(())
+}
+
+/// Both combat sites and mined-out fields linger and replace after their group clears.
+fn track_site_clearance(db: Db, world: Arc<World>, site_id: i64, system: i64, members: Vec<i64>) {
+    let completion_world = world.clone();
+    world.post(system, move |s| {
+        s.spawn_group(members, move |_| {
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(CLEARED_SITE_LINGER_SECS)).await;
+                if let Err(e) = replace_site(&db, &completion_world, site_id).await {
+                    warn!("replacing site {site_id}: {}", err_text(e));
+                }
+            });
+        });
+    });
 }
 
 /// Put one hostile NPC of each of `groups` (a random type of the group) in space for
@@ -1504,7 +1520,7 @@ async fn spawn_rats(c: &mut Client, system: i64, center: V3, faction: i64, group
         };
         let (id, type_id) = (ball.id, ball.type_id);
         c.world.add_ship(system, ball).await.map_err(CallError::Internal)?;
-        super::combat::spawn_npc(c.db.clone(), c.world.clone(), system, id, type_id, Some(super::combat::HOSTILE_TO_ALL));
+        super::combat::spawn_npc(c.db.clone(), c.world.clone(), system, id, type_id, Some(crate::space::HOSTILE_TO_ALL)).await?;
         spawned.push(id);
     }
     Ok(spawned)
@@ -1554,18 +1570,13 @@ pub async fn belt_rats(c: &mut Client, system: i64, belt: i64, center: V3) -> Re
         }
     };
     info!(user = c.login.user_id, "belt {belt} in {system}: spawned {} rats", spawned.len());
-    let world = c.world.clone();
-    tokio::spawn(async move {
-        let spawned: Arc<[i64]> = spawned.into();
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            let spawned = Arc::clone(&spawned);
-            if !world.with(system, move |s| spawned.iter().any(|id| s.contains(*id))).await.unwrap_or(false) {
-                break;
-            }
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(BELT_RAT_RESPAWN_SECS)).await;
-        state().belts.remove(&belt);
+    c.world.post(system, move |s| {
+        s.spawn_group(spawned, move |_s| {
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(BELT_RAT_RESPAWN_SECS)).await;
+                state().belts.remove(&belt);
+            });
+        });
     });
     Ok(())
 }
@@ -1574,23 +1585,6 @@ pub(super) fn err_text(e: CallError) -> String {
     match e {
         CallError::Internal(e) => format!("{e:#}"),
         CallError::User { msg, .. } => msg,
-    }
-}
-
-/// Once a combat site's NPCs are all gone it is done: it lingers briefly, then a new site
-/// of the same kind appears elsewhere in the system.
-async fn watch_site(db: Db, world: Arc<World>, site_id: i64, system: i64, npcs: Vec<i64>) {
-    let npcs: Arc<[i64]> = npcs.into();
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        let npcs = Arc::clone(&npcs);
-        if !world.with(system, move |s| npcs.iter().any(|id| s.contains(*id))).await.unwrap_or(false) {
-            break;
-        }
-    }
-    tokio::time::sleep(std::time::Duration::from_secs(CLEARED_SITE_LINGER_SECS)).await;
-    if let Err(e) = replace_site(&db, &world, site_id).await {
-        warn!("replacing site {site_id}: {}", err_text(e));
     }
 }
 
@@ -1738,7 +1732,7 @@ pub async fn warp_to_scan(c: &mut Client, target: &str, min_range: f64) -> CallR
                 s.containers = Some(rocks.clone());
             }
             persist(&c.db, site.id).await?;
-            tokio::spawn(watch_site(c.db.clone(), c.world.clone(), site.id, system, rocks));
+            track_site_clearance(c.db.clone(), c.world.clone(), site.id, system, rocks);
         }
     } else if site.is_hack_site() {
         if site.containers.is_none() {

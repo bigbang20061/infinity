@@ -1,6 +1,6 @@
 //! Actor-owned ballpark state and visibility, mirroring michelle.py and destiny.
 //! Celestials are supplied by the facade from SDE; dynamic state is in memory.
-//! NPC brains and closure timers are introduced in later phases.
+//! NPC decisions and spawn-group callbacks run in the tick; DB effects use a worker.
 use super::*;
 
 #[derive(Default)]
@@ -12,7 +12,12 @@ pub struct System {
     registry: Arc<Pilots>,
     positions: HashMap<i64, V3>,
     pending: Option<HashMap<i64, Vec<Value>>>,
-    ms: i64,
+    pub(super) ms: i64,
+    pub(super) brains: HashMap<i64, NpcBrain>,
+    pub(super) npc_jobs: Option<mpsc::UnboundedSender<npc::EffectJob>>,
+    pub(super) groups: HashMap<u64, npc::SpawnGroup>,
+    pub(super) member_groups: HashMap<i64, std::collections::HashSet<u64>>,
+    pub(super) due_brains: Vec<i64>,
 }
 impl System {
     pub fn new(id: i64, registry: Arc<Pilots>) -> Self {
@@ -53,6 +58,7 @@ impl System {
                 self.pilots.remove(&char_id);
             }
         }
+        self.npc_removed(id);
         Some(ball)
     }
 
@@ -72,7 +78,7 @@ impl System {
         for b in self.balls.values_mut() { b.evolve(ms, &self.positions); }
     }
     pub(super) fn is_cold(&self) -> bool {
-        self.observers.is_empty() && !self.balls.values().any(|b|
+        self.brains.is_empty() && self.observers.is_empty() && !self.balls.values().any(|b|
             (b.free && b.mode != MODE_MISSILE && (b.mode != MODE_STOP || len(b.vel) > 1e-9))
             || (b.cloak != 0 && b.cloak_until > 0))
     }
@@ -85,6 +91,7 @@ impl System {
         let expired: Vec<_> = self.balls.values().filter(|b|
             b.cloak != 0 && b.cloak_until > 0 && b.cloak_until <= filetime).map(|b| b.id).collect();
         for id in expired { self.uncloak(id); }
+        self.think_npcs();
         for (client, events) in self.pending.take().unwrap() {
             if let Some((_, tx)) = self.observers.get(&client) {
                 if tx.send(events).is_err() { self.observers.remove(&client); }

@@ -1,6 +1,6 @@
 //! Per-system unbounded closure mailbox and 100 ms simulation driver.
 //! Mirrors destiny's ballpark advancement; no database or client protocol decoding.
-//! NPC workers and closure timers are not implemented in this phase.
+//! NPC effects use one sequential worker per system; closure timers are not implemented.
 use super::*;
 use std::sync::Weak;
 use std::time::Duration;
@@ -15,6 +15,7 @@ impl SystemHandle {
     pub(super) fn send(&self, job: Job) -> std::result::Result<(), mpsc::error::SendError<Job>> { self.0.send(job) }
 }
 pub(super) fn start(mut system: System, id: i64, systems: Weak<Mutex<HashMap<i64, SystemHandle>>>) -> SystemHandle {
+    npc::start_worker(&mut system);
     let (tx, mut rx) = mpsc::unbounded_channel::<Job>();
     let identity = tx.downgrade();
     let task = tokio::spawn(async move {

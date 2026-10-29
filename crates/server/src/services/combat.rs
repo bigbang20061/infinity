@@ -17,8 +17,8 @@
 //! and repair themselves; a pilot's ship can be destroyed. Active modules apply their effects
 //! (hardeners through fit, propulsion speed via destiny, repairers each cycle), and a kill
 //! pays the NPC's bounty and leaves a wreck with loot.
-//! NPC AI and missile impact timers run in separate tasks; space state is accessed
-//! through per-system actor messages, while weapon and database work stays outside.
+//! NPC decisions run in the per-system actor, with weapon and repair effects resolved
+//! by its worker outside the actor. Missile impact timers run in separate tasks.
 
 use super::dogma::load_items;
 use super::inventory::notify_item_change;
@@ -26,7 +26,7 @@ use super::fit::{Fit, Key};
 use super::{Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
 use crate::db::Db;
-use crate::space::{event, now_ms, now_tick, Ball, NotifyTx, World, MODE_MISSILE, MODE_ORBIT, MODE_STOP, MODE_WARP, V3};
+use crate::space::{event, now_ms, now_tick, Ball, NotifyTx, NpcAction, NpcBrain, NpcConfig, NpcEffects, NpcFuture, World, MODE_MISSILE, MODE_WARP, V3};
 use marshal::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -130,10 +130,6 @@ struct State {
     condition: HashMap<i64, Condition>,
     /// moduleID -> FILETIME its reload finishes
     reloading: HashMap<i64, i64>,
-    /// NPCs with a running AI
-    npcs: HashSet<i64>,
-    /// npcID -> pilots who have shot at it
-    aggressors: HashMap<i64, HashSet<i64>>,
 }
 
 /// Modules currently running their activation effect (services::fit applies them).
@@ -785,7 +781,9 @@ fn absorb(now: &mut [f64; 3], resonance: &[[f64; 4]; 3], raw: [f64; 4]) -> f64 {
 async fn damage_npc(db: &Db, world: &World, system: i64, target: i64, raw: [f64; 4], attacker: Option<i64>) -> Result<f64, CallError> {
     let Some(ball) = world.ball(system, target).await else { return Ok(0.0) };
     if let Some(pilot) = attacker {
-        state().aggressors.entry(target).or_default().insert(pilot);
+        world.post(system, move |s| {
+            s.add_aggressor(target, pilot);
+        });
     }
     let known = state().hp.get(&target).cloned();
     let mut hp = match known {
@@ -801,11 +799,6 @@ async fn damage_npc(db: &Db, world: &World, system: i64, target: i64, raw: [f64;
         info!("ball {target} (type {}) destroyed", ball.type_id);
         world.destroy_ball(system, target).await;
         forget_target(world, target);
-        {
-            let mut st = state();
-            st.npcs.remove(&target);
-            st.aggressors.remove(&target);
-        }
         if let Err(e) = reward_kill(db, world, system, &ball, attacker).await {
             warn!("wreck of {target}: {}", match e {
                 CallError::Internal(e) => format!("{e:#}"),
@@ -1647,127 +1640,78 @@ async fn npc_stats(db: &Db, type_id: i32) -> Result<NpcStats, CallError> {
     })
 }
 
-/// Bring a spawned NPC to life: it goes for the nearest of its `owner` (the mission runner)
-/// and whoever has shot it, orbits at its fly range, locks and fires its turrets or missiles
-/// until one of them is gone, repairing itself as it goes.
-/// `spawn_npc` owner for NPCs that attack any pilot who comes near (exploration sites).
-pub const HOSTILE_TO_ALL: i64 = -1;
-
-pub fn spawn_npc(db: Db, world: Arc<World>, system: i64, id: i64, type_id: i32, owner: Option<i64>) {
-    state().npcs.insert(id);
-    tokio::spawn(async move {
-        if let Err(e) = npc_ai(&db, &world, system, id, type_id, owner).await {
-            warn!("npc {id}: {}", match e {
-                CallError::Internal(e) => format!("{e:#}"),
-                CallError::User { msg, .. } => msg,
-            });
+/// Attach a brain to a spawned NPC; its effects run on the system's worker.
+pub async fn spawn_npc(db: Db, world: Arc<World>, system: i64, id: i64, type_id: i32, owner: Option<i64>) -> Result<(), CallError> {
+    let stats = match npc_stats(&db, type_id).await {
+        Ok(stats) => Arc::new(stats),
+        Err(error) => {
+            world.post(system, move |s| { s.remove_ball(id); });
+            return Err(error);
         }
+    };
+    let config = NpcConfig {
+        fly_range: stats.fly_range,
+        aggro_range: stats.aggro_range,
+        rate_of_fire_ms: stats.rate_of_fire_ms,
+        repairs: stats.repairs,
+    };
+    let weak_world = Arc::downgrade(&world);
+    let effects: NpcEffects = Arc::new(move |action| -> NpcFuture {
+        let db = db.clone();
+        let weak_world = weak_world.clone();
+        let stats = stats.clone();
+        Box::pin(async move {
+            let Some(world) = weak_world.upgrade() else { return };
+            match action {
+                NpcAction::Shot { me, victim } => {
+                    if let Err(e) = npc_shot(&db, &world, system, id, type_id, &stats, me, victim).await {
+                        warn!("npc {id}: {}", match e {
+                            CallError::Internal(e) => format!("{e:#}"),
+                            CallError::User { msg, .. } => msg,
+                        });
+                    }
+                }
+                NpcAction::Repair => npc_repair(&world, system, id, &stats),
+            }
+        })
     });
+    let brain = NpcBrain::new(owner, config, effects);
+    world.post(system, move |s| {
+        s.add_npc(id, brain);
+    });
+    Ok(())
 }
 
-async fn npc_ai(db: &Db, world: &Arc<World>, system: i64, id: i64, type_id: i32, owner: Option<i64>) -> Result<(), CallError> {
-    let stats = npc_stats(db, type_id).await?;
-    let mut next_repair = 0i64;
-    // (ship, pilot, locked from)
-    let mut target: Option<(i64, i64, i64)> = None;
-    let mut announced = false;
-    let mut next_shot = 0i64;
-    loop {
-        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-        if !state().npcs.contains(&id) {
-            return Ok(());
-        }
-        // Pilots this NPC fights: its mission runner (or everyone) and anyone who has shot it.
-        let enemies: HashSet<i64> = state().aggressors.get(&id).cloned().unwrap_or_default().into_iter().chain(owner).collect();
-        let aggro_range = stats.aggro_range;
-        let current_target = target;
-        let Some((me, victim, nearest)) = world.with(system, move |s| {
-            let hostile = |ch: i64| owner == Some(HOSTILE_TO_ALL) || enemies.contains(&ch);
-            let me = s.ball(id)?;
-            let victim = current_target.and_then(|(ship, _, _)| s.ball(ship))
-                .filter(|b| b.cloak == 0 && dist(b.pos, me.pos) < aggro_range * 2.0);
-            let nearest = if victim.is_none() {
-                s.pilots()
-                    .filter(|b| b.char_id.is_some_and(hostile) && b.cloak == 0 && b.mode != MODE_WARP && dist(b.pos, me.pos) <= aggro_range)
-                    .min_by(|a, b| dist(a.pos, me.pos).partial_cmp(&dist(b.pos, me.pos)).unwrap_or(std::cmp::Ordering::Equal))
-            } else {
-                None
+async fn npc_shot(db: &Db, world: &Arc<World>, system: i64, id: i64, type_id: i32, stats: &NpcStats, me: Ball, victim: Ball) -> Result<(), CallError> {
+    let ship = victim.id;
+    let gap = (dist(me.pos, victim.pos) - me.radius as f64 - victim.radius as f64).max(0.0);
+    if let Some((charge, multiplier, c)) = &stats.missile {
+        let (charge, multiplier) = (*charge, *multiplier);
+        let velocity = attr(c, ATTR_MISSILE_VELOCITY, 3_000.0).max(1.0);
+        let flight = velocity * attr(c, ATTR_EXPLOSION_DELAY, 5_000.0) / 1000.0;
+        if gap <= flight {
+            let missile = Missile {
+                charge,
+                raw: ATTR_DAMAGE.map(|a| attr(c, a, 0.0) * multiplier),
+                aoe_cloud: attr(c, ATTR_AOE_CLOUD_SIZE, 40.0),
+                velocity,
+                flight_range: flight,
+                weapon: type_id,
+                attacker: None,
             };
-            Some((me.clone(), victim.cloned(), nearest.cloned()))
-        }).await.flatten() else { return Ok(()) };
-        npc_repair(world, system, id, &stats, &mut next_repair);
-        // Keep the current target while it is around, else take the nearest visible pilot.
-        let current = target.filter(|_| victim.is_some());
-        if current.is_none() {
-            if let Some((ship, pilot, _)) = target.take() {
-                world.notify_pilot(pilot, "OnTarget", vec![Value::str("otherlost"), Value::Int(id), Value::None]);
-                let _ = ship;
-                world.command(system, id, |b, t, _| {
-                    b.mode = MODE_STOP;
-                    b.speed_fraction = 0.0;
-                    vec![event(t, "Stop", vec![Value::Int(b.id)])]
-                });
-            }
-            if let Some(b) = nearest {
-                let (ship, pilot, orbit) = (b.id, b.char_id.unwrap_or(0), stats.fly_range);
-                world.command(system, id, move |b, t, _| {
-                    b.mode = MODE_ORBIT;
-                    b.follow_id = ship;
-                    b.follow_range = orbit as f32;
-                    b.speed_fraction = 1.0;
-                    vec![
-                        event(t, "Orbit", vec![Value::Int(b.id), Value::Int(ship), Value::Float(orbit)]),
-                        event(t, "SetSpeedFraction", vec![Value::Int(b.id), Value::Float(1.0)]),
-                    ]
-                });
-                // Locking takes a few seconds before the first shot.
-                let locked = filetime_now() + 3 * SEC;
-                target = Some((ship, pilot, locked));
-                announced = false;
-                next_shot = locked;
-                debug!("npc {id} engages {ship}");
-            }
-            continue;
+            launch_missile(db.clone(), world.clone(), system, me.clone(), victim.clone(), me.owner_id, None, missile).await?;
         }
-        let Some((ship, pilot, locked)) = current else { continue };
-        let now = filetime_now();
-        if !announced && now >= locked {
-            world.notify_pilot(pilot, "OnTarget", vec![Value::str("otheradd"), Value::Int(id)]);
-            announced = true;
-        }
-        if now < next_shot {
-            continue;
-        }
-        let Some(victim) = victim else { continue };
-        let gap = (dist(me.pos, victim.pos) - me.radius as f64 - victim.radius as f64).max(0.0);
-        if let Some((charge, multiplier, c)) = &stats.missile {
-            let (charge, multiplier) = (*charge, *multiplier);
-            let velocity = attr(c, ATTR_MISSILE_VELOCITY, 3_000.0).max(1.0);
-            let flight = velocity * attr(c, ATTR_EXPLOSION_DELAY, 5_000.0) / 1000.0;
-            if gap <= flight {
-                let missile = Missile {
-                    charge,
-                    raw: ATTR_DAMAGE.map(|a| attr(c, a, 0.0) * multiplier),
-                    aoe_cloud: attr(c, ATTR_AOE_CLOUD_SIZE, 40.0),
-                    velocity,
-                    flight_range: flight,
-                    weapon: type_id,
-                    attacker: None,
-                };
-                launch_missile(db.clone(), world.clone(), system, me.clone(), victim.clone(), me.owner_id, None, missile).await?;
-            }
-        }
-        if stats.damage.iter().any(|d| *d > 0.0) && gap <= stats.optimal + stats.falloff * 3.0 {
-            if let Some(guid) = stats.fx.as_deref() {
-                let fx = fire_fx(id, None, guid, Some(ship), None, true, stats.rate_of_fire_ms, 1);
-                world.broadcast(system, id, vec![fx]);
-            }
-            let multiplier = turret_roll(gap, stats.optimal, stats.falloff);
-            let dealt = if multiplier > 0.0 { damage(db, world, system, ship, victim.char_id, stats.damage.map(|d| d * multiplier), None).await? } else { 0.0 };
-            report_hit(world, id, ship, me.char_id, victim.char_id, type_id, dealt, hit_quality(multiplier));
-        }
-        next_shot = now + (stats.rate_of_fire_ms * 10_000.0) as i64;
     }
+    if stats.damage.iter().any(|d| *d > 0.0) && gap <= stats.optimal + stats.falloff * 3.0 {
+        if let Some(guid) = stats.fx.as_deref() {
+            let fx = fire_fx(id, None, guid, Some(ship), None, true, stats.rate_of_fire_ms, 1);
+            world.broadcast(system, id, vec![fx]);
+        }
+        let multiplier = turret_roll(gap, stats.optimal, stats.falloff);
+        let dealt = if multiplier > 0.0 { damage(db, world, system, ship, victim.char_id, stats.damage.map(|d| d * multiplier), None).await? } else { 0.0 };
+        report_hit(world, id, ship, me.char_id, victim.char_id, type_id, dealt, hit_quality(multiplier));
+    }
+    Ok(())
 }
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
@@ -1820,13 +1764,11 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
 
 
 /// A damaged NPC boosts its shield and repairs its armor every repair cycle.
-fn npc_repair(world: &World, system: i64, id: i64, stats: &NpcStats, next: &mut i64) {
-    let (shield, armor, cycle) = stats.repairs;
-    let now = filetime_now();
-    if (shield <= 0.0 && armor <= 0.0) || now < *next {
+fn npc_repair(world: &World, system: i64, id: i64, stats: &NpcStats) {
+    let (shield, armor, _) = stats.repairs;
+    if shield <= 0.0 && armor <= 0.0 {
         return;
     }
-    *next = now + (cycle * 10_000.0) as i64;
     let health = {
         let mut st = state();
         let Some(hp) = st.hp.get_mut(&id) else { return };

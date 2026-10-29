@@ -17,7 +17,8 @@
 //! goods back) and agent interactions (a choice of answers). The live server's dungeon layouts never
 //! shipped with the client, so a site is a deadspace point near a planet of the
 //! agent's system, spawned with that dungeon faction's mission NPCs on first approach.
-//! The objective completes once every spawned NPC is gone.
+//! The objective completes once the actor's spawned NPC group is cleared. Site
+//! records and group state are held in memory.
 
 use super::{keyval, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
@@ -645,9 +646,15 @@ async fn remove(c: &Client, agent_id: i64) -> Result<(), CallError> {
 
 // ---------------------------------------------------------------- sites and NPCs
 
-/// (character, agent) -> (solar system, NPCs spawned at the site).
-fn sites() -> &'static Mutex<HashMap<(i64, i64), (i64, Vec<i64>)>> {
-    static SITES: OnceLock<Mutex<HashMap<(i64, i64), (i64, Vec<i64>)>>> = OnceLock::new();
+struct MissionSite {
+    system: i64,
+    npcs: Vec<i64>,
+    group: u64,
+}
+
+/// (character, agent) -> system, spawned NPCs, and actor group for the site.
+fn sites() -> &'static Mutex<HashMap<(i64, i64), MissionSite>> {
+    static SITES: OnceLock<Mutex<HashMap<(i64, i64), MissionSite>>> = OnceLock::new();
     SITES.get_or_init(Default::default)
 }
 
@@ -755,27 +762,32 @@ async fn ensure_site(c: &mut Client, m: &Mission) -> Result<(), CallError> {
         spawned.push(ball.id);
         let (id, type_id) = (ball.id, ball.type_id);
         c.world.add_ship(m.system_id, ball).await.map_err(CallError::Internal)?;
-        super::combat::spawn_npc(c.db.clone(), c.world.clone(), m.system_id, id, type_id, Some(me));
+        super::combat::spawn_npc(c.db.clone(), c.world.clone(), m.system_id, id, type_id, Some(me)).await?;
     }
+    let group_members = spawned.clone();
+    let group = c.world.with(m.system_id, move |s| s.spawn_group(group_members, |_| {})).await
+        .ok_or_else(|| CallError::Internal(anyhow::anyhow!("system actor stopped")))?;
     info!(user = c.login.user_id, "agent {}: spawned {} NPCs for mission {} in {}", m.agent_id, spawned.len(), m.mission_id, m.system_id);
-    sites().lock().unwrap().insert((me, m.agent_id), (m.system_id, spawned));
+    sites().lock().unwrap().insert((me, m.agent_id), MissionSite { system: m.system_id, npcs: spawned, group });
     Ok(())
 }
 
 fn despawn(c: &Client, char_id: i64, agent_id: i64) {
-    if let Some((system, npcs)) = sites().lock().unwrap().remove(&(char_id, agent_id)) {
-        for id in npcs {
-            c.world.post(system, move |s| { s.remove_ball(id); });
-        }
+    if let Some(site) = sites().lock().unwrap().remove(&(char_id, agent_id)) {
+        c.world.post(site.system, move |s| {
+            for id in site.npcs {
+                s.remove_ball(id);
+            }
+        });
     }
 }
 
-/// Is the mission's objective done: its site spawned and every NPC there gone?
+/// Is the accepted mission's spawned NPC group cleared?
 async fn objective_done(c: &Client, m: &Mission) -> bool {
+    if m.state != STATE_ACCEPTED { return false; }
     let me = c.session.int("charid").unwrap_or(0);
-    let Some((system, npcs)) = sites().lock().unwrap().get(&(me, m.agent_id)).cloned() else { return false };
-    let any_remaining = c.world.with(system, move |s| npcs.iter().any(|id| s.contains(*id))).await.unwrap_or(false);
-    m.state == STATE_ACCEPTED && !any_remaining
+    let Some((system, group)) = sites().lock().unwrap().get(&(me, m.agent_id)).map(|site| (site.system, site.group)) else { return false };
+    c.world.with(system, move |s| s.group_remaining(group) == 0).await.unwrap_or(false)
 }
 
 // ---------------------------------------------------------------- client shapes
