@@ -1,5 +1,8 @@
 //! `config` service: the server side of the client's cfg Recordsets
 //! (eve/common/script/sys/eveCfg.py). Multi-fetchers return `(header, rows)`.
+//! Owner, location, ticker and alliance records come from game and SDE tables.
+//! `GetStationSolarSystemsByOwner` returns distinct systems from `sde.sta_stations`;
+//! player-owned structures are not included.
 
 use super::{db_err, value_ids, Call, CallError, CallResult};
 use crate::client::{short, Client};

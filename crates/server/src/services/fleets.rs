@@ -6,7 +6,8 @@
 //! carry the fleet in their session (fleetid, wingid, squadid, fleetrole), which also puts
 //! them in the fleet chat channel; joins, departures and changes are pushed to every member
 //! (OnFleetJoin, OnFleetLeave, OnFleetMemberChanged...). A pilot who logs off leaves.
-//! Fleet warps, boosts, ads and the fleet finder aren't supported.
+//! The fleet finder returns an empty advert dictionary: fleets are not advertised.
+//! Fleet warps, boosts and advertising are not supported.
 
 use super::{keyval, notify_error, value_text, Call, CallError, CallResult};
 use crate::client::Client;

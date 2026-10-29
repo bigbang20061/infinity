@@ -72,6 +72,8 @@ pub const FACTION_ANGEL_CARTEL: i64 = 500011;
 // SDE dogma attribute and effect IDs.
 /// SDE dgmAttributeTypes: mass.
 pub const ATTR_MASS: i32 = 4;
+/// SDE dgmAttributeTypes: hp (structure hitpoint capacity).
+pub const ATTR_STRUCTURE_HP: i32 = 9;
 /// SDE dgmAttributeTypes: capacity.
 pub const ATTR_CAPACITY: i32 = 38;
 /// SDE dgmAttributeTypes: volume.

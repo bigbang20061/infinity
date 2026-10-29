@@ -1,5 +1,10 @@
 //! Map, corporation and wallet-side services the neocom windows load from
 //! (eve/client/script/ui/shared/maps, mapView, neocom/corporation, wallet).
+//! Corporation rows come from `sde.crp_npc_corporations` or `game.corporations`;
+//! character corporation lookup uses `game.characters` and `sde.npc_characters`.
+//! Public corporation rows include `allowWar` (false for NPC corporations).
+//! NPC corporation trading is not modelled: `GetCorpInfo` returns an empty list.
+//! Many map, wallet and war queries likewise return empty fallback data.
 
 use super::{db_err, row, rowset, Call, CallError, CallResult};
 use crate::client::Client;

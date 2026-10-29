@@ -8,6 +8,8 @@
 //! Agents come from the retail agent list (crate::retail). Basic agents offer the
 //! build's own kill missions (sde_native.missions, BasicKillMission) whose dungeon
 //! difficulty matches the agent's level.
+//! `GetDisabledMissions` returns an empty list. Agent info uses the retail agent
+//! list; unbound or non-agent info requests return None.
 //!
 //! Epic arcs (sde_native.epicarcs) chain missions across agents: an arc's first step is
 //! offered by its agent to anyone who hasn't begun it, and each completed step unlocks

@@ -1,7 +1,9 @@
-//! Services the client calls while entering / sitting in a station that only
-//! need empty-but-well-formed answers for now (no wars, agents, campaigns...).
-//! The SettingsInfo code object is specifically CPython 2.7 marshal and bytecode;
-//! its encoded flags and opcodes are not portable to another Python version.
+//! Station and login services, including station data used by `uisvc.GetStation`.
+//! Station information comes from `sde.sta_stations`; activity auto-popup state is
+//! persisted per character in `game.characters` (missing characters default to 1).
+//! Activity badges and other unmodelled services return empty or no-op fallbacks.
+//! The SettingsInfo code object used by carbonui settingsSvc.UpdateSettingsStatistics
+//! is CPython 2.7 marshal and bytecode, not portable to another Python version.
 
 use super::{db_err, rowset, Call, CallError, CallResult};
 use crate::client::Client;
@@ -144,7 +146,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             let me = c.session.int("charid").unwrap_or(0);
             match c.db.client.query_opt("SELECT activities_pop_state FROM game.characters WHERE character_id = $1", &[&me]).await {
                 Ok(r) => int(r.map(|r| r.get::<_, i32>(0) as i64).unwrap_or(1)),
-                Err(e) => return Some(Err(CallError::Internal(e.into()))),
+                Err(e) => return Some(Err(db_err(e))),
             }
         }
         ("activityMgr", "SetActivitiesPopState") => {
@@ -152,7 +154,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             let state = call.args.first().and_then(|v| v.as_int()).unwrap_or(1) as i32;
             match c.db.client.execute("UPDATE game.characters SET activities_pop_state = $2 WHERE character_id = $1", &[&me, &state]).await {
                 Ok(_) => Value::Bool(true),
-                Err(e) => return Some(Err(CallError::Internal(e.into()))),
+                Err(e) => return Some(Err(db_err(e))),
             }
         }
         // No activity badges are shown, so there's nothing to clear.
