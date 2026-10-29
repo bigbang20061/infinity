@@ -9,8 +9,9 @@
 //!
 //! Celestials come from the SDE; dynamic balls stay in memory. Each system
 //! owns an actor with a 100 ms tick and closure messages. Destiny stamps remain
-//! whole seconds. NPC decisions and spawn groups live in the actor; combat effects
-//! run on a per-system worker. Persistent position snapshots are not supported.
+//! whole seconds. NPC decisions, spawn groups and closure timers live in the actor;
+//! combat effects run on a per-system worker. Timers fire on ticks in deadline and
+//! scheduling order. Persistent timers and position snapshots are not supported.
 
 use crate::db::Db;
 use anyhow::Result;
@@ -511,6 +512,11 @@ impl World {
     /// No implicit loading; no-op if the system is not running.
     pub fn post(&self, id: i64, f: impl FnOnce(&mut System) + Send + 'static) {
         if let Some(handle) = self.running(id) { let _ = handle.send(Box::new(f)); }
+    }
+    /// No implicit loading; no-op if the system is not running. The delay starts
+    /// when the actor processes this message; the closure runs on a due tick (D3).
+    pub fn schedule(&self, system: i64, delay_ms: u64, f: impl FnOnce(&mut System) + Send + 'static) {
+        self.post(system, move |s| s.schedule(delay_ms, f));
     }
     pub async fn ball(&self, system: i64, id: i64) -> Option<Ball> {
         self.with(system, move |s| s.ball(id).cloned()).await.flatten()

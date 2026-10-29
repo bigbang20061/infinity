@@ -1,7 +1,12 @@
 //! Actor-owned ballpark state and visibility, mirroring michelle.py and destiny.
 //! Celestials are supplied by the facade from SDE; dynamic state is in memory.
-//! NPC decisions and spawn-group callbacks run in the tick; DB effects use a worker.
+//! NPC decisions, spawn-group callbacks and transient timers run in the tick;
+//! DB effects use a worker. Neither timers nor dynamic balls survive a restart.
 use super::*;
+use std::collections::BTreeMap;
+use std::future::Future;
+
+type Timer = Box<dyn FnOnce(&mut System) + Send>;
 
 #[derive(Default)]
 pub struct System {
@@ -12,9 +17,11 @@ pub struct System {
     registry: Arc<Pilots>,
     positions: HashMap<i64, V3>,
     pending: Option<HashMap<i64, Vec<Value>>>,
+    timers: BTreeMap<(i64, u64), Timer>,
+    timer_sequence: u64,
     pub(super) ms: i64,
     pub(super) brains: HashMap<i64, NpcBrain>,
-    pub(super) npc_jobs: Option<mpsc::UnboundedSender<npc::EffectJob>>,
+    pub(super) effect_jobs: Option<mpsc::UnboundedSender<npc::EffectJob>>,
     pub(super) groups: HashMap<u64, npc::SpawnGroup>,
     pub(super) member_groups: HashMap<i64, std::collections::HashSet<u64>>,
     pub(super) due_brains: Vec<i64>,
@@ -22,6 +29,22 @@ pub struct System {
 impl System {
     pub fn new(id: i64, registry: Arc<Pilots>) -> Self {
         Self { id, registry, ..Self::default() }
+    }
+    /// Schedule relative to this actor's current millisecond clock. Due timers
+    /// run only on ticks, ordered by deadline and then insertion order (also for
+    /// zero delays). D3 applies: no await, DB access or calls back into World.
+    pub fn schedule(&mut self, delay_ms: u64, f: impl FnOnce(&mut System) + Send + 'static) {
+        let due = self.ms.saturating_add(i64::try_from(delay_ms).unwrap_or(i64::MAX));
+        let sequence = self.timer_sequence;
+        self.timer_sequence = sequence.checked_add(1).expect("space timer sequence exhausted");
+        self.timers.insert((due, sequence), Box::new(f));
+    }
+    /// Hand owned async work to this system's sequential effects worker.
+    /// The future is polled outside the actor and may access DB and World.
+    pub fn defer(&self, job: impl Future<Output = ()> + Send + 'static) {
+        if self.effect_jobs.as_ref().is_none_or(|tx| tx.send(npc::EffectJob::Deferred(Box::pin(job))).is_err()) {
+            tracing::warn!(system = self.id, "space effects worker unavailable");
+        }
     }
     pub fn ball(&self, id: i64) -> Option<&Ball> {
         self.balls.get(&id)
@@ -78,7 +101,7 @@ impl System {
         for b in self.balls.values_mut() { b.evolve(ms, &self.positions); }
     }
     pub(super) fn is_cold(&self) -> bool {
-        self.brains.is_empty() && self.observers.is_empty() && !self.balls.values().any(|b|
+        self.timers.is_empty() && self.brains.is_empty() && self.observers.is_empty() && !self.balls.values().any(|b|
             (b.free && b.mode != MODE_MISSILE && (b.mode != MODE_STOP || len(b.vel) > 1e-9))
             || (b.cloak != 0 && b.cloak_until > 0))
     }
@@ -91,6 +114,10 @@ impl System {
         let expired: Vec<_> = self.balls.values().filter(|b|
             b.cloak != 0 && b.cloak_until > 0 && b.cloak_until <= filetime).map(|b| b.id).collect();
         for id in expired { self.uncloak(id); }
+        while self.timers.first_key_value().is_some_and(|(&(due, _), _)| due <= ms) {
+            let (_, timer) = self.timers.pop_first().unwrap();
+            timer(self);
+        }
         self.think_npcs();
         for (client, events) in self.pending.take().unwrap() {
             if let Some((_, tx)) = self.observers.get(&client) {
@@ -425,5 +452,68 @@ mod tests {
         for (a, b) in one.pos.into_iter().zip(ten.pos).chain(one.vel.into_iter().zip(ten.vel)) {
             assert!((a - b).abs() <= 1e-6 * a.abs().max(1.0));
         }
+    }
+
+    #[test]
+    fn timers_fire_by_deadline_not_insertion_order_without_firing_early() {
+        let mut s = System::default();
+        let fired = Arc::new(Mutex::new(Vec::new()));
+        s.evolve_all(1000);
+        for (delay, label) in [(250, 3), (101, 2), (50, 1)] {
+            let fired = fired.clone();
+            s.schedule(delay, move |s| fired.lock().unwrap().push((label, s.ms)));
+        }
+        s.tick(1000);
+        assert!(fired.lock().unwrap().is_empty());
+        s.tick(1100);
+        assert_eq!(*fired.lock().unwrap(), [(1, 1100)]);
+        s.tick(1300);
+        assert_eq!(*fired.lock().unwrap(), [(1, 1100), (2, 1300), (3, 1300)]);
+        s.tick(1400);
+        assert_eq!(fired.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn same_due_timers_fire_in_scheduling_order_including_nested_schedule() {
+        let mut s = System::default();
+        let fired = Arc::new(Mutex::new(Vec::new()));
+        let first = fired.clone();
+        s.schedule(100, move |s| {
+            first.lock().unwrap().push(1);
+            s.schedule(0, move |_| first.lock().unwrap().push(3));
+        });
+        let second = fired.clone();
+        s.schedule(100, move |_| second.lock().unwrap().push(2));
+        s.tick(100);
+        assert_eq!(*fired.lock().unwrap(), [1, 2, 3]);
+    }
+
+    #[test]
+    fn timer_for_removed_ball_is_harmless_and_other_timers_still_fire() {
+        let mut s = System::default();
+        s.insert(ball(1, None, 0.0));
+        s.schedule(100, |s| {
+            assert!(s.destroy_ball(1).is_none());
+            assert!(!s.contains(1));
+        });
+        s.schedule(100, |s| s.insert(ball(2, None, 0.0)));
+        s.remove_ball(1).unwrap();
+        s.tick(100);
+        assert!(s.contains(2));
+        assert!(s.timers.is_empty());
+    }
+
+    #[test]
+    fn pending_timer_keeps_otherwise_idle_system_out_of_cold_skip() {
+        let mut s = System::default();
+        assert!(s.is_cold());
+        s.schedule(1000, |s| assert_eq!(s.ms, 1000));
+        assert!(!s.is_cold());
+        s.tick(100);
+        assert_eq!(s.ms, 100);
+        assert!(!s.is_cold());
+        s.tick(1000);
+        assert!(s.timers.is_empty());
+        assert!(s.is_cold());
     }
 }

@@ -17,8 +17,8 @@
 //! and repair themselves; a pilot's ship can be destroyed. Active modules apply their effects
 //! (hardeners through fit, propulsion speed via destiny, repairers each cycle), and a kill
 //! pays the NPC's bounty and leaves a wreck with loot.
-//! NPC decisions run in the per-system actor, with weapon and repair effects resolved
-//! by its worker outside the actor. Missile impact timers run in separate tasks.
+//! NPC decisions and missile impact timers run in the per-system actor, with weapon,
+//! repair and missile damage effects resolved by its worker outside the actor.
 
 use super::dogma::load_items;
 use super::inventory::notify_item_change;
@@ -1283,19 +1283,25 @@ async fn launch_missile(db: Db, world: Arc<World>, system: i64, from: Ball, targ
     world.add_ship(system, missile).await.map_err(CallError::Internal)?;
     let signature = attr(&attributes(&db, target.type_id).await?, ATTR_SIGNATURE_RADIUS, target.radius as f64);
     let distance = dist(from.pos, target.pos);
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs_f64((distance / m.velocity.max(1.0)).clamp(0.5, 30.0))).await;
-        world.destroy_ball(system, missile_id).await;
-        let reached = distance <= m.flight_range + 2_000.0;
-        let target_id = target.id;
-        let present = world.with(system, move |s| s.contains(target_id)).await.unwrap_or(false);
-        let (dealt, quality) = if reached && present {
-            let application = (signature / m.aoe_cloud.max(1.0)).min(1.0);
-            (damage(&db, &world, system, target.id, target.char_id, m.raw.map(|d| d * application), m.attacker).await.unwrap_or(0.0), 3)
-        } else {
-            (0.0, 0)
-        };
-        report_hit(&world, from.id, target.id, from.char_id, target.char_id, m.weapon, dealt, quality);
+    let delay_ms = std::time::Duration::from_secs_f64((distance / m.velocity.max(1.0)).clamp(0.5, 30.0)).as_millis() as u64;
+    let (shooter_id, shooter_pilot) = (from.id, from.char_id);
+    let (target_id, target_pilot) = (target.id, target.char_id);
+    let (flight_range, aoe_cloud, raw, weapon, attacker) = (m.flight_range, m.aoe_cloud, m.raw, m.weapon, m.attacker);
+    let world_ref = Arc::downgrade(&world);
+    world.schedule(system, delay_ms, move |s| {
+        s.destroy_ball(missile_id);
+        let present = s.contains(target_id);
+        let reached = distance <= flight_range + 2_000.0;
+        s.defer(async move {
+            let Some(world) = world_ref.upgrade() else { return };
+            let (dealt, quality) = if reached && present {
+                let application = (signature / aoe_cloud.max(1.0)).min(1.0);
+                (damage(&db, &world, system, target_id, target_pilot, raw.map(|d| d * application), attacker).await.unwrap_or(0.0), 3)
+            } else {
+                (0.0, 0)
+            };
+            report_hit(&world, shooter_id, target_id, shooter_pilot, target_pilot, weapon, dealt, quality);
+        });
     });
     Ok(())
 }

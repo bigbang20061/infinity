@@ -1,6 +1,6 @@
 //! Per-system unbounded closure mailbox and 100 ms simulation driver.
 //! Mirrors destiny's ballpark advancement; no database or client protocol decoding.
-//! NPC effects use one sequential worker per system; closure timers are not implemented.
+//! NPC and timer effects share one sequential worker per system; timers fire on ticks.
 use super::*;
 use std::sync::Weak;
 use std::time::Duration;

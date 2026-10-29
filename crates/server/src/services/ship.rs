@@ -330,10 +330,11 @@ pub(super) async fn jump_out_and_arrive(c: &mut Client, system: i64, ship: i64, 
     // effects.JumpOutWormhole hides the jumping ship with a repeating client-side
     // CloakRegardless effect; it ends only when told to, once the pilot sees the new system.
     if guid == "effects.JumpOutWormhole" {
-        let world = c.world.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-            world.broadcast(dest_system, ship, vec![special_fx_stop(now_tick(), ship, "effects.CloakRegardless")]);
+        c.world.schedule(dest_system, 3000, move |s| {
+            s.broadcast(
+                ship,
+                vec![special_fx_stop(now_tick(), ship, "effects.CloakRegardless")],
+            );
         });
     }
     Ok(())

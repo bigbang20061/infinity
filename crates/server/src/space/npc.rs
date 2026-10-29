@@ -1,6 +1,7 @@
 //! Actor-owned NPC decisions and spawn groups, mirroring entity targeting and
 //! destiny Orbit/Stop events. Combat attributes are loaded by services from SDE;
-//! weapon and repair effects run on a per-system worker, never inside the actor.
+//! Weapon, repair and deferred timer effects share a sequential per-system worker,
+//! never running inside the actor.
 //! Brains and groups are transient; persistent NPC simulation is not supported.
 use super::*;
 use std::collections::HashSet;
@@ -49,16 +50,19 @@ impl NpcBrain {
     }
 }
 
-pub(super) struct EffectJob {
-    effects: NpcEffects,
-    action: NpcAction,
+pub(super) enum EffectJob {
+    Npc { effects: NpcEffects, action: NpcAction },
+    Deferred(Pin<Box<dyn Future<Output = ()> + Send>>),
 }
 pub(super) fn start_worker(system: &mut System) {
     let (tx, mut rx) = mpsc::unbounded_channel::<EffectJob>();
-    system.npc_jobs = Some(tx);
+    system.effect_jobs = Some(tx);
     tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
-            (job.effects)(job.action).await;
+            match job {
+                EffectJob::Npc { effects, action } => effects(action).await,
+                EffectJob::Deferred(future) => future.await,
+            }
         }
     });
 }
@@ -111,8 +115,8 @@ impl System {
         }
     }
     fn npc_effect(&self, brain: &NpcBrain, action: NpcAction) {
-        if let Some(tx) = &self.npc_jobs {
-            let _ = tx.send(EffectJob { effects: brain.effects.clone(), action });
+        if let Some(tx) = &self.effect_jobs {
+            let _ = tx.send(EffectJob::Npc { effects: brain.effects.clone(), action });
         }
     }
     pub(super) fn think_npcs(&mut self) {
@@ -205,7 +209,7 @@ mod tests {
         registry.register_pilot(10, notify);
         let mut s = System::new(1, registry);
         let (tx, rx) = mpsc::unbounded_channel();
-        s.npc_jobs = Some(tx);
+        s.effect_jobs = Some(tx);
         s.insert(ball(1000, None, 0.0));
         s.add_npc(1000, NpcBrain::new(owner, NpcConfig {
             fly_range: 20.0, aggro_range: 100.0, rate_of_fire_ms: 2500.0,
@@ -278,14 +282,32 @@ mod tests {
             assert!(jobs.try_recv().is_err());
         }
         s.tick(3000);
-        assert!(matches!(jobs.try_recv().unwrap().action, NpcAction::Shot { .. }));
+        assert!(matches!(jobs.try_recv().unwrap(), EffectJob::Npc { action: NpcAction::Shot { .. }, .. }));
         assert!(s.brains[&1000].announced);
         for ms in [3100, 4000, 5000] {
             s.tick(ms);
             assert!(jobs.try_recv().is_err());
         }
         s.tick(6000);
-        assert!(matches!(jobs.try_recv().unwrap().action, NpcAction::Shot { .. }));
+        assert!(matches!(jobs.try_recv().unwrap(), EffectJob::Npc { action: NpcAction::Shot { .. }, .. }));
+        assert!(jobs.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn timer_defers_async_work_without_polling_inside_actor() {
+        let (mut s, mut jobs, _) = setup(None);
+        let count = Arc::new(AtomicUsize::new(0));
+        let deferred = count.clone();
+        s.schedule(100, move |s| {
+            s.defer(async move { deferred.fetch_add(1, Ordering::Relaxed); });
+        });
+        s.tick(100);
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+        let EffectJob::Deferred(future) = jobs.try_recv().unwrap() else {
+            panic!("expected deferred timer work");
+        };
+        future.await;
+        assert_eq!(count.load(Ordering::Relaxed), 1);
         assert!(jobs.try_recv().is_err());
     }
     #[test]
