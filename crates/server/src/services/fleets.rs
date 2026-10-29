@@ -184,6 +184,8 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     let int = |i: usize| call.args.get(i).and_then(|v| v.as_int());
     let world = c.world.clone();
     match (call.service, call.method) {
+        // {fleetID: advert dict} for the fleet finder: fleets don't advertise here.
+        ("fleetProxy", "GetAvailableFleetAds") => return Some(Ok(Value::Dict(vec![]))),
         ("fleetObjectHandler", "CreateFleet") if !call.bound => {
             if c.session.int("fleetid").is_some() {
                 return Some(Err(CallError::User { msg: "FleetError".into(), dict: vec![] }));

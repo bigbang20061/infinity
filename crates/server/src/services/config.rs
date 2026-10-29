@@ -123,6 +123,17 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
         "GetMultiOwnersEx" | "GetOwnersEx" => owners(c, &keys).await,
         "GetMultiLocationsEx" | "GetLocationsEx" => locations(c, &keys).await,
         "GetMultiCorpTickerNamesEx" | "GetCorpTickerNamesEx" => tickers(c, &keys).await,
+        // [KeyVal(solarSystemID)] where the corporation owns a station (info window, map).
+        "GetStationSolarSystemsByOwner" => {
+            let owner = keys.first().copied().unwrap_or(0);
+            let rows = c
+                .db
+                .client
+                .query("SELECT DISTINCT solar_system_id::bigint FROM sde.sta_stations WHERE owner_id::bigint = $1", &[&owner])
+                .await
+                .map_err(db_err)?;
+            Ok(Value::list(rows.iter().map(|r| super::keyval([("solarSystemID", Value::Int(r.get(0)))]))))
+        }
         "GetMultiAllianceShortNamesEx" | "GetAllianceShortNamesEx" => {
             let rows = c
                 .db

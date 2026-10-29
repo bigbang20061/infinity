@@ -130,6 +130,24 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             Err(e) => return Some(Err(e)),
         },
         ("activityMgr", "GetActivityBadgeStatuses") => Value::list([]),
+        // The activities window's auto-popup setting (0: open it at login), kept per character.
+        ("activityMgr", "GetActivitiesPopState") => {
+            let me = c.session.int("charid").unwrap_or(0);
+            match c.db.client.query_opt("SELECT activities_pop_state FROM game.characters WHERE character_id = $1", &[&me]).await {
+                Ok(r) => int(r.map(|r| r.get::<_, i32>(0) as i64).unwrap_or(1)),
+                Err(e) => return Some(Err(CallError::Internal(e.into()))),
+            }
+        }
+        ("activityMgr", "SetActivitiesPopState") => {
+            let me = c.session.int("charid").unwrap_or(0);
+            let state = call.args.first().and_then(|v| v.as_int()).unwrap_or(1) as i32;
+            match c.db.client.execute("UPDATE game.characters SET activities_pop_state = $2 WHERE character_id = $1", &[&me, &state]).await {
+                Ok(_) => Value::Bool(true),
+                Err(e) => return Some(Err(CallError::Internal(e.into()))),
+            }
+        }
+        // No activity badges are shown, so there's nothing to clear.
+        ("activityMgr", "ActivitySeen") => Value::None,
         ("warRegistry", "GetWars") => empty_dict(),
         ("operationsManager", "can_character_play_the_tutorial") => Value::Bool(false),
         ("insurgencySolarsystem", "GetAllVisibleCampaigns") => Value::list([]),

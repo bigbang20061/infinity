@@ -200,7 +200,95 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             ("addresses", rowset(&["contactID", "inWatchlist", "relationshipID", "labelMask"], vec![])),
             ("blocked", rowset(&["senderID"], vec![])),
         ])),
-        ("charMgr", "ListStations") => Ok(rowset(&["stationID", "itemCount"], vec![])),
+        // Assets window (invCache global inventory): stations holding the character's items...
+        ("charMgr", "ListStations") => match c
+            .db
+            .client
+            .query(
+                "SELECT i.location_id, count(*), st.type_id::bigint, st.solar_system_id::bigint FROM game.items i
+                 JOIN sde.sta_stations st ON st.station_id = i.location_id
+                 WHERE i.owner_id = $1 GROUP BY i.location_id, st.type_id, st.solar_system_id",
+                &[&me],
+            )
+            .await
+        {
+            Ok(rows) => Ok(rowset(
+                &["stationID", "itemCount", "typeID", "solarSystemID"],
+                rows.iter().map(|r| vec![Value::Int(r.get(0)), Value::Int(r.get(1)), Value::Int(r.get(2)), Value::Int(r.get(3))]).collect(),
+            )),
+            Err(e) => Err(db_err(e)),
+        },
+        // ...the items at one of them...
+        ("charMgr", "ListStationItems") => {
+            let station = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
+            super::dogma::load_items(c, "i.location_id = $1 AND i.owner_id = $2", &[&station, &me]).await.map(|items| Value::list(items.iter().map(|i| i.row())))
+        }
+        // ...and everything the character owns, inside containers and ships too (asset search).
+        ("charMgr", "ListIncludingContainers") => {
+            super::dogma::load_items(c, "i.owner_id = $1 AND i.item_id <> $1", &[&me]).await.map(|items| Value::list(items.iter().map(|i| i.row())))
+        }
+        // GetRepairQuotes(itemIDs) -> {itemID: [KeyVal(itemID, typeID, damage, maxHealth,
+        // costToRepairOneUnitOfDamage)]}. Docking already repairs ships (combat::repair), so
+        // nothing in a station is damaged.
+        ("repairSvc", "GetRepairQuotes") => {
+            let ids: Vec<i64> = call.args.first().and_then(|v| v.items()).unwrap_or(&[]).iter().filter_map(|v| v.as_int()).collect();
+            match c
+                .db
+                .client
+                .query(
+                    "SELECT i.item_id, i.type_id::bigint, COALESCE((SELECT value FROM sde.type_attributes a WHERE a.type_id = i.type_id AND a.attribute_id = 9), 0)::float8
+                     FROM game.items i WHERE i.item_id = ANY($1) AND i.owner_id = $2",
+                    &[&ids, &me],
+                )
+                .await
+            {
+                Ok(rows) => Ok(Value::Dict(
+                    rows.iter()
+                        .map(|r| {
+                            let id: i64 = r.get(0);
+                            let quote = keyval([
+                                ("itemID", Value::Int(id)),
+                                ("typeID", Value::Int(r.get(1))),
+                                ("damage", Value::Float(0.0)),
+                                ("maxHealth", Value::Float(r.get(2))),
+                                ("costToRepairOneUnitOfDamage", Value::Float(0.0)),
+                            ]);
+                            (Value::Int(id), Value::list([quote]))
+                        })
+                        .collect(),
+                )),
+                Err(e) => Err(db_err(e)),
+            }
+        }
+        ("repairSvc", "RepairItemsInStation") | ("repairSvc", "RepairItemsInStructure") => Ok(Value::None),
+        // The info window's private notes: GetNote(itemID) -> text or None, SetNote(itemID, text).
+        ("charMgr", "GetNote") => {
+            let item = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
+            match c.db.client.query_opt("SELECT note FROM game.char_notes WHERE char_id = $1 AND item_id = $2", &[&me, &item]).await {
+                Ok(r) => Ok(r.map(|r| Value::unicode(r.get::<_, String>(0))).unwrap_or(Value::None)),
+                Err(e) => Err(db_err(e)),
+            }
+        }
+        ("charMgr", "SetNote") => {
+            let item = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
+            let note = call.args.get(1).and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
+            let r = if note.trim().is_empty() {
+                c.db.client.execute("DELETE FROM game.char_notes WHERE char_id = $1 AND item_id = $2", &[&me, &item]).await
+            } else {
+                c.db.client
+                    .execute(
+                        "INSERT INTO game.char_notes (char_id, item_id, note) VALUES ($1, $2, $3)
+                         ON CONFLICT (char_id, item_id) DO UPDATE SET note = $3",
+                        &[&me, &item, &note],
+                    )
+                    .await
+            };
+            r.map(|_| Value::None).map_err(db_err)
+        }
+        // Nothing is held in asset safety: there are no player structures.
+        ("structureAssetSafety", "GetItemsInSafetyForCharacter") | ("structureAssetSafety", "GetItemsInSafetyForCorp") => Ok(Value::list([])),
+        // The server enforces no banned words of its own; the client checks its regexes.
+        ("bannedwords", "check_words_allowed") => Ok(Value::None),
         // KeyVal(id, type_id, solar_system_id, is_fallback)
         ("home_station", "get_home_station") => {
             let r = c

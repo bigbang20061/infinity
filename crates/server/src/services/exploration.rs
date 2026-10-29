@@ -2087,8 +2087,9 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             c.notify("OnSignalTrackerFullState", vec![Value::Int(system), full_state(system)]);
             Some(Ok(Value::None))
         }
+        // Docked (the Agency refreshing local anomalies), it's the system the station is in.
         ("scanMgr", "GetFullState") => {
-            let system = c.session.int("solarsystemid")?;
+            let system = c.session.int("solarsystemid").or_else(|| c.session.int("solarsystemid2"))?;
             if let Err(e) = ensure_loaded(&c.db, &c.world, system).await {
                 return Some(Err(e));
             }

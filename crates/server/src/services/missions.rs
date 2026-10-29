@@ -1300,6 +1300,8 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                 let id = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
                 Some(Ok(self::agent(id).map(|a| Value::Int(a.system_id)).unwrap_or(Value::None)))
             }
+            // Mission IDs switched off server-side (agents.IsMissionDisabled): none.
+            "GetDisabledMissions" => Some(Ok(Value::list([]))),
             _ => None,
         };
     };
@@ -1309,6 +1311,13 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         Err(e) => return Some(Err(e)),
     };
     Some(match call.method {
+        // The agent's show-info tab: KeyVal(stationID, level, services, incompatible).
+        "GetInfoServiceDetails" => Ok(keyval([
+            ("stationID", if agent.station_id > 0 { Value::Int(agent.station_id) } else { Value::None }),
+            ("level", Value::Int(agent.level)),
+            ("services", Value::list([])),
+            ("incompatible", Value::None),
+        ])),
         "DoAction" => {
             let action = call.args.first().and_then(|v| v.as_int());
             do_action(c, agent, action).await

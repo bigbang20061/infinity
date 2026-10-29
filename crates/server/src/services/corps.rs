@@ -445,7 +445,8 @@ pub async fn corporation_line(db: &Db, corp: i64) -> Result<Option<Vec<Value>>, 
     // Hangar then wallet division names; None for the client's defaults.
     let divisions: Vec<Option<String>> = r.get::<_, Option<Vec<Option<String>>>>(23).unwrap_or_default();
     line.extend((0..14).map(|i| divisions.get(i).cloned().flatten().filter(|n| !n.is_empty()).map(Value::unicode).unwrap_or(Value::None)));
-    line.extend([Value::Bool(r.get(19)), Value::Bool(r.get(9)), Value::Bool(r.get(10)), Value::None, Value::Int(r.get(18)), opt(22)]);
+    // ..., chosenExecutorID, allowWar: wars can't be declared yet.
+    line.extend([Value::Bool(r.get(19)), Value::Bool(r.get(9)), Value::Bool(r.get(10)), Value::None, Value::Int(r.get(18)), opt(22), Value::Bool(false)]);
     Ok(Some(line))
 }
 

@@ -73,6 +73,7 @@ const CORP_HEADER: &[&str] = &[
     "aggressionSettings",
     "createDateTime",
     "chosenExecutorID",
+    "allowWar",
 ];
 
 /// A corporation row: NPC corporations from the SDE, player corporations from game.corporations.
@@ -120,7 +121,8 @@ async fn corporation(c: &Client, corp_id: i64) -> Result<Value, CallError> {
     ];
     line.extend(std::iter::repeat_n(Value::None, 7)); // shapes, colours, typeface
     line.extend(std::iter::repeat_n(Value::None, 14)); // division names
-    line.extend([Value::Bool(false), Value::Bool(false), Value::Bool(false), Value::None, Value::None, Value::None]);
+    // ..., chosenExecutorID, allowWar (no wars can be declared on NPC corporations)
+    line.extend([Value::Bool(false), Value::Bool(false), Value::Bool(false), Value::None, Value::None, Value::None, Value::Bool(false)]);
     Ok(row(CORP_HEADER, line))
 }
 
@@ -160,7 +162,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         ("map", "GetTriglavianMinorVictorySystems") | ("map", "GetEdencomMinorVictorySystems") | ("map", "GetEdencomFortressSystems") => {
             Value::list([])
         }
-        ("config", "GetStationSolarSystemsByOwner") => rowset(&["solarSystemID"], vec![]),
         ("stationSvc", "GetAllianceSystems") => Value::list([]),
         // (jumpBridgeGates, hasAccessTo, hasNoAccessTo)
         ("structureDirectory", "GetStructureMapData") => Value::list([]),
@@ -199,6 +200,24 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         // Show info on a corporation (corporationInfoWindow reads ceoID, stationID, shares...).
         ("corpmgr", "GetPublicInfo") => return Some(corporation(c, arg_int(0).unwrap_or(my_corp)).await),
         ("corpmgr", "GetAssetInventory") | ("corpmgr", "GetAssetInventoryForLocation") | ("corpmgr", "SearchAssets") => Value::list([]),
+        // A player character's corporation, or an NPC's (agents) from the SDE.
+        ("corpmgr", "GetCorporationIDForCharacter") => {
+            let id = arg_int(0).unwrap_or(0);
+            let r = c
+                .db
+                .client
+                .query_opt(
+                    "SELECT corporation_id FROM game.characters WHERE character_id = $1
+                     UNION ALL SELECT (data->>'corporationID')::bigint FROM sde.npc_characters WHERE character_id = $1
+                     LIMIT 1",
+                    &[&id],
+                )
+                .await;
+            match r {
+                Ok(r) => r.and_then(|r| r.get::<_, Option<i64>>(0)).map(Value::Int).unwrap_or(Value::None),
+                Err(e) => return Some(Err(db_err(e))),
+            }
+        }
         ("corpRegistry", "GetOldApplications") | ("corpRegistry", "GetAllianceApplications") => Value::Dict(vec![]),
         ("corpRegistry", "GetPendingAutoKicks") => Value::list([]),
         ("corpRegistry", "GetShareholders") => rowset(&["shareholderID", "shares", "shareholderCorporationID"], vec![]),
@@ -239,6 +258,8 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         // (medals, medalInfo): medals come from player corporations; medalInfo is only
         // Filter()ed per received medal.
         ("corporationSvc", "GetMedalsReceived") => Value::tuple([Value::list([]), Value::list([])]),
+        // An NPC corporation's market supply and demand (typeID, sellPrice, buyPrice...): none traded.
+        ("corporationSvc", "GetCorpInfo") => Value::list([]),
         // NPC corporations hold no shareholder votes.
         ("voteManager", "CanViewVotes") => Value::Bool(false),
         // No shared bookmark folders exist (accessGroupBookmarkMgr.AddFolder keeps none).

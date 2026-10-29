@@ -66,6 +66,15 @@ ALTER TABLE game.items ADD COLUMN IF NOT EXISTS z double precision;
 ALTER TABLE game.characters ADD COLUMN IF NOT EXISTS free_skill_points bigint NOT NULL DEFAULT 0;
 ALTER TABLE game.characters ADD COLUMN IF NOT EXISTS home_station_id bigint;
 UPDATE game.characters SET home_station_id = station_id WHERE home_station_id IS NULL AND station_id IS NOT NULL;
+-- A character's private notes on anything with an info window (charMgr GetNote/SetNote).
+CREATE TABLE IF NOT EXISTS game.char_notes (
+    char_id bigint NOT NULL,
+    item_id bigint NOT NULL,
+    note    text NOT NULL,
+    PRIMARY KEY (char_id, item_id)
+);
+-- The activities window's auto-popup setting (activityMgr pop state; 0 opens it at login).
+ALTER TABLE game.characters ADD COLUMN IF NOT EXISTS activities_pop_state integer NOT NULL DEFAULT 1;
 
 CREATE TABLE IF NOT EXISTS game.skills (
     character_id bigint NOT NULL REFERENCES game.characters,
