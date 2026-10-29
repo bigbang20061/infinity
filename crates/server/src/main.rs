@@ -107,6 +107,7 @@ async fn main() -> Result<()> {
     let world = space::World::new(db.clone(), cfg.system_capacity);
     tokio::spawn(services::expire_market_orders(db.clone(), world.clone()));
     tokio::spawn(services::settle_auctions(db.clone(), world.clone()));
+    tokio::spawn(services::run_billing(db.clone(), world.clone()));
     tokio::spawn(log_exit("public gateway", gateway::serve(cfg.gateway_bind.clone(), gateway::Gateway::new(db.clone(), cfg.cdn_url()))));
     tokio::spawn(log_exit("chat", chat::serve(cfg.chat_bind.clone(), hub.clone())));
     let upstream = images::Upstream::new(&cfg.image_upstream);

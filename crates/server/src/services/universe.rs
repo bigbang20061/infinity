@@ -72,6 +72,7 @@ const CORP_HEADER: &[&str] = &[
     "friendlyFire",
     "aggressionSettings",
     "createDateTime",
+    "chosenExecutorID",
 ];
 
 /// A corporation row: NPC corporations from the SDE, player corporations from game.corporations.
@@ -119,7 +120,7 @@ async fn corporation(c: &Client, corp_id: i64) -> Result<Value, CallError> {
     ];
     line.extend(std::iter::repeat_n(Value::None, 7)); // shapes, colours, typeface
     line.extend(std::iter::repeat_n(Value::None, 14)); // division names
-    line.extend([Value::Bool(false), Value::Bool(false), Value::Bool(false), Value::None, Value::None]);
+    line.extend([Value::Bool(false), Value::Bool(false), Value::Bool(false), Value::None, Value::None, Value::None]);
     Ok(row(CORP_HEADER, line))
 }
 
@@ -198,23 +199,18 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         // Show info on a corporation (corporationInfoWindow reads ceoID, stationID, shares...).
         ("corpmgr", "GetPublicInfo") => return Some(corporation(c, arg_int(0).unwrap_or(my_corp)).await),
         ("corpmgr", "GetAssetInventory") | ("corpmgr", "GetAssetInventoryForLocation") | ("corpmgr", "SearchAssets") => Value::list([]),
-        ("corpRegistry", "GetTitles") | ("corpRegistry", "GetLabels") | ("corpRegistry", "GetCorporateContacts") => Value::Dict(vec![]),
-        ("corpRegistry", "GetBulletins") => Value::list([]),
         ("corpRegistry", "GetOldApplications") | ("corpRegistry", "GetAllianceApplications") => Value::Dict(vec![]),
         ("corpRegistry", "GetPendingAutoKicks") => Value::list([]),
         ("corpRegistry", "GetShareholders") => rowset(&["shareholderID", "shares", "shareholderCorporationID"], vec![]),
         ("corpRegistry", "GetSharesByShareholder") => rowset(&["shareholderID", "shares", "corporationID"], vec![]),
         ("corpRegistry", "GetStructureReinforceDefault") => Value::None,
         ("corpRegistry", "DoesMyCorpAcceptStructures") | ("corpRegistry", "DoesCorpRestrictCorpMails") => Value::Bool(false),
-        ("corpRegistry", "GetInfoWindowDataForChar") => Value::None,
         ("warsInfoMgr", "GetWarsByOwnerID") => Value::Dict(vec![]),
         ("warsInfoMgr", "GetTop") | ("warsInfoMgr", "GetWarsRequiringAssistance") => Value::list([]),
         ("allianceRegistry", "GetDaysInAlliance") => Value::Int(0),
         ("allianceRegistry", "GetAllianceMembersOlderThan") => Value::list([]),
 
         // ---- wallet ----
-        ("billMgr", "GetCorporationBills") | ("billMgr", "GetCorporationBillsReceivable") => Value::list([]),
-        ("billMgr", "GetAutomaticPaySettings") => Value::Dict(vec![]),
         ("rewardMgr", "GetRewardLPLogs") => Value::list([]),
         ("account", "GetJournal") | ("account", "GetJournalForAccounts") | ("account", "GetTransactions") => Value::list([]),
         ("account", "GetWalletDivisionsInfo") => Value::list([]),
@@ -251,7 +247,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         // ---- probe / directional scanner (scanSvc.GetScanMan) ----
         ("scanMgr", "GetSystemScanMgr") => c.bind("scanMgr", Value::None),
 
-        ("officeManager", "GetCorporationsWithOffices") => Value::list([]),
         ("repairableShipMgr", "GetServiceLifeDamage") => Value::Float(0.0),
         ("monolithTaskTrackerMgr", "UpdateClientAchievmentsAndCounters") => Value::None,
         // typeID -> expert system state; none installed.

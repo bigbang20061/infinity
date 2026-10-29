@@ -124,7 +124,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         }
         ("milestoneMgr", "ProcessCharacterLogon") => Value::None,
         ("structureDirectory", "GetMyDockableStructures") => Value::list([]),
-        ("officeManager", "GetMyCorporationsOffices") => Value::list([]),
         ("fwWarzoneSolarsystem", "GetLocalOccupationState") => Value::tuple([c.session.get("solarsystemid2").clone(), Value::None]),
         ("map", "GetStationInfo") => match station_info(c).await {
             Ok(v) => v,

@@ -49,6 +49,8 @@ async fn list(c: &Client, container: &Container, flags: Option<Vec<i64>>) -> Res
             let flags = flags.unwrap_or_else(|| vec![FLAG_HANGAR]);
             load_items(c, "i.location_id = $1 AND i.owner_id = $2 AND i.flag_id = ANY($3)", &[station_id, owner_id, &flags]).await
         }
+        // Another corporation's hangars stay closed.
+        Container::Item(item_id) if super::offices::office_owner(&c.db, *item_id).await?.is_some_and(|corp| c.session.int("corpid") != Some(corp)) => Ok(vec![]),
         Container::Item(item_id) => match flags {
             Some(flags) => load_items(c, "i.location_id = $1 AND i.flag_id = ANY($2)", &[item_id, &flags]).await,
             None => load_items(c, "i.location_id = $1", &[item_id]).await,
@@ -140,6 +142,8 @@ const FLAG_CARGO: i32 = 5;
 /// const.locationJunkyard: where items go when they stop existing.
 const LOCATION_JUNKYARD: i64 = 10;
 const CATEGORY_SHIP: i64 = 6;
+/// appConst.corpRoleHangarCanTake1; divisions 2-7 are the next bits.
+const ROLE_HANGAR_CAN_TAKE_1: i64 = 8192;
 // invCache change keys (carbon const ix*, inventorycommon const ixStackSize/ixSingleton)
 const IX_LOCATION_ID: i64 = 3;
 const IX_FLAG: i64 = 4;
@@ -216,13 +220,31 @@ async fn move_item(c: &mut Client, container: &Container, item_id: i64, flag: Op
     if Some(item_id) == c.session.int("shipid") && matches!(container, Container::Item(_)) {
         return Err(CallError::User { msg: "CanNotPlaceActiveShipInAnotherHangar".into(), dict: vec![] });
     }
+    // Out of a corporation hangar: the division's take role (or Director) is needed.
+    if let Some(corp) = super::offices::office_owner(&c.db, item.location_id).await? {
+        let (my_corp, roles) = super::corps::membership(&c.db, char_id).await?;
+        let take = ROLE_HANGAR_CAN_TAKE_1 << (item.flag_id - super::offices::FLAG_CORP_SAG1).clamp(0, 6);
+        if my_corp != corp || roles & (take | super::corps::ROLE_DIRECTOR) == 0 {
+            return Err(CallError::User { msg: "CustomNotify".into(), dict: vec![("notify".into(), Value::unicode("你没有从该军团机库部门取出物品的职权。"))] });
+        }
+    }
     let (location, owner, mut flag) = match container {
         Container::Hangar { station_id, owner_id } => (*station_id, *owner_id, flag.filter(|f| *f != FLAG_AUTOFIT).unwrap_or(FLAG_HANGAR)),
-        Container::Item(id) => {
-            let is_ship = load_items(c, "i.item_id = $1", &[id]).await?.first().is_some_and(|i| i.category_id == CATEGORY_SHIP);
-            let default = if is_ship { FLAG_CARGO } else { FLAG_HANGAR };
-            (*id, char_id, flag.unwrap_or(default))
-        }
+        Container::Item(id) => match super::offices::office_owner(&c.db, *id).await? {
+            // Into a corporation hangar: the corporation owns what's in it.
+            Some(corp) => {
+                if c.session.int("corpid") != Some(corp) {
+                    return Err(CallError::User { msg: "CustomNotify".into(), dict: vec![("notify".into(), Value::unicode("这不是你军团的机库。"))] });
+                }
+                let sag = super::offices::FLAG_CORP_SAG1;
+                (*id, corp, flag.filter(|f| (sag..sag + 7).contains(f)).unwrap_or(sag))
+            }
+            None => {
+                let is_ship = load_items(c, "i.item_id = $1", &[id]).await?.first().is_some_and(|i| i.category_id == CATEGORY_SHIP);
+                let default = if is_ship { FLAG_CARGO } else { FLAG_HANGAR };
+                (*id, char_id, flag.unwrap_or(default))
+            }
+        },
     };
     if flag == FLAG_AUTOFIT {
         flag = match free_slot(c, location, item.type_id).await? {

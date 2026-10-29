@@ -15,8 +15,6 @@ fn db_err(e: tokio_postgres::Error) -> CallError {
 
 /// facwarCommon._ALL_WARFARE_FACTIONS: Caldari, Minmatar, Amarr, Gallente, Guristas, Angels.
 const FW_FACTIONS: [i64; 6] = [500001, 500002, 500003, 500004, 500010, 500011];
-/// The live server's station office capacity never shipped with the client or SDE.
-const STATION_OFFICE_SLOTS: i64 = 24;
 /// The roguelike lab's weekly reset (Monday), at the daily downtime turnover.
 const WEEKLY_RESET_HOUR_UTC: u64 = 3;
 
@@ -122,7 +120,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         }
         ("fwCharacterEnlistmentMgr", "SetMyCorpAllowedEnlistmentFactions") => set_allowed_factions(c, call).await,
         // Bound to the docked station; no corporation rents offices here.
-        ("officeManager", "GetEmptyOfficeCount") => Ok(Value::Int(STATION_OFFICE_SLOTS)),
         ("roguelikeMgr", "CallExploreRequested") => explore(c),
         // alert.__BeanDeliveryBoy: {counterID: (count, time)}, or the zlib-compressed group form.
         ("alert", "BeanDelivery" | "GroupBeanDelivery") => {

@@ -10,6 +10,7 @@ use tracing::warn;
 const TYPE_CHARACTER: i64 = 1373;
 const TYPE_CORPORATION: i64 = 2;
 const TYPE_FACTION: i64 = 30;
+const TYPE_ALLIANCE: i64 = 16159;
 
 fn db_err(e: tokio_postgres::Error) -> CallError {
     CallError::Internal(e.into())
@@ -37,8 +38,9 @@ pub async fn owners(c: &Client, ids: &[i64]) -> Result<Value, CallError> {
              UNION ALL SELECT corporation_id, name, $3::bigint, 0, NULL FROM game.corporations WHERE corporation_id = ANY($1::bigint[])
              UNION ALL SELECT character_id, data->'name'->>'en', $2::bigint, (data->>'gender')::boolean::int, (data->>'nameID')::bigint
                        FROM sde.npc_characters WHERE character_id = ANY($1::bigint[])
-             UNION ALL SELECT faction_id, name, $4::bigint, 0, NULL FROM sde.chr_factions WHERE faction_id = ANY($1::bigint[])",
-            &[&ids, &TYPE_CHARACTER, &TYPE_CORPORATION, &TYPE_FACTION],
+             UNION ALL SELECT faction_id, name, $4::bigint, 0, NULL FROM sde.chr_factions WHERE faction_id = ANY($1::bigint[])
+             UNION ALL SELECT alliance_id, name, $5::bigint, 0, NULL FROM game.alliances WHERE alliance_id = ANY($1::bigint[])",
+            &[&ids, &TYPE_CHARACTER, &TYPE_CORPORATION, &TYPE_FACTION, &TYPE_ALLIANCE],
         )
         .await
         .map_err(db_err)?;
@@ -122,7 +124,14 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
         "GetMultiLocationsEx" | "GetLocationsEx" => locations(c, &keys).await,
         "GetMultiCorpTickerNamesEx" | "GetCorpTickerNamesEx" => tickers(c, &keys).await,
         "GetMultiAllianceShortNamesEx" | "GetAllianceShortNamesEx" => {
-            Ok(Value::tuple([header(&["allianceID", "shortName"]), Value::list([])]))
+            let rows = c
+                .db
+                .client
+                .query("SELECT alliance_id, short_name FROM game.alliances WHERE alliance_id = ANY($1::bigint[])", &[&keys])
+                .await
+                .map_err(db_err)?;
+            let data = rows.iter().map(|r| Value::list([Value::Int(r.get(0)), Value::unicode(r.get::<_, String>(1))])).collect();
+            Ok(Value::tuple([header(&["allianceID", "shortName"]), Value::List(data)]))
         }
         _ => {
             warn!(

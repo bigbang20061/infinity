@@ -198,7 +198,7 @@ impl Ball {
         if let Some(ch) = self.char_id {
             fields.push(("charID", Value::Int(ch)));
             fields.push(("corpID", Value::Int(self.corp_id)));
-            fields.push(("allianceID", Value::None));
+            fields.push(("allianceID", if self.alliance_id > 0 { Value::Int(self.alliance_id) } else { Value::None }));
             fields.push(("warFactionID", Value::None));
             if !self.slim.iter().any(|(k, _)| *k == "securityStatus") {
                 fields.push(("securityStatus", Value::Float(0.0)));

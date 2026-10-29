@@ -1,6 +1,8 @@
 //! Remote services the client calls (`sm.RemoteSvc(name).Method(...)`).
 
 mod agency;
+mod alliances;
+mod bills;
 mod bookmarks;
 mod calendar;
 mod character;
@@ -10,6 +12,7 @@ mod charsel;
 mod config;
 mod contracts;
 mod corps;
+mod corpwallet;
 mod crimewatch;
 mod dogma;
 mod exploration;
@@ -23,6 +26,8 @@ mod inventory;
 mod mail;
 mod market;
 mod npe;
+mod offices;
+mod orgs;
 mod mining;
 mod missions;
 mod ship;
@@ -36,6 +41,7 @@ mod universe;
 pub use contracts::settle_auctions;
 pub use fleets::logged_off as fleet_logged_off;
 pub use market::expire_orders as expire_market_orders;
+pub use bills::run_billing;
 
 use crate::client::{filetime_now, short, Client};
 use marshal::{DbRowDescriptor, DbType, Value};
@@ -230,6 +236,21 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
                 return r;
             }
             if let Some(r) = fleets::dispatch(c, call).await {
+                return r;
+            }
+            if let Some(r) = orgs::dispatch(c, call).await {
+                return r;
+            }
+            if let Some(r) = corpwallet::dispatch(c, call).await {
+                return r;
+            }
+            if let Some(r) = offices::dispatch(c, call).await {
+                return r;
+            }
+            if let Some(r) = bills::dispatch(c, call).await {
+                return r;
+            }
+            if let Some(r) = alliances::dispatch(c, call).await {
                 return r;
             }
             if let Some(r) = corps::dispatch(c, call).await {

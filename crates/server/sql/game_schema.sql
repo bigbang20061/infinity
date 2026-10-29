@@ -341,8 +341,31 @@ CREATE TABLE IF NOT EXISTS game.corporations (
 CREATE UNIQUE INDEX IF NOT EXISTS corporations_name_idx ON game.corporations (lower(name)) WHERE NOT deleted;
 CREATE UNIQUE INDEX IF NOT EXISTS corporations_ticker_idx ON game.corporations (upper(ticker)) WHERE NOT deleted;
 SELECT setval('game.corporations_corporation_id_seq', GREATEST((SELECT max(corporation_id) FROM game.corporations), 98000000), true);
--- A member's corporation roles (appConst.corpRole* mask), the same at every location.
+-- A member's corporation roles (appConst.corpRole* mask), the same at every location, the
+-- roles they may grant, their titles (game.corp_titles bits) and free-text title.
 ALTER TABLE game.characters ADD COLUMN IF NOT EXISTS corp_roles bigint NOT NULL DEFAULT 0;
+ALTER TABLE game.characters ADD COLUMN IF NOT EXISTS corp_grantable_roles bigint NOT NULL DEFAULT 0;
+ALTER TABLE game.characters ADD COLUMN IF NOT EXISTS corp_title_mask bigint NOT NULL DEFAULT 0;
+ALTER TABLE game.characters ADD COLUMN IF NOT EXISTS corp_title text NOT NULL DEFAULT '';
+-- Hangar division 1-7 then wallet division 1-7 names (NULL: the client's defaults).
+ALTER TABLE game.corporations ADD COLUMN IF NOT EXISTS division_names text[];
+
+-- A corporation's titles: title_id is the title's bit in a member's corp_title_mask, and its
+-- roles add to the holder's.
+CREATE TABLE IF NOT EXISTS game.corp_titles (
+    corporation_id   bigint NOT NULL,
+    title_id         bigint NOT NULL,
+    name             text NOT NULL DEFAULT '',
+    roles            bigint NOT NULL DEFAULT 0,
+    grantable_roles  bigint NOT NULL DEFAULT 0,
+    roles_hq         bigint NOT NULL DEFAULT 0,
+    grantable_hq     bigint NOT NULL DEFAULT 0,
+    roles_base       bigint NOT NULL DEFAULT 0,
+    grantable_base   bigint NOT NULL DEFAULT 0,
+    roles_other      bigint NOT NULL DEFAULT 0,
+    grantable_other  bigint NOT NULL DEFAULT 0,
+    PRIMARY KEY (corporation_id, title_id)
+);
 
 -- Applications and invitations (status: appConst.crpApplication*).
 CREATE TABLE IF NOT EXISTS game.corp_applications (
@@ -356,6 +379,126 @@ CREATE TABLE IF NOT EXISTS game.corp_applications (
 );
 CREATE INDEX IF NOT EXISTS corp_applications_corp_idx ON game.corp_applications (corporation_id, status);
 CREATE INDEX IF NOT EXISTS corp_applications_char_idx ON game.corp_applications (character_id, status);
+
+-- Alliances (services/alliances.rs); IDs from 99,000,000 like the live server's.
+CREATE TABLE IF NOT EXISTS game.alliances (
+    alliance_id      bigserial PRIMARY KEY,
+    name             text NOT NULL,
+    short_name       text NOT NULL,
+    description      text NOT NULL DEFAULT '',
+    url              text NOT NULL DEFAULT '',
+    executor_corp_id bigint,
+    creator_corp_id  bigint NOT NULL,
+    creator_char_id  bigint NOT NULL,
+    dictatorial      boolean NOT NULL DEFAULT false,
+    created          bigint NOT NULL,
+    deleted          boolean NOT NULL DEFAULT false
+);
+CREATE UNIQUE INDEX IF NOT EXISTS alliances_name_idx ON game.alliances (lower(name)) WHERE NOT deleted;
+CREATE UNIQUE INDEX IF NOT EXISTS alliances_short_name_idx ON game.alliances (upper(short_name)) WHERE NOT deleted;
+SELECT setval('game.alliances_alliance_id_seq', GREATEST((SELECT max(alliance_id) FROM game.alliances), 99000000), true);
+-- A corporation's alliance, since when, and the member corporation it backs as executor.
+ALTER TABLE game.corporations ADD COLUMN IF NOT EXISTS alliance_id bigint;
+ALTER TABLE game.corporations ADD COLUMN IF NOT EXISTS alliance_joined bigint;
+ALTER TABLE game.corporations ADD COLUMN IF NOT EXISTS chosen_executor_id bigint;
+
+-- Alliances a corporation has been in (alliance_id NULL: left), for its alliance history.
+CREATE TABLE IF NOT EXISTS game.alliance_history (
+    corporation_id bigint NOT NULL,
+    alliance_id    bigint,
+    start_date     bigint NOT NULL
+);
+CREATE INDEX IF NOT EXISTS alliance_history_corp_idx ON game.alliance_history (corporation_id, start_date);
+
+-- A corporation's application to an alliance (state: appConst.allianceApplication*).
+CREATE TABLE IF NOT EXISTS game.alliance_applications (
+    alliance_id      bigint NOT NULL,
+    corporation_id   bigint NOT NULL,
+    application_text text NOT NULL DEFAULT '',
+    state            integer NOT NULL,
+    created          bigint NOT NULL,
+    PRIMARY KEY (alliance_id, corporation_id)
+);
+
+-- An alliance's declared relationships (appConst.allianceRelationship*) to other owners.
+CREATE TABLE IF NOT EXISTS game.alliance_relationships (
+    alliance_id  bigint NOT NULL,
+    to_id        bigint NOT NULL,
+    relationship integer NOT NULL,
+    PRIMARY KEY (alliance_id, to_id)
+);
+
+-- Corporation offices (services/offices.rs): office_id is the office's item (typeOffice) at
+-- the station, which holds the corporation hangar divisions' items (flagCorpSAG1-7).
+CREATE TABLE IF NOT EXISTS game.offices (
+    office_id      bigint PRIMARY KEY,
+    corporation_id bigint NOT NULL,
+    station_id     bigint NOT NULL,
+    rented_until   bigint NOT NULL,
+    UNIQUE (corporation_id, station_id)
+);
+
+-- Bills (services/bills.rs): bill_type is appConst.billType*, status appConst.bill*
+-- (0 unpaid, 1 paid); external_id is what the bill is for (an office for rent).
+CREATE TABLE IF NOT EXISTS game.bills (
+    bill_id      bigserial PRIMARY KEY,
+    bill_type    integer NOT NULL,
+    debtor_id    bigint NOT NULL,
+    creditor_id  bigint NOT NULL,
+    amount       numeric(20, 2) NOT NULL,
+    due          bigint NOT NULL,
+    interest     double precision NOT NULL DEFAULT 0,
+    external_id  bigint,
+    external_id2 bigint,
+    status       integer NOT NULL DEFAULT 0,
+    created      bigint NOT NULL
+);
+CREATE INDEX IF NOT EXISTS bills_debtor_idx ON game.bills (debtor_id, status);
+CREATE INDEX IF NOT EXISTS bills_creditor_idx ON game.bills (creditor_id, status);
+-- Which bill types an owner pays automatically, and from which wallet division.
+CREATE TABLE IF NOT EXISTS game.bill_autopay (
+    owner_id  bigint NOT NULL,
+    bill_type integer NOT NULL,
+    enabled   boolean NOT NULL,
+    PRIMARY KEY (owner_id, bill_type)
+);
+ALTER TABLE game.corporations ADD COLUMN IF NOT EXISTS bill_division integer NOT NULL DEFAULT 1000;
+
+-- Corporation wallet divisions (services/corpwallet.rs): account_key 1000-1006.
+CREATE TABLE IF NOT EXISTS game.corp_wallets (
+    corporation_id bigint NOT NULL,
+    account_key    integer NOT NULL,
+    balance        numeric(20, 2) NOT NULL DEFAULT 0,
+    PRIMARY KEY (corporation_id, account_key)
+);
+
+-- Corporation and alliance bulletins, contacts and contact labels (services/orgs.rs);
+-- owner_id is the corporation or alliance.
+CREATE TABLE IF NOT EXISTS game.org_bulletins (
+    bulletin_id  bigserial PRIMARY KEY,
+    owner_id     bigint NOT NULL,
+    title        text NOT NULL,
+    body         text NOT NULL,
+    edit_char_id bigint NOT NULL,
+    edit_date    bigint NOT NULL,
+    sort_order   integer NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS org_bulletins_owner_idx ON game.org_bulletins (owner_id);
+CREATE TABLE IF NOT EXISTS game.org_contacts (
+    owner_id        bigint NOT NULL,
+    contact_id      bigint NOT NULL,
+    relationship_id double precision NOT NULL,
+    label_mask      bigint NOT NULL DEFAULT 0,
+    PRIMARY KEY (owner_id, contact_id)
+);
+-- label_id is the label's bit in a contact's label_mask.
+CREATE TABLE IF NOT EXISTS game.org_labels (
+    owner_id bigint NOT NULL,
+    label_id bigint NOT NULL,
+    name     text NOT NULL,
+    color    integer,
+    PRIMARY KEY (owner_id, label_id)
+);
 
 -- Corporations a character has joined, and when.
 CREATE TABLE IF NOT EXISTS game.employment_history (

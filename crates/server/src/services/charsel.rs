@@ -221,8 +221,11 @@ async fn select_character(c: &mut Client, char_id: i64) -> Result<(), CallError>
         .db
         .client
         .query_opt(
-            "SELECT corporation_id, station_id, solar_system_id, constellation_id, region_id, gender_id, bloodline_id, race_id, name, corp_roles
-             FROM game.characters WHERE character_id = $1 AND user_id = $2 AND NOT deleted",
+            "SELECT corporation_id, station_id, solar_system_id, constellation_id, region_id, gender_id, bloodline_id, race_id, name,
+                    corp_roles | COALESCE((SELECT bit_or(t.roles) FROM game.corp_titles t
+                                            WHERE t.corporation_id = ch.corporation_id AND ch.corp_title_mask & t.title_id <> 0), 0),
+                    (SELECT alliance_id FROM game.corporations co WHERE co.corporation_id = ch.corporation_id)
+             FROM game.characters ch WHERE character_id = $1 AND user_id = $2 AND NOT deleted",
             &[&char_id, &c.login.user_id],
         )
         .await
@@ -262,9 +265,11 @@ async fn select_character(c: &mut Client, char_id: i64) -> Result<(), CallError>
     let opt = |v: Option<i64>| v.map(Value::Int).unwrap_or(Value::None);
     let corp: i64 = r.get(0);
     let roles: i64 = r.get(9);
+    let alliance: Option<i64> = r.get(10);
     c.change_session(vec![
         ("charid", int(char_id)),
         ("corpid", int(corp)),
+        ("allianceid", opt(alliance)),
         ("corprole", int(roles)),
         ("rolesAtAll", int(roles)),
         ("rolesAtBase", int(roles)),
@@ -289,7 +294,7 @@ async fn select_character(c: &mut Client, char_id: i64) -> Result<(), CallError>
     }
     c.world.register_pilot(char_id, c.notify_tx.clone());
     let role = c.session.int("role").unwrap_or(0);
-    c.chat.set_profile(char_id, &r.get::<_, String>(8), r.get::<_, i32>(5) as i64, corp, None, None, role);
+    c.chat.set_profile(char_id, &r.get::<_, String>(8), r.get::<_, i32>(5) as i64, corp, alliance, None, role);
     info!(user = c.login.user_id, "character {char_id} entering game at station {station:?} / system {system}");
     Ok(())
 }

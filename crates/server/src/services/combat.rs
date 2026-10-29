@@ -905,17 +905,32 @@ async fn repair_player(db: &Db, world: &World, system: i64, ship: i64, char_id: 
 async fn reward_kill(db: &Db, world: &World, system: i64, npc: &Ball, killer: Option<i64>) -> Result<(), CallError> {
     let bounty = attr(&attributes(db, npc.type_id).await?, ATTR_ENTITY_KILL_BOUNTY, 0.0);
     if let Some(pilot) = killer.filter(|_| bounty > 0.0) {
+        // A player corporation takes its tax rate of the bounty into its master wallet.
+        let corp_tax = db
+            .client
+            .query_opt(
+                "SELECT co.corporation_id, co.tax_rate FROM game.characters ch JOIN game.corporations co ON co.corporation_id = ch.corporation_id
+                 WHERE ch.character_id = $1 AND NOT co.deleted",
+                &[&pilot],
+            )
+            .await
+            .map_err(db_err)?
+            .map(|r| (r.get::<_, i64>(0), r.get::<_, f64>(1).clamp(0.0, 1.0)));
+        let tax = corp_tax.map(|(_, rate)| (bounty * rate * 100.0).round() / 100.0).unwrap_or(0.0);
         let balance: f64 = db
             .client
             .query_one(
                 "UPDATE game.characters SET balance = balance + $2::float8::numeric WHERE character_id = $1 RETURNING balance::float8",
-                &[&pilot, &bounty],
+                &[&pilot, &(bounty - tax)],
             )
             .await
             .map_err(db_err)?
             .get(0);
         world.notify_pilot(pilot, "OnAccountChange", vec![Value::str("cash"), Value::Int(pilot), Value::Float(balance)]);
-        info!("{pilot} earned {bounty:.0} ISK bounty for {}", npc.type_id);
+        if let Some((corp, _)) = corp_tax.filter(|_| tax > 0.0) {
+            super::corpwallet::corp_credit(db, world, corp, super::corpwallet::MASTER, tax).await?;
+        }
+        info!("{pilot} earned {bounty:.0} ISK bounty for {} ({tax:.0} corporation tax)", npc.type_id);
         super::crimewatch::npc_killed(db, world, pilot).await?;
     }
     let wreck = db

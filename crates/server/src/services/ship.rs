@@ -58,7 +58,7 @@ pub(super) async fn ship_ball(c: &Client, ship_id: i64, pos: [f64; 3]) -> Result
         type_id: r.get(0),
         owner_id: char_id,
         corp_id: corp,
-        alliance_id: -1,
+        alliance_id: c.session.int("allianceid").unwrap_or(-1),
         char_id: Some(char_id),
         mode: MODE_STOP,
         radius: r.get::<_, Option<f64>>(1).unwrap_or(50.0) as f32,
