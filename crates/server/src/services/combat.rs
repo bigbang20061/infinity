@@ -20,6 +20,7 @@
 //! Target locks, reloads, module cycles, pulses and missile impacts use system
 //! actor timers. Database-backed effects run on deferred workers outside the actor.
 //! Dropped cycle owners release their own in-memory activation markers without notifications.
+//! Reset clears a pilot's targets and pending locks and stops only that pilot's modules.
 
 use super::dogma::load_items;
 use super::inventory::notify_item_change;
@@ -138,14 +139,19 @@ struct Hp {
     resonance: [[f64; 4]; 3],
 }
 
+struct ActiveModule {
+    char_id: i64,
+    stop: Arc<AtomicBool>,
+}
+
 #[derive(Default)]
 struct State {
     /// charID -> locked targets
     targets: HashMap<i64, HashSet<i64>>,
     /// (charID, targetID) -> lock attempt in progress
     locking: HashMap<(i64, i64), u64>,
-    /// moduleID -> stop flag of its running cycle
-    active: HashMap<i64, Arc<AtomicBool>>,
+    /// moduleID -> owner and stop flag of its running cycle
+    active: HashMap<i64, ActiveModule>,
     /// Most recent activation, retained to invalidate deferred propulsion updates.
     activation_generation: HashMap<i64, Arc<AtomicBool>>,
     /// ballID -> hit points left (NPCs)
@@ -156,6 +162,16 @@ struct State {
     condition: HashMap<i64, Condition>,
     /// moduleID -> FILETIME its reload finishes
     reloading: HashMap<i64, i64>,
+}
+
+impl State {
+    fn reset_character(&mut self, char_id: i64) {
+        self.targets.remove(&char_id);
+        self.locking.retain(|(ch, _), _| *ch != char_id);
+        for active in self.active.values().filter(|active| active.char_id == char_id) {
+            active.stop.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Modules currently running their activation effect (services::fit applies them).
@@ -208,13 +224,7 @@ fn attr(a: &HashMap<i32, f64>, id: i32, default: f64) -> f64 {
 /// Stop everything a character was doing in space (docking, jumping, logging off).
 pub fn reset(c: &Client) {
     let Some(char_id) = c.session.int("charid") else { return };
-    let mut st = state();
-    st.targets.remove(&char_id);
-    st.locking.retain(|(ch, _), _| *ch != char_id);
-    // Cycle tasks check their ship is still in space; flag them all to stop.
-    for stop in st.active.values() {
-        stop.store(true, Ordering::Relaxed);
-    }
+    state().reset_character(char_id);
 }
 
 // ---------------------------------------------------------------- targeting
@@ -1387,7 +1397,7 @@ impl Drop for ActivationOwner {
     fn drop(&mut self) {
         if !self.armed { return; }
         let mut st = state();
-        if st.active.get(&self.master).is_some_and(|current| Arc::ptr_eq(current, &self.generation)) {
+        if st.active.get(&self.master).is_some_and(|current| Arc::ptr_eq(&current.stop, &self.generation)) {
             st.active.remove(&self.master);
         }
         if st.activation_generation.get(&self.master).is_some_and(|current| Arc::ptr_eq(current, &self.generation)) {
@@ -1415,7 +1425,7 @@ struct Cycle {
 fn cycle_valid(s: &System, cycle: &Cycle) -> bool {
     s.contains(cycle.cx.ship_id)
         && cycle.target.is_none_or(|target| s.contains(target))
-        && state().active.get(&cycle.modules[0].id).is_some_and(|v| Arc::ptr_eq(v, &cycle.stop))
+        && state().active.get(&cycle.modules[0].id).is_some_and(|v| Arc::ptr_eq(&v.stop, &cycle.stop))
 }
 
 fn cycle_deadline(start: i64, duration_ms: f64) -> i64 {
@@ -1435,8 +1445,8 @@ fn schedule_cycle_end(s: &mut System, start: i64, duration_ms: f64, f: impl FnOn
     s.schedule_at(end, move |s| f(s, end));
 }
 
-fn retire_activation(active: &mut HashMap<i64, Arc<AtomicBool>>, master: i64, stop: &Arc<AtomicBool>, publish: impl FnOnce()) -> bool {
-    if !active.get(&master).is_some_and(|current| Arc::ptr_eq(current, stop)) { return false; }
+fn retire_activation(active: &mut HashMap<i64, ActiveModule>, master: i64, stop: &Arc<AtomicBool>, publish: impl FnOnce()) -> bool {
+    if !active.get(&master).is_some_and(|current| Arc::ptr_eq(&current.stop, stop)) { return false; }
     publish();
     active.remove(&master);
     true
@@ -1689,7 +1699,7 @@ async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
     {
         let mut st = state();
         if st.active.contains_key(&item_id) { return Ok(Value::None); }
-        st.active.insert(item_id, stop.clone());
+        st.active.insert(item_id, ActiveModule { char_id: cx.char_id, stop: stop.clone() });
         st.activation_generation.insert(item_id, stop.clone());
     }
     let owner = ActivationOwner { master: item_id, generation: stop.clone(), armed: true };
@@ -1719,7 +1729,7 @@ async fn set_online(c: &mut Client, item_id: i64, online: bool) -> CallResult {
     }
     if !online {
         if let Some(stop) = state().active.get(&item_id) {
-            stop.store(true, Ordering::Relaxed);
+            stop.stop.store(true, Ordering::Relaxed);
         }
     }
     let effect = Effect { id: EFFECT_ONLINE, guid: None, duration_attribute: None, weapon: None, repair: None, propulsion: false, mining: None };
@@ -1746,7 +1756,7 @@ pub(super) fn pulse_effect(c: &mut Client, module: i64, effect_id: i64, target: 
 fn deactivate(call: &Call<'_>) -> CallResult {
     let item_id = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
     if let Some(stop) = state().active.get(&item_id) {
-        stop.store(true, Ordering::Relaxed);
+        stop.stop.store(true, Ordering::Relaxed);
     }
     Ok(Value::None)
 }
@@ -1954,13 +1964,51 @@ fn npc_repair(world: &World, system: i64, id: i64, stats: &NpcStats) {
 mod tests {
     use super::*;
     #[test]
+    fn reset_only_stops_owning_pilots_modules() {
+        let mut st = State::default();
+        let a = 1;
+        let b = 2;
+        let flags: Vec<_> = (0..3).map(|_| Arc::new(AtomicBool::new(false))).collect();
+        for (master, owner, flag) in [(10, a, &flags[0]), (11, a, &flags[1]), (12, b, &flags[2])] {
+            st.active.insert(master, ActiveModule { char_id: owner, stop: flag.clone() });
+            st.activation_generation.insert(master, flag.clone());
+        }
+        st.targets.insert(a, HashSet::from([20]));
+        st.targets.insert(b, HashSet::from([a, 21]));
+        st.locking.insert((a, 20), 1);
+        st.locking.insert((b, a), 2);
+        st.locking.insert((b, 21), 3);
+
+        st.reset_character(a);
+        assert!(flags[0].load(Ordering::Relaxed));
+        assert!(flags[1].load(Ordering::Relaxed));
+        assert!(!flags[2].load(Ordering::Relaxed));
+        assert!(!st.targets.contains_key(&a));
+        assert_eq!(st.targets.get(&b), Some(&HashSet::from([a, 21])));
+        assert_eq!(st.locking, HashMap::from([((b, a), 2), ((b, 21), 3)]));
+        assert_eq!(st.active.len(), 3);
+        assert_eq!(st.activation_generation.len(), 3);
+        for (master, flag) in [(10, &flags[0]), (11, &flags[1]), (12, &flags[2])] {
+            assert!(Arc::ptr_eq(&st.active[&master].stop, flag));
+            assert!(Arc::ptr_eq(&st.activation_generation[&master], flag));
+        }
+        st.reset_character(3);
+        st.reset_character(a);
+        assert!(!flags[2].load(Ordering::Relaxed));
+        assert_eq!(st.targets.get(&b), Some(&HashSet::from([a, 21])));
+        assert_eq!(st.locking, HashMap::from([((b, a), 2), ((b, 21), 3)]));
+        assert_eq!(st.active.len(), 3);
+        assert_eq!(st.activation_generation.len(), 3);
+    }
+
+    #[test]
     fn discarded_cycle_owners_release_only_their_generation() {
         let master = -9011;
         let generation = Arc::new(AtomicBool::new(false));
         {
             let mut st = state();
             assert!(!st.active.contains_key(&master));
-            st.active.insert(master, generation.clone());
+            st.active.insert(master, ActiveModule { char_id: 1, stop: generation.clone() });
             st.activation_generation.insert(master, generation.clone());
         }
         let owner = ActivationOwner { master, generation: generation.clone(), armed: true };
@@ -1971,7 +2019,7 @@ mod tests {
             let mut st = state();
             assert!(!st.active.contains_key(&master));
             assert!(!st.activation_generation.contains_key(&master));
-            st.active.insert(master, generation.clone());
+            st.active.insert(master, ActiveModule { char_id: 1, stop: generation.clone() });
             st.activation_generation.insert(master, generation.clone());
         }
         let owner = ActivationOwner { master, generation: generation.clone(), armed: true };
@@ -1984,7 +2032,7 @@ mod tests {
         }
         {
             let mut st = state();
-            st.active.insert(master, generation.clone());
+            st.active.insert(master, ActiveModule { char_id: 1, stop: generation.clone() });
             st.activation_generation.insert(master, generation.clone());
         }
         let owner = ActivationOwner { master, generation: generation.clone(), armed: true };
@@ -1999,7 +2047,7 @@ mod tests {
         let replacement = Arc::new(AtomicBool::new(false));
         {
             let mut st = state();
-            st.active.insert(master, replacement.clone());
+            st.active.insert(master, ActiveModule { char_id: 1, stop: replacement.clone() });
             st.activation_generation.insert(master, replacement.clone());
         }
         let owner = ActivationOwner { master, generation, armed: true };
@@ -2007,7 +2055,7 @@ mod tests {
         schedule_cycle_end(&mut system, 0, 1000.0, move |_, _| drop(owner));
         drop(system);
         let mut st = state();
-        assert!(Arc::ptr_eq(&st.active[&master], &replacement));
+        assert!(Arc::ptr_eq(&st.active[&master].stop, &replacement));
         assert!(Arc::ptr_eq(&st.activation_generation[&master], &replacement));
         st.active.remove(&master);
         st.activation_generation.remove(&master);
@@ -2047,11 +2095,11 @@ mod tests {
 
         let old = Arc::new(AtomicBool::new(false));
         let replacement = Arc::new(AtomicBool::new(false));
-        let mut active = HashMap::from([(1, replacement.clone())]);
+        let mut active = HashMap::from([(1, ActiveModule { char_id: 1, stop: replacement.clone() })]);
         let mut published = false;
         assert!(!retire_activation(&mut active, 1, &old, || published = true));
         assert!(!published);
-        assert!(Arc::ptr_eq(&active[&1], &replacement));
+        assert!(Arc::ptr_eq(&active[&1].stop, &replacement));
         assert!(retire_activation(&mut active, 1, &replacement, || published = true));
         assert!(published);
         assert!(active.is_empty());
