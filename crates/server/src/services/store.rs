@@ -379,7 +379,8 @@ fn token_ids(v: Option<&Value>) -> Vec<i64> {
         .collect()
 }
 
-/// ClaimRedeemTokens(tokens, charID, useHomeStation=False) -> {'errors', 'itemsCreated', 'stationID', 'isk_balance'}
+/// ClaimRedeemTokens(tokens, charID, useHomeStation=False) -> {'errors', 'itemsCreated', 'stationID',
+/// 'isk_balance', 'activated_licenses', 'isk_rewarded'}
 async fn claim_tokens(c: &mut Client, call: &Call<'_>) -> CallResult {
     let ids = token_ids(call.args.first());
     let char_id = call.args.get(1).and_then(|v| v.as_int()).or_else(|| c.session.int("charid")).unwrap_or(0);
@@ -451,6 +452,9 @@ async fn claim_tokens(c: &mut Client, call: &Call<'_>) -> CallResult {
         ("itemsCreated", Value::list(items)),
         ("stationID", station.map(Value::Int).unwrap_or(Value::None)),
         ("isk_balance", Value::None),
+        // RedeemItemsContainer._OnRedeem indexes these when no items were created (SP tokens).
+        ("activated_licenses", Value::list([])),
+        ("isk_rewarded", Value::Int(0)),
     ]))
 }
 

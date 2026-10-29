@@ -190,6 +190,11 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             let id = call.args.first().and_then(|v| v.as_int()).unwrap_or(me);
             employment(c, id).await
         }
+        // Just the history, newest first (facWarSvc.IsCharacterInFwCooldown).
+        ("corporationSvc", "GetEmploymentRecord") => {
+            let id = call.args.first().and_then(|v| v.as_int()).unwrap_or(me);
+            super::corps::employment_rows(&c.db, id).await.map(Value::List)
+        }
 
         ("charMgr", "GetContactList") => Ok(keyval([
             ("addresses", rowset(&["contactID", "inWatchlist", "relationshipID", "labelMask"], vec![])),

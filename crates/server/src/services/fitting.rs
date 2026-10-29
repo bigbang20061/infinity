@@ -298,6 +298,8 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         ("charFittingMgr", "UpdateNameAndDescription") => rename_fitting(c, call).await,
         ("charFittingMgr", _) => fittings(c, call).await,
         ("corpFittingMgr", "GetFittings") | ("allianceFittingMgr", "GetFittings") => Ok(Value::Dict(vec![])),
+        // {fittingID: fitting} shared by the community corporation: none.
+        ("corpFittingMgr", "GetCommunityFittings") => Ok(Value::Dict(vec![])),
 
         ("blueprintManager", "GetLimits") => Ok(Value::dict([("maxBlueprintResults", Value::Int(10_000))])),
         // GetBlueprintDataByOwner(ownerID, facilityID) -> (blueprints, {facilityID: count})

@@ -81,6 +81,8 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         // (jumpActivation, jumpFatigue, lastUpdated)
         ("jumpTimers", "GetTimers") => Value::tuple([int(0), int(0), int(crate::client::filetime_now())]),
         ("petitioner", "GetUnreadMessages") => Value::list([]),
+        // No external help centre: the help window keeps the in-game petition flow.
+        ("petitioner", "IsZendeskEnabled") | ("petitioner", "IsZendeskSwapEnabled") => Value::Bool(false),
         ("ship", "GetDirtTimestamp") => int(crate::client::filetime_now()),
         ("shipKillCounter", "GetItemKillCountPlayer") => int(0),
         ("shipCosmeticsMgr", "GetEnabledCosmetics") => empty_dict(),
@@ -108,6 +110,18 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         ("charMgr", "LogSettings") => Value::None,
         ("charMgr", "GetCharacterSettings") => empty_dict(),
         ("ProjectDiscovery", "initialize_tutorial_status") => Value::Bool(true),
+        // Analysis Kredits (the LP store's Project Discovery currency).
+        ("ProjectDiscovery", "get_player_analysis_kredits") => int(0),
+        // Store telemetry/refresh requests; the live server answers with pushed data we don't model.
+        ("monetizationMgr", "CallUserRequested") | ("exchangeShopMgr", "CallExchangeShopOpened") => Value::None,
+        // Moving ISK into the amplification matrix isn't modelled: refuse rather than let the
+        // client report a deposit that never happened.
+        ("amplificationMatrixSolarsystemMgr", "TransferCash") => {
+            return Some(Err(CallError::User {
+                msg: "CustomNotify".into(),
+                dict: vec![("notify".into(), Value::unicode("增幅矩阵暂不可用。"))],
+            }))
+        }
         ("milestoneMgr", "ProcessCharacterLogon") => Value::None,
         ("structureDirectory", "GetMyDockableStructures") => Value::list([]),
         ("officeManager", "GetMyCorporationsOffices") => Value::list([]),

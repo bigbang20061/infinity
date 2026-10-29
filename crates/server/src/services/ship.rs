@@ -563,9 +563,12 @@ pub(super) fn warp_to(c: &mut Client, object: Option<(V3, f64)>, point: V3, min_
         // Destiny only enters warp once aligned at 75% of max velocity, and thrust scales
         // with the speed fraction (Ball::IsAlignedForWarp, GotoThrust): warp at full throttle,
         // or a stopped ship sits aligning until the 180 s MAX_ALIGN_TICKS fallback.
+        // effects.Warping drives the tunnel, camera and audio (and WarpOut for onlookers);
+        // it follows the ball through align and warp and the client stops it on exit.
         vec![
             event(t, "WarpTo", vec![Value::Int(b.id), Value::Float(to[0]), Value::Float(to[1]), Value::Float(to[2]), Value::Float(min_range), Value::Int(b.warp_factor)]),
             event(t, "SetSpeedFraction", vec![Value::Int(b.id), Value::Float(1.0)]),
+            special_fx(t, b.id, None, None, "effects.Warping", None),
         ]
     })
 }
@@ -656,7 +659,14 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             let Some(o) = found else {
                 return Some(Ok(Value::None));
             };
-            warp_to(c, Some((o.pos, o.radius as f64)), o.pos, min_range)
+            let warped = warp_to(c, Some((o.pos, o.radius as f64)), o.pos, min_range);
+            // Warping to an asteroid belt brings out its rats.
+            if let (Ok(_), false, Some(system)) = (&warped, by_pilot, c.session.int("solarsystemid")) {
+                if let Err(e) = super::exploration::belt_rats(c, system, o.id, o.pos).await {
+                    warn!(user = c.login.user_id, "belt rats at {}: {}", o.id, super::exploration::err_text(e));
+                }
+            }
+            warped
         }
         ("beyonce", "CmdStargateJump") => {
             let from_gate = a.first().and_then(|v| v.as_int()).unwrap_or(0);

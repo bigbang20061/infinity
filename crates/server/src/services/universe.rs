@@ -17,6 +17,12 @@ fn row(header: &[&str], line: Vec<Value>) -> Value {
     )
 }
 
+/// Faction warfare warzones: (warzoneID, the two factions fighting over it).
+const WARZONES: &[(i64, [i64; 2])] = &[
+    (1, [500003, 500002]), // Amarr Empire / Minmatar Republic
+    (2, [500001, 500004]), // Caldari State / Gallente Federation
+];
+
 const CORP_HEADER: &[&str] = &[
     "corporationID",
     "corporationName",
@@ -168,12 +174,19 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             ("equilibriumValue", Value::Float(1.0)),
         ]),
         ("structureDirectory", "GetSolarSystemsWithBeacons") => Value::list([]),
-        ("dungeonInstanceCacheMgr", _) => Value::list([]),
+        // {solarSystemID: [instances] or count}; the Agency's anomaly trackers iterate these
+        // as dicts and add the current system's sites from the sensor overlay themselves.
+        ("dungeonInstanceCacheMgr", _) => Value::Dict(vec![]),
         // (pilots by solarSystemID, docked pilots by solarSystemID, divisor)
         ("machoNet", "GetClusterGameStatisticsForClient") => Value::tuple([Value::Dict(vec![]), Value::Dict(vec![]), Value::Int(1)]),
-        // {warzoneID: {solarSystemID: occupationState}}
+        // {warzoneID: {solarSystemID: occupationState}}: no system is contested yet, but every
+        // warzone must be present (WarzoneStatusGauge indexes it by the faction's warzone).
         ("fwWarzoneSolarsystem", "GetAllWarzonesOccupationStates") | ("fwWarzoneSolarsystem", "GetAllWarzonesOccupationStatesUncached") => {
-            Value::Dict(vec![])
+            Value::Dict(WARZONES.iter().map(|(id, _)| (Value::Int(*id), Value::Dict(vec![]))).collect())
+        }
+        // {warzoneID: [factionID, ...]} (fwWarzoneSvc.GetWarzoneIdForFaction)
+        ("fwWarzoneSolarsystem", "GetAllWarzones") => {
+            Value::Dict(WARZONES.iter().map(|(id, factions)| (Value::Int(*id), Value::list(factions.iter().map(|f| Value::Int(*f))))).collect())
         }
 
         // ---- corporations ----
@@ -182,6 +195,8 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             return Some(corporation(c, corp).await);
         }
         ("corpmgr", "GetCorporations") => return Some(corporation(c, arg_int(0).unwrap_or(my_corp)).await),
+        // Show info on a corporation (corporationInfoWindow reads ceoID, stationID, shares...).
+        ("corpmgr", "GetPublicInfo") => return Some(corporation(c, arg_int(0).unwrap_or(my_corp)).await),
         ("corpmgr", "GetAssetInventory") | ("corpmgr", "GetAssetInventoryForLocation") | ("corpmgr", "SearchAssets") => Value::list([]),
         ("corpRegistry", "GetTitles") | ("corpRegistry", "GetLabels") | ("corpRegistry", "GetCorporateContacts") => Value::Dict(vec![]),
         ("corpRegistry", "GetBulletins") => Value::list([]),
@@ -221,6 +236,8 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         ("dungeonExplorationMgr", "GetMyEscalatingPathDetails") => Value::list([]),
         // (factionID, directFactionID, corpFactionID): not enlisted.
         ("fwCharacterEnlistmentMgr", "GetMyEnlistment") => Value::tuple([Value::None, Value::None, Value::None]),
+        // FILETIME the direct-enlistment cooldown ends; never enlisted, so none.
+        ("fwCharacterEnlistmentMgr", "GetMyDirectEnlistmentCooldownTimestamp") => Value::Int(0),
         // Not enlisted in a militia: no ranks.
         ("facWarMgr", "GetMyCharacterRankOverview") => Value::list([]),
         // (medals, medalInfo): medals come from player corporations; medalInfo is only

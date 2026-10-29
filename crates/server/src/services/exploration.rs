@@ -44,6 +44,7 @@ const SEC: i64 = 10_000_000;
 const GROUP_COSMIC_SIGNATURE: i64 = 502;
 const GROUP_COSMIC_ANOMALY: i64 = 885;
 const GROUP_PLANET: i32 = 7;
+const GROUP_ASTEROID_BELT: i32 = 9;
 // probescanning.const scan groups
 const SCAN_GROUP_SIGNATURES: i64 = 3;
 const SCAN_GROUP_ANOMALIES: i64 = 8;
@@ -225,6 +226,8 @@ struct State {
     /// (character, connection) -> polarization end (FILETIME); a connection is keyed by
     /// the lower site ID of its two ends.
     polarized: HashMap<(i64, i64), i64>,
+    /// Asteroid belts whose rats are in space or that were cleared recently (belt_rats).
+    belts: HashSet<i64>,
 }
 
 fn state() -> MutexGuard<'static, State> {
@@ -1359,6 +1362,18 @@ async fn spawn_site_npcs(c: &mut Client, site: &Site) -> Result<(), CallError> {
     } else {
         site_classes(site.difficulty).iter().map(|class| format!("{} {class}", rat_prefix(faction))).collect()
     };
+    let spawned = spawn_rats(c, site.system, site.pos, faction, &groups, (15_000.0, 40_000.0)).await?;
+    info!(user = c.login.user_id, "site {} ({}) in {}: spawned {} NPCs", site.target, site.id, site.system, spawned.len());
+    if let Some(s) = state().sites.get_mut(&site.id) {
+        s.npcs = Some(spawned.clone());
+    }
+    tokio::spawn(watch_site(c.db.clone(), c.world.clone(), site.id, site.system, spawned));
+    Ok(())
+}
+
+/// Put one hostile NPC of each of `groups` (a random type of the group) in space for
+/// `faction`, between `spread.0` and `spread.1` metres from `center`.
+async fn spawn_rats(c: &mut Client, system: i64, center: V3, faction: i64, groups: &[String], spread: (f64, f64)) -> Result<Vec<i64>, CallError> {
     let corp: i64 = c
         .db
         .client
@@ -1379,14 +1394,14 @@ async fn spawn_site_npcs(c: &mut Client, site: &Site) -> Result<(), CallError> {
                         (SELECT value FROM sde.type_attributes WHERE type_id = t.type_id AND attribute_id = 70)
                  FROM sde.inv_types t JOIN sde.inv_groups g ON g.group_id = t.group_id
                  WHERE g.category_id = 11 AND g.name = $1 ORDER BY random() LIMIT 1",
-                &[&group],
+                &[group],
             )
             .await
             .map_err(db_err)?
         else {
             continue;
         };
-        let d = 15_000.0 + rand01() * 25_000.0;
+        let d = spread.0 + rand01() * (spread.1 - spread.0);
         let v = rand_dir();
         let ball = Ball {
             id: super::missions::NEXT_NPC_ID.fetch_add(1, Ordering::Relaxed),
@@ -1401,7 +1416,7 @@ async fn spawn_site_npcs(c: &mut Client, site: &Site) -> Result<(), CallError> {
             max_vel: r.get::<_, Option<f64>>(3).unwrap_or(300.0) as f32,
             agility: r.get::<_, Option<f64>>(4).unwrap_or(3.0) as f32,
             speed_fraction: 0.0,
-            pos: [site.pos[0] + v[0] * d, site.pos[1] + v[1] * d * 0.3, site.pos[2] + v[2] * d],
+            pos: [center[0] + v[0] * d, center[1] + v[1] * d * 0.3, center[2] + v[2] * d],
             vel: [0.0; 3],
             goto: [0.0; 3],
             follow_id: 0,
@@ -1419,19 +1434,73 @@ async fn spawn_site_npcs(c: &mut Client, site: &Site) -> Result<(), CallError> {
             slim: vec![("corpID", Value::Int(corp))],
         };
         let (id, type_id) = (ball.id, ball.type_id);
-        c.world.add_ship(site.system, ball).await.map_err(CallError::Internal)?;
-        super::combat::spawn_npc(c.db.clone(), c.world.clone(), site.system, id, type_id, Some(super::combat::HOSTILE_TO_ALL));
+        c.world.add_ship(system, ball).await.map_err(CallError::Internal)?;
+        super::combat::spawn_npc(c.db.clone(), c.world.clone(), system, id, type_id, Some(super::combat::HOSTILE_TO_ALL));
         spawned.push(id);
     }
-    info!(user = c.login.user_id, "site {} ({}) in {}: spawned {} NPCs", site.target, site.id, site.system, spawned.len());
-    if let Some(s) = state().sites.get_mut(&site.id) {
-        s.npcs = Some(spawned.clone());
+    Ok(spawned)
+}
+
+// ---------------------------------------------------------------- belt rats
+
+/// A cleared belt stays empty this long before a pilot warping in finds new rats.
+const BELT_RAT_RESPAWN_SECS: u64 = 15 * 60;
+
+/// Belt rat hull classes by security: a few frigates in high-sec, up to battleships in null.
+fn belt_classes(security: f64) -> &'static [&'static str] {
+    if security >= 0.45 {
+        &["Frigate", "Frigate", "Destroyer"]
+    } else if security > 0.0 {
+        &["Frigate", "Destroyer", "Cruiser", "Cruiser"]
+    } else {
+        &["Cruiser", "BattleCruiser", "BattleCruiser", "Battleship"]
     }
-    tokio::spawn(watch_site(c.db.clone(), c.world.clone(), site.id, site.system, spawned));
+}
+
+/// A pilot is warping to `belt`: unless its rats are still about (or it was cleared less
+/// than BELT_RAT_RESPAWN_SECS ago), the region's pirates spawn there. Other celestials
+/// and wormhole space get none.
+pub async fn belt_rats(c: &mut Client, system: i64, belt: i64, center: V3) -> Result<(), CallError> {
+    if state().belts.contains(&belt) {
+        return Ok(());
+    }
+    let is_belt = c
+        .db
+        .client
+        .query_opt("SELECT 1 FROM sde.map_celestials WHERE item_id = $1 AND group_id = $2", &[&(belt as i32), &GROUP_ASTEROID_BELT])
+        .await
+        .map_err(db_err)?
+        .is_some();
+    let info = system_info(&c.db, system).await?;
+    if !is_belt || (1..=6).contains(&info.class) || !state().belts.insert(belt) {
+        return Ok(());
+    }
+    let faction = pirate_faction(info.faction, info.region);
+    let groups: Vec<String> = belt_classes(info.security).iter().map(|class| format!("{} {class}", rat_prefix(faction))).collect();
+    let spawned = match spawn_rats(c, system, center, faction, &groups, (5_000.0, 20_000.0)).await {
+        Ok(s) => s,
+        Err(e) => {
+            state().belts.remove(&belt);
+            return Err(e);
+        }
+    };
+    info!(user = c.login.user_id, "belt {belt} in {system}: spawned {} rats", spawned.len());
+    let world = c.world.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let balls = world.balls_snapshot(system).unwrap_or_default();
+            if !spawned.iter().any(|id| balls.contains_key(id)) {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(BELT_RAT_RESPAWN_SECS)).await;
+        state().belts.remove(&belt);
+    });
     Ok(())
 }
 
-fn err_text(e: CallError) -> String {
+pub(super) fn err_text(e: CallError) -> String {
     match e {
         CallError::Internal(e) => format!("{e:#}"),
         CallError::User { msg, .. } => msg,
