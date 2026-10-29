@@ -21,6 +21,7 @@
 //! actor timers. Database-backed effects run on deferred workers outside the actor.
 //! Dropped cycle owners release their own in-memory activation markers without notifications.
 //! Reset clears a pilot's targets and pending locks and stops only that pilot's modules.
+//! Missiles in flight use a temporary, nonpersistent ID namespace.
 
 use super::dogma::load_items;
 use super::inventory::notify_item_change;
@@ -124,10 +125,10 @@ const HIT_NORMAL_THRESHOLD: f64 = 1.0;
 /// Existing combat-log good threshold.
 const HIT_GOOD_THRESHOLD: f64 = 1.2;
 
+/// Server design decision: missile IDs clear NPCs (9.0e12), exploration sites (9.5e12), probes (9.6e12), and asteroids (9.7e12).
+const MISSILE_ID_START: i64 = 9_800_000_000_000;
 /// Temporary item IDs for missiles in flight.
-/// Missile balls; clear of NPCs (9.0e12), exploration sites (9.5e12), probes (9.6e12) and
-/// asteroids (9.7e12).
-static NEXT_MISSILE_ID: AtomicI64 = AtomicI64::new(9_800_000_000_000);
+static NEXT_MISSILE_ID: AtomicI64 = AtomicI64::new(MISSILE_ID_START);
 static NEXT_LOCK: AtomicU64 = AtomicU64::new(1);
 
 // ---------------------------------------------------------------- state
@@ -1963,6 +1964,41 @@ fn npc_repair(world: &World, system: i64, id: i64, stats: &NpcStats) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn missile_lifecycle_preserves_exploration_site() {
+        let mut system = System::default();
+        let site = Ball {
+            id: 9_500_000_000_000, type_id: 1, owner_id: 1, corp_id: 1, alliance_id: -1,
+            char_id: None, signature_radius: None, mode: crate::space::MODE_STOP, radius: 1.0, mass: 1.0,
+            max_vel: 1.0, agility: 1.0, speed_fraction: 0.0,
+            pos: [1.0, 2.0, 3.0], vel: [0.0; 3], goto: [0.0; 3],
+            follow_id: 0, follow_range: 0.0, free: true, global: false,
+            massive: true, warp: None, warp_factor: 0, last_ms: 0,
+            cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new(),
+        };
+        let (site_id, site_type, site_pos) = (site.id, site.type_id, site.pos);
+        let missile_id = NEXT_MISSILE_ID.fetch_add(1, Ordering::Relaxed);
+        let missile = Ball {
+            id: missile_id, type_id: 2, mode: MODE_MISSILE, pos: [4.0, 5.0, 6.0],
+            ..site.clone()
+        };
+        system.insert(site);
+        system.insert(missile);
+
+        let retained_site = system.ball(site_id).unwrap();
+        assert_eq!((retained_site.id, retained_site.type_id, retained_site.pos), (site_id, site_type, site_pos));
+        let retained_missile = system.ball(missile_id).unwrap();
+        assert_eq!((retained_missile.id, retained_missile.type_id, retained_missile.pos), (missile_id, 2, [4.0, 5.0, 6.0]));
+        let second_id = NEXT_MISSILE_ID.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(missile_id, second_id);
+        assert_eq!(second_id, missile_id + 1);
+
+        system.destroy_ball(missile_id).unwrap();
+        assert!(!system.contains(missile_id));
+        let retained_site = system.ball(site_id).unwrap();
+        assert_eq!((retained_site.id, retained_site.type_id, retained_site.pos), (site_id, site_type, site_pos));
+    }
+
     #[test]
     fn reset_only_stops_owning_pilots_modules() {
         let mut st = State::default();
