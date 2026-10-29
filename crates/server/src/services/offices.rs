@@ -5,8 +5,8 @@
 //! inventory lists and moves them). Renting again before the period ends extends it;
 //! renewing is billed (services/bills).
 
-use super::corps::{ceo_of, is_player_corp, membership};
-use super::{db_err, keyval, notify_error, Call, CallError, CallResult};
+use super::corps::is_player_corp;
+use super::{active_corporation_member_ids, db_err, has_role_or_is_ceo, keyval, notify_error, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
 use crate::consts::{ACCOUNT_CASH, FILETIME_DAY, RENTAL_DAYS, ROLE_DIRECTOR};
 use crate::db::Db;
@@ -14,11 +14,22 @@ use crate::space::World;
 use marshal::Value;
 use tracing::info;
 
-pub(super) const TYPE_OFFICE: i32 = 27;
+/// SDE invTypes: Office.
+const TYPE_OFFICE: i32 = 27;
+/// Server office item policy: no inventory flag on the station's office item.
+const OFFICE_ITEM_FLAG: i32 = 0;
 /// Offices a station has room for (the live server's capacity never shipped with the client or SDE).
 const STATION_OFFICE_SLOTS: i64 = 24;
 /// appConst.corpRoleCanRentOffice
 const ROLE_CAN_RENT_OFFICE: i64 = 562_949_953_421_312;
+/// Server office rent policy: security used when the station's system is unavailable.
+const DEFAULT_SECURITY: f64 = 0.5;
+/// Server office rent policy: minimum rent in ISK.
+const BASE_RENT: f64 = 100_000.0;
+/// Server office rent policy: additional ISK at security 1.
+const SECURITY_RENT: f64 = 900_000.0;
+/// Server office rent policy: half-ISK tolerance for rounded quotes.
+const QUOTE_TOLERANCE: f64 = 0.5;
 
 /// The rent for one period at `station`: dearer in busier, higher-security space.
 pub(super) async fn rent_price(db: &Db, station: i64) -> Result<f64, CallError> {
@@ -32,8 +43,8 @@ pub(super) async fn rent_price(db: &Db, station: i64) -> Result<f64, CallError> 
         .await
         .map_err(db_err)?
         .map(|r| r.get(0))
-        .unwrap_or(0.5);
-    Ok((100_000.0 + 900_000.0 * security.clamp(0.0, 1.0)).round())
+        .unwrap_or(DEFAULT_SECURITY);
+    Ok((BASE_RENT + SECURITY_RENT * security.clamp(0.0, 1.0)).round())
 }
 
 /// The corporation's office at `station`, if it rents one.
@@ -53,9 +64,8 @@ pub(super) async fn office_owner(db: &Db, item: i64) -> Result<Option<i64>, Call
 
 /// Tell the corporation's online members its offices changed.
 async fn announce(db: &Db, world: &World, corp: i64, office: i64) -> Result<(), CallError> {
-    let rows = db.client.query("SELECT character_id FROM game.characters WHERE corporation_id = $1 AND NOT deleted", &[&corp]).await.map_err(db_err)?;
-    for r in rows {
-        world.notify_pilot(r.get(0), "OnOfficeRentalChange", vec![Value::Int(corp), Value::Int(office)]);
+    for id in active_corporation_member_ids(db, corp).await? {
+        world.notify_pilot(id, "OnOfficeRentalChange", vec![Value::Int(corp), Value::Int(office)]);
     }
     Ok(())
 }
@@ -76,8 +86,8 @@ pub(super) async fn rent(db: &Db, world: &World, corp: i64, station: i64) -> Res
     let office: i64 = db
         .client
         .query_one(
-            "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton) VALUES ($1, $2, $3, 0, 1, true) RETURNING item_id",
-            &[&TYPE_OFFICE, &corp, &station],
+            "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton) VALUES ($1, $2, $3, $4, 1, true) RETURNING item_id",
+            &[&TYPE_OFFICE, &corp, &station, &OFFICE_ITEM_FLAG],
         )
         .await
         .map_err(db_err)?
@@ -96,8 +106,7 @@ pub(super) async fn rent(db: &Db, world: &World, corp: i64, station: i64) -> Res
 
 /// A director, the CEO, or a member allowed to rent offices.
 async fn may_rent(db: &Db, me: i64, corp: i64) -> Result<bool, CallError> {
-    let (my_corp, roles) = membership(db, me).await?;
-    Ok(my_corp == corp && (roles & (ROLE_DIRECTOR | ROLE_CAN_RENT_OFFICE) != 0 || ceo_of(db, corp).await? == Some(me)))
+    has_role_or_is_ceo(db, me, corp, ROLE_DIRECTOR | ROLE_CAN_RENT_OFFICE).await
 }
 
 /// The office rows the client keeps (officeID, stationID, solarsystemID, stationTypeID).
@@ -163,7 +172,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             }
             let quoted = call.args.first().and_then(|v| v.as_float().or_else(|| v.as_int().map(|i| i as f64)));
             match rent_price(db, station).await {
-                Ok(price) if quoted.is_some_and(|q| q + 0.5 < price) => return Some(Err(notify_error("办公室租金已变动，请重新查询。"))),
+                Ok(price) if quoted.is_some_and(|q| q + QUOTE_TOLERANCE < price) => return Some(Err(notify_error("办公室租金已变动，请重新查询。"))),
                 Err(e) => return Some(Err(e)),
                 _ => {}
             }

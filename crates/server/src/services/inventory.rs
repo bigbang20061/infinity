@@ -3,9 +3,9 @@
 //! (eve/client/script/environment/invCache.py, invCacheContainer).
 
 use super::dogma::{load_items, Item};
-use super::{db_err, keyval, Call, CallError, CallResult};
+use super::{db_err, keyval, value_id_list, Call, CallError, CallResult};
 use crate::client::{short, Client};
-use crate::consts::{ATTR_CAPACITY, CATEGORY_SHIP, FLAG_CARGO, FLAG_CORP_SAG1, FLAG_HANGAR, FLAG_PILOT, IX_FLAG, IX_LOCATION_ID, IX_SINGLETON, IX_STACK_SIZE, LOCATION_JUNKYARD, ROLE_DIRECTOR, TYPE_CHARACTER};
+use crate::consts::{ATTR_CAPACITY, CATEGORY_SHIP, FLAG_CARGO, FLAG_CORP_SAG1, FLAG_FITTING_FIRST, FLAG_FITTING_LAST, FLAG_HANGAR, FLAG_PILOT, FLAG_RIG_FIRST, FLAG_RIG_LAST, FLAG_SUBSYSTEM_FIRST, FLAG_SUBSYSTEM_LAST, IX_FLAG, IX_LOCATION_ID, IX_SINGLETON, IX_STACK_SIZE, LOCATION_JUNKYARD, ROLE_DIRECTOR, TYPE_CHARACTER};
 use marshal::Value;
 use tracing::warn;
 
@@ -140,7 +140,7 @@ const ROLE_HANGAR_CAN_TAKE_1: i64 = 8192;
 
 /// Fitting slot flags: low, medium, high, rig and subsystem slots.
 pub fn is_fitting_flag(flag: i32) -> bool {
-    (11..=34).contains(&flag) || (92..=99).contains(&flag) || (125..=132).contains(&flag)
+    (FLAG_FITTING_FIRST..=FLAG_FITTING_LAST).contains(&flag) || (FLAG_RIG_FIRST..=FLAG_RIG_LAST).contains(&flag) || (FLAG_SUBSYSTEM_FIRST..=FLAG_SUBSYSTEM_LAST).contains(&flag)
 }
 
 /// `OnItemChange(item, change, location)` for `item_id` as it is now in the database.
@@ -319,10 +319,6 @@ async fn stack_all(c: &mut Client, container: &Container, flag: Option<i64>) -> 
     Ok(())
 }
 
-fn int_list(v: Option<&Value>) -> Vec<i64> {
-    v.and_then(|v| v.items()).map(|l| l.iter().filter_map(|x| x.as_int()).collect()).unwrap_or_default()
-}
-
 /// Calls on the inventory manager (`invbroker` bound to a location).
 pub async fn broker(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     let char_id = c.session.int("charid").unwrap_or(0);
@@ -384,7 +380,7 @@ pub async fn broker(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         }
         // TrashItems(itemIDs, locationID) -> [error messages]
         "TrashItems" => {
-            let ids = int_list(call.args.first());
+            let ids = value_id_list(call.args.first());
             let r = async {
                 let items = load_items(c, "i.item_id = ANY($1) AND i.owner_id = $2", &[&ids, &char_id]).await?;
                 for item in items {
@@ -440,7 +436,7 @@ pub async fn inventory(c: &mut Client, call: &Call<'_>) -> CallResult {
         // MultiAdd(itemIDs, sourceID, flag=)
         "MultiAdd" => {
             let flag = call.kwargs.get("flag").and_then(|v| v.as_int()).map(|f| f as i32);
-            for item_id in int_list(call.args.first()) {
+            for item_id in value_id_list(call.args.first()) {
                 move_item(c, &container, item_id, flag, None).await?;
             }
             Ok(Value::None)

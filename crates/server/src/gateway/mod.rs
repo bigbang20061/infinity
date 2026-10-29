@@ -24,6 +24,19 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+/// gRPC protocol: one compression byte followed by a four-byte message length.
+const GRPC_HEADER_LEN: usize = 5;
+/// RFC 4122: UUIDs contain 16 bytes.
+const UUID_LEN: usize = 16;
+/// Server limit for gateway request log excerpts, in bytes.
+const LOG_EXCERPT_LEN: usize = 300;
+/// Server limit for nesting when populating default gateway responses.
+const DEFAULT_RESPONSE_DEPTH: u32 = 4;
+/// Server limit for nesting when collecting request identifiers.
+const IDENTIFIER_DEPTH: u32 = 2;
+/// gRPC status code UNIMPLEMENTED, encoded as an ASCII trailer value.
+const GRPC_UNIMPLEMENTED: &str = "12";
+
 static DESCRIPTORS: &[u8] = include_bytes!("../../proto/eve_protos.desc");
 
 pub fn pool() -> &'static DescriptorPool {
@@ -169,6 +182,10 @@ pub fn message(name: &str) -> Option<MessageDescriptor> {
     pool().get_message_by_name(name)
 }
 
+pub(super) fn response_name(request: &str) -> Option<String> {
+    request.strip_suffix("Request").map(|s| format!("{s}Response"))
+}
+
 /// Who sent a request.
 pub struct Caller {
     pub user_id: Option<i64>,
@@ -205,7 +222,7 @@ impl Gateway {
                 if let Some(tx) = streams.get(app) {
                     let _ = tx.send(Notice {
                         dispatched: Some(now_timestamp()),
-                        uuid: crate::handshake::rand_i64().to_le_bytes().repeat(2),
+                        uuid: crate::handshake::rand_i64().to_le_bytes().repeat(UUID_LEN / std::mem::size_of::<i64>()),
                         internal_origin: "infinity".into(),
                         tenant: String::new(),
                         payload: Some(pack(payload)),
@@ -221,7 +238,7 @@ impl Gateway {
 
 /// gRPC length-prefixed message framing.
 fn grpc_frame(msg: &[u8]) -> Bytes {
-    let mut b = BytesMut::with_capacity(5 + msg.len());
+    let mut b = BytesMut::with_capacity(GRPC_HEADER_LEN + msg.len());
     b.extend_from_slice(&[0]);
     b.extend_from_slice(&(msg.len() as u32).to_be_bytes());
     b.extend_from_slice(msg);
@@ -231,19 +248,19 @@ fn grpc_frame(msg: &[u8]) -> Bytes {
 /// Pull complete gRPC messages out of `buf`.
 fn take_messages(buf: &mut BytesMut) -> Vec<Bytes> {
     let mut out = Vec::new();
-    while buf.len() >= 5 {
+    while buf.len() >= GRPC_HEADER_LEN {
         let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
-        if buf.len() < 5 + len {
+        if buf.len() < GRPC_HEADER_LEN + len {
             break;
         }
-        buf.advance(5);
+        buf.advance(GRPC_HEADER_LEN);
         out.push(buf.split_to(len).freeze());
     }
     out
 }
 
 fn ok_headers() -> http::Response<()> {
-    http::Response::builder().status(200).header("content-type", "application/grpc").body(()).unwrap()
+    http::Response::builder().status(http::StatusCode::OK).header("content-type", "application/grpc").body(()).unwrap()
 }
 
 fn ok_trailers() -> http::HeaderMap {
@@ -350,7 +367,7 @@ async fn stream(
         other => {
             warn!("gateway: unknown gRPC method {other}");
             let mut t = http::HeaderMap::new();
-            t.insert("grpc-status", http::HeaderValue::from_static("12")); // UNIMPLEMENTED
+            t.insert("grpc-status", http::HeaderValue::from_static(GRPC_UNIMPLEMENTED));
             send.send_trailers(t)?;
         }
     }
@@ -367,28 +384,28 @@ async fn handle_request(gw: &Gateway, req: Request) -> Response {
     let mut rsp = Response {
         dispatched: Some(now_timestamp()),
         correlation_uuid: req.correlation_uuid.clone(),
-        status_code: 200,
+        status_code: http::StatusCode::OK.as_u16() as u32,
         status_message: String::new(),
         payload: None,
         internal_origin: "infinity".into(),
         application_instance_uuid: req.application_instance_uuid.clone(),
     };
     let Some(any) = req.payload else {
-        rsp.status_code = 400;
+        rsp.status_code = http::StatusCode::BAD_REQUEST.as_u16() as u32;
         rsp.status_message = "missing payload".into();
         return rsp;
     };
     let name = type_name(&any.type_url).to_string();
     let Some(desc) = message(&name) else {
         warn!("gateway: unknown request type {name}");
-        rsp.status_code = 400;
+        rsp.status_code = http::StatusCode::BAD_REQUEST.as_u16() as u32;
         rsp.status_message = format!("unknown type {name}");
         return rsp;
     };
     let payload = match DynamicMessage::decode(desc, any.value.as_slice()) {
         Ok(m) => m,
         Err(e) => {
-            rsp.status_code = 400;
+            rsp.status_code = http::StatusCode::BAD_REQUEST.as_u16() as u32;
             rsp.status_message = format!("bad payload: {e}");
             return rsp;
         }
@@ -405,24 +422,24 @@ async fn handle_request(gw: &Gateway, req: Request) -> Response {
         }
         Ok(None) => {
             // Unimplemented: answer with the matching `...Response` so the UI can proceed.
-            let rsp_name = name.strip_suffix("Request").map(|s| format!("{s}Response"));
+            let rsp_name = response_name(&name);
             match rsp_name.as_deref().and_then(message) {
                 Some(d) => {
                     info!("gateway: default reply {} (char {:?}) for {name} {}", d.full_name(), caller.character_id, short_msg(&payload));
                     let mut m = DynamicMessage::new(d);
-                    fill_defaults(&mut m, 4, &known_ids(&payload, &caller));
+                    fill_defaults(&mut m, DEFAULT_RESPONSE_DEPTH, &known_ids(&payload, &caller));
                     rsp.payload = Some(pack(&m));
                 }
                 None => {
                     warn!("gateway: UNHANDLED {name} (no matching response type) {}", short_msg(&payload));
-                    rsp.status_code = 501;
+                    rsp.status_code = http::StatusCode::NOT_IMPLEMENTED.as_u16() as u32;
                     rsp.status_message = "not implemented".into();
                 }
             }
         }
         Err(e) => {
             warn!("gateway: {name} failed: {e:#}");
-            rsp.status_code = 500;
+            rsp.status_code = http::StatusCode::INTERNAL_SERVER_ERROR.as_u16() as u32;
             rsp.status_message = format!("{e:#}");
         }
     }
@@ -454,7 +471,7 @@ pub fn known_ids(req: &DynamicMessage, caller: &Caller) -> HashMap<String, Dynam
             }
         }
     }
-    walk(req, &mut ids, 2);
+    walk(req, &mut ids, IDENTIFIER_DEPTH);
     ids
 }
 
@@ -491,7 +508,7 @@ pub fn fill_defaults(m: &mut DynamicMessage, depth: u32, ids: &HashMap<String, D
             continue;
         }
         match f.kind() {
-            Kind::Bytes if f.name() == "uuid" => m.set_field(&f, PV::Bytes(Bytes::from_static(&[0u8; 16]))),
+            Kind::Bytes if f.name() == "uuid" => m.set_field(&f, PV::Bytes(Bytes::from_static(&[0u8; UUID_LEN]))),
             Kind::Message(md) if !md.full_name().starts_with("google.protobuf.") => {
                 if let Some(id) = ids.get(md.full_name()) {
                     m.set_field(&f, PV::Message(id.clone()));
@@ -508,8 +525,8 @@ pub fn fill_defaults(m: &mut DynamicMessage, depth: u32, ids: &HashMap<String, D
 
 fn short_msg(m: &DynamicMessage) -> String {
     let s = format!("{m}");
-    if s.len() > 300 {
-        format!("{}...", &s[..s.char_indices().take_while(|(i, _)| *i < 300).last().map(|(i, _)| i).unwrap_or(0)])
+    if s.len() > LOG_EXCERPT_LEN {
+        format!("{}...", &s[..s.char_indices().take_while(|(i, _)| *i < LOG_EXCERPT_LEN).last().map(|(i, _)| i).unwrap_or(0)])
     } else {
         s
     }
@@ -519,6 +536,12 @@ fn short_msg(m: &DynamicMessage) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn response_name_requires_request_suffix() {
+        assert_eq!(response_name("eve_public.ExampleRequest").as_deref(), Some("eve_public.ExampleResponse"));
+        assert_eq!(response_name("eve_public.Example"), None);
+    }
 
     #[test]
     fn descriptor_pool_resolves() {

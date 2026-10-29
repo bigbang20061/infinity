@@ -10,7 +10,7 @@
 //! Notifications (game.notifications) are what other systems post for a character
 //! (`notify`): a type, a sender and YAML data the client's formatter for that type reads.
 
-use super::{db_err, keyval, notify_error, Call, CallError, CallResult};
+use super::{db_err, keyval, notify_error, value_id_list, value_text, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
 use crate::consts::FILETIME_MINUTE;
 use crate::db::Db;
@@ -19,22 +19,38 @@ use marshal::Value;
 use std::io::Write;
 use tracing::info;
 
-// appConst.mailStatusMask* / mailLabel*
-const STATUS_READ: i32 = 1;
-const STATUS_REPLIED: i32 = 2;
-const STATUS_FORWARDED: i32 = 4;
-const STATUS_TRASHED: i32 = 8;
-const LABEL_INBOX: i32 = 1;
-const LABEL_SENT: i32 = 2;
-const LABEL_CORPORATION: i32 = 4;
-/// The lowest bit free for the character's own labels.
-const FIRST_CUSTOM_LABEL: i32 = 16;
-/// appConst.mailMaxRecipients
-const MAX_RECIPIENTS: usize = 50;
+/// Server sentinel for a missing notification group ID.
+const MISSING_NOTIFICATION_GROUP: i32 = -1;
 
-fn ids(v: Option<&Value>) -> Vec<i64> {
-    v.and_then(|v| v.items()).unwrap_or(&[]).iter().filter_map(|i| i.as_int()).collect()
-}
+/// Client appConst.mailStatusMask read bit.
+const STATUS_READ: i32 = 1;
+/// Client appConst.mailStatusMask replied bit.
+const STATUS_REPLIED: i32 = 2;
+/// Client appConst.mailStatusMask forwarded bit.
+const STATUS_FORWARDED: i32 = 4;
+/// Client appConst.mailStatusMask trashed bit.
+const STATUS_TRASHED: i32 = 8;
+/// Client appConst.mailLabel inbox bit.
+const LABEL_INBOX: i32 = 1;
+/// Client appConst.mailLabel sent bit.
+const LABEL_SENT: i32 = 2;
+/// Client appConst.mailLabel corporation bit.
+const LABEL_CORPORATION: i32 = 4;
+/// Client appConst mail labels: lowest bit free for custom labels.
+const FIRST_CUSTOM_LABEL: i32 = 16;
+/// Client appConst.mailMaxRecipients.
+const MAX_RECIPIENTS: usize = 50;
+/// Server mail policy: maximum title characters.
+const MAX_MAIL_TITLE_LENGTH: usize = 150;
+/// Server mail policy: first custom-label bit position.
+const FIRST_CUSTOM_LABEL_BIT: u32 = 4;
+/// Server mail policy: exclusive upper custom-label bit position.
+const CUSTOM_LABEL_BIT_END: u32 = 30;
+/// Server notification policy: maximum rows returned.
+const MAX_NOTIFICATIONS: i32 = 1000;
+/// Client appConst mail labels: mask retaining the four built-in labels.
+const BUILTIN_LABEL_MASK: i32 = 15;
+
 
 /// The mail rows SyncMail and GetMailHeaders return.
 fn header_rows(rows: &[tokio_postgres::Row]) -> Value {
@@ -76,19 +92,18 @@ async fn sync(c: &Client, last_id: i64) -> CallResult {
 
 /// Player members of a corporation.
 async fn corp_members(db: &Db, corp: i64) -> Result<Vec<i64>, CallError> {
-    let rows = db.client.query("SELECT character_id FROM game.characters WHERE corporation_id = $1 AND NOT deleted", &[&corp]).await.map_err(db_err)?;
-    Ok(rows.iter().map(|r| r.get(0)).collect())
+    Ok(super::active_corporation_member_ids(db, corp).await?.collect())
 }
 
 /// `SendMail(toCharacterIDs, toListID, toCorpOrAllianceID, title, body, isReplyTo, isForwardedFrom)` -> messageID.
 async fn send(c: &Client, call: &Call<'_>) -> CallResult {
     let (db, world) = (&c.db, &*c.world);
     let me = c.session.int("charid").unwrap_or(0);
-    let to_chars = ids(call.args.first());
+    let to_chars = value_id_list(call.args.first());
     let to_list = call.args.get(1).and_then(|v| v.as_int());
     let to_corp = call.args.get(2).and_then(|v| v.as_int());
-    let text = |i: usize| call.args.get(i).and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
-    let (title, body) = (text(3).chars().take(150).collect::<String>(), text(4));
+    let title = value_text(call.args.get(3), MAX_MAIL_TITLE_LENGTH);
+    let body = call.args.get(4).and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
     let (reply_to, forwarded_from) = (call.args.get(5).and_then(|v| v.as_int()).unwrap_or(0), call.args.get(6).and_then(|v| v.as_int()).unwrap_or(0));
     if to_list.is_some() {
         return Err(notify_error("暂不支持邮件列表。"));
@@ -184,7 +199,7 @@ async fn body(c: &Client, id: i64, mark_read: bool) -> CallResult {
         return Ok(Value::None);
     };
     if mark_read {
-        set_bits(&c.db, me, "message_id = ANY($2)", &[id], STATUS_READ, true).await?;
+        set_bits(&c.db, me, ("message_id = ANY($2)", None), &[id], STATUS_READ, true).await?;
     }
     let text: String = r.get(0);
     let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
@@ -193,25 +208,28 @@ async fn body(c: &Client, id: i64, mark_read: bool) -> CallResult {
 }
 
 /// Set or clear status bits on the character's messages matching `which` ($2 = ids).
-async fn set_bits(db: &Db, me: i64, which: &str, ids: &[i64], bits: i32, on: bool) -> Result<(), CallError> {
+async fn set_bits(db: &Db, me: i64, (which, mask): (&str, Option<i32>), ids: &[i64], bits: i32, on: bool) -> Result<(), CallError> {
     let set = if on { "status_mask | $3::int" } else { "status_mask & ~($3::int)" };
-    db.client
-        .execute(&format!("UPDATE game.mail_status SET status_mask = {set} WHERE char_id = $1 AND {which}"), &[&me, &ids.to_vec(), &bits])
-        .await
-        .map_err(db_err)?;
+    let sql = format!("UPDATE game.mail_status SET status_mask = {set} WHERE char_id = $1 AND {which}");
+    let ids = ids.to_vec();
+    if let Some(mask) = mask {
+        db.client.execute(&sql, &[&me, &ids, &bits, &mask]).await.map_err(db_err)?;
+    } else {
+        db.client.execute(&sql, &[&me, &ids, &bits]).await.map_err(db_err)?;
+    }
     Ok(())
 }
 
 /// Messages a selector covers: listed ids, a label, a mailing list (none), or all.
-fn selector(method: &str) -> &'static str {
+fn selector(method: &str) -> (&'static str, Option<i32>) {
     if method.ends_with("ByLabel") {
-        "label_mask & ($2::bigint[])[1]::int <> 0 AND status_mask & 8 = 0"
+        ("label_mask & ($2::bigint[])[1]::int <> 0 AND status_mask & $4::int = 0", Some(STATUS_TRASHED))
     } else if method.ends_with("ByList") {
-        "false AND $2::bigint[] IS NOT NULL"
+        ("false AND $2::bigint[] IS NOT NULL", None)
     } else if method.starts_with("MoveAll") || method.starts_with("MarkAll") {
-        "$2::bigint[] IS NOT NULL"
+        ("$2::bigint[] IS NOT NULL", None)
     } else {
-        "message_id = ANY($2)"
+        ("message_id = ANY($2)", None)
     }
 }
 
@@ -238,7 +256,7 @@ async fn labels(c: &Client) -> CallResult {
 async fn create_label(c: &Client, name: &str, color: Option<i64>) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
     let used: Vec<i32> = c.db.client.query("SELECT label_id FROM game.mail_labels WHERE char_id = $1", &[&me]).await.map_err(db_err)?.iter().map(|r| r.get(0)).collect();
-    let Some(id) = (4..30).map(|b| 1i32 << b).filter(|b| *b >= FIRST_CUSTOM_LABEL).find(|b| !used.contains(b)) else {
+    let Some(id) = (FIRST_CUSTOM_LABEL_BIT..CUSTOM_LABEL_BIT_END).map(|b| 1i32 << b).filter(|b| *b >= FIRST_CUSTOM_LABEL).find(|b| !used.contains(b)) else {
         return Err(notify_error("标签数量已达上限。"));
     };
     c.db.client
@@ -276,7 +294,7 @@ async fn notifications(c: &Client, where_sql: &str, arg: i64) -> CallResult {
         .query(
             &format!(
                 "SELECT notification_id, type_id::bigint, sender_id, processed, created, data FROM game.notifications
-                 WHERE receiver_id = $1 AND {where_sql} ORDER BY notification_id DESC LIMIT 1000"
+                 WHERE receiver_id = $1 AND {where_sql} ORDER BY notification_id DESC LIMIT {MAX_NOTIFICATIONS}"
             ),
             &[&me, &arg],
         )
@@ -302,7 +320,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     Some(match (call.service, call.method) {
         ("mailMgr", "SyncMail") => sync(c, int(1).unwrap_or(0)).await,
         ("mailMgr", "GetMailHeaders") => {
-            let wanted = ids(call.args.first());
+            let wanted = value_id_list(call.args.first());
             match db.client.query(&format!("{HEADER_SELECT} WHERE s.char_id = $1 AND m.message_id = ANY($2)"), &[&me, &wanted]).await {
                 Ok(rows) => Ok(header_rows(&rows)),
                 Err(e) => Err(db_err(e)),
@@ -311,19 +329,19 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         ("mailMgr", "SendMail") => send(c, call).await,
         ("mailMgr", "GetBody") => body(c, int(0).unwrap_or(0), call.args.get(1).is_some_and(|v| matches!(v, Value::Bool(true)) || v.as_int() == Some(1))).await,
         ("mailMgr", m @ ("MarkAsRead" | "MarkAsReadByLabel" | "MarkAsReadByList" | "MarkAllAsRead")) => {
-            let arg = if m.ends_with("ByLabel") { vec![int(0).unwrap_or(0)] } else { ids(call.args.first()) };
+            let arg = if m.ends_with("ByLabel") { vec![int(0).unwrap_or(0)] } else { value_id_list(call.args.first()) };
             set_bits(db, me, selector(m), &arg, STATUS_READ, true).await.map(|_| Value::None)
         }
         ("mailMgr", m @ ("MarkAsUnread" | "MarkAsUnreadByLabel" | "MarkAsUnreadByList" | "MarkAllAsUnread")) => {
-            let arg = if m.ends_with("ByLabel") { vec![int(0).unwrap_or(0)] } else { ids(call.args.first()) };
+            let arg = if m.ends_with("ByLabel") { vec![int(0).unwrap_or(0)] } else { value_id_list(call.args.first()) };
             set_bits(db, me, selector(m), &arg, STATUS_READ, false).await.map(|_| Value::None)
         }
         ("mailMgr", m @ ("MoveToTrash" | "MoveToTrashByLabel" | "MoveToTrashByList" | "MoveAllToTrash")) => {
-            let arg = if m.ends_with("ByLabel") { vec![int(0).unwrap_or(0)] } else { ids(call.args.first()) };
+            let arg = if m.ends_with("ByLabel") { vec![int(0).unwrap_or(0)] } else { value_id_list(call.args.first()) };
             set_bits(db, me, selector(m), &arg, STATUS_TRASHED, true).await.map(|_| Value::None)
         }
         ("mailMgr", m @ ("MoveFromTrash" | "MoveAllFromTrash")) => {
-            let arg = ids(call.args.first());
+            let arg = value_id_list(call.args.first());
             set_bits(db, me, selector(m), &arg, STATUS_TRASHED, false).await.map(|_| Value::None)
         }
         ("mailMgr", "EmptyTrash") => db
@@ -333,7 +351,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             .map(|_| Value::None)
             .map_err(db_err),
         ("mailMgr", "DeleteMail") => {
-            let wanted = ids(call.args.first());
+            let wanted = value_id_list(call.args.first());
             db.client.execute("DELETE FROM game.mail_status WHERE char_id = $1 AND message_id = ANY($2)", &[&me, &wanted]).await.map(|_| Value::None).map_err(db_err)
         }
         ("mailMgr", "GetLabels") => labels(c).await,
@@ -369,18 +387,20 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         }
         // AssignLabels / RemoveLabels / ReplaceLabels([messageID], labelID)
         ("mailMgr", m @ ("AssignLabels" | "RemoveLabels" | "ReplaceLabels")) => {
-            let wanted = ids(call.args.first());
+            let wanted = value_id_list(call.args.first());
             let label = int(1).unwrap_or(0) as i32;
-            let set = match m {
-                "AssignLabels" => "label_mask | $3::int",
-                "RemoveLabels" => "label_mask & ~($3::int)",
-                _ => "(label_mask & 15) | $3::int",
+            let (set, mask) = match m {
+                "AssignLabels" => ("label_mask | $3::int", None),
+                "RemoveLabels" => ("label_mask & ~($3::int)", None),
+                _ => ("(label_mask & $4::int) | $3::int", Some(BUILTIN_LABEL_MASK)),
             };
-            db.client
-                .execute(&format!("UPDATE game.mail_status SET label_mask = {set} WHERE char_id = $1 AND message_id = ANY($2)"), &[&me, &wanted, &label])
-                .await
-                .map(|_| Value::None)
-                .map_err(db_err)
+            let sql = format!("UPDATE game.mail_status SET label_mask = {set} WHERE char_id = $1 AND message_id = ANY($2)");
+            let result = if let Some(mask) = mask {
+                db.client.execute(&sql, &[&me, &wanted, &label, &mask]).await
+            } else {
+                db.client.execute(&sql, &[&me, &wanted, &label]).await
+            };
+            result.map(|_| Value::None).map_err(db_err)
         }
         ("mailingListsMgr", "Create") => Err(notify_error("暂不支持邮件列表。")),
 
@@ -389,9 +409,9 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             notifications(c, "notification_id > $2", from).await
         }
         ("notificationMgr", "GetUnprocessed") => notifications(c, "NOT processed AND $2::bigint IS NOT NULL", 0).await,
-        ("notificationMgr", "GetByGroupID") => notifications(c, "group_id::bigint = $2", int(0).unwrap_or(-1)).await,
+        ("notificationMgr", "GetByGroupID") => notifications(c, "group_id::bigint = $2", int(0).unwrap_or(MISSING_NOTIFICATION_GROUP as i64)).await,
         ("notificationMgr", "MarkAsProcessed") => {
-            let wanted = ids(call.args.first());
+            let wanted = value_id_list(call.args.first());
             db.client
                 .execute("UPDATE game.notifications SET processed = true WHERE receiver_id = $1 AND notification_id = ANY($2)", &[&me, &wanted])
                 .await
@@ -400,7 +420,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         }
         ("notificationMgr", "MarkGroupAsProcessed") => db
             .client
-            .execute("UPDATE game.notifications SET processed = true WHERE receiver_id = $1 AND group_id = $2", &[&me, &(int(0).unwrap_or(-1) as i32)])
+            .execute("UPDATE game.notifications SET processed = true WHERE receiver_id = $1 AND group_id = $2", &[&me, &(int(0).unwrap_or(MISSING_NOTIFICATION_GROUP as i64) as i32)])
             .await
             .map(|_| Value::None)
             .map_err(db_err),
@@ -408,7 +428,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             db.client.execute("UPDATE game.notifications SET processed = true WHERE receiver_id = $1", &[&me]).await.map(|_| Value::None).map_err(db_err)
         }
         ("notificationMgr", "DeleteNotifications") => {
-            let wanted = ids(call.args.first());
+            let wanted = value_id_list(call.args.first());
             db.client
                 .execute("DELETE FROM game.notifications WHERE receiver_id = $1 AND notification_id = ANY($2)", &[&me, &wanted])
                 .await
@@ -417,7 +437,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         }
         ("notificationMgr", "DeleteGroupNotifications") => db
             .client
-            .execute("DELETE FROM game.notifications WHERE receiver_id = $1 AND group_id = $2", &[&me, &(int(0).unwrap_or(-1) as i32)])
+            .execute("DELETE FROM game.notifications WHERE receiver_id = $1 AND group_id = $2", &[&me, &(int(0).unwrap_or(MISSING_NOTIFICATION_GROUP as i64) as i32)])
             .await
             .map(|_| Value::None)
             .map_err(db_err),

@@ -5,15 +5,18 @@
 //! Fitting modules themselves is inventory moves into slot flags (inventory.rs) plus
 //! the online state dogma.rs keeps.
 
-use super::dogma::{load_items, ship_state};
+use super::dogma::{load_items, ship_state, wire_quantity};
 use super::inventory::notify_item_change;
-use super::{db_err, keyval, user_error, value_field, Call, CallError, CallResult};
+use super::{db_err, keyval, user_error, value_field, value_id_list, value_ids, Call, CallError, CallResult};
 use crate::client::Client;
-use crate::consts::{CATEGORY_SHIP, FLAG_HANGAR, IX_SINGLETON, IX_STACK_SIZE};
+use crate::consts::{BLUEPRINT_INFINITE_RUNS, CATEGORY_SHIP, FLAG_HANGAR, INDUSTRY_JOB_STATUS_INSTALLED, IX_LOCATION_ID, IX_SINGLETON, IX_STACK_SIZE};
 use marshal::Value;
 use tracing::info;
 
+/// SDE invCategories: Blueprint.
 const CATEGORY_BLUEPRINT: i64 = 9;
+/// Server response limit advertised by blueprintManager.GetLimits.
+const MAX_BLUEPRINT_RESULTS: i64 = 10_000;
 
 /// Board(shipID, oldShipID) -> shipState: make an assembled ship in this station's hangar
 /// the active one (clientDogmaLocation.MakeShipActive).
@@ -39,11 +42,7 @@ async fn board(c: &mut Client, ship_id: i64) -> CallResult {
 /// AssembleShip(itemIDs, name=, subSystems=) -> the assembled ship's itemID (or IDs).
 async fn assemble(c: &mut Client, call: &Call<'_>) -> CallResult {
     let char_id = c.session.int("charid").unwrap_or(0);
-    let ids: Vec<i64> = match call.args.first() {
-        Some(Value::Int(id)) => vec![*id],
-        Some(v) => v.items().unwrap_or_default().iter().filter_map(|x| x.as_int()).collect(),
-        None => vec![],
-    };
+    let ids = value_ids(call.args.first());
     let name = call.kwargs.get("name").and_then(|v| v.as_text()).map(|t| t.into_owned());
     let mut assembled = vec![];
     for id in ids {
@@ -66,7 +65,7 @@ async fn assemble(c: &mut Client, call: &Call<'_>) -> CallResult {
                 .await
                 .map_err(db_err)?
                 .get(0);
-            notify_item_change(c, new_id, vec![(3, Value::Int(0))]).await?;
+            notify_item_change(c, new_id, vec![(IX_LOCATION_ID, Value::Int(0))]).await?;
             new_id
         } else {
             c.db.client
@@ -195,7 +194,7 @@ async fn fittings(c: &mut Client, call: &Call<'_>) -> CallResult {
             Value::None
         }
         "DeleteManyFittings" => {
-            let ids: Vec<i64> = call.args.get(1).and_then(|v| v.items()).unwrap_or_default().iter().filter_map(|v| v.as_int()).collect();
+            let ids = value_id_list(call.args.get(1));
             db.execute("DELETE FROM game.fittings WHERE owner_id = $1 AND fitting_id = ANY($2)", &[&owner, &ids]).await.map_err(db_err)?;
             Value::None
         }
@@ -229,8 +228,8 @@ async fn blueprints(c: &Client, owner: i64, item: Option<i64>) -> Result<Vec<Val
             "SELECT i.item_id, i.type_id, i.owner_id, i.location_id, i.flag_id, i.quantity, i.singleton,
                     COALESCE(loc.type_id, st.type_id), COALESCE(st.solar_system_id::bigint, loc.location_id, ch.solar_system_id),
                     st.station_id::bigint, COALESCE(b.material_efficiency, 0)::bigint, COALESCE(b.time_efficiency, 0)::bigint,
-                    COALESCE(b.runs, -1)::bigint,
-                    (SELECT j.job_id FROM game.industry_jobs j WHERE j.blueprint_id = i.item_id AND j.status = 1 LIMIT 1)
+                    COALESCE(b.runs, $4::int)::bigint,
+                    (SELECT j.job_id FROM game.industry_jobs j WHERE j.blueprint_id = i.item_id AND j.status = $5::int LIMIT 1)
              FROM game.items i
              JOIN sde.inv_types t USING (type_id)
              LEFT JOIN game.items loc ON loc.item_id = i.location_id
@@ -238,7 +237,7 @@ async fn blueprints(c: &Client, owner: i64, item: Option<i64>) -> Result<Vec<Val
              LEFT JOIN game.characters ch ON ch.character_id = i.owner_id
              LEFT JOIN game.blueprints b ON b.item_id = i.item_id
              WHERE i.owner_id = $1 AND t.category_id = $2 AND ($3::bigint IS NULL OR i.item_id = $3) AND i.location_id > 0",
-            &[&owner, &(CATEGORY_BLUEPRINT as i32), &item],
+            &[&owner, &(CATEGORY_BLUEPRINT as i32), &item, &BLUEPRINT_INFINITE_RUNS, &INDUSTRY_JOB_STATUS_INSTALLED],
         )
         .await
         .map_err(db_err)?;
@@ -247,7 +246,7 @@ async fn blueprints(c: &Client, owner: i64, item: Option<i64>) -> Result<Vec<Val
         .map(|r| {
             let singleton: bool = r.get(6);
             let stored = r.get::<_, i32>(5) as i64;
-            let quantity = if singleton { if stored == -2 { -2 } else { -1 } } else { stored };
+            let quantity = wire_quantity(singleton, stored);
             keyval([
                 ("itemID", Value::Int(r.get(0))),
                 ("typeID", Value::Int(r.get::<_, i32>(1) as i64)),
@@ -282,7 +281,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         // {fittingID: fitting} shared by the community corporation: none.
         ("corpFittingMgr", "GetCommunityFittings") => Ok(Value::Dict(vec![])),
 
-        ("blueprintManager", "GetLimits") => Ok(Value::dict([("maxBlueprintResults", Value::Int(10_000))])),
+        ("blueprintManager", "GetLimits") => Ok(Value::dict([("maxBlueprintResults", Value::Int(MAX_BLUEPRINT_RESULTS))])),
         // GetBlueprintDataByOwner(ownerID, facilityID) -> (blueprints, {facilityID: count})
         ("blueprintManager", "GetBlueprintDataByOwner") => {
             let owner = call.args.first().and_then(|v| v.as_int()).unwrap_or(char_id);

@@ -4,9 +4,12 @@
 use crate::dbrow::rle_pack;
 use crate::{strings, tag, Value};
 
+/// Server codec design: initial allocation for an encoded marshal stream.
+const INITIAL_OUTPUT_CAPACITY: usize = 64;
+
 /// Encode `v` as a complete marshal stream.
 pub fn dumps(v: &Value) -> Vec<u8> {
-    let mut out = Vec::with_capacity(64);
+    let mut out = Vec::with_capacity(INITIAL_OUTPUT_CAPACITY);
     out.push(tag::SIGNATURE);
     out.extend_from_slice(&0i32.to_le_bytes()); // shared object count
     write(&mut out, v);
@@ -56,7 +59,7 @@ fn long_bytes(i: i64) -> Vec<u8> {
     let mut b = i.to_le_bytes().to_vec();
     while b.len() > 1 {
         let (last, prev) = (b[b.len() - 1], b[b.len() - 2]);
-        if (last == 0 && prev & 0x80 == 0) || (last == 0xFF && prev & 0x80 != 0) {
+        if crate::redundant_sign_byte(last, prev) {
             b.pop();
         } else {
             break;

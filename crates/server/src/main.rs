@@ -23,6 +23,13 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
+/// Server allocation policy: initial ephemeral client ID.
+const FIRST_CLIENT_ID: i64 = 1_000_000_000_000;
+/// Server online population counter delta when a session joins.
+const ONLINE_JOIN_DELTA: i64 = 1;
+/// Server online population counter delta when a session leaves.
+const ONLINE_LEAVE_DELTA: i64 = -1;
+
 /// Values the client checks during the handshake; defaults match the
 /// Infinity build 3653293 start.ini and eveMachoNetVersion.machoVersion.
 pub struct Config {
@@ -120,7 +127,7 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(&cfg.bind).await.with_context(|| format!("binding {}", cfg.bind))?;
     info!("listening on {} (macho {}, build {}, {}@{})", cfg.bind, cfg.macho_version, cfg.boot_build, cfg.boot_codename, cfg.boot_region);
 
-    let next_client_id = Arc::new(AtomicI64::new(1_000_000_000_000));
+    let next_client_id = Arc::new(AtomicI64::new(FIRST_CLIENT_ID));
     loop {
         let (stream, peer) = listener.accept().await?;
         stream.set_nodelay(true).ok();
@@ -140,11 +147,11 @@ async fn main() -> Result<()> {
                     return;
                 }
             };
-            db.add_online(1);
+            db.add_online(ONLINE_JOIN_DELTA);
             if let Err(e) = client::Client::new(conn, cfg, db.clone(), hub, world, login).run().await {
                 error!("{peer} session ended with error: {e:#}");
             }
-            db.add_online(-1);
+            db.add_online(ONLINE_LEAVE_DELTA);
         });
     }
 }

@@ -4,14 +4,14 @@
 
 use super::{db_err, Call, CallError, CallResult};
 use crate::client::Client;
-use crate::consts::SECONDS_PER_HOUR;
+use crate::consts::{FACTION_AMARR, FACTION_ANGEL_CARTEL, FACTION_CALDARI, FACTION_GALLENTE, FACTION_GURISTAS, FACTION_MINMATAR, SECONDS_PER_HOUR};
 use marshal::Value;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info};
 
 /// facwarCommon._ALL_WARFARE_FACTIONS: Caldari, Minmatar, Amarr, Gallente, Guristas, Angels.
-const FW_FACTIONS: [i64; 6] = [500001, 500002, 500003, 500004, 500010, 500011];
+const FW_FACTIONS: [i64; 6] = [FACTION_CALDARI, FACTION_MINMATAR, FACTION_AMARR, FACTION_GALLENTE, FACTION_GURISTAS, FACTION_ANGEL_CARTEL];
 /// The roguelike lab's weekly reset (Monday), at the daily downtime turnover.
 const WEEKLY_RESET_HOUR_UTC: u64 = 3;
 /// Unix time convention: seconds per day.

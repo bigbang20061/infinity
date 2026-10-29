@@ -26,9 +26,9 @@
 use super::dogma::load_items;
 use super::inventory::notify_item_change;
 use super::fit::{Fit, Key};
-use super::{db_err, rand01, user_error, Call, CallError, CallResult};
+use super::{db_err, rand01, user_error, value_id_list, Call, CallError, CallResult};
 use crate::client::{filetime_now, filetime_ticks_from_ms, Client};
-use crate::consts::{ACCOUNT_CASH, ATTR_CAPACITY, ATTR_EXPLOSION_DELAY, ATTR_IS_ONLINE, ATTR_MASS, ATTR_MAX_RANGE, ATTR_MAX_VELOCITY, ATTR_QUANTITY, ATTR_SIGNATURE_RADIUS, DAMAGE_TYPE_COUNT, EFFECT_AFTERBURNER, EFFECT_MICROWARPDRIVE, EFFECT_ONLINE, FILETIME_SECOND, FLAG_CARGO, FLAG_HANGAR, IX_FLAG, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD};
+use crate::consts::{ACCOUNT_CASH, ATTR_ARMOR_DAMAGE, ATTR_CAPACITOR_CAPACITY, ATTR_CAPACITY, ATTR_CHARGE, ATTR_EXPLOSION_DELAY, ATTR_HULL_DAMAGE, ATTR_IS_ONLINE, ATTR_MASS, ATTR_MAX_RANGE, ATTR_MAX_VELOCITY, ATTR_QUANTITY, ATTR_SHIELD_CAPACITY, ATTR_SHIELD_CHARGE, ATTR_SIGNATURE_RADIUS, CATEGORY_CHARGE, DAMAGE_TYPE_COUNT, EFFECT_AFTERBURNER, EFFECT_MICROWARPDRIVE, EFFECT_ONLINE, FILETIME_SECOND, FLAG_CARGO, FLAG_HANGAR, IX_FLAG, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD};
 use crate::db::Db;
 use crate::space::{dist, event, lock_time_ms, metres_to_km, ms_to_seconds, seconds_to_ms, now_ms, now_tick, Ball, NotifyTx, NpcAction, NpcBrain, NpcConfig, NpcEffects, NpcFuture, System, World, MODE_MISSILE, MODE_WARP, V3};
 use marshal::Value;
@@ -41,19 +41,14 @@ const HI_SLOTS: std::ops::RangeInclusive<i32> = 27..=34;
 const ATTR_DAMAGE_MULTIPLIER: i32 = 64;
 const ATTR_FALLOFF: i32 = 158;
 const ATTR_DAMAGE: [i32; 4] = [114, 118, 117, 116]; // em, thermal, kinetic, explosive
-const ATTR_HP: [i32; 3] = [263, 265, 9]; // shield, armor, structure
+const ATTR_HP: [i32; 3] = [ATTR_SHIELD_CAPACITY, 265, 9]; // shield, armor, structure
 const ATTR_RESONANCE: [[i32; 4]; 3] = [[271, 274, 273, 272], [267, 270, 269, 268], [113, 110, 109, 111]];
 const ATTR_SCAN_RESOLUTION: i32 = 564;
 const ATTR_MAX_TARGET_RANGE: i32 = 76;
 const ATTR_MAX_LOCKED_TARGETS: i32 = 192;
 const ATTR_AOE_CLOUD_SIZE: i32 = 654;
-const ATTR_CHARGE: i32 = 18; // capacitor level
-const ATTR_CAPACITOR_CAPACITY: i32 = 482;
 const ATTR_RECHARGE_RATE: i32 = 55;
 const ATTR_CAPACITOR_NEED: i32 = 6;
-const ATTR_SHIELD_CHARGE: i32 = 264;
-const ATTR_ARMOR_DAMAGE: i32 = 266;
-const ATTR_HULL_DAMAGE: i32 = 3;
 const ATTR_SHIELD_RECHARGE_RATE: i32 = 479;
 const ATTR_RELOAD_TIME: i32 = 1795;
 const ATTR_NEXT_ACTIVATION_TIME: i32 = 2729;
@@ -424,18 +419,23 @@ async fn unload(c: &mut Client, ship: i64, module: &super::dogma::Item, location
     deposit(c, owner, location, flag, type_id, qty, ship).await
 }
 
+// Unlike value_ids, scalar module IDs accept Bool through as_int; lists take precedence.
+fn module_ids(v: Option<&Value>) -> Vec<i64> {
+    match v {
+        Some(v) if v.items().is_some() => v.items().unwrap().iter().filter_map(|m| m.as_int()).collect(),
+        Some(v) => v.as_int().into_iter().collect(),
+        None => vec![],
+    }
+}
+
 /// LoadAmmo(shipID, moduleID | [moduleIDs], [chargeItemIDs], chargeLocationID): fill each
 /// module (and its group) with charges from the given stacks, swapping out other types.
 /// In space the charges go in after the module's reload time (OnChargeBeingLoadedToModule
 /// and nextActivationTime drive the client's reload animation); docked it is immediate.
 async fn load_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
     let ship = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
-    let mut modules: Vec<i64> = match call.args.get(1) {
-        Some(v) if v.items().is_some() => v.items().unwrap().iter().filter_map(|m| m.as_int()).collect(),
-        Some(v) => v.as_int().into_iter().collect(),
-        None => vec![],
-    };
-    let charge_ids: Vec<i64> = call.args.get(2).and_then(|v| v.items()).unwrap_or_default().iter().filter_map(|v| v.as_int()).collect();
+    let mut modules = module_ids(call.args.get(1));
+    let charge_ids = value_id_list(call.args.get(2));
     let mut all = vec![];
     for m in modules.drain(..) {
         for id in bank(&c.db, ship, m).await? {
@@ -585,11 +585,7 @@ async fn apply_loads(db: &Db, notify: &NotifyTx, owner: i64, ship: i64, loads: &
 /// container ID or (containerID, ownerID, flag).
 async fn unload_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
     let ship = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
-    let modules: Vec<i64> = match call.args.get(1) {
-        Some(v) if v.items().is_some() => v.items().unwrap().iter().filter_map(|m| m.as_int()).collect(),
-        Some(v) => v.as_int().into_iter().collect(),
-        None => vec![],
-    };
+    let modules = module_ids(call.args.get(1));
     let (location, flag) = match call.args.get(2) {
         Some(v) if v.items().is_some() => {
             let t = v.items().unwrap();
@@ -965,7 +961,7 @@ async fn reward_kill(db: &Db, world: &World, system: i64, npc: &Ball, killer: Op
             .await
             .map_err(db_err)?
             .map(|r| (r.get::<_, i64>(0), r.get::<_, f64>(1).clamp(0.0, 1.0)));
-        let tax = corp_tax.map(|(_, rate)| (bounty * rate * 100.0).round() / 100.0).unwrap_or(0.0);
+        let tax = corp_tax.map(|(_, rate)| super::market::round2(bounty * rate)).unwrap_or(0.0);
         let balance: f64 = db
             .client
             .query_one(
@@ -1013,15 +1009,15 @@ async fn reward_kill(db: &Db, world: &World, system: i64, npc: &Ball, killer: Op
         .client
         .query(
             "SELECT t.type_id, t.category_id FROM sde.inv_types t JOIN game.retail_prices r USING (type_id)
-             WHERE t.published AND t.category_id IN (7, 8) AND r.average BETWEEN 1000 AND GREATEST($1::float8, 50000)
+             WHERE t.published AND t.category_id IN (7, $3) AND r.average BETWEEN 1000 AND GREATEST($1::float8, 50000)
              ORDER BY random() LIMIT $2",
-            &[&bounty, &picks],
+            &[&bounty, &picks, &CATEGORY_CHARGE],
         )
         .await
         .map_err(db_err)?;
     for r in &loot {
         let (type_id, category): (i32, i32) = (r.get(0), r.get(1));
-        let quantity: i32 = if category == 8 { 20 + (rand01() * 100.0) as i32 } else { 1 };
+        let quantity: i32 = if category == CATEGORY_CHARGE { 20 + (rand01() * 100.0) as i32 } else { 1 };
         db.client
             .execute(
                 "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity) VALUES ($1, $2, $3, 0, $4)",
@@ -1894,7 +1890,6 @@ async fn npc_shot(db: &Db, world: &Arc<World>, system: i64, id: i64, type_id: i3
 }
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
-    let ids = |v: Option<&Value>| -> Vec<i64> { v.and_then(|v| v.items()).unwrap_or_default().iter().filter_map(|x| x.as_int()).collect() };
     Some(match call.method {
         "AddTarget" => add_target(c, call.args.first().and_then(|v| v.as_int()).unwrap_or(0)).await,
         "CancelAddTarget" => {
@@ -1909,7 +1904,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             Ok(Value::None)
         }
         "RemoveTargets" => {
-            drop_targets(c, &ids(call.args.first()));
+            drop_targets(c, &value_id_list(call.args.first()));
             Ok(Value::None)
         }
         "ClearTargets" => {
@@ -1964,6 +1959,17 @@ fn npc_repair(world: &World, system: i64, id: i64, stats: &NpcStats) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn module_ids_preserve_scalar_and_list_shapes() {
+        assert_eq!(module_ids(None), Vec::<i64>::new());
+        assert_eq!(module_ids(Some(&Value::Int(42))), vec![42]);
+        assert_eq!(module_ids(Some(&Value::Bool(true))), vec![1]);
+        assert_eq!(module_ids(Some(&Value::Bool(false))), vec![0]);
+        assert_eq!(module_ids(Some(&Value::list([Value::Int(7), Value::Bool(true), Value::None]))), vec![7, 1]);
+        assert_eq!(module_ids(Some(&Value::list([]))), Vec::<i64>::new());
+        assert_eq!(module_ids(Some(&Value::None)), Vec::<i64>::new());
+    }
+
     #[test]
     fn missile_lifecycle_preserves_exploration_site() {
         let mut system = System::default();

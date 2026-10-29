@@ -6,20 +6,24 @@
 //! is attending. Online invitees hear of new, changed and cancelled events. Alliance events
 //! aren't supported.
 
-use super::{db_err, keyval, notify_error, Call, CallError, CallResult};
+use super::{db_err, keyval, notify_error, value_id_list, value_text, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
-use crate::consts::ROLE_DIRECTOR;
+use crate::consts::{FILETIME_SECOND, FILETIME_UNIX_EPOCH, ROLE_DIRECTOR};
 use marshal::{DbRowDescriptor, DbType, Value};
 
-// appConst.eventResponse*
+/// Client appConst.eventResponseDeleted.
 const RESPONSE_DELETED: i32 = 1;
+/// Client appConst.eventResponseUndecided.
 const RESPONSE_UNDECIDED: i32 = 3;
+/// Client appConst.eventResponseAccepted.
 const RESPONSE_ACCEPTED: i32 = 4;
+/// Server calendar policy: maximum initial invitees.
 const MAX_INVITEES: usize = 50;
+/// Server calendar policy: maximum event title characters.
+const MAX_TITLE_LENGTH: usize = 100;
+/// Server calendar policy: maximum event description characters.
+const MAX_DESCRIPTION_LENGTH: usize = 10000;
 
-fn text(v: Option<&Value>, max: usize) -> String {
-    v.and_then(|v| v.as_text()).map(|t| t.chars().take(max).collect()).unwrap_or_default()
-}
 
 /// Events the character sees in a month: their own, their corporation's, and those they're invited to.
 async fn event_list(c: &Client, month: i64, year: i64) -> CallResult {
@@ -32,10 +36,10 @@ async fn event_list(c: &Client, month: i64, year: i64) -> CallResult {
             "SELECT e.event_id, e.owner_id, e.event_date, e.modified, e.duration::bigint, e.importance::bigint, e.title, e.deleted
              FROM game.calendar_events e
              WHERE (e.owner_id IN ($1, $2) OR EXISTS (SELECT 1 FROM game.calendar_responses r WHERE r.event_id = e.event_id AND r.char_id = $1 AND r.status <> $5))
-               AND extract(month FROM to_timestamp((e.event_date - 116444736000000000) / 10000000.0))::int = $3
-               AND extract(year FROM to_timestamp((e.event_date - 116444736000000000) / 10000000.0))::int = $4
+               AND extract(month FROM to_timestamp((e.event_date - $6::bigint) / ($7::bigint)::numeric))::int = $3
+               AND extract(year FROM to_timestamp((e.event_date - $6::bigint) / ($7::bigint)::numeric))::int = $4
              ORDER BY e.event_date",
-            &[&me, &corp, &(month as i32), &(year as i32), &RESPONSE_DELETED],
+            &[&me, &corp, &(month as i32), &(year as i32), &RESPONSE_DELETED, &FILETIME_UNIX_EPOCH, &FILETIME_SECOND],
         )
         .await
         .map_err(db_err)?;
@@ -78,7 +82,7 @@ async fn create(c: &Client, call: &Call<'_>, owner: i64) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
     let when = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
     let duration = call.args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as i32;
-    let (title, description) = (text(call.args.get(2), 100), text(call.args.get(3), 10000));
+    let (title, description) = (value_text(call.args.get(2), MAX_TITLE_LENGTH), value_text(call.args.get(3), MAX_DESCRIPTION_LENGTH));
     let important = call.args.get(4).and_then(|v| v.as_int()).unwrap_or(0) as i32;
     let now = filetime_now();
     let id: i64 = c
@@ -121,12 +125,12 @@ async fn edit(c: &Client, call: &Call<'_>) -> CallResult {
     let old = call.args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
     let when = call.args.get(2).and_then(|v| v.as_int()).unwrap_or(old);
     let duration = call.args.get(3).and_then(|v| v.as_int()).unwrap_or(0) as i32;
-    let title = text(call.args.get(4), 100);
+    let title = value_text(call.args.get(4), MAX_TITLE_LENGTH);
     let important = call.args.get(6).and_then(|v| v.as_int()).unwrap_or(0) as i32;
     c.db.client
         .execute(
             "UPDATE game.calendar_events SET event_date = $2, duration = $3, title = $4, description = $5, importance = $6, modified = $7 WHERE event_id = $1",
-            &[&event, &when, &duration, &title, &text(call.args.get(5), 10000), &important, &filetime_now()],
+            &[&event, &when, &duration, &title, &value_text(call.args.get(5), MAX_DESCRIPTION_LENGTH), &important, &filetime_now()],
         )
         .await
         .map_err(db_err)?;
@@ -229,13 +233,12 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             if owner != Some(me) {
                 return Some(Err(notify_error("你无法修改该活动。")));
             }
-            let list = |i: usize| call.args.get(i).and_then(|v| v.items()).unwrap_or(&[]).iter().filter_map(|v| v.as_int()).collect::<Vec<i64>>();
-            for g in list(1) {
+            for g in value_id_list(call.args.get(1)) {
                 if let Err(e) = c.db.client.execute("INSERT INTO game.calendar_responses (event_id, char_id, status) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING", &[&event, &g, &RESPONSE_UNDECIDED]).await {
                     return Some(Err(db_err(e)));
                 }
             }
-            let gone = list(2);
+            let gone = value_id_list(call.args.get(2));
             c.db.client
                 .execute("DELETE FROM game.calendar_responses WHERE event_id = $1 AND char_id = ANY($2) AND char_id <> $3", &[&event, &gone, &me])
                 .await

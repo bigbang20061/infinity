@@ -3,13 +3,33 @@
 
 use super::{db_err, item_descriptor, keyval, Call, CallError, CallResult};
 use crate::client::{filetime_now, short, Client};
-use crate::consts::{ATTR_CAPACITY, ATTR_IS_ONLINE, ATTR_MASS, ATTR_QUANTITY, ATTR_RADIUS, ATTR_VOLUME, EFFECT_ONLINE, FLAG_HANGAR, FLAG_PILOT, TYPE_CHARACTER};
+use crate::consts::{ATTR_ARMOR_DAMAGE, ATTR_CAPACITOR_CAPACITY, ATTR_CAPACITY, ATTR_CHARGE, ATTR_HULL_DAMAGE, ATTR_IS_ONLINE, ATTR_MASS, ATTR_QUANTITY, ATTR_RADIUS, ATTR_SHIELD_CAPACITY, ATTR_SHIELD_CHARGE, ATTR_VOLUME, BLUEPRINT_COPY_QUANTITY, EFFECT_ONLINE, FLAG_HANGAR, FLAG_PILOT, SINGLETON_QUANTITY, TYPE_CHARACTER};
 use marshal::Value;
 use std::collections::BTreeMap;
 use tracing::warn;
 
+/// SDE invGroups: Character.
 const GROUP_CHARACTER: i64 = 1;
+/// SDE invCategories: Owner.
 const CATEGORY_OWNER: i64 = 1;
+
+/// SDE dgmAttributeTypes: HUD defaults for attributes 1175 through 1177.
+const HUD_ATTRIBUTE_1175: i64 = 1175;
+/// SDE dgmAttributeTypes: HUD default attribute 1176.
+const HUD_ATTRIBUTE_1176: i64 = 1176;
+/// SDE dgmAttributeTypes: HUD default attribute 1177.
+const HUD_ATTRIBUTE_1177: i64 = 1177;
+/// Server online-effect duration wire choice for godma.py RefreshItemEffects' tuple.
+const ONLINE_EFFECT_DURATION: i64 = -1;
+/// Server online-effect repeat wire choice for godma.py RefreshItemEffects' tuple.
+const ONLINE_EFFECT_REPEAT: i64 = -1;
+/// Server brain version wire choice for godma.py ProcessAllInfo's character brain tuple.
+const BRAIN_VERSION: i64 = -1;
+
+/// Inventory wire quantity: singleton originals are -1 and blueprint copies are -2.
+pub(super) fn wire_quantity(singleton: bool, quantity: i64) -> i64 {
+    if singleton { if quantity == BLUEPRINT_COPY_QUANTITY { BLUEPRINT_COPY_QUANTITY } else { SINGLETON_QUANTITY } } else { quantity }
+}
 
 /// An inventory item as the client's item DBRow expects it.
 pub struct Item {
@@ -27,9 +47,7 @@ pub struct Item {
 
 impl Item {
     pub fn row(&self) -> Value {
-        // Singletons carry quantity -1 (blueprint copies -2); stacksize/singleton are virtual
-        // columns (eveCfg.StackSize/Singleton).
-        let quantity = if self.singleton { if self.quantity == -2 { -2 } else { -1 } } else { self.quantity as i64 };
+        let quantity = wire_quantity(self.singleton, self.quantity as i64);
         item_descriptor().row(&[
             Value::Int(self.item_id),
             Value::Int(self.type_id as i64),
@@ -118,8 +136,8 @@ fn online_effect(item_id: i64, char_id: i64, ship_id: i64) -> Vec<(Value, Value)
         Value::list([]),
         Value::Int(EFFECT_ONLINE),
         Value::Int(filetime_now()),
-        Value::Int(-1),
-        Value::Int(-1),
+        Value::Int(ONLINE_EFFECT_DURATION),
+        Value::Int(ONLINE_EFFECT_REPEAT),
     ];
     vec![(Value::Int(EFFECT_ONLINE), Value::tuple(env))]
 }
@@ -145,20 +163,9 @@ fn info_keyed(item_row: Value, key: Value, attributes: BTreeMap<i64, f64>, activ
 async fn character_info(c: &Client) -> Result<Value, CallError> {
     let char_id = c.session.int("charid").ok_or_else(|| CallError::Internal(anyhow::anyhow!("no character selected")))?;
     let ship_id = c.session.int("shipid").unwrap_or(0);
-    let r = c
-        .db
-        .client
-        .query_one(
-            "SELECT b.charisma, b.intelligence, b.memory, b.perception, b.willpower
-             FROM game.characters ch JOIN sde.chr_bloodlines b USING (bloodline_id) WHERE ch.character_id = $1",
-            &[&char_id],
-        )
-        .await
-        .map_err(db_err)?;
+    let character_attrs = super::skills::character_attributes(c, char_id).await?;
     let mut attrs = type_attributes(c, TYPE_CHARACTER).await?;
-    for (i, attr) in (164..=168).enumerate() {
-        attrs.insert(attr, r.get::<_, Option<i32>>(i).unwrap_or(5) as f64 + 17.0);
-    }
+    attrs.extend(character_attrs);
     let item = Item {
         item_id: char_id,
         type_id: TYPE_CHARACTER,
@@ -224,7 +231,7 @@ async fn ship_info(c: &Client) -> Result<Vec<(Value, Value)>, CallError> {
     super::combat::refill_capacitor(ship_id);
     let char_id = c.session.int("charid").unwrap_or(0);
     let fit = super::fit::Fit::load(&c.db, char_id, ship_id).await?;
-    let (cap, shield_max) = (fit.value(super::fit::Key::Ship, 482), fit.value(super::fit::Key::Ship, 263));
+    let (cap, shield_max) = (fit.value(super::fit::Key::Ship, ATTR_CAPACITOR_CAPACITY), fit.value(super::fit::Key::Ship, ATTR_SHIELD_CAPACITY));
     let (shield, armor_damage, hull_damage) = super::combat::ship_condition(ship_id).unwrap_or((shield_max, 0.0, 0.0));
     for item in items {
         let mut attrs = type_attributes(c, item.type_id).await?;
@@ -250,12 +257,12 @@ async fn ship_info(c: &Client) -> Result<Vec<(Value, Value)>, CallError> {
         };
         attrs.entry(ATTR_MASS as i64).or_insert(0.0); // mass is always present
         if item.item_id == ship_id {
-            attrs.insert(18, cap);
-            attrs.insert(264, shield);
-            attrs.insert(266, armor_damage);
-            attrs.insert(3, hull_damage);
+            attrs.insert(ATTR_CHARGE as i64, cap);
+            attrs.insert(ATTR_SHIELD_CHARGE as i64, shield);
+            attrs.insert(ATTR_ARMOR_DAMAGE as i64, armor_damage);
+            attrs.insert(ATTR_HULL_DAMAGE as i64, hull_damage);
         }
-        for k in [3, 266, 1175, 1176, 1177] {
+        for k in [ATTR_HULL_DAMAGE as i64, ATTR_ARMOR_DAMAGE as i64, HUD_ATTRIBUTE_1175, HUD_ATTRIBUTE_1176, HUD_ATTRIBUTE_1177] {
             attrs.entry(k).or_insert(0.0);
         }
         out.push((Value::Int(item.item_id), info(item.row(), item.item_id, attrs, active)));
@@ -293,7 +300,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
                 let char_id = c.session.int("charid").unwrap_or(0);
                 // (charItems, brain); brain = (version, charEffects, shipEffects, structureEffects)
                 // -- godma.Prime unpacks "_, charBrain = allInfo.charInfo".
-                let brain = Value::tuple([Value::Int(-1), Value::list([]), Value::list([]), Value::list([])]);
+                let brain = Value::tuple([Value::Int(BRAIN_VERSION), Value::list([]), Value::list([]), Value::list([])]);
                 Value::tuple([Value::Dict(vec![(Value::Int(char_id), ch)]), brain])
             } else {
                 Value::None

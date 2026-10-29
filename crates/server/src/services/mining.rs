@@ -19,7 +19,7 @@
 //! Reprocessing Efficiency and the item's own processing skill, less a 5% tax in ISK.
 
 use super::fit::{Fit, Key};
-use super::{db_err, keyval, notify_error, rand01, rand_dir, Call, CallError, CallResult};
+use super::{db_err, keyval, notify_error, rand01, rand_dir, value_id_list, Call, CallError, CallResult};
 use crate::client::{filetime_now, unix_ms_from_filetime_ceil, Client};
 use crate::consts::{ATTR_CAPACITY, ATTR_MAX_RANGE, FILETIME_SECOND, FLAG_CARGO, FLAG_HANGAR, GROUP_ASTEROID_BELT, IX_LOCATION_ID, IX_STACK_SIZE};
 use crate::db::Db;
@@ -581,10 +581,6 @@ async fn reprocessable(c: &Client, ids: &[i64]) -> Result<Vec<super::dogma::Item
     super::dogma::load_items(c, "i.item_id = ANY($1) AND i.owner_id = $2 AND (i.location_id = $3 OR i.location_id = $4)", &[&ids.to_vec(), &char_id, &station, &ship]).await
 }
 
-fn id_list(v: Option<&Value>) -> Vec<i64> {
-    v.and_then(|v| v.items()).map(|l| l.iter().filter_map(|x| x.as_int()).collect()).unwrap_or_default()
-}
-
 /// Bound reprocessingSvc (Moniker('reprocessingSvc', stationID)).
 async fn reprocessing(c: &mut Client, call: &Call<'_>) -> CallResult {
     let char_id = c.session.int("charid").unwrap_or(0);
@@ -592,7 +588,7 @@ async fn reprocessing(c: &mut Client, call: &Call<'_>) -> CallResult {
         // GetQuotes(itemIDs, activeShipID) -> (stationTax, {typeID|None: stationEfficiency}, {itemID: quote})
         "GetQuotes" => {
             let mut quotes = vec![];
-            for item in reprocessable(c, &id_list(call.args.first())).await? {
+            for item in reprocessable(c, &value_id_list(call.args.first())).await? {
                 if let Some(q) = quote(c, char_id, &item).await? {
                     quotes.push((Value::Int(item.item_id), quote_value(item.item_id, &q)));
                 }
@@ -610,7 +606,7 @@ async fn reprocessing(c: &mut Client, call: &Call<'_>) -> CallResult {
             let station = c.session.int("stationid").ok_or_else(|| notify_error("你必须停靠在空间站里才能进行精炼。"))?;
             let out_location = call.args.get(3).and_then(|v| v.as_int()).unwrap_or(station);
             let out_flag = call.args.get(4).and_then(|v| v.as_int()).map(|f| f as i32).unwrap_or(FLAG_HANGAR);
-            let items = reprocessable(c, &id_list(call.args.first())).await?;
+            let items = reprocessable(c, &value_id_list(call.args.first())).await?;
             let mut done = vec![];
             let mut output: HashMap<i32, i64> = HashMap::new();
             let mut tax = 0.0;

@@ -7,7 +7,7 @@
 //! less per Infomorph Synchronizing level. Implants aren't modelled, so clones carry none
 //! and cost nothing. Ship-borne clone vat bays aren't supported.
 
-use super::{crowset, db_err, notify_error, Call, CallError, CallResult};
+use super::{crowset, db_err, notify_error, value_text, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
 use crate::consts::{FILETIME_HOUR, FLAG_HANGAR, TYPE_CAPSULE};
 use marshal::{DbRowDescriptor, DbType, Value};
@@ -18,6 +18,8 @@ const SKILL_ADVANCED_INFOMORPH_PSYCHOLOGY: i32 = 33407;
 const SKILL_INFOMORPH_SYNCHRONIZING: i32 = 33399;
 /// Existing server policy: base jump clone cooldown before skill reduction, in hours.
 const BASE_JUMP_COOLDOWN_HOURS: i64 = 24;
+/// Existing server policy: maximum jump clone name characters.
+const MAX_CLONE_NAME_LENGTH: usize = 100;
 
 async fn skill(c: &Client, me: i64, skill: i32) -> Result<i64, CallError> {
     Ok(c.db
@@ -170,7 +172,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         },
         // SetJumpCloneName(cloneID, name)
         "SetJumpCloneName" => {
-            let name: String = call.args.get(1).and_then(|v| v.as_text()).map(|t| t.chars().take(100).collect()).unwrap_or_default();
+            let name = value_text(call.args.get(1), MAX_CLONE_NAME_LENGTH);
             c.db.client
                 .execute("UPDATE game.jump_clones SET name = $3 WHERE clone_id = $1 AND owner_id = $2", &[&int(0), &me, &name])
                 .await

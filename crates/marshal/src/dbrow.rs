@@ -1,6 +1,13 @@
 //! `blue.DBRowDescriptor` / `blue.DBRow` (carbonengine/blue PyRowSet.cpp).
+//!
+//! `PyRowSet.cpp` defines the DBTYPE codes, fixed-column widths, bit layout
+//! and nibble RLE arithmetic below; those wire values are limited to this codec.
+//! Changes to the wire format require updating both packing and unpacking.
 
 use crate::{Error, Value};
+
+/// ADO DBTYPE_CY stores currency as a signed integer scaled by 10,000.
+const CURRENCY_SCALE: f64 = 10000.0;
 
 /// ADO DBTYPE codes accepted by `ColumnDescriptor::TypeSize`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,24 +37,24 @@ impl DbType {
     pub fn from_code(c: i64) -> Option<DbType> {
         use DbType::*;
         Some(match c {
-            0 => Empty,
-            2 => I2,
-            3 => I4,
-            4 => R4,
-            5 => R8,
-            6 => Cy,
-            11 => Bool,
-            16 => I1,
-            17 => UI1,
-            18 => UI2,
-            19 => UI4,
-            20 => I8,
-            21 => UI8,
-            64 => FileTime,
-            128 => Bytes,
-            129 => Str,
-            130 => WStr,
-            135 => DbTimestamp,
+            x if x == Empty as i64 => Empty,
+            x if x == I2 as i64 => I2,
+            x if x == I4 as i64 => I4,
+            x if x == R4 as i64 => R4,
+            x if x == R8 as i64 => R8,
+            x if x == Cy as i64 => Cy,
+            x if x == Bool as i64 => Bool,
+            x if x == I1 as i64 => I1,
+            x if x == UI1 as i64 => UI1,
+            x if x == UI2 as i64 => UI2,
+            x if x == UI4 as i64 => UI4,
+            x if x == I8 as i64 => I8,
+            x if x == UI8 as i64 => UI8,
+            x if x == FileTime as i64 => FileTime,
+            x if x == Bytes as i64 => Bytes,
+            x if x == Str as i64 => Str,
+            x if x == WStr as i64 => WStr,
+            x if x == DbTimestamp as i64 => DbTimestamp,
             _ => return None,
         })
     }
@@ -230,7 +237,7 @@ impl DbRowDescriptor {
                         }
                         DbType::R8 => v.as_float().unwrap_or(0.0).to_le_bytes(),
                         DbType::Cy => match v {
-                            Value::Float(f) => ((f * 10000.0).round() as i64).to_le_bytes(),
+                            Value::Float(f) => ((f * CURRENCY_SCALE).round() as i64).to_le_bytes(),
                             _ => v.as_int().unwrap_or(0).to_le_bytes(),
                         },
                         _ => v.as_int().unwrap_or(0).to_le_bytes(),

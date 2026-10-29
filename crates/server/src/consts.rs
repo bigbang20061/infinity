@@ -48,10 +48,26 @@ pub const GROUP_PLANET: i32 = 7;
 pub const GROUP_ASTEROID_BELT: i32 = 9;
 /// SDE invCategories: Ship.
 pub const CATEGORY_SHIP: i32 = 6;
+/// SDE invCategories: Charge.
+pub const CATEGORY_CHARGE: i32 = 8;
 /// SDE invTypes: Hacking skill.
 pub const SKILL_HACKING: i32 = 21718;
 /// SDE invTypes: Archaeology skill.
 pub const SKILL_ARCHAEOLOGY: i32 = 13278;
+
+// SDE faction IDs.
+/// SDE chrFactions: Caldari State.
+pub const FACTION_CALDARI: i64 = 500001;
+/// SDE chrFactions: Minmatar Republic.
+pub const FACTION_MINMATAR: i64 = 500002;
+/// SDE chrFactions: Amarr Empire.
+pub const FACTION_AMARR: i64 = 500003;
+/// SDE chrFactions: Gallente Federation.
+pub const FACTION_GALLENTE: i64 = 500004;
+/// SDE chrFactions: Guristas Pirates.
+pub const FACTION_GURISTAS: i64 = 500010;
+/// SDE chrFactions: Angel Cartel.
+pub const FACTION_ANGEL_CARTEL: i64 = 500011;
 
 // SDE dogma attribute and effect IDs.
 /// SDE dgmAttributeTypes: mass.
@@ -74,6 +90,20 @@ pub const ATTR_QUANTITY: i32 = 805;
 pub const ATTR_IS_ONLINE: i32 = 2;
 /// SDE dgmAttributeTypes: explosionDelay (also used for probe lifetime).
 pub const ATTR_EXPLOSION_DELAY: i32 = 281;
+/// SDE dgmAttributeTypes: capacitorCapacity.
+pub const ATTR_CAPACITOR_CAPACITY: i32 = 482;
+/// SDE dgmAttributeTypes: shieldCapacity.
+pub const ATTR_SHIELD_CAPACITY: i32 = 263;
+/// SDE dgmAttributeTypes: charge.
+pub const ATTR_CHARGE: i32 = 18;
+/// SDE dgmAttributeTypes: shieldCharge.
+pub const ATTR_SHIELD_CHARGE: i32 = 264;
+/// SDE dgmAttributeTypes: armorDamage.
+pub const ATTR_ARMOR_DAMAGE: i32 = 266;
+/// SDE dgmAttributeTypes: damage (hull damage), not hitpoint capacity hp (9).
+pub const ATTR_HULL_DAMAGE: i32 = 3;
+/// SDE dgmAttributeTypes: requiredSkill1.
+pub const ATTR_REQUIRED_SKILL_1: i32 = 182;
 /// SDE dgmEffects: online; an effect ID, not an effect category.
 pub const EFFECT_ONLINE: i64 = 16;
 /// SDE dgmEffects: moduleBonusMicrowarpdrive.
@@ -86,6 +116,18 @@ pub const EFFECT_AFTERBURNER: i32 = 6731;
 pub const FLAG_HANGAR: i32 = 4;
 /// Client inventorycommon.const.flagCargo.
 pub const FLAG_CARGO: i32 = 5;
+/// Client inventorycommon.const.flagLoSlot0.
+pub const FLAG_FITTING_FIRST: i32 = 11;
+/// Client inventorycommon.const.flagHiSlot7.
+pub const FLAG_FITTING_LAST: i32 = 34;
+/// Client inventorycommon.const.flagRigSlot0.
+pub const FLAG_RIG_FIRST: i32 = 92;
+/// Client inventorycommon.const.flagRigSlot7.
+pub const FLAG_RIG_LAST: i32 = 99;
+/// Client inventorycommon.const.flagSubSystemSlot0.
+pub const FLAG_SUBSYSTEM_FIRST: i32 = 125;
+/// Client inventorycommon.const.flagSubSystemSlot7.
+pub const FLAG_SUBSYSTEM_LAST: i32 = 132;
 /// Client inventorycommon.const.flagPilot.
 pub const FLAG_PILOT: i32 = 57;
 /// Client inventorycommon.const.flagCorpSAG1; other divisions follow it.
@@ -100,6 +142,38 @@ pub const IX_FLAG: i64 = 4;
 pub const IX_STACK_SIZE: i64 = 9;
 /// Client inventorycommon.const.ixSingleton: inventory singleton change key.
 pub const IX_SINGLETON: i64 = 10;
+
+// Client inventory singleton quantity encoding.
+/// Client inventory singleton encoding: blueprint copy.
+pub const BLUEPRINT_COPY_QUANTITY: i64 = -2;
+/// Client inventory singleton encoding: original or singleton item.
+pub const SINGLETON_QUANTITY: i64 = -1;
+
+// Server corporation and alliance creation validation policy.
+/// Minimum corporation or alliance name length.
+pub const ORG_NAME_MIN_LENGTH: usize = 4;
+/// Maximum corporation or alliance name length.
+pub const ORG_NAME_MAX_LENGTH: usize = 50;
+/// Minimum corporation or alliance short name length.
+pub const ORG_SHORT_NAME_MIN_LENGTH: usize = 2;
+/// Maximum corporation or alliance short name length.
+pub const ORG_SHORT_NAME_MAX_LENGTH: usize = 5;
+
+// Client corporation public row conventions.
+/// Client corporation row: hangar and wallet division name count.
+pub const CORP_DIVISION_NAME_COUNT: usize = 14;
+/// Client corporation public row: unlimited member limit.
+pub const CORPORATION_UNLIMITED_MEMBER_LIMIT: i64 = -1;
+/// Client corporation public row: NPC corporation type.
+pub const CORPORATION_TYPE_NPC: i64 = 1;
+/// Client corporation public row: player corporation type.
+pub const CORPORATION_TYPE_PLAYER: i64 = 2;
+
+// Client industry job and blueprint conventions.
+/// Client industry job status: installed.
+pub const INDUSTRY_JOB_STATUS_INSTALLED: i32 = 1;
+/// Client blueprint original convention: infinite runs, distinct from quantity encoding.
+pub const BLUEPRINT_INFINITE_RUNS: i32 = -1;
 
 // Client corporation and service roles.
 /// Client appConst.corpRoleDirector.

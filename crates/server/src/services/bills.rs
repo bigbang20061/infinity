@@ -7,8 +7,7 @@
 //! automatically from a wallet division (billMgr automatic payment settings). Billing runs
 //! every ten minutes. An office whose rent goes unpaid isn't taken away.
 
-use super::corps::{ceo_of, membership};
-use super::{db_err, keyval, notify_error, Call, CallError, CallResult};
+use super::{active_corporation_member_ids, db_err, has_role_or_is_ceo, keyval, notify_error, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
 use crate::consts::{ACCOUNT_CASH, FILETIME_DAY, RENTAL_DAYS, ROLE_ACCOUNTANT, ROLE_DIRECTOR};
 use crate::db::Db;
@@ -59,9 +58,8 @@ pub(super) async fn bills(db: &Db, owner: i64, creditor: bool) -> CallResult {
 
 /// Tell `corp`'s online members their bills changed.
 async fn announce(db: &Db, world: &World, corp: i64) -> Result<(), CallError> {
-    let rows = db.client.query("SELECT character_id FROM game.characters WHERE corporation_id = $1 AND NOT deleted", &[&corp]).await.map_err(db_err)?;
-    for r in rows {
-        world.notify_pilot(r.get(0), "OnBillReceived", vec![]);
+    for id in active_corporation_member_ids(db, corp).await? {
+        world.notify_pilot(id, "OnBillReceived", vec![]);
     }
     Ok(())
 }
@@ -163,8 +161,7 @@ pub async fn run_billing(db: Db, world: Arc<World>) {
 
 /// An accountant, director or the CEO of `corp`.
 pub(super) async fn is_accountant(db: &Db, me: i64, corp: i64) -> Result<bool, CallError> {
-    let (my_corp, roles) = membership(db, me).await?;
-    Ok(my_corp == corp && (roles & (ROLE_ACCOUNTANT | ROLE_DIRECTOR) != 0 || ceo_of(db, corp).await? == Some(me)))
+    has_role_or_is_ceo(db, me, corp, ROLE_ACCOUNTANT | ROLE_DIRECTOR).await
 }
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {

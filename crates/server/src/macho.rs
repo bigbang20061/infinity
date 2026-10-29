@@ -5,27 +5,53 @@
 use anyhow::{anyhow, bail, Result};
 use marshal::Value;
 
+/// Client carbon/common/script/net/machoNetPacket.py command identifiers.
 pub mod cmd {
+    /// Client machoNetPacket IdentificationReq.
     pub const IDENTIFICATION_REQ: i64 = 2;
+    /// Client machoNetPacket IdentificationRsp.
+    pub const IDENTIFICATION_RSP: i64 = 3;
+    /// Client machoNetPacket CallReq.
     pub const CALL_REQ: i64 = 6;
+    /// Client machoNetPacket CallRsp.
     pub const CALL_RSP: i64 = 7;
+    /// Client machoNetPacket TransportClosed.
     pub const TRANSPORTCLOSED: i64 = 8;
+    /// Client machoNetPacket Notification.
     pub const NOTIFICATION: i64 = 12;
+    /// Client machoNetPacket ErrorResponse.
     pub const ERRORRESPONSE: i64 = 15;
+    /// Client machoNetPacket SessionChangeNotification.
     pub const SESSIONCHANGENOTIFICATION: i64 = 16;
+    /// Client machoNetPacket SessionInitialStateNotification.
     pub const SESSIONINITIALSTATENOTIFICATION: i64 = 18;
+    /// Client machoNetPacket PingReq.
     pub const PING_REQ: i64 = 20;
+    /// Client machoNetPacket PingRsp.
     pub const PING_RSP: i64 = 21;
 }
 
-/// `MACHONETERR_*`
+/// Client machoNet MACHONETERR_UNMACHODESTINATION.
 pub const ERR_UNMACHODESTINATION: i64 = 0;
+/// Client machoNet MACHONETERR_WRAPPEDEXCEPTION.
 pub const ERR_WRAPPEDEXCEPTION: i64 = 2;
+/// Client machoNetAddress ADDRESS_TYPE_NODE.
+const ADDRESS_NODE: i64 = 1;
+/// Client machoNetAddress ADDRESS_TYPE_CLIENT.
+const ADDRESS_CLIENT: i64 = 2;
+/// Client machoNetAddress ADDRESS_TYPE_BROADCAST.
+const ADDRESS_BROADCAST: i64 = 4;
+/// Client machoNetAddress ADDRESS_TYPE_ANY.
+const ADDRESS_ANY: i64 = 8;
+/// Client MachoPacket.__getstate__: tracing fields after the six core fields.
+const PACKET_TAIL_FIELDS: usize = 8;
+/// Client MachoPacket.__getstate__: number of mandatory core fields.
+const PACKET_CORE_FIELDS: usize = 6;
 
 fn class_for(command: i64) -> &'static str {
     match command {
-        2 => "carbon.common.script.net.machoNetPacket.IdentificationReq",
-        3 => "carbon.common.script.net.machoNetPacket.IdentificationRsp",
+        cmd::IDENTIFICATION_REQ => "carbon.common.script.net.machoNetPacket.IdentificationReq",
+        cmd::IDENTIFICATION_RSP => "carbon.common.script.net.machoNetPacket.IdentificationRsp",
         cmd::CALL_REQ => "carbon.common.script.net.machoNetPacket.CallReq",
         cmd::CALL_RSP => "carbon.common.script.net.machoNetPacket.CallRsp",
         cmd::TRANSPORTCLOSED => "carbon.common.script.net.machoNetPacket.TransportClosed",
@@ -72,10 +98,10 @@ impl Address {
         let s = state.items().ok_or_else(|| anyhow!("address state is not a tuple"))?;
         let get = |i: usize| s.get(i).cloned().unwrap_or(Value::None);
         Ok(match get(0).as_int() {
-            Some(1) => Address::Node { node_id: get(1).as_int().unwrap_or(0), service: opt_str(&get(2)), call_id: get(3) },
-            Some(2) => Address::Client { client_id: get(1).as_int().unwrap_or(0), call_id: get(2), service: opt_str(&get(3)) },
-            Some(4) => Address::Broadcast { broadcast_id: get(1), narrowcast: get(2), idtype: get(3) },
-            Some(8) => Address::Any { service: opt_str(&get(1)), call_id: get(2) },
+            Some(ADDRESS_NODE) => Address::Node { node_id: get(1).as_int().unwrap_or(0), service: opt_str(&get(2)), call_id: get(3) },
+            Some(ADDRESS_CLIENT) => Address::Client { client_id: get(1).as_int().unwrap_or(0), call_id: get(2), service: opt_str(&get(3)) },
+            Some(ADDRESS_BROADCAST) => Address::Broadcast { broadcast_id: get(1), narrowcast: get(2), idtype: get(3) },
+            Some(ADDRESS_ANY) => Address::Any { service: opt_str(&get(1)), call_id: get(2) },
             other => bail!("unknown address type {other:?}"),
         })
     }
@@ -83,15 +109,15 @@ impl Address {
     pub fn to_value(&self) -> Value {
         let state = match self {
             Address::Node { node_id, service, call_id } => {
-                vec![Value::Int(1), Value::Int(*node_id), str_or_none(service), call_id.clone()]
+                vec![Value::Int(ADDRESS_NODE), Value::Int(*node_id), str_or_none(service), call_id.clone()]
             }
             Address::Client { client_id, call_id, service } => {
-                vec![Value::Int(2), Value::Int(*client_id), call_id.clone(), str_or_none(service)]
+                vec![Value::Int(ADDRESS_CLIENT), Value::Int(*client_id), call_id.clone(), str_or_none(service)]
             }
             Address::Broadcast { broadcast_id, narrowcast, idtype } => {
-                vec![Value::Int(4), broadcast_id.clone(), narrowcast.clone(), idtype.clone()]
+                vec![Value::Int(ADDRESS_BROADCAST), broadcast_id.clone(), narrowcast.clone(), idtype.clone()]
             }
-            Address::Any { service, call_id } => vec![Value::Int(8), str_or_none(service), call_id.clone()],
+            Address::Any { service, call_id } => vec![Value::Int(ADDRESS_ANY), str_or_none(service), call_id.clone()],
         };
         Value::Instance(Box::new(Value::str("carbon.common.script.net.machoNetAddress.MachoAddress")), Box::new(Value::Tuple(state)))
     }
@@ -112,17 +138,17 @@ pub struct Packet {
 
 impl Packet {
     pub fn new(command: i64, source: Address, destination: Address, user_id: Value, body: Vec<Value>) -> Packet {
-        Packet { command, source, destination, user_id, body, oob: Value::None, tail: vec![Value::None; 8] }
+        Packet { command, source, destination, user_id, body, oob: Value::None, tail: vec![Value::None; PACKET_TAIL_FIELDS] }
     }
 
     pub fn from_value(v: &Value) -> Result<Packet> {
         let Value::Instance(_, state) = v else { bail!("packet is not an instance") };
         let s = state.items().ok_or_else(|| anyhow!("packet state is not a tuple"))?;
-        if s.len() < 6 {
+        if s.len() < PACKET_CORE_FIELDS {
             bail!("packet state too short ({})", s.len());
         }
-        let mut tail: Vec<Value> = s[6..].to_vec();
-        tail.resize(8, Value::None);
+        let mut tail: Vec<Value> = s[PACKET_CORE_FIELDS..].to_vec();
+        tail.resize(PACKET_TAIL_FIELDS, Value::None);
         Ok(Packet {
             command: s[0].as_int().ok_or_else(|| anyhow!("packet command is not an int"))?,
             source: Address::from_value(&s[1])?,
@@ -149,7 +175,7 @@ impl Packet {
 
     /// `MachoPacket.Response`: swap addresses, keep user and tracing fields.
     pub fn response(&self, command: i64, body: Vec<Value>) -> Packet {
-        let mut tail = vec![Value::None; 8];
+        let mut tail = vec![Value::None; PACKET_TAIL_FIELDS];
         tail[2] = self.tail[2].clone(); // trace_id
         tail[4] = self.tail[4].clone(); // sampled
         tail[5] = self.tail[5].clone(); // ingress_id

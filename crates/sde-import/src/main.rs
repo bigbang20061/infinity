@@ -20,7 +20,14 @@ use std::time::Instant;
 use tokio::sync::Semaphore;
 use tokio_postgres::{Client, NoTls};
 
+/// Importer design: flush COPY data in one-mebibyte chunks.
 const COPY_CHUNK: usize = 1 << 20;
+/// Importer design: initial extra room for a COPY row beyond the flush threshold.
+const COPY_BUFFER_HEADROOM: usize = 4096;
+/// JSON syntax: a backslash escape consists of the slash and escaped byte.
+const JSON_ESCAPE_BYTES: usize = 2;
+/// JSON syntax: the six ASCII bytes of a NUL Unicode escape.
+const JSON_NUL_ESCAPE_BYTES: usize = 6;
 
 struct Args {
     sde: PathBuf,
@@ -124,11 +131,11 @@ fn sanitize(line: &str) -> std::borrow::Cow<'_, str> {
         if in_str {
             if c == b'\\' {
                 if b[i..].starts_with(b"\\u0000") {
-                    i += 6;
+                    i += JSON_NUL_ESCAPE_BYTES;
                     continue;
                 }
-                out.extend_from_slice(&b[i..(i + 2).min(b.len())]);
-                i += 2;
+                out.extend_from_slice(&b[i..(i + JSON_ESCAPE_BYTES).min(b.len())]);
+                i += JSON_ESCAPE_BYTES;
                 continue;
             }
             if c == b'"' {
@@ -187,7 +194,7 @@ async fn load_table(client: &mut Client, job: &Job) -> Result<u64> {
     let text = tokio::fs::read_to_string(&job.path)
         .await
         .with_context(|| format!("reading {}", job.path.display()))?;
-    let mut buf = Vec::with_capacity(COPY_CHUNK + 4096);
+    let mut buf = Vec::with_capacity(COPY_CHUNK + COPY_BUFFER_HEADROOM);
     let mut rows = 0u64;
     for (n, raw) in text.lines().enumerate() {
         let raw = raw.trim();

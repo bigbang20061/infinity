@@ -13,9 +13,9 @@
 //! aren't supported.
 
 use super::corps::{ceo_of, is_player_corp, membership};
-use super::{crowset, db_err, keyval, notify_error, Call, CallError, CallResult};
+use super::{crowset, db_err, keyval, notify_error, trimmed_arg_text, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
-use crate::consts::{ACCOUNT_CASH, ROLE_DIRECTOR};
+use crate::consts::{ACCOUNT_CASH, ORG_NAME_MAX_LENGTH, ORG_NAME_MIN_LENGTH, ORG_SHORT_NAME_MAX_LENGTH, ORG_SHORT_NAME_MIN_LENGTH, ROLE_DIRECTOR};
 use crate::db::Db;
 use crate::space::World;
 use marshal::{DbRowDescriptor, DbType, Value};
@@ -23,15 +23,26 @@ use tracing::info;
 
 /// appConst.allianceCreationCost
 const CREATION_COST: f64 = 1_000_000_000.0;
-// appConst.allianceApplication*
+/// Client appConst.allianceApplicationNew.
 const APP_NEW: i32 = 1;
+/// Client appConst.allianceApplicationAccepted.
 const APP_ACCEPTED: i32 = 2;
+/// Client appConst.allianceApplicationEffective.
 const APP_EFFECTIVE: i32 = 3;
+/// Client appConst.allianceApplicationRejected.
 const APP_REJECTED: i32 = 4;
-
-fn text_arg(call: &Call<'_>, i: usize) -> String {
-    call.args.get(i).and_then(|v| v.as_text()).map(|t| t.trim().to_string()).unwrap_or_default()
-}
+/// Server policy: default number of ranked alliances returned.
+const DEFAULT_RANKED_LIMIT: i64 = 100;
+/// Server policy: maximum number of ranked alliances returned.
+const MAX_RANKED_LIMIT: i64 = 1000;
+/// Server majority calculation: twice the backing must exceed the total.
+const MAJORITY_DENOMINATOR: i64 = 2;
+/// Server suggestion algorithm: maximum ticker or short-name length.
+const SUGGESTION_MAX_LENGTH: usize = 5;
+/// Server suggestion algorithm: fallback compact-name lengths.
+const SUGGESTION_FALLBACK_LENGTHS: [usize; 2] = [4, 3];
+/// Server suggestion algorithm: minimum returned name length.
+const SUGGESTION_MIN_LENGTH: usize = 2;
 
 /// `dbutil.CIndexedRowset(header, column)` filled with `rows` keyed by their `column` value.
 fn indexed_rowset(header: &DbRowDescriptor, column: &str, rows: Vec<(i64, Value)>) -> Value {
@@ -292,12 +303,12 @@ async fn unallied_ceo_corp(db: &Db, me: i64) -> Result<i64, CallError> {
 async fn create(c: &Client, call: &Call<'_>) -> CallResult {
     let (db, world) = (&c.db, &*c.world);
     let me = c.session.int("charid").unwrap_or(0);
-    let (name, short_name, description, url) = (text_arg(call, 0), text_arg(call, 1).to_uppercase(), text_arg(call, 2), text_arg(call, 3));
+    let (name, short_name, description, url) = (trimmed_arg_text(call, 0), trimmed_arg_text(call, 1).to_uppercase(), trimmed_arg_text(call, 2), trimmed_arg_text(call, 3));
     let corp = unallied_ceo_corp(db, me).await?;
-    if !(4..=50).contains(&name.chars().count()) {
+    if !(ORG_NAME_MIN_LENGTH..=ORG_NAME_MAX_LENGTH).contains(&name.chars().count()) {
         return Err(notify_error("联盟名称长度必须为 4 到 50 个字符。"));
     }
-    if !(2..=5).contains(&short_name.chars().count()) || !short_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
+    if !(ORG_SHORT_NAME_MIN_LENGTH..=ORG_SHORT_NAME_MAX_LENGTH).contains(&short_name.chars().count()) || !short_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
         return Err(notify_error("联盟简称必须为 2 到 5 个字母、数字、点或短横线。"));
     }
     let taken: bool = db
@@ -461,7 +472,7 @@ async fn support_executor(db: &Db, world: &World, me: i64, alliance: i64, candid
         .await
         .map_err(db_err)?;
     let (backing, total): (i64, i64) = (r.get(0), r.get(1));
-    if backing * 2 > total {
+    if backing * MAJORITY_DENOMINATOR > total {
         let old_alliance = alliance_line_of(db, alliance).await?;
         let changed = db
             .client
@@ -478,17 +489,22 @@ async fn support_executor(db: &Db, world: &World, me: i64, alliance: i64, candid
 
 // ---------------------------------------------------------------- calls
 
-/// GetSuggestedAllianceShortNames(name) -> [KeyVal(shortName)]
-fn suggested_short_names(name: &str) -> Value {
+/// Server suggestion algorithm shared by corporation tickers and alliance short names.
+pub(super) fn suggested_names(name: &str) -> Vec<String> {
     let initials: String = name.split_whitespace().filter_map(|w| w.chars().find(|c| c.is_ascii_alphanumeric())).collect::<String>().to_uppercase();
     let compact: String = name.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_uppercase();
     let mut out: Vec<String> = vec![];
-    for t in [initials.chars().take(5).collect::<String>(), compact.chars().take(5).collect(), compact.chars().take(4).collect(), compact.chars().take(3).collect()] {
-        if t.len() >= 2 && !out.contains(&t) {
+    for t in [initials.chars().take(SUGGESTION_MAX_LENGTH).collect::<String>(), compact.chars().take(SUGGESTION_MAX_LENGTH).collect(), compact.chars().take(SUGGESTION_FALLBACK_LENGTHS[0]).collect(), compact.chars().take(SUGGESTION_FALLBACK_LENGTHS[1]).collect()] {
+        if t.len() >= SUGGESTION_MIN_LENGTH && !out.contains(&t) {
             out.push(t);
         }
     }
-    Value::list(out.into_iter().map(|t| keyval([("shortName", Value::unicode(t))])))
+    out
+}
+
+/// GetSuggestedAllianceShortNames(name) -> [KeyVal(shortName)]
+fn suggested_short_names(name: &str) -> Value {
+    Value::list(suggested_names(name).into_iter().map(|t| keyval([("shortName", Value::unicode(t))])))
 }
 
 /// The alliance side of corpRegistry.
@@ -498,10 +514,10 @@ async fn corp_registry(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     let int = |i: usize| call.args.get(i).and_then(|v| v.as_int()).unwrap_or(0);
     Some(match call.method {
         "CreateAlliance" => create(c, call).await,
-        "GetSuggestedAllianceShortNames" => Ok(suggested_short_names(&text_arg(call, 0))),
+        "GetSuggestedAllianceShortNames" => Ok(suggested_short_names(&trimmed_arg_text(call, 0))),
         // ApplyToJoinAlliance(allianceID, applicationText)
         "ApplyToJoinAlliance" => {
-            let (alliance, text) = (int(0), text_arg(call, 1));
+            let (alliance, text) = (int(0), trimmed_arg_text(call, 1));
             let corp = match unallied_ceo_corp(db, me).await {
                 Ok(corp) => corp,
                 Err(e) => return Some(Err(e)),
@@ -575,7 +591,7 @@ async fn alliance_registry(c: &mut Client, call: &Call<'_>) -> Option<CallResult
         "GetAlliancePublicInfo" => return Some(alliance_row(db, int(0)).await),
         // GetRankedAlliances(maxLen): the largest alliances by pilots.
         "GetRankedAlliances" => {
-            let limit = call.args.first().and_then(|v| v.as_int()).unwrap_or(100).clamp(1, 1000);
+            let limit = call.args.first().and_then(|v| v.as_int()).unwrap_or(DEFAULT_RANKED_LIMIT).clamp(1, MAX_RANKED_LIMIT);
             return Some(match db.client.query(&format!("{ALLIANCE_SELECT} WHERE NOT a.deleted ORDER BY 12 DESC, a.alliance_id LIMIT $1"), &[&limit]).await {
                 Ok(rows) => {
                     let header = alliance_header();
@@ -635,7 +651,7 @@ async fn alliance_registry(c: &mut Client, call: &Call<'_>) -> Option<CallResult
             let old = alliance_line_of(db, alliance).await.ok().flatten();
             match db
                 .client
-                .execute("UPDATE game.alliances SET description = $2, url = $3 WHERE alliance_id = $1", &[&alliance, &text_arg(call, 0), &text_arg(call, 1)])
+                .execute("UPDATE game.alliances SET description = $2, url = $3 WHERE alliance_id = $1", &[&alliance, &trimmed_arg_text(call, 0), &trimmed_arg_text(call, 1)])
                 .await
             {
                 Ok(_) => alliance_changed(db, world, alliance, old).await.map(|_| Value::None),

@@ -25,9 +25,9 @@
 //! - bound scanMgr.ConeScan(angle, range, x, y, z) -> [record(id, typeID, groupID)].
 //! - beyonce.CmdWarpToStuff('scan', targetID); wormholeMgr.WormholeJump(wormholeID).
 
-use super::{db_err, keyval, notify_error, off_surface, rand01, rand_dir, Call, CallError, CallResult};
+use super::{db_err, keyval, notify_error, off_surface, rand01, rand_dir, value_ids, Call, CallError, CallResult};
 use crate::client::{filetime_now, filetime_ticks_from_seconds, Client};
-use crate::consts::{ATTR_EXPLOSION_DELAY, AU, FILETIME_SECOND, FLAG_CARGO, GROUP_ASTEROID_BELT, GROUP_PLANET, SKILL_ARCHAEOLOGY, SKILL_HACKING};
+use crate::consts::{ATTR_EXPLOSION_DELAY, ATTR_REQUIRED_SKILL_1, AU, FACTION_AMARR, FACTION_ANGEL_CARTEL, FACTION_CALDARI, FACTION_GALLENTE, FACTION_GURISTAS, FACTION_MINMATAR, FILETIME_SECOND, FLAG_CARGO, GROUP_ASTEROID_BELT, GROUP_PLANET, SKILL_ARCHAEOLOGY, SKILL_HACKING};
 use crate::db::Db;
 use crate::space::{dist, kg_to_tonnes, minutes_to_seconds, now_ms, Ball, World, MODE_RIGID, MODE_STOP, V3};
 use marshal::Value;
@@ -308,13 +308,13 @@ async fn systems_of_class(db: &Db, class: i64) -> Result<Vec<i64>, CallError> {
 /// The pirates of an empire's space (or of a pirate-held system).
 fn pirate_faction(faction: Option<i64>, region: i64) -> i64 {
     match faction {
-        Some(500001) => 500010,                                   // Caldari: Guristas
-        Some(500002) => 500011,                                   // Minmatar: Angel Cartel
-        Some(500003) if region % 2 == 0 => 500019,                // Amarr: Sansha's Nation
-        Some(500003 | 500007 | 500008) => 500012,                 // Amarr, Ammatar, Khanid: Blood Raiders
-        Some(500004) => 500020,                                   // Gallente: Serpentis
-        Some(f @ (500010 | 500011 | 500012 | 500019 | 500020)) => f,
-        _ => [500010, 500011, 500012, 500019, 500020][(region % 5) as usize],
+        Some(FACTION_CALDARI) => FACTION_GURISTAS,                  // Caldari: Guristas
+        Some(FACTION_MINMATAR) => FACTION_ANGEL_CARTEL,             // Minmatar: Angel Cartel
+        Some(FACTION_AMARR) if region % 2 == 0 => 500019,           // Amarr: Sansha's Nation
+        Some(FACTION_AMARR | 500007 | 500008) => 500012,            // Amarr, Ammatar, Khanid: Blood Raiders
+        Some(FACTION_GALLENTE) => 500020,                           // Gallente: Serpentis
+        Some(f @ (FACTION_GURISTAS | FACTION_ANGEL_CARTEL | 500012 | 500019 | 500020)) => f,
+        _ => [FACTION_GURISTAS, FACTION_ANGEL_CARTEL, 500012, 500019, 500020][(region % 5) as usize],
     }
 }
 
@@ -1268,11 +1268,7 @@ async fn request_scans(c: &mut Client, call: &Call<'_>) -> CallResult {
 /// bound scanMgr.RecoverProbes(probeIDs) -> recovered probe IDs; they return to cargo.
 async fn recover_probes(c: &mut Client, call: &Call<'_>, destroy: bool) -> CallResult {
     let (Some(ship), Some(char_id)) = (c.session.int("shipid"), c.session.int("charid")) else { return Ok(Value::list([])) };
-    let ids: Vec<i64> = match call.args.first() {
-        Some(v) if v.items().is_some() => v.items().unwrap().iter().filter_map(|v| v.as_int()).collect(),
-        Some(v) => v.as_int().into_iter().collect(),
-        None => vec![],
-    };
+    let ids = value_ids(call.args.first());
     let mut back: HashMap<i32, i32> = HashMap::new();
     let mut done = vec![];
     let mut recovered_by_system: HashMap<i64, Vec<i64>> = HashMap::new();
@@ -1368,8 +1364,8 @@ fn site_classes(difficulty: i64) -> &'static [&'static str] {
 /// NPC group name prefixes of a faction's site rats.
 fn rat_prefix(faction: i64) -> &'static str {
     match faction {
-        500010 => "Asteroid Guristas",
-        500011 => "Asteroid Angel Cartel",
+        FACTION_GURISTAS => "Asteroid Guristas",
+        FACTION_ANGEL_CARTEL => "Asteroid Angel Cartel",
         500012 => "Asteroid Blood Raiders",
         500019 => "Asteroid Sansha's Nation",
         500020 => "Asteroid Serpentis",
@@ -1393,7 +1389,7 @@ fn sleeper_groups(difficulty: i64) -> [&'static str; 3] {
 
 /// Spawn a combat site's NPCs (once) and register its clearance callback.
 async fn spawn_site_npcs(c: &mut Client, site: &Site) -> Result<(), CallError> {
-    let faction = site.faction.unwrap_or(500010);
+    let faction = site.faction.unwrap_or(FACTION_GURISTAS);
     let sleepers = faction == 500021 && site.name_id.is_some() && site.archetype == Some(24) && site.strength_attr == STRENGTH_ALL && {
         let class = system_info(&c.db, site.system).await?.class;
         (1..=6).contains(&class)
@@ -1831,8 +1827,8 @@ async fn expire_wormholes(db: &Db, world: &World) -> Result<(), CallError> {
 /// Container name prefixes of a faction's data and relic sites.
 fn container_prefix(faction: i64) -> &'static str {
     match faction {
-        500010 => "Guristas",
-        500011 => "Angel",
+        FACTION_GURISTAS => "Guristas",
+        FACTION_ANGEL_CARTEL => "Angel",
         500012 => "Blood",
         500019 => "Sansha",
         500020 => "Serpentis",
@@ -1889,7 +1885,7 @@ fn container_ball(id: i64, type_id: i32, pos: V3, radius: f32, security_state: i
 /// Spawn a data or relic site's containers with their loot (once).
 async fn spawn_containers(c: &mut Client, site: &Site) -> Result<(), CallError> {
     let relic = site.strength_attr == STRENGTH_MAGNETOMETRIC;
-    let faction = site.faction.unwrap_or(500010);
+    let faction = site.faction.unwrap_or(FACTION_GURISTAS);
     let prefix = container_prefix(faction);
     let sleeper = prefix == "Sleeper";
     let skill = if relic { SKILL_ARCHAEOLOGY } else { SKILL_HACKING };
@@ -1900,12 +1896,12 @@ async fn spawn_containers(c: &mut Client, site: &Site) -> Result<(), CallError> 
             "SELECT t.type_id, COALESCE(t.radius, 300)::float8 FROM sde.inv_types t
              JOIN sde.type_attributes h ON h.type_id = t.type_id
              JOIN sde.dogma_attributes hd ON hd.attribute_id = h.attribute_id AND hd.name = 'hackable'
-             JOIN sde.type_attributes sk ON sk.type_id = t.type_id AND sk.attribute_id = 182 AND sk.value::int = $2
+             JOIN sde.type_attributes sk ON sk.type_id = t.type_id AND sk.attribute_id = $6 AND sk.value::int = $2
              LEFT JOIN sde.type_attributes tier ON tier.type_id = t.type_id
                   AND tier.attribute_id = (SELECT attribute_id FROM sde.dogma_attributes WHERE name = 'tierDifficulty')
              WHERE t.group_id = $1 AND (t.name LIKE $3 || ' %' OR ($4 AND t.name LIKE '%Sleeper%'))
                AND COALESCE(tier.value, 1) <= $5",
-            &[&GROUP_SCATTER_CONTAINER, &skill, &prefix, &sleeper, &((site.difficulty + 1) as f64)],
+            &[&GROUP_SCATTER_CONTAINER, &skill, &prefix, &sleeper, &((site.difficulty + 1) as f64), &ATTR_REQUIRED_SKILL_1],
         )
         .await
         .map_err(db_err)?;

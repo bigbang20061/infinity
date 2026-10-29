@@ -1,6 +1,6 @@
 //! A client socket that speaks marshalled values over packet framing.
 
-use crate::framing::{read_frame, write_frame};
+use crate::framing::{inflate, read_frame, write_frame};
 use anyhow::{Context, Result};
 use marshal::Value;
 use std::net::SocketAddr;
@@ -9,6 +9,11 @@ use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::trace;
+
+/// zlib CMF byte used by the client's MachoNet packet compression.
+const ZLIB_HEADER: u8 = 0x78;
+/// Server diagnostic policy: maximum packet bytes included in decode errors.
+const DECODE_ERROR_PREVIEW_BYTES: usize = 64;
 
 pub struct Conn {
     pub stream: TcpStream,
@@ -20,14 +25,11 @@ async fn recv_value<R: AsyncRead + Unpin>(r: &mut R, peer: SocketAddr) -> Result
     let Some(mut frame) = read_frame(r).await? else { return Ok(None) };
     // "Packet Compression: MachoNet": the transport zlib-compresses large packets
     // itself, without the framing flag. A marshal stream never starts with 'x'.
-    if frame.payload.first() == Some(&0x78) {
-        let mut out = Vec::with_capacity(frame.payload.len() * 4);
-        std::io::Read::read_to_end(&mut flate2::read::ZlibDecoder::new(&frame.payload[..]), &mut out)
-            .context("inflating machoNet-compressed packet")?;
-        frame.payload = out;
+    if frame.payload.first() == Some(&ZLIB_HEADER) {
+        frame.payload = inflate(&frame.payload).context("inflating machoNet-compressed packet")?;
     }
     let v = marshal::loads(&frame.payload)
-        .with_context(|| format!("undecodable packet ({} bytes): {:02x?}", frame.payload.len(), &frame.payload[..frame.payload.len().min(64)]))?;
+        .with_context(|| format!("undecodable packet ({} bytes): {:02x?}", frame.payload.len(), &frame.payload[..frame.payload.len().min(DECODE_ERROR_PREVIEW_BYTES)]))?;
     trace!(%peer, "<< {v:?}");
     Ok(Some(v))
 }

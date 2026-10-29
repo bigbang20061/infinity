@@ -1,9 +1,22 @@
 //! Services the client calls while entering / sitting in a station that only
 //! need empty-but-well-formed answers for now (no wars, agents, campaigns...).
+//! The SettingsInfo code object is specifically CPython 2.7 marshal and bytecode;
+//! its encoded flags and opcodes are not portable to another Python version.
 
 use super::{db_err, rowset, Call, CallError, CallResult};
 use crate::client::Client;
 use marshal::Value;
+
+/// CPython 2.7 code flags: CO_OPTIMIZED | CO_NEWLOCALS | CO_NOFREE.
+const SETTINGS_CODE_FLAGS: i32 = 0x43;
+/// CPython 2.7 bytecode for BUILD_MAP 0; RETURN_VALUE.
+const SETTINGS_CODE_BYTES: &[u8] = &[0x69, 0x00, 0x00, 0x53];
+/// Station query column boundary between integer IDs and floating-point coordinates.
+const STATION_ID_COLUMNS: usize = 7;
+/// Station query column count, including security.
+const STATION_COLUMNS: usize = 11;
+/// Station item bits query column count.
+const STATION_ITEM_BITS_COLUMNS: usize = 4;
 
 /// CPython 2.7 `marshal.dumps(code)` for `def SettingsInfo(): return {}`.
 /// carbonui settingsSvc.UpdateSettingsStatistics loads it into a function and calls it.
@@ -24,8 +37,8 @@ fn settings_info_code() -> Vec<u8> {
     i32le(&mut o, 0); // argcount
     i32le(&mut o, 0); // nlocals
     i32le(&mut o, 1); // stacksize
-    i32le(&mut o, 0x43); // CO_OPTIMIZED | CO_NEWLOCALS | CO_NOFREE
-    s(&mut o, &[0x69, 0x00, 0x00, 0x53]); // BUILD_MAP 0; RETURN_VALUE
+    i32le(&mut o, SETTINGS_CODE_FLAGS);
+    s(&mut o, SETTINGS_CODE_BYTES);
     o.push(b'(');
     i32le(&mut o, 1);
     o.push(b'N'); // consts = (None,)
@@ -56,8 +69,8 @@ async fn station_info(c: &Client) -> Result<Value, CallError> {
     let lines = rows
         .iter()
         .map(|r| {
-            let mut l: Vec<Value> = (0..7).map(|i| r.get::<_, Option<i64>>(i).map(Value::Int).unwrap_or(Value::None)).collect();
-            l.extend((7..11).map(|i| Value::Float(r.get::<_, Option<f64>>(i).unwrap_or(0.0))));
+            let mut l: Vec<Value> = (0..STATION_ID_COLUMNS).map(|i| r.get::<_, Option<i64>>(i).map(Value::Int).unwrap_or(Value::None)).collect();
+            l.extend((STATION_ID_COLUMNS..STATION_COLUMNS).map(|i| Value::Float(r.get::<_, Option<f64>>(i).unwrap_or(0.0))));
             l.insert(1, Value::unicode(""));
             l
         })
@@ -165,7 +178,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                 Ok(r) => r,
                 Err(e) => return Some(Err(db_err(e))),
             };
-            Value::list((0..4).map(|i| r.get::<_, Option<i64>>(i).map(int).unwrap_or(Value::None)))
+            Value::list((0..STATION_ITEM_BITS_COLUMNS).map(|i| r.get::<_, Option<i64>>(i).map(int).unwrap_or(Value::None)))
         }
         _ => return None,
     }))

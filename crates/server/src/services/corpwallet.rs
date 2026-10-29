@@ -7,7 +7,7 @@
 //! (OnAccountChange with the division's 'cash'..'cash7' name). Journals aren't kept.
 
 use super::corps::{ceo_of, is_player_corp, membership};
-use super::{db_err, keyval, notify_error, Call, CallError, CallResult};
+use super::{active_corporation_member_ids, db_err, has_role_or_is_ceo, keyval, notify_error, Call, CallError, CallResult};
 use crate::client::Client;
 use crate::consts::{ACCOUNT_CASH, ROLE_ACCOUNTANT, ROLE_DIRECTOR};
 use crate::db::Db;
@@ -15,10 +15,11 @@ use crate::space::World;
 use marshal::Value;
 use tracing::info;
 
+/// Client corporation wallet convention: seven account divisions.
 const DIVISIONS: i32 = 7;
-// appConst.corpRole*
+/// Client appConst.corpRoleJuniorAccountant.
 const ROLE_JUNIOR_ACCOUNTANT: i64 = 4_503_599_627_370_496;
-/// corpRoleAccountCanTake1; the other divisions' roles are the next bits.
+/// Client appConst.corpRoleAccountCanTake1; other divisions' roles are the next bits.
 const ROLE_CAN_TAKE_1: i64 = 134_217_728;
 
 fn valid_key(key: i32) -> bool {
@@ -45,9 +46,8 @@ pub(super) async fn corp_balance(db: &Db, corp: i64, key: i32) -> Result<f64, Ca
 
 /// Tell the corporation's online members a division's new balance.
 async fn announce(db: &Db, world: &World, corp: i64, key: i32, balance: f64) -> Result<(), CallError> {
-    let rows = db.client.query("SELECT character_id FROM game.characters WHERE corporation_id = $1 AND NOT deleted", &[&corp]).await.map_err(db_err)?;
-    for r in rows {
-        world.notify_pilot(r.get(0), "OnAccountChange", vec![Value::str(key_name(key)), Value::Int(corp), Value::Float(balance)]);
+    for id in active_corporation_member_ids(db, corp).await? {
+        world.notify_pilot(id, "OnAccountChange", vec![Value::str(key_name(key)), Value::Int(corp), Value::Float(balance)]);
     }
     Ok(())
 }
@@ -94,9 +94,8 @@ pub(super) async fn corp_debit(db: &Db, world: &World, corp: i64, key: i32, amou
 
 /// Whether `char_id` may pay out of `corp`'s division `key`.
 pub(super) async fn may_take(db: &Db, char_id: i64, corp: i64, key: i32) -> Result<bool, CallError> {
-    let (my_corp, roles) = membership(db, char_id).await?;
     let can_take = ROLE_CAN_TAKE_1 << (key - ACCOUNT_CASH);
-    Ok(my_corp == corp && (roles & (ROLE_DIRECTOR | ROLE_ACCOUNTANT | can_take) != 0 || ceo_of(db, corp).await? == Some(char_id)))
+    has_role_or_is_ceo(db, char_id, corp, ROLE_DIRECTOR | ROLE_ACCOUNTANT | can_take).await
 }
 
 /// Pay `amount` to `to` (a character, or a player corporation's division `to_key`).

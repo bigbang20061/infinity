@@ -14,7 +14,7 @@
 
 use super::{db_err, notify_error, rand01, Call, CallError, CallResult};
 use crate::client::Client;
-use crate::consts::{ATTR_MAX_RANGE, SKILL_ARCHAEOLOGY, SKILL_HACKING};
+use crate::consts::{ATTR_MAX_RANGE, ATTR_REQUIRED_SKILL_1, SKILL_ARCHAEOLOGY, SKILL_HACKING};
 use crate::space::{dist, metres_to_km};
 use marshal::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -67,7 +67,6 @@ const EVENT_DISTANCEINDICATOR: i64 = 308;
 
 const EFFECT_DO_HACKING: i64 = 1738;
 const ATTR_DURATION: i32 = 73;
-const ATTR_REQUIRED_SKILL_1: i32 = 182;
 const ATTR_VIRUS_COHERENCE: i32 = 1909;
 const ATTR_VIRUS_STRENGTH: i32 = 1910;
 const ATTR_VIRUS_SLOTS: i32 = 1911;

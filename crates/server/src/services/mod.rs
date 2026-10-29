@@ -1,7 +1,8 @@
 //! Remote services the client calls (`sm.RemoteSvc(name).Method(...)`).
 //!
-//! Shared error builders, wire-field readers, randomness and surface-aware site placement
-//! live here. Each service retains its own fallback and offset policy.
+//! Shared error builders, wire-field readers, randomness, corporation queries and surface-aware
+//! site placement live here. The site query reads `sde.map_celestials`; each service retains its
+//! own fallback and offset policy.
 
 mod agency;
 mod alliances;
@@ -62,6 +63,8 @@ const UNIT_SPHERE_DIAMETER: f64 = 2.0;
 const SITE_DIRECTION_FLATTENING: f64 = 0.2;
 /// Design policy: guard normalization of a near-zero site direction.
 const SITE_DIRECTION_EPSILON: f64 = 1e-9;
+/// Client kiring.common.const.ANTI_ADDICTION_PASS_CODE.
+const ANTI_ADDICTION_PASS_CODE: i64 = 201;
 
 /// The pilot's ship was destroyed: eject (raised by combat through the pilot's notify channel).
 pub async fn ship_destroyed(c: &mut Client, args: &[Value]) {
@@ -111,6 +114,30 @@ pub fn notify_error(text: impl Into<String>) -> CallError {
     user_error("CustomNotify", vec![("notify".into(), Value::unicode(text.into()))])
 }
 
+/// Read a call argument as text, trimming whitespace; missing or non-text arguments become empty.
+pub(super) fn trimmed_arg_text(call: &Call<'_>, index: usize) -> String {
+    call.args.get(index).and_then(|v| v.as_text()).map(|t| t.trim().to_string()).unwrap_or_default()
+}
+
+/// Read client text, limiting it to `max` Unicode characters.
+pub(super) fn value_text(v: Option<&Value>, max: usize) -> String {
+    v.and_then(|v| v.as_text()).map(|t| t.chars().take(max).collect()).unwrap_or_default()
+}
+
+/// Read integer IDs from a single integer or an iterable client value.
+pub(super) fn value_ids(v: Option<&Value>) -> Vec<i64> {
+    match v {
+        Some(Value::Int(i)) => vec![*i],
+        Some(v) => v.items().map(|it| it.iter().filter_map(|x| x.as_int()).collect()).unwrap_or_default(),
+        None => vec![],
+    }
+}
+
+/// Read integer IDs from an iterable client value.
+pub(super) fn value_id_list(v: Option<&Value>) -> Vec<i64> {
+    v.and_then(|v| v.items()).unwrap_or(&[]).iter().filter_map(|v| v.as_int()).collect()
+}
+
 /// A uniformly distributed binary64 value in [0, 1).
 pub fn rand01() -> f64 {
     (crate::handshake::rand_i64() as u64 >> (u64::BITS - RANDOM_SIGNIFICANT_BITS)) as f64 / (1u64 << RANDOM_SIGNIFICANT_BITS) as f64
@@ -131,6 +158,19 @@ pub fn value_field<'a>(v: &'a Value, name: &str) -> Option<&'a Value> {
     }
 }
 
+/// Accept a member of `corp_id` with any role in `role_mask` or who is its CEO.
+/// Membership and CEO lookup errors propagate; the CEO is queried only if needed.
+pub(super) async fn has_role_or_is_ceo(db: &Db, char_id: i64, corp_id: i64, role_mask: i64) -> Result<bool, CallError> {
+    let (my_corp, roles) = corps::membership(db, char_id).await?;
+    Ok(my_corp == corp_id && (roles & role_mask != 0 || corps::ceo_of(db, corp_id).await? == Some(char_id)))
+}
+
+/// Iterate character IDs for all non-deleted members of `corp_id`; database errors propagate.
+pub(super) async fn active_corporation_member_ids(db: &Db, corp_id: i64) -> Result<impl Iterator<Item = i64>, CallError> {
+    let rows = db.client.query("SELECT character_id FROM game.characters WHERE corporation_id = $1 AND NOT deleted", &[&corp_id]).await.map_err(db_err)?;
+    Ok(rows.into_iter().map(|r| r.get(0)))
+}
+
 /// Choose a planet and its radius; callers retain their fallback and offset policy.
 pub async fn site_position(db: &Db, system: i64) -> Result<Option<(V3, f64)>, CallError> {
     let planet = db.client.query_opt(
@@ -149,25 +189,14 @@ pub(super) fn off_surface(center: V3, radius: f64, distance: f64) -> V3 {
     [center[0] + flat[0] / len * d, center[1] + flat[1] / len * d, center[2] + flat[2] / len * d]
 }
 
-#[cfg(test)]
-mod placement_tests {
-    use super::*;
-
-    #[test]
-    fn surface_offset_includes_radius() {
-        let center = [1.0e9, -2.0e9, 3.0e9];
-        for radius in [0.0, 6_000_000.0, 1.0e12] {
-            let clearance = 1_000_000.0;
-            let actual = crate::space::dist(center, off_surface(center, radius, clearance));
-            let expected = radius + clearance;
-            assert!((actual - expected).abs() < expected * 1e-12, "{actual} != {expected}");
-        }
-    }
-}
-
 /// `utillib.KeyVal(**kw)`: attribute-access record.
 pub fn keyval<K: AsRef<[u8]>>(fields: impl IntoIterator<Item = (K, Value)>) -> Value {
     Value::instance("utillib.KeyVal", fields)
+}
+
+/// `carbon.common.script.sys.row.Row` with the supplied header and list-valued line.
+pub(super) fn row(header: Value, line: Vec<Value>) -> Value {
+    Value::instance("carbon.common.script.sys.row.Row", [("header", header), ("line", Value::List(line))])
 }
 
 /// `eve.common.script.sys.rowset.Rowset(header, lines)` (old-style instance, plain __dict__).
@@ -277,8 +306,8 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
         ])),
         ("kiringMgr", "IsMonochromeStyleEnabled") => Ok(Value::Bool(false)),
         // kiring.common.const.ANTI_ADDICTION_PASS_CODE
-        ("kiringMgr", "GetFaceRecognitionCode") => Ok(Value::tuple([Value::Int(201), s("")])),
-        ("kiringMgr", "GetAntiAddictionCode") => Ok(Value::Int(201)),
+        ("kiringMgr", "GetFaceRecognitionCode") => Ok(Value::tuple([Value::Int(ANTI_ADDICTION_PASS_CODE), s("")])),
+        ("kiringMgr", "GetAntiAddictionCode") => Ok(Value::Int(ANTI_ADDICTION_PASS_CODE)),
         ("kiringMgr", "IsZhStoreEnabled") => Ok(Value::Bool(false)),
 
         ("pingService", "Ping") => Ok(Value::None),
@@ -404,6 +433,22 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
                 short(call.kwargs)
             );
             Ok(Value::None)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn surface_offset_includes_radius() {
+        let center = [1.0e9, -2.0e9, 3.0e9];
+        for radius in [0.0, 6_000_000.0, 1.0e12] {
+            let clearance = 1_000_000.0;
+            let actual = crate::space::dist(center, off_surface(center, radius, clearance));
+            let expected = radius + clearance;
+            assert!((actual - expected).abs() < expected * 1e-12, "{actual} != {expected}");
         }
     }
 }

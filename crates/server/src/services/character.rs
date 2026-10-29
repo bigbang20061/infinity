@@ -3,8 +3,11 @@
 
 use super::{db_err, keyval, rowset, Call, CallError, CallResult};
 use crate::client::Client;
-use crate::consts::TYPE_CHARACTER;
+use crate::consts::{FILETIME_SECOND, FILETIME_UNIX_EPOCH, TYPE_CHARACTER};
 use marshal::Value;
+
+/// Client paperdoll.State.no_recustomization protocol state.
+const PAPERDOLL_NO_RECUSTOMIZATION: i64 = 0;
 
 fn char_id(c: &Client) -> i64 {
     c.session.int("charid").unwrap_or(0)
@@ -16,9 +19,9 @@ async fn public_info(c: &Client, id: i64) -> Result<Value, CallError> {
         .client
         .query_opt(
             "SELECT name, corporation_id, race_id, bloodline_id, ancestry_id, school_id, gender_id,
-                    (extract(epoch FROM created_at) * 10000000)::bigint + 116444736000000000
+                    (extract(epoch FROM created_at) * $2::bigint)::bigint + $3::bigint
              FROM game.characters WHERE character_id = $1",
-            &[&id],
+            &[&id, &FILETIME_SECOND, &FILETIME_UNIX_EPOCH],
         )
         .await
         .map_err(db_err)?;
@@ -157,7 +160,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             public_info(c, id).await.map(|info| if info.is_none() { info } else { Value::list([info]) })
         }
         // ---- paperdoll ----
-        ("charMgr", "GetPaperdollState") => Ok(Value::Int(0)), // paperdoll.State.no_recustomization
+        ("charMgr", "GetPaperdollState") => Ok(Value::Int(PAPERDOLL_NO_RECUSTOMIZATION)),
         ("paperDollServer", "GetMyPaperDollData") | ("paperDollServer", "GetPaperDollData") => {
             let id = call.args.first().and_then(|v| v.as_int()).unwrap_or(me);
             doll_blob(c, id, "appearance").await.map(|mut v| {

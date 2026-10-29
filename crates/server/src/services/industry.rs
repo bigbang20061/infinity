@@ -16,9 +16,9 @@ use super::contracts::{field, show_items};
 use super::dogma::load_items_db;
 use super::fit::{Fit, Key};
 use super::market::{debit, deliver, graph, jumps, lock, take_items};
-use super::{db_err, keyval, notify_error, rand01, user_error, Call, CallError, CallResult};
+use super::{db_err, keyval, notify_error, rand01, user_error, value_id_list, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
-use crate::consts::{FILETIME_DAY, FILETIME_SECOND, FLAG_HANGAR, IX_LOCATION_ID, LOCATION_JUNKYARD};
+use crate::consts::{BLUEPRINT_COPY_QUANTITY, BLUEPRINT_INFINITE_RUNS, FILETIME_DAY, FILETIME_SECOND, FLAG_HANGAR, INDUSTRY_JOB_STATUS_INSTALLED, IX_LOCATION_ID, LOCATION_JUNKYARD};
 use crate::db::Db;
 use crate::space::World;
 use marshal::Value;
@@ -34,7 +34,6 @@ const RESEARCH_TIME: i32 = 3;
 const RESEARCH_MATERIAL: i32 = 4;
 const COPYING: i32 = 5;
 const INVENTION: i32 = 8;
-const STATUS_INSTALLED: i32 = 1;
 const STATUS_DELIVERED: i32 = 101;
 const STATUS_CANCELLED: i32 = 102;
 const MAX_MATERIAL_EFFICIENCY: i32 = 10;
@@ -172,13 +171,13 @@ async fn blueprint(db: &Db, item_id: i64) -> Result<Blueprint, CallError> {
         .client
         .query_opt(
             "SELECT i.item_id, i.type_id, i.owner_id, st.station_id::bigint, i.singleton, i.quantity,
-                    COALESCE(b.material_efficiency, 0), COALESCE(b.time_efficiency, 0), COALESCE(b.runs, -1)
+                    COALESCE(b.material_efficiency, 0), COALESCE(b.time_efficiency, 0), COALESCE(b.runs, $2)
              FROM game.items i
              LEFT JOIN game.items loc ON loc.item_id = i.location_id
              LEFT JOIN sde.sta_stations st ON st.station_id::bigint = COALESCE(loc.location_id, i.location_id)
              LEFT JOIN game.blueprints b ON b.item_id = i.item_id
              WHERE i.item_id = $1",
-            &[&item_id],
+            &[&item_id, &BLUEPRINT_INFINITE_RUNS],
         )
         .await
         .map_err(db_err)?
@@ -191,7 +190,7 @@ async fn blueprint(db: &Db, item_id: i64) -> Result<Blueprint, CallError> {
         station: r.get(3),
         singleton,
         quantity,
-        copy: singleton && quantity == -2,
+        copy: singleton && quantity == BLUEPRINT_COPY_QUANTITY as i32,
         me: r.get(6),
         te: r.get(7),
         runs: r.get(8),
@@ -565,7 +564,7 @@ async fn plan(
 async fn job_counts(db: &Db, installer: i64) -> Result<HashMap<i32, i64>, CallError> {
     let rows = db
         .client
-        .query("SELECT activity_id, count(*) FROM game.industry_jobs WHERE installer_id = $1 AND status = $2 GROUP BY 1", &[&installer, &STATUS_INSTALLED])
+        .query("SELECT activity_id, count(*) FROM game.industry_jobs WHERE installer_id = $1 AND status = $2 GROUP BY 1", &[&installer, &INDUSTRY_JOB_STATUS_INSTALLED])
         .await
         .map_err(db_err)?;
     Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
@@ -594,7 +593,7 @@ async fn install(c: &Client, request: &Value) -> CallResult {
     }
     let busy: bool = db
         .client
-        .query_one("SELECT EXISTS (SELECT 1 FROM game.industry_jobs WHERE blueprint_id = $1 AND status = $2)", &[&bp.item_id, &STATUS_INSTALLED])
+        .query_one("SELECT EXISTS (SELECT 1 FROM game.industry_jobs WHERE blueprint_id = $1 AND status = $2)", &[&bp.item_id, &INDUSTRY_JOB_STATUS_INSTALLED])
         .await
         .map_err(db_err)?
         .get(0);
@@ -740,7 +739,7 @@ async fn install(c: &Client, request: &Value) -> CallResult {
         end: now + p.seconds * FILETIME_SECOND,
         completed: None,
         completed_by: None,
-        status: STATUS_INSTALLED,
+        status: INDUSTRY_JOB_STATUS_INSTALLED,
     };
     j.id = db
         .client
@@ -799,8 +798,8 @@ async fn make_copies(db: &Db, world: &World, owner: i64, station: i64, type_id: 
         let id: i64 = db
             .client
             .query_one(
-                "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton) VALUES ($1, $2, $3, $4, -2, true) RETURNING item_id",
-                &[&type_id, &owner, &station, &FLAG_HANGAR],
+                "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton) VALUES ($1, $2, $3, $4, $5::bigint::integer, true) RETURNING item_id",
+                &[&type_id, &owner, &station, &FLAG_HANGAR, &BLUEPRINT_COPY_QUANTITY],
             )
             .await
             .map_err(db_err)?
@@ -892,7 +891,7 @@ async fn complete(c: &Client, id: i64) -> Result<(), CallError> {
     if j.owner != me && j.installer != me {
         return Err(user_error("IndustryJobAccessDenied", vec![]));
     }
-    if j.status != STATUS_INSTALLED {
+    if j.status != INDUSTRY_JOB_STATUS_INSTALLED {
         return Err(notify_error("该项目已经交付。"));
     }
     if j.end > filetime_now() {
@@ -911,7 +910,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         }
         ("facilityManager", "GetFacility") => facility(&c.db, int(0)).await.map(|f| f.data()),
         ("facilityManager", "GetFacilitiesByID") => {
-            let ids: Vec<i64> = call.args.first().and_then(|v| v.items()).unwrap_or(&[]).iter().filter_map(|v| v.as_int()).collect();
+            let ids = value_id_list(call.args.first());
             let mut out = vec![];
             for id in ids {
                 match facility(&c.db, id).await {
@@ -962,10 +961,10 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             let completed = call.args.get(1).is_some_and(|v| matches!(v, Value::Bool(true)) || v.as_int().is_some_and(|i| i != 0));
             let rows = if completed {
                 c.db.client
-                    .query(&format!("{JOB_SELECT} WHERE owner_id = $1 AND (status = $2 OR completed_date >= $3) ORDER BY job_id"), &[&owner, &STATUS_INSTALLED, &(filetime_now() - COMPLETED_JOB_HISTORY_DAYS * FILETIME_DAY)])
+                    .query(&format!("{JOB_SELECT} WHERE owner_id = $1 AND (status = $2 OR completed_date >= $3) ORDER BY job_id"), &[&owner, &INDUSTRY_JOB_STATUS_INSTALLED, &(filetime_now() - COMPLETED_JOB_HISTORY_DAYS * FILETIME_DAY)])
                     .await
             } else {
-                c.db.client.query(&format!("{JOB_SELECT} WHERE owner_id = $1 AND status = $2 ORDER BY job_id"), &[&owner, &STATUS_INSTALLED]).await
+                c.db.client.query(&format!("{JOB_SELECT} WHERE owner_id = $1 AND status = $2 ORDER BY job_id"), &[&owner, &INDUSTRY_JOB_STATUS_INSTALLED]).await
             };
             match rows {
                 Ok(rows) => Ok(Value::list(rows.iter().map(|r| job_from_row(r).keyval()))),
@@ -1000,7 +999,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         ("industryManager", "CancelJob") => {
             let _trading = lock().await;
             match job(&c.db, int(0)).await {
-                Ok(mut j) if (j.owner == me || j.installer == me) && j.status == STATUS_INSTALLED => {
+                Ok(mut j) if (j.owner == me || j.installer == me) && j.status == INDUSTRY_JOB_STATUS_INSTALLED => {
                     j.status = STATUS_CANCELLED;
                     j.completed = Some(filetime_now());
                     j.completed_by = Some(me);

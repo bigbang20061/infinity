@@ -9,13 +9,26 @@
 use std::io::{self, Read};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+/// Carbonengine io `protocol.h`: low bits containing packet length.
 const SIZE_MASK: u32 = 0x0FFF_FFFF;
-/// Body starts with a u32 OOB length, then OOB bytes, then the payload.
+/// Carbonengine io `protocol.h`: body has a u32 OOB length and OOB bytes.
 const FLAG_OOB: u32 = 1 << 28;
+/// Carbonengine io `protocol.h`: body is zlib-compressed.
 const FLAG_ZLIB: u32 = 1 << 29;
+/// Carbonengine io `protocol.h`: body is snappy-compressed.
 const FLAG_SNAPPY: u32 = 1 << 30;
+/// Client SocketTransportFactory.MaxPacketSize, in bytes.
+pub const MAX_PACKET: usize = 10 * 1024 * 1024;
+/// Carbonengine packet framing: a little-endian u32 occupies four bytes.
+const HEADER_BYTES: usize = std::mem::size_of::<u32>();
+/// Server allocation estimate for either form of zlib-compressed packet.
+const INFLATE_CAPACITY_FACTOR: usize = 4;
 
-pub const MAX_PACKET: usize = 10 * 1024 * 1024; // SocketTransportFactory.MaxPacketSize
+pub(crate) fn inflate(payload: &[u8]) -> io::Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(payload.len() * INFLATE_CAPACITY_FACTOR);
+    flate2::read::ZlibDecoder::new(payload).read_to_end(&mut out)?;
+    Ok(out)
+}
 
 pub struct Frame {
     pub payload: Vec<u8>,
@@ -24,7 +37,7 @@ pub struct Frame {
 
 /// Read one packet; `Ok(None)` on clean EOF at a packet boundary.
 pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Option<Frame>> {
-    let mut hdr = [0u8; 4];
+    let mut hdr = [0u8; HEADER_BYTES];
     match r.read_exact(&mut hdr).await {
         Ok(_) => {}
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
@@ -41,19 +54,17 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Option<Fr
     let mut body = vec![0u8; len];
     r.read_exact(&mut body).await?;
 
-    let (oob, mut payload) = if header & FLAG_OOB != 0 && body.len() >= 4 {
-        let n = u32::from_le_bytes(body[..4].try_into().unwrap()) as usize;
-        if 4 + n > body.len() {
+    let (oob, mut payload) = if header & FLAG_OOB != 0 && body.len() >= HEADER_BYTES {
+        let n = u32::from_le_bytes(body[..HEADER_BYTES].try_into().unwrap()) as usize;
+        if HEADER_BYTES + n > body.len() {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "OOB length exceeds packet"));
         }
-        (Some(body[4..4 + n].to_vec()), body[4 + n..].to_vec())
+        (Some(body[HEADER_BYTES..HEADER_BYTES + n].to_vec()), body[HEADER_BYTES + n..].to_vec())
     } else {
         (None, body)
     };
     if header & FLAG_ZLIB != 0 {
-        let mut out = Vec::with_capacity(payload.len() * 4);
-        flate2::read::ZlibDecoder::new(&payload[..]).read_to_end(&mut out)?;
-        payload = out;
+        payload = inflate(&payload)?;
     }
     Ok(Some(Frame { payload, oob }))
 }
@@ -62,8 +73,37 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, payload: &[u8]) -> io
     if payload.len() > SIZE_MASK as usize {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "packet too large"));
     }
-    let mut buf = Vec::with_capacity(4 + payload.len());
+    let mut buf = Vec::with_capacity(HEADER_BYTES + payload.len());
     buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     buf.extend_from_slice(payload);
     w.write_all(&buf).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{inflate, read_frame, FLAG_ZLIB};
+    use flate2::{write::ZlibEncoder, Compression};
+    use std::io::Write;
+
+    #[tokio::test]
+    async fn inflates_zlib_payload_and_frame() {
+        let payload = b"compressed packet payload";
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        assert_eq!(inflate(&compressed).unwrap(), payload);
+
+        let header = FLAG_ZLIB | compressed.len() as u32;
+        let mut frame = header.to_le_bytes().to_vec();
+        frame.extend_from_slice(&compressed);
+        let decoded = read_frame(&mut frame.as_slice()).await.unwrap().unwrap();
+        assert_eq!(decoded.payload, payload);
+        assert!(decoded.oob.is_none());
+    }
+
+    #[test]
+    fn rejects_malformed_zlib() {
+        assert!(inflate(&[0xff, 0xff, 0xff, 0xff]).is_err());
+    }
 }

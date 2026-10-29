@@ -11,18 +11,20 @@
 //! operations applied in order and stacking penalties on non-stackable attributes.
 
 use super::{db_err, CallError};
-use crate::consts::{ATTR_CAPACITY, ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_RADIUS, ATTR_SIGNATURE_RADIUS, ATTR_VOLUME, CATEGORY_SHIP, EFFECT_AFTERBURNER, EFFECT_MICROWARPDRIVE, TYPE_CHARACTER};
+use crate::consts::{ATTR_CAPACITY, ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_RADIUS, ATTR_REQUIRED_SKILL_1, ATTR_SIGNATURE_RADIUS, ATTR_VOLUME, CATEGORY_CHARGE, CATEGORY_SHIP, EFFECT_AFTERBURNER, EFFECT_MICROWARPDRIVE, FLAG_FITTING_FIRST, FLAG_FITTING_LAST, FLAG_RIG_FIRST, FLAG_RIG_LAST, FLAG_SUBSYSTEM_FIRST, FLAG_SUBSYSTEM_LAST, TYPE_CHARACTER};
 use crate::db::Db;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
-pub const ATTR_SKILL_LEVEL: i32 = 280;
-/// requiredSkill1..6
-const ATTR_REQUIRED_SKILLS: [i32; 6] = [182, 183, 184, 1285, 1289, 1290];
-// Categories whose modifiers are exempt from stacking penalties.
-const CATEGORY_CHARGE: i32 = 8;
+/// SDE dgmAttributeTypes: skillLevel.
+const ATTR_SKILL_LEVEL: i32 = 280;
+/// SDE dgmAttributeTypes: requiredSkill1 through requiredSkill6.
+const ATTR_REQUIRED_SKILLS: [i32; 6] = [ATTR_REQUIRED_SKILL_1, 183, 184, 1285, 1289, 1290];
+/// SDE invCategories: Skill, exempt from stacking penalties.
 const CATEGORY_SKILL: i32 = 16;
+/// SDE invCategories: Implant, exempt from stacking penalties.
 const CATEGORY_IMPLANT: i32 = 20;
+/// SDE invCategories: Subsystem, exempt from stacking penalties.
 const CATEGORY_SUBSYSTEM: i32 = 32;
 /// SDE dogma effect category: passive.
 const EFFECT_CATEGORY_PASSIVE: i32 = 0;
@@ -30,12 +32,44 @@ const EFFECT_CATEGORY_PASSIVE: i32 = 0;
 const EFFECT_CATEGORY_ACTIVE: i32 = 1;
 /// SDE dogma effect category: online.
 const EFFECT_CATEGORY_ONLINE: i32 = 4;
+/// SDE dgmAttributeTypes: speedFactor.
 const ATTR_SPEED_FACTOR: i32 = 20;
+/// SDE dgmAttributeTypes: speedBoostFactor.
 const ATTR_SPEED_BOOST_FACTOR: i32 = 567;
+/// SDE dgmAttributeTypes: massAddition.
 const ATTR_MASS_ADDITION: i32 = 796;
+/// SDE dgmAttributeTypes: signatureRadiusBonus.
 const ATTR_SIGNATURE_RADIUS_BONUS: i32 = 554;
 /// skillEffect: skill point bookkeeping (operation 9), not a modifier we evaluate.
 const EFFECT_SKILL: i32 = 132;
+/// SDE dogma modifier operation: PreAssign.
+const OP_PRE_ASSIGN: i32 = -1;
+/// SDE dogma modifier operation: PreMul.
+const OP_PRE_MUL: i32 = 0;
+/// SDE dogma modifier operation: PreDiv.
+const OP_PRE_DIV: i32 = 1;
+/// SDE dogma modifier operation: ModAdd.
+const OP_MOD_ADD: i32 = 2;
+/// SDE dogma modifier operation: ModSub.
+const OP_MOD_SUB: i32 = 3;
+/// SDE dogma modifier operation: PostMul.
+const OP_POST_MUL: i32 = 4;
+/// SDE dogma modifier operation: PostDiv.
+const OP_POST_DIV: i32 = 5;
+/// SDE dogma modifier operation: PostPercent.
+const OP_POST_PERCENT: i32 = 6;
+/// SDE dogma modifier operation: PostAssign.
+const OP_POST_ASSIGN: i32 = 7;
+/// Dogma stacking penalty curve divisor, used by the server fitting formula.
+const STACKING_PENALTY_DIVISOR: f64 = 2.67;
+/// Server dogma stacking penalty curve squares the normalized modifier index.
+const STACKING_PENALTY_EXPONENT: i32 = 2;
+/// Percentage points per whole multiplier.
+const PERCENT_SCALE: f64 = 100.0;
+/// Server sentinel for an SDE modifier with no operation, outside supported operations.
+const MISSING_MODIFIER_OPERATION: i32 = -100;
+/// SDE modifier skillTypeID sentinel selecting the source item's type.
+const MODIFIER_SOURCE_ITEM_TYPE: i32 = -1;
 
 /// An item in the fit.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -130,12 +164,12 @@ async fn types(db: &Db, types: &[i32]) -> Result<HashMap<i32, Arc<TypeData>>, Ca
     let mods = db
         .client
         .query(
-            "SELECT te.type_id, COALESCE(e.effect_category, 0), m->>'func', COALESCE(m->>'domain', ''), COALESCE((m->>'operation')::int, -100),
+            "SELECT te.type_id, COALESCE(e.effect_category, 0), m->>'func', COALESCE(m->>'domain', ''), COALESCE((m->>'operation')::int, $3),
                     COALESCE((m->>'modifiedAttributeID')::int, 0), COALESCE((m->>'modifyingAttributeID')::int, 0),
                     (m->>'groupID')::int, (m->>'skillTypeID')::int
              FROM sde.type_effects te JOIN sde.dogma_effects e USING (effect_id), jsonb_array_elements(e.modifier_info) m
              WHERE te.type_id = ANY($1) AND e.effect_id <> $2 AND jsonb_typeof(e.modifier_info) = 'array'",
-            &[&missing, &EFFECT_SKILL],
+            &[&missing, &EFFECT_SKILL, &MISSING_MODIFIER_OPERATION],
         )
         .await
         .map_err(db_err)?;
@@ -227,8 +261,8 @@ impl Fit {
             .client
             .query(
                 "SELECT item_id, type_id, COALESCE(online, false), flag_id FROM game.items WHERE location_id = $1
-                 AND (flag_id BETWEEN 11 AND 34 OR flag_id BETWEEN 92 AND 99 OR flag_id BETWEEN 125 AND 132)",
-                &[&ship],
+                 AND (flag_id BETWEEN $2 AND $3 OR flag_id BETWEEN $4 AND $5 OR flag_id BETWEEN $6 AND $7)",
+                &[&ship, &FLAG_FITTING_FIRST, &FLAG_FITTING_LAST, &FLAG_RIG_FIRST, &FLAG_RIG_LAST, &FLAG_SUBSYSTEM_FIRST, &FLAG_SUBSYSTEM_LAST],
             )
             .await
             .map_err(db_err)?;
@@ -289,7 +323,7 @@ impl Fit {
         };
         let required = |skill: Option<i32>| {
             let skill = match skill {
-                Some(-1) | None => self.nodes.get(&source).map(|n| n.type_id),
+                Some(MODIFIER_SOURCE_ITEM_TYPE) | None => self.nodes.get(&source).map(|n| n.type_id),
                 s => s,
             };
             skill.is_some_and(|s| t.required_skills().any(|r| r == s))
@@ -365,14 +399,14 @@ impl Fit {
                 continue;
             }
             match attr {
-                ATTR_MASS => mods.push((2, self.value_guarded(key, ATTR_MASS_ADDITION, visiting), false)),
+                ATTR_MASS => mods.push((OP_MOD_ADD, self.value_guarded(key, ATTR_MASS_ADDITION, visiting), false)),
                 ATTR_MAX_VELOCITY => {
                     let mass = self.value_guarded(Key::Ship, ATTR_MASS, visiting).max(1.0);
-                    let factor = self.value_guarded(key, ATTR_SPEED_FACTOR, visiting) / 100.0;
+                    let factor = self.value_guarded(key, ATTR_SPEED_FACTOR, visiting) / PERCENT_SCALE;
                     let thrust = self.value_guarded(key, ATTR_SPEED_BOOST_FACTOR, visiting);
-                    mods.push((4, 1.0 + factor * thrust / mass, false));
+                    mods.push((OP_POST_MUL, 1.0 + factor * thrust / mass, false));
                 }
-                _ if mwd => mods.push((6, self.value_guarded(key, ATTR_SIGNATURE_RADIUS_BONUS, visiting), false)),
+                _ if mwd => mods.push((OP_POST_PERCENT, self.value_guarded(key, ATTR_SIGNATURE_RADIUS_BONUS, visiting), false)),
                 _ => {}
             }
         }
@@ -385,7 +419,7 @@ impl Fit {
 fn apply(base: f64, mods: &[(i32, f64, bool)]) -> f64 {
     let mut v = base;
     let of = |op: i32| mods.iter().filter(move |m| m.0 == op);
-    if let Some(m) = of(-1).last() {
+    if let Some(m) = of(OP_PRE_ASSIGN).last() {
         v = m.1;
     }
     let multiply = |v: f64, factors: Vec<(f64, bool)>| -> f64 {
@@ -404,19 +438,19 @@ fn apply(base: f64, mods: &[(i32, f64, bool)]) -> f64 {
         down.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         for list in [up, down] {
             for (i, f) in list.into_iter().enumerate() {
-                out *= 1.0 + (f - 1.0) * (-((i as f64) / 2.67).powi(2)).exp();
+                out *= 1.0 + (f - 1.0) * (-((i as f64) / STACKING_PENALTY_DIVISOR).powi(STACKING_PENALTY_EXPONENT)).exp();
             }
         }
         out
     };
-    v = multiply(v, of(0).map(|m| (m.1, m.2)).collect());
-    v = multiply(v, of(1).filter(|m| m.1 != 0.0).map(|m| (1.0 / m.1, m.2)).collect());
-    v += of(2).map(|m| m.1).sum::<f64>();
-    v -= of(3).map(|m| m.1).sum::<f64>();
-    v = multiply(v, of(4).map(|m| (m.1, m.2)).collect());
-    v = multiply(v, of(5).filter(|m| m.1 != 0.0).map(|m| (1.0 / m.1, m.2)).collect());
-    v = multiply(v, of(6).map(|m| (1.0 + m.1 / 100.0, m.2)).collect());
-    if let Some(m) = of(7).last() {
+    v = multiply(v, of(OP_PRE_MUL).map(|m| (m.1, m.2)).collect());
+    v = multiply(v, of(OP_PRE_DIV).filter(|m| m.1 != 0.0).map(|m| (1.0 / m.1, m.2)).collect());
+    v += of(OP_MOD_ADD).map(|m| m.1).sum::<f64>();
+    v -= of(OP_MOD_SUB).map(|m| m.1).sum::<f64>();
+    v = multiply(v, of(OP_POST_MUL).map(|m| (m.1, m.2)).collect());
+    v = multiply(v, of(OP_POST_DIV).filter(|m| m.1 != 0.0).map(|m| (1.0 / m.1, m.2)).collect());
+    v = multiply(v, of(OP_POST_PERCENT).map(|m| (1.0 + m.1 / PERCENT_SCALE, m.2)).collect());
+    if let Some(m) = of(OP_POST_ASSIGN).last() {
         v = m.1;
     }
     v

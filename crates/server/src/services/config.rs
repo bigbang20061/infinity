@@ -1,23 +1,21 @@
 //! `config` service: the server side of the client's cfg Recordsets
 //! (eve/common/script/sys/eveCfg.py). Multi-fetchers return `(header, rows)`.
 
-use super::{db_err, Call, CallError, CallResult};
+use super::{db_err, value_ids, Call, CallError, CallResult};
 use crate::client::{short, Client};
 use crate::consts::TYPE_CHARACTER;
 use marshal::Value;
 use tracing::warn;
 
+/// SDE invTypes: Corporation.
 const TYPE_CORPORATION: i64 = 2;
+/// SDE invTypes: Faction.
 const TYPE_FACTION: i64 = 30;
+/// SDE invTypes: Alliance.
 const TYPE_ALLIANCE: i64 = 16159;
+/// Client cfg ticker row: remaining optional fields after owner ID and ticker.
+const TICKER_OPTIONAL_FIELDS: usize = 6;
 
-fn ids(v: Option<&Value>) -> Vec<i64> {
-    match v {
-        Some(Value::Int(i)) => vec![*i],
-        Some(v) => v.items().map(|it| it.iter().filter_map(|x| x.as_int()).collect()).unwrap_or_default(),
-        None => vec![],
-    }
-}
 
 fn header(cols: &[&str]) -> Value {
     Value::list(cols.iter().map(|c| Value::str(*c)))
@@ -102,7 +100,7 @@ async fn tickers(c: &Client, ids: &[i64]) -> Result<Value, CallError> {
         .iter()
         .map(|r| {
             let mut row = vec![Value::Int(r.get(0)), Value::str(r.get::<_, Option<String>>(1).unwrap_or_default())];
-            row.extend(std::iter::repeat_n(Value::None, 6));
+            row.extend(std::iter::repeat_n(Value::None, TICKER_OPTIONAL_FIELDS));
             Value::List(row)
         })
         .collect();
@@ -113,7 +111,7 @@ async fn tickers(c: &Client, ids: &[i64]) -> Result<Value, CallError> {
 }
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
-    let keys = ids(call.args.first());
+    let keys = value_ids(call.args.first());
     match call.method {
         "GetMultiOwnersEx" | "GetOwnersEx" => owners(c, &keys).await,
         "GetMultiLocationsEx" | "GetLocationsEx" => locations(c, &keys).await,

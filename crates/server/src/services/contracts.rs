@@ -18,7 +18,7 @@
 
 use super::dogma::{load_items_db, Item};
 use super::market::{credit, debit, deliver, lock, round2, station, take_items};
-use super::{db_err, keyval, notify_error, user_error, Call, CallError, CallResult};
+use super::{db_err, keyval, notify_error, user_error, value_id_list, value_text, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
 use crate::consts::{ACCOUNT_CASH, FILETIME_DAY, FILETIME_MINUTE, FLAG_HANGAR, IX_LOCATION_ID, LOCATION_JUNKYARD};
 use crate::db::Db;
@@ -433,7 +433,7 @@ async fn create(c: &Client, info: &Value) -> CallResult {
     let corp = c.session.int("corpid").unwrap_or(0);
     let int = |k: &str| field(info, k).and_then(|v| v.as_int()).unwrap_or(0);
     let money = |k: &str| round2(field(info, k).and_then(|v| v.as_float()).unwrap_or(0.0));
-    let text = |k: &str, max: usize| field(info, k).and_then(|v| v.as_text()).map(|t| t.chars().take(max).collect::<String>()).unwrap_or_default();
+    let text = |k: &str, max: usize| value_text(field(info, k), max);
     if truthy(field(info, "forCorp")) {
         return Err(notify_error("暂不支持军团合同。"));
     }
@@ -1113,7 +1113,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         }
         // DeleteMultipleContracts([contractID]) -> (deleted, failed)
         "DeleteMultipleContracts" => {
-            let ids: Vec<i64> = call.args.first().and_then(|v| v.items()).unwrap_or(&[]).iter().filter_map(|v| v.as_int()).collect();
+            let ids = value_id_list(call.args.first());
             let _trading = lock().await;
             let (mut deleted, mut failed) = (vec![], vec![]);
             for id in ids {
@@ -1167,7 +1167,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "GetItemsInContainer" => items_in(c, int(1), false).await,
         // GetNumItemsInContainers(stationID, [containerID], forCorp, flag) -> {containerID: count}
         "GetNumItemsInContainers" => {
-            let ids: Vec<i64> = call.args.get(1).and_then(|v| v.items()).unwrap_or(&[]).iter().filter_map(|v| v.as_int()).collect();
+            let ids = value_id_list(call.args.get(1));
             match c
                 .db
                 .client

@@ -5,6 +5,7 @@
 //! presence, MUC rooms (`<channel>@conference.<host>/<charID>`) and direct
 //! messages. Plain TCP: the launcher sets `chatserver_disable_tls=1` in prefs.ini.
 
+use crate::consts::TYPE_CHARACTER;
 use anyhow::{bail, Result};
 use base64::Engine;
 use quick_xml::events::Event;
@@ -14,6 +15,11 @@ use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+
+/// RFC 8259: JSON control characters below U+0020 require escaping.
+const JSON_CONTROL_LIMIT: u32 = 0x20;
+/// XEP-0045 status code identifying the recipient's own presence.
+const MUC_SELF_PRESENCE: u16 = 110;
 
 /// A parsed XML element (one stanza or a child of one).
 #[derive(Debug, Clone, Default)]
@@ -88,7 +94,7 @@ fn json_str(s: &str) -> String {
         match ch {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c if (c as u32) < JSON_CONTROL_LIMIT => out.push_str(&format!("\\u{:04x}", c as u32)),
             c => out.push(c),
         }
     }
@@ -114,9 +120,9 @@ impl Hub {
     /// What chat shows about a character (xmppchatsvc._GetPresenceUserData): affiliations,
     /// session role, and an eveowners row `[ownerID, ownerName, typeID, gender, ownerNameID]`.
     pub fn set_profile(&self, char_id: i64, name: &str, gender: i64, corp: i64, alliance: Option<i64>, faction: Option<i64>, role: i64) {
-        let info = format!("[{char_id}, {}, 1373, {gender}, null]", json_str(name));
+        let info = format!("[{char_id}, {}, {TYPE_CHARACTER}, {gender}, null]", json_str(name));
         let el = format!(
-            "<eve_user_data corpid='{corp}' allianceid='{}' warfactionid='{}' typeid='1373' role='{role}' info='{}'/>",
+            "<eve_user_data corpid='{corp}' allianceid='{}' warfactionid='{}' typeid='{TYPE_CHARACTER}' role='{role}' info='{}'/>",
             alliance.unwrap_or(0),
             faction.unwrap_or(0),
             esc(&info)
@@ -367,7 +373,7 @@ fn presence(c: &mut Conn, el: &Element) -> Result<()> {
         if let Some(occ) = rooms.get_mut(room) {
             occ.remove(&nick);
             let p = format!("<presence from='{room}/{nick}' type='unavailable'>{}</x></presence>", item(&full));
-            let _ = c.tx.send(format!("<presence id='{}' from='{room}/{nick}' to='{full}' type='unavailable'>{}<status code='110'/></x></presence>", esc(&id), item(&full)));
+            let _ = c.tx.send(format!("<presence id='{}' from='{room}/{nick}' to='{full}' type='unavailable'>{}<status code='{MUC_SELF_PRESENCE}'/></x></presence>", esc(&id), item(&full)));
             for o in occ.values() {
                 let _ = o.tx.send(p.clone());
             }
@@ -392,7 +398,7 @@ fn presence(c: &mut Conn, el: &Element) -> Result<()> {
     }
     occ.insert(nick.clone(), Occupant { full_jid: full.clone(), tx: c.tx.clone() });
     let _ = c.tx.send(format!(
-        "<presence id='{}' from='{room}/{nick}' to='{full}'>{}<status code='110'/></x>{me}</presence>",
+        "<presence id='{}' from='{room}/{nick}' to='{full}'>{}<status code='{MUC_SELF_PRESENCE}'/></x>{me}</presence>",
         esc(&id),
         item(&full)
     ));
