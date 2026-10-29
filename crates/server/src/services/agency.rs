@@ -4,6 +4,7 @@
 
 use super::{db_err, Call, CallError, CallResult};
 use crate::client::Client;
+use crate::consts::SECONDS_PER_HOUR;
 use marshal::Value;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,6 +16,10 @@ const FW_FACTIONS: [i64; 6] = [500001, 500002, 500003, 500004, 500010, 500011];
 const WEEKLY_RESET_HOUR_UTC: u64 = 3;
 /// Unix time convention: seconds per day.
 const DAY_SECONDS: u64 = 86_400;
+/// Standard calendar unit: days per week.
+const DAYS_PER_WEEK: u64 = 7;
+/// Calendar offset: the Unix epoch was three days after Monday.
+const UNIX_EPOCH_MONDAY_OFFSET_DAYS: u64 = 3;
 
 fn is_npc_corp(corp_id: i64) -> bool {
     (1_000_000..2_000_000).contains(&corp_id)
@@ -89,9 +94,11 @@ async fn set_allowed_factions(c: &Client, call: &Call<'_>) -> CallResult {
 
 /// Unix seconds of the next Monday reset.
 fn next_weekly_reset(now: u64) -> u64 {
-    let today = now / DAY_SECONDS * DAY_SECONDS + WEEKLY_RESET_HOUR_UTC * 3600;
-    // 1970-01-01 was a Thursday: day n is a Monday when (n + 3) % 7 == 0.
-    (0..=7).map(|d| today + d * DAY_SECONDS).find(|t| *t > now && (t / DAY_SECONDS + 3) % 7 == 0).unwrap_or(today + 7 * DAY_SECONDS)
+    let today = now / DAY_SECONDS * DAY_SECONDS + WEEKLY_RESET_HOUR_UTC * SECONDS_PER_HOUR as u64;
+    (0..=DAYS_PER_WEEK)
+        .map(|d| today + d * DAY_SECONDS)
+        .find(|t| *t > now && (t / DAY_SECONDS + UNIX_EPOCH_MONDAY_OFFSET_DAYS) % DAYS_PER_WEEK == 0)
+        .unwrap_or(today + DAYS_PER_WEEK * DAY_SECONDS)
 }
 
 /// CallExploreRequested(): answered with OnExploreResponsed(text-format

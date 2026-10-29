@@ -23,6 +23,16 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use tracing::{info, warn};
 
+/// Existing server policy for market order maintenance cadence.
+const ORDER_MAINTENANCE_INTERVAL_SECONDS: u64 = 60;
+
+/// Existing server policy for closed market order history, in days.
+const ORDER_HISTORY_DAYS: i64 = 90;
+/// Existing server policy for the default transaction history, in days.
+const DEFAULT_TRANSACTION_HISTORY_DAYS: i64 = 30;
+/// Existing server policy for market price history, in days.
+const PRICE_HISTORY_DAYS: i64 = 365;
+
 const RANGE_STATION: i64 = -1;
 const RANGE_SOLAR_SYSTEM: i64 = 0;
 const RANGE_REGION: i64 = 32767;
@@ -832,7 +842,7 @@ async fn cancel(c: &Client, order_id: i64) -> CallResult {
 /// Close players' orders past their duration, once a minute.
 pub async fn expire_orders(db: Db, world: Arc<World>) {
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(ORDER_MAINTENANCE_INTERVAL_SECONDS)).await;
         if let Err(CallError::Internal(e)) = expire(&db, &world).await {
             warn!("expiring market orders failed: {e:#}");
         }
@@ -925,7 +935,7 @@ async fn order_history(c: &Client) -> CallResult {
             "SELECT order_id, type_id::bigint, region_id, station_id, range::bigint, bid, price, vol_entered::bigint, vol_remaining::bigint,
                     issued, min_volume::bigint, duration::bigint, state::bigint, closed
              FROM game.market_order_history WHERE char_id = $1 AND closed >= $2 ORDER BY closed DESC LIMIT 1000",
-            &[&me, &(filetime_now() - 90 * FILETIME_DAY)],
+            &[&me, &(filetime_now() - ORDER_HISTORY_DAYS * FILETIME_DAY)],
         )
         .await
         .map_err(db_err)?;
@@ -978,7 +988,7 @@ async fn order_history(c: &Client) -> CallResult {
 /// `CharGetTransactions(fromDate)`: the character's fills, newest first (marketSvc.py).
 async fn transactions(c: &Client, from: Option<i64>) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
-    let from = from.unwrap_or(filetime_now() - 30 * FILETIME_DAY);
+    let from = from.unwrap_or(filetime_now() - DEFAULT_TRANSACTION_HISTORY_DAYS * FILETIME_DAY);
     let rows = c
         .db
         .client
@@ -1062,7 +1072,7 @@ async fn price_history(c: &Client, type_ids: &[i32]) -> Result<HashMap<i32, (Val
             "SELECT type_id, date / $3 * $3 AS day, min(price), max(price), sum(price * quantity) / sum(quantity), sum(quantity)::bigint, count(*)
              FROM game.market_transactions WHERE region_id = $1 AND type_id = ANY($2) AND date >= $4
              GROUP BY 1, 2 ORDER BY 1, 2",
-            &[&region, &type_ids.to_vec(), &FILETIME_DAY, &(today - 365 * FILETIME_DAY)],
+            &[&region, &type_ids.to_vec(), &FILETIME_DAY, &(today - PRICE_HISTORY_DAYS * FILETIME_DAY)],
         )
         .await
         .map_err(db_err)?;

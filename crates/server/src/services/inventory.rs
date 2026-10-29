@@ -11,6 +11,8 @@ use tracing::warn;
 
 /// const.containerHangar: "my hangar in the current station".
 const CONTAINER_HANGAR: i64 = 10004;
+/// Existing server policy for the highest corporation-hangar division index.
+const MAX_CORP_HANGAR_DIVISION_INDEX: i32 = 6;
 /// Internal bound-object name for a single inventory.
 pub const INVENTORY: &str = "invInventory";
 
@@ -209,7 +211,7 @@ async fn move_item(c: &mut Client, container: &Container, item_id: i64, flag: Op
     // Out of a corporation hangar: the division's take role (or Director) is needed.
     if let Some(corp) = super::offices::office_owner(&c.db, item.location_id).await? {
         let (my_corp, roles) = super::corps::membership(&c.db, char_id).await?;
-        let take = ROLE_HANGAR_CAN_TAKE_1 << (item.flag_id - FLAG_CORP_SAG1).clamp(0, 6);
+        let take = ROLE_HANGAR_CAN_TAKE_1 << (item.flag_id - FLAG_CORP_SAG1).clamp(0, MAX_CORP_HANGAR_DIVISION_INDEX);
         if my_corp != corp || roles & (take | ROLE_DIRECTOR) == 0 {
             return Err(CallError::User { msg: "CustomNotify".into(), dict: vec![("notify".into(), Value::unicode("你没有从该军团机库部门取出物品的职权。"))] });
         }

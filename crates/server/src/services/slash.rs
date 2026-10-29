@@ -12,6 +12,9 @@ use crate::consts::{FLAG_CARGO, FLAG_HANGAR, GM_ROLES};
 use marshal::Value;
 use tracing::info;
 
+/// Server design: clearance in metres when teleporting to an item.
+const TELEPORT_CLEARANCE: f64 = 5000.0;
+
 const COMMANDS: [(&str, &str); 9] = [
     ("tr", "/tr me <itemID|characterID|solarSystemID|stationID|celestialID> — teleport"),
     ("wh", "/wh — teleport next to a wormhole (scanned down for you)"),
@@ -64,7 +67,7 @@ async fn tr(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
     let here = c.session.int("solarsystemid").unwrap_or(0);
     // Something in this system's ballpark.
     if let Some((ball_pos, radius)) = c.world.with(here, move |s| s.ball(id).map(|b| (b.pos, b.radius))).await.flatten() {
-        let pos = [ball_pos[0] + radius as f64 + 5000.0, ball_pos[1], ball_pos[2]];
+        let pos = [ball_pos[0] + radius as f64 + TELEPORT_CLEARANCE, ball_pos[1], ball_pos[2]];
         super::ship::teleport(c, here, pos).await?;
         return Ok(format!("teleported to {id}"));
     }
@@ -93,7 +96,7 @@ async fn tr(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
         .await
         .map_err(db_err)?
     {
-        let pos = [p.get::<_, f64>(1) + p.get::<_, f64>(4) + 5000.0, p.get(2), p.get(3)];
+        let pos = [p.get::<_, f64>(1) + p.get::<_, f64>(4) + TELEPORT_CLEARANCE, p.get(2), p.get(3)];
         super::ship::teleport(c, p.get(0), pos).await?;
         return Ok(format!("teleported to {id}"));
     }
@@ -111,9 +114,9 @@ async fn tr(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
         .map_err(db_err)?;
     if let Some(r) = at {
         let system: i64 = r.get(0);
-        let pos = [r.get::<_, f64>(1) + 5000.0, r.get(2), r.get(3)];
+        let pos = [r.get::<_, f64>(1) + TELEPORT_CLEARANCE, r.get(2), r.get(3)];
         let live = c.world.with(system, move |s| s.pilot_ball(id).or_else(|| s.ball(id)).map(|b| b.pos)).await.flatten();
-        let pos = live.map(|p| [p[0] + 5000.0, p[1], p[2]]).unwrap_or(pos);
+        let pos = live.map(|p| [p[0] + TELEPORT_CLEARANCE, p[1], p[2]]).unwrap_or(pos);
         super::ship::teleport(c, system, pos).await?;
         return Ok(format!("teleported to {id} in {system}"));
     }

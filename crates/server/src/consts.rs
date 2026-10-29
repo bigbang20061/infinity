@@ -18,6 +18,18 @@ pub const FILETIME_HOUR: i64 = 60 * FILETIME_MINUTE;
 pub const FILETIME_DAY: i64 = 24 * FILETIME_HOUR;
 /// Server subscription policy: expiry at 2100-12-31, expressed as FILETIME.
 pub const FAR_FUTURE: i64 = 157_766_976_000_000_000;
+// Standard time units.
+/// Standard time unit: seconds in a minute.
+pub const SECONDS_PER_MINUTE: i64 = 60;
+/// Standard time unit: seconds in an hour.
+pub const SECONDS_PER_HOUR: i64 = 3600;
+
+// Existing damage representation.
+/// SDE/dogma damage attribute grouping: EM, thermal, kinetic and explosive.
+pub const DAMAGE_TYPE_COUNT: usize = 4;
+/// Ship damage layer model: shield, armor and structure.
+pub const DAMAGE_LAYER_COUNT: usize = 3;
+
 
 // Distances.
 /// Server distance convention: the IAU astronomical unit, in metres.

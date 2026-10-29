@@ -29,6 +29,9 @@ use std::sync::Arc;
 use tokio_postgres::types::ToSql;
 use tracing::{info, warn};
 
+/// Existing server policy for auction maintenance cadence.
+const AUCTION_MAINTENANCE_INTERVAL_SECONDS: u64 = 60;
+
 const TYPE_PLASTIC_WRAP: i32 = 3468;
 
 // appConst.conType*
@@ -800,7 +803,7 @@ async fn settle(db: &Db, world: &World, k: &mut Contract, winner: i64, amount: f
 /// Settle expired auctions with bids, once a minute.
 pub async fn settle_auctions(db: Db, world: Arc<World>) {
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(AUCTION_MAINTENANCE_INTERVAL_SECONDS)).await;
         if let Err(CallError::Internal(e)) = settle_expired(&db, &world).await {
             warn!("settling auctions failed: {e:#}");
         }

@@ -15,7 +15,7 @@
 
 use super::dogma::load_items;
 use super::{db_err, keyval, Call, CallError, CallResult};
-use crate::client::{filetime_now, Client};
+use crate::client::{filetime_now, unix_seconds_from_filetime, Client};
 use crate::consts::FLAG_HANGAR;
 use marshal::Value;
 use std::sync::OnceLock;
@@ -29,6 +29,8 @@ const DAILY_GIFT_OFFER: i64 = 1;
 const DAILY_GIFT_TYPE: i32 = 52520;
 /// Daily turnover of login rewards and daily offers (UTC; 11:00 Beijing time).
 const TURNOVER: &str = "03:00:00";
+/// Existing server policy: daily reward turnover offset from midnight UTC, in seconds.
+const TURNOVER_OFFSET_SECONDS: i64 = 10_800;
 const REWARD_DAY_SQL: &str = "(now() AT TIME ZONE 'UTC' - interval '3 hours')::date";
 
 /// Skill points granted per redeemed type (redeem/data.py `get_redeem_data`).
@@ -257,7 +259,7 @@ fn product_json(o: &Offer) -> Value {
 
 /// `YYYY-MM-DDTHH:MM:SSZ` of the current daily period's start.
 fn period_start() -> String {
-    let secs = (filetime_now() - crate::consts::FILETIME_UNIX_EPOCH) / 10_000_000 - 3 * 3600;
+    let secs = unix_seconds_from_filetime(filetime_now()) - TURNOVER_OFFSET_SECONDS;
     let day = secs.div_euclid(86_400);
     // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
     let z = day + 719_468;

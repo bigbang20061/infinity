@@ -17,11 +17,14 @@ use marshal::Value;
 use std::sync::Arc;
 use tracing::{info, warn};
 
+/// Existing server policy for billing maintenance cadence.
+const BILLING_INTERVAL_SECONDS: u64 = 600;
+
 // appConst.billType* and bill status
 const BILL_RENTAL: i32 = 2;
 const UNPAID: i32 = 0;
 const PAID: i32 = 1;
-/// Rent is billed this long before the period ends.
+/// Retained server advance-billing policy for rent before the period ends.
 const BILL_AHEAD: i64 = 7 * FILETIME_DAY;
 
 const BILL_SELECT: &str =
@@ -154,7 +157,7 @@ pub async fn run_billing(db: Db, world: Arc<World>) {
         if let Err(CallError::Internal(e)) = run(&db, &world).await {
             warn!("billing failed: {e:#}");
         }
-        tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(BILLING_INTERVAL_SECONDS)).await;
     }
 }
 

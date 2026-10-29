@@ -11,6 +11,13 @@ use tracing::{error, info};
 const GAME_SCHEMA: &str = include_str!("../sql/game_schema.sql");
 const MARKET_SEED: &str = include_str!("../sql/market_seed.sql");
 
+/// Existing server policy for the first database reconnect delay.
+const RECONNECT_INITIAL_DELAY_SECONDS: u64 = 1;
+/// Existing server policy for the largest database reconnect retry delay.
+const RECONNECT_MAX_RETRY_DELAY_SECONDS: u64 = 16;
+/// Existing server policy for exponential database reconnect backoff.
+const RECONNECT_BACKOFF_FACTOR: u64 = 2;
+
 #[derive(Clone)]
 pub struct Db {
     pub client: Arc<Client>,
@@ -30,14 +37,14 @@ impl Db {
     }
 
     pub async fn connect(url: &str) -> Result<Db> {
-        let mut delay = 1;
+        let mut delay = RECONNECT_INITIAL_DELAY_SECONDS;
         let (client, conn) = loop {
             match tokio_postgres::connect(url, NoTls).await {
                 Ok(c) => break c,
-                Err(e) if delay <= 16 => {
+                Err(e) if delay <= RECONNECT_MAX_RETRY_DELAY_SECONDS => {
                     info!("database not ready ({e}); retrying in {delay}s");
                     tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-                    delay *= 2;
+                    delay *= RECONNECT_BACKOFF_FACTOR;
                 }
                 Err(e) => return Err(e).context("connecting to PostgreSQL"),
             }

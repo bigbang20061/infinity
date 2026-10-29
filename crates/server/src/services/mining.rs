@@ -5,7 +5,8 @@
 //! the system: ores by the system's security band, sized in the thousands of m3 each.
 //! Exploration's ore, ice and gas sites get fields of their own (services/exploration).
 //! Rocks are stored in game.asteroids and shrink as they are mined; an emptied belt
-//! grows back after BELT_REGROW_SECS.
+//! grows back after BELT_REGROW_SECS, scheduled on its system actor. Depletion
+//! timestamps persist; timers are restored when the system's fields are loaded.
 //!
 //! A mining module runs through combat's activation loop (the `miningLaser` /
 //! `miningClouds` effects): at the end of each cycle `extract` moves its yield
@@ -19,7 +20,7 @@
 
 use super::fit::{Fit, Key};
 use super::{db_err, keyval, notify_error, rand01, rand_dir, Call, CallError, CallResult};
-use crate::client::{filetime_now, Client};
+use crate::client::{filetime_now, unix_ms_from_filetime_ceil, Client};
 use crate::consts::{ATTR_CAPACITY, ATTR_MAX_RANGE, FILETIME_SECOND, FLAG_CARGO, FLAG_HANGAR, GROUP_ASTEROID_BELT, IX_LOCATION_ID, IX_STACK_SIZE};
 use crate::db::Db;
 use crate::space::{dist, now_ms, Ball, NotifyTx, World, MODE_RIGID, V3};
@@ -39,8 +40,8 @@ const FLAG_MINING_HOLD: i32 = 134; // flagGeneralMiningHold
 const SKILL_REPROCESSING: i32 = 3385;
 const SKILL_REPROCESSING_EFFICIENCY: i32 = 3389;
 const SKILL_SCRAPMETAL: i32 = 12196;
-/// An emptied belt grows back after this long.
-const BELT_REGROW_SECS: i64 = 2 * 3600;
+/// Server policy: an emptied belt grows back after two hours.
+const BELT_REGROW_SECS: i64 = 7200;
 /// NPC station reprocessing: base yield and tax (of the materials' value, in ISK).
 const STATION_EFFICIENCY: f64 = 0.5;
 const STATION_TAX: f64 = 0.05;
@@ -124,6 +125,7 @@ fn rock_ball(id: i64, type_id: i32, pos: V3, radius: f32) -> Ball {
         corp_id: 1,
         alliance_id: -1,
         char_id: None,
+        signature_radius: None,
         mode: MODE_RIGID,
         radius,
         mass: 1e34,
@@ -253,6 +255,7 @@ pub async fn ensure_fields(db: &Db, world: &Arc<World>, system: i64) -> Result<(
             .map(|r| r.get(0));
         let regrow_at = depleted.flatten().map(|t| t + BELT_REGROW_SECS * FILETIME_SECOND);
         if regrow_at.is_some_and(|t| t > now) {
+            world.system(system).await.map_err(CallError::Internal)?;
             schedule_regrow(db.clone(), world.clone(), system, belt, [b.get(1), b.get(2), b.get(3)], regrow_at.unwrap_or(now));
             continue;
         }
@@ -276,19 +279,24 @@ async fn grow_belt(db: &Db, world: &World, system: i64, belt: i64, center: V3, s
 }
 
 fn schedule_regrow(db: Db, world: Arc<World>, system: i64, belt: i64, center: V3, at: i64) {
-    tokio::spawn(async move {
-        let wait = ((at - filetime_now()) / FILETIME_SECOND).max(0) as u64;
-        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
-        let result = async {
-            let (security, jspace) = system_band(&db, system).await?;
-            grow_belt(&db, &world, system, belt, center, security, jspace).await
-        };
-        if let Err(e) = result.await {
-            warn!("mining: regrowing belt {belt}: {}", match e {
-                CallError::Internal(e) => format!("{e:#}"),
-                CallError::User { msg, .. } => msg,
+    let deadline_ms = unix_ms_from_filetime_ceil(at);
+    let world_ref = Arc::downgrade(&world);
+    world.post(system, move |s| {
+        s.schedule_at(deadline_ms, move |s| {
+            s.defer(async move {
+                let Some(world) = world_ref.upgrade() else { return };
+                let result = async {
+                    let (security, jspace) = system_band(&db, system).await?;
+                    grow_belt(&db, &world, system, belt, center, security, jspace).await
+                };
+                if let Err(e) = result.await {
+                    warn!("mining: regrowing belt {belt}: {}", match e {
+                        CallError::Internal(e) => format!("{e:#}"),
+                        CallError::User { msg, .. } => msg,
+                    });
+                }
             });
-        }
+        });
     });
 }
 
@@ -654,6 +662,13 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regrowth_deadline_rounds_up_to_milliseconds() {
+        let whole = crate::client::filetime_from_unix_ms(42);
+        assert_eq!(unix_ms_from_filetime_ceil(whole), 42);
+        assert_eq!(unix_ms_from_filetime_ceil(whole + 1), 43);
+    }
 
     #[test]
     fn ore_bands_follow_security() {

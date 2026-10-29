@@ -6,6 +6,11 @@ use super::*;
 use std::collections::BTreeMap;
 use std::future::Future;
 
+
+/// Existing server cold-skip speed tolerance.
+const MOVING_SPEED_EPSILON: f64 = 1e-9;
+/// Destiny destruction effect EXPLOSION.
+const DESTRUCTION_EFFECT_EXPLOSION: i64 = 3;
 type Timer = Box<dyn FnOnce(&mut System) + Send>;
 
 #[derive(Default)]
@@ -22,6 +27,7 @@ pub struct System {
     pub(super) ms: i64,
     pub(super) brains: HashMap<i64, NpcBrain>,
     pub(super) effect_jobs: Option<mpsc::UnboundedSender<npc::EffectJob>>,
+    pub(super) deferred_jobs: Option<mpsc::UnboundedSender<npc::NpcFuture>>,
     pub(super) groups: HashMap<u64, npc::SpawnGroup>,
     pub(super) member_groups: HashMap<i64, std::collections::HashSet<u64>>,
     pub(super) due_brains: Vec<i64>,
@@ -34,15 +40,19 @@ impl System {
     /// run only on ticks, ordered by deadline and then insertion order (also for
     /// zero delays). D3 applies: no await, DB access or calls back into World.
     pub fn schedule(&mut self, delay_ms: u64, f: impl FnOnce(&mut System) + Send + 'static) {
-        let due = self.ms.saturating_add(i64::try_from(delay_ms).unwrap_or(i64::MAX));
+        self.schedule_at(self.ms.saturating_add(i64::try_from(delay_ms).unwrap_or(i64::MAX)), f);
+    }
+    /// Queue an absolute Unix-millisecond deadline, ordered by insertion on ties.
+    pub fn schedule_at(&mut self, due: i64, f: impl FnOnce(&mut System) + Send + 'static) {
         let sequence = self.timer_sequence;
         self.timer_sequence = sequence.checked_add(1).expect("space timer sequence exhausted");
         self.timers.insert((due, sequence), Box::new(f));
     }
-    /// Hand owned async work to this system's sequential effects worker.
-    /// The future is polled outside the actor and may access DB and World.
+    /// Actor simulation time in Unix milliseconds.
+    pub fn now_ms(&self) -> i64 { self.ms }
+    /// Submit owned async work to the concurrent worker outside the actor.
     pub fn defer(&self, job: impl Future<Output = ()> + Send + 'static) {
-        if self.effect_jobs.as_ref().is_none_or(|tx| tx.send(npc::EffectJob::Deferred(Box::pin(job))).is_err()) {
+        if self.deferred_jobs.as_ref().is_none_or(|tx| tx.send(Box::pin(job)).is_err()) {
             tracing::warn!(system = self.id, "space effects worker unavailable");
         }
     }
@@ -101,12 +111,14 @@ impl System {
         for b in self.balls.values_mut() { b.evolve(ms, &self.positions); }
     }
     pub(super) fn is_cold(&self) -> bool {
-        self.timers.is_empty() && self.brains.is_empty() && self.observers.is_empty() && !self.balls.values().any(|b|
-            (b.free && b.mode != MODE_MISSILE && (b.mode != MODE_STOP || len(b.vel) > 1e-9))
+        !self.timers.first_key_value().is_some_and(|(&(due, _), _)| due <= self.ms)
+            && self.brains.is_empty() && self.observers.is_empty() && !self.balls.values().any(|b|
+            (b.free && b.mode != MODE_MISSILE && (b.mode != MODE_STOP || len(b.vel) > MOVING_SPEED_EPSILON))
             || (b.cloak != 0 && b.cloak_until > 0))
     }
     pub fn tick(&mut self, ms: i64) {
         self.observers.retain(|_, (_, tx)| !tx.is_closed());
+        self.ms = ms;
         if self.is_cold() { return; }
         self.pending = Some(HashMap::new());
         self.evolve_all(ms);
@@ -140,32 +152,32 @@ impl System {
         self.deliver(visibility, events);
     }
     pub fn add_ship(&mut self, ball: Ball) {
-        if ball.cloak == 0 { self.deliver(None, vec![add_balls_event(self.ms / 1000, &ball)]); }
+        if ball.cloak == 0 { self.deliver(None, vec![add_balls_event(destiny_stamp(self.ms), &ball)]); }
         self.insert(ball);
     }
     pub fn remove_ball(&mut self, id: i64) -> Option<Ball> {
         let b = self.take(id)?;
         self.observers.retain(|_, (ego, _)| *ego != id);
         if b.cloak == 0 {
-            self.deliver(None, vec![event(self.ms / 1000, "RemoveBalls", vec![Value::list([Value::Int(id)])])]);
+            self.deliver(None, vec![event(destiny_stamp(self.ms), "RemoveBalls", vec![Value::list([Value::Int(id)])])]);
         }
         if b.char_id.is_some() { self.registry.pump_queue(self.id, self.population()); }
         Some(b)
     }
     pub fn destroy_ball(&mut self, id: i64) -> Option<Ball> {
         let b = self.take(id)?;
-        let stamp = self.ms / 1000;
+        let stamp = destiny_stamp(self.ms);
         self.deliver(Some((b.id, b.cloak)), vec![
-            event(stamp, "TerminalPlayDestructionEffect", vec![Value::Int(id), Value::Int(3)]),
+            event(stamp, "TerminalPlayDestructionEffect", vec![Value::Int(id), Value::Int(DESTRUCTION_EFFECT_EXPLOSION)]),
             event(stamp, "RemoveBalls", vec![Value::list([Value::Int(id)])]),
         ]);
         if b.char_id.is_some() { self.registry.pump_queue(self.id, self.population()); }
         Some(b)
     }
-    pub fn set_health(&mut self, id: i64, health: [f64; 3]) {
+    pub fn set_health(&mut self, id: i64, health: [f64; DAMAGE_LAYER_COUNT]) {
         let Some(b) = self.balls.get_mut(&id) else { return };
         b.health = health;
-        let update = event(self.ms / 1000, "OnDamageStateChange", vec![Value::Int(id), b.damage_state()]);
+        let update = event(destiny_stamp(self.ms), "OnDamageStateChange", vec![Value::Int(id), b.damage_state()]);
         self.broadcast(id, vec![update]);
     }
     pub fn uncloak(&mut self, ship: i64) -> bool {
@@ -173,8 +185,8 @@ impl System {
         if ball.cloak == 0 { return false; }
         ball.cloak = 0;
         ball.cloak_until = 0;
-        let add = add_balls_event(self.ms / 1000, ball);
-        let own = event(self.ms / 1000, "UncloakBall", vec![Value::Int(ship)]);
+        let add = add_balls_event(destiny_stamp(self.ms), ball);
+        let own = event(destiny_stamp(self.ms), "UncloakBall", vec![Value::Int(ship)]);
         self.observers.retain(|&client, (ego, tx)| {
             if tx.is_closed() { return false; }
             let update = if *ego == ship { own.clone() } else { add.clone() };
@@ -187,7 +199,7 @@ impl System {
     }
     pub fn observe(&mut self, client_id: i64, ego: i64, tx: DestinyTx) -> Value {
         let system_id = self.id;
-        let tick = self.ms / 1000;
+        let tick = destiny_stamp(self.ms);
         self.observers.insert(client_id, (ego, tx));
         let mut state = vec![DESTINY_FULLSTATE];
         state.extend_from_slice(&(tick as i32).to_le_bytes());
@@ -202,7 +214,7 @@ impl System {
         }
         let sol = Value::instance(
             "eve.common.script.util.slimItem.SlimItem",
-            [("itemID", Value::Int(system_id)), ("typeID", Value::Int(5)), ("ownerID", Value::Int(1))],
+            [("itemID", Value::Int(system_id)), ("typeID", Value::Int(crate::consts::TYPE_SOLAR_SYSTEM.into())), ("ownerID", Value::Int(1))],
         );
         let bag = Value::instance(
             "utillib.KeyVal",
@@ -227,7 +239,7 @@ impl System {
     /// The commanded ball is detached temporarily; the rest of the system is borrowed, not cloned.
     pub fn command(&mut self, ship: i64, f: impl FnOnce(&mut Ball, i64, &System) -> Vec<Value>) {
         let Some(mut ball) = self.balls.remove(&ship) else { return };
-        let events = f(&mut ball, self.ms / 1000, self);
+        let events = f(&mut ball, destiny_stamp(self.ms), self);
         let visibility = (ball.id, ball.cloak);
         self.balls.insert(ship, ball);
         if !events.is_empty() { self.deliver(Some(visibility), events); }
@@ -240,7 +252,7 @@ mod tests {
     fn ball(id: i64, pilot: Option<i64>, x: f64) -> Ball {
         Ball {
             id, type_id: 1, owner_id: 1, corp_id: 1, alliance_id: -1,
-            char_id: pilot, mode: MODE_STOP, radius: 1.0, mass: 1e6,
+            char_id: pilot, signature_radius: pilot.map(|_| 1.0), mode: MODE_STOP, radius: 1.0, mass: 1e6,
             max_vel: 100.0, agility: 1.0, speed_fraction: 0.0,
             pos: [x, 0.0, 0.0], vel: [0.0; 3], goto: [0.0; 3],
             follow_id: 0, follow_range: 0.0, free: true, global: false,
@@ -504,16 +516,31 @@ mod tests {
     }
 
     #[test]
-    fn pending_timer_keeps_otherwise_idle_system_out_of_cold_skip() {
+    fn future_timer_allows_cold_skip_until_due() {
         let mut s = System::default();
-        assert!(s.is_cold());
         s.schedule(1000, |s| assert_eq!(s.ms, 1000));
-        assert!(!s.is_cold());
+        assert!(s.is_cold());
         s.tick(100);
         assert_eq!(s.ms, 100);
-        assert!(!s.is_cold());
+        assert!(s.is_cold());
         s.tick(1000);
         assert!(s.timers.is_empty());
         assert!(s.is_cold());
+    }
+
+    #[test]
+    fn absolute_deadlines_preserve_cadence_and_tie_order() {
+        let mut s = System::default();
+        let result = Arc::new(Mutex::new(Vec::new()));
+        let first = result.clone();
+        s.schedule_at(150, move |s| {
+            first.lock().unwrap().push((1, s.now_ms()));
+            s.schedule_at(300, move |s| first.lock().unwrap().push((3, s.now_ms())));
+        });
+        let second = result.clone();
+        s.schedule_at(150, move |s| second.lock().unwrap().push((2, s.now_ms())));
+        s.tick(200);
+        s.tick(300);
+        assert_eq!(*result.lock().unwrap(), [(1, 200), (2, 200), (3, 300)]);
     }
 }

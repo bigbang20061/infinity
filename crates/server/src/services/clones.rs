@@ -16,6 +16,8 @@ use tracing::info;
 const SKILL_INFOMORPH_PSYCHOLOGY: i32 = 24242;
 const SKILL_ADVANCED_INFOMORPH_PSYCHOLOGY: i32 = 33407;
 const SKILL_INFOMORPH_SYNCHRONIZING: i32 = 33399;
+/// Existing server policy: base jump clone cooldown before skill reduction, in hours.
+const BASE_JUMP_COOLDOWN_HOURS: i64 = 24;
 
 async fn skill(c: &Client, me: i64, skill: i32) -> Result<i64, CallError> {
     Ok(c.db
@@ -80,7 +82,7 @@ async fn jump(c: &mut Client, me: i64, dest: i64, clone_id: i64) -> CallResult {
     };
     let last: Option<i64> =
         c.db.client.query_one("SELECT last_clone_jump FROM game.characters WHERE character_id = $1", &[&me]).await.map_err(db_err)?.get(0);
-    let cooldown = (24 - skill(c, me, SKILL_INFOMORPH_SYNCHRONIZING).await?) * FILETIME_HOUR;
+    let cooldown = (BASE_JUMP_COOLDOWN_HOURS - skill(c, me, SKILL_INFOMORPH_SYNCHRONIZING).await?) * FILETIME_HOUR;
     let now = filetime_now();
     if let Some(ready) = last.map(|l| l + cooldown).filter(|r| *r > now) {
         let hours = (ready - now) as f64 / FILETIME_HOUR as f64;

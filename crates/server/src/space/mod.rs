@@ -10,11 +10,12 @@
 //! Celestials come from the SDE; dynamic balls stay in memory. Each system
 //! owns an actor with a 100 ms tick and closure messages. Destiny stamps remain
 //! whole seconds. NPC decisions, spawn groups and closure timers live in the actor;
-//! combat effects run on a per-system worker. Timers fire on ticks in deadline and
-//! scheduling order. Persistent timers and position snapshots are not supported.
+//! NPC combat effects run sequentially and deferred jobs concurrently outside it.
+//! Timers fire on ticks in deadline and scheduling order; persistent timers and
+//! position snapshots are not supported.
 //! Shared vector distances are defined here for simulation and service callers.
 
-use crate::consts::{AU, FILETIME_SECOND};
+use crate::consts::{AU, DAMAGE_LAYER_COUNT, FILETIME_SECOND, SECONDS_PER_MINUTE};
 use crate::db::Db;
 use anyhow::Result;
 use marshal::{DbRowDescriptor, DbType, Value};
@@ -48,8 +49,40 @@ pub const CLOAK_RESTORE: u8 = 2;
 const DESTINY_FULLSTATE: u8 = 0;
 const DESTINY_BALLS: u8 = 1;
 
+/// SI time conversion.
+const MILLISECONDS_PER_SECOND: i64 = 1000;
+/// SI distance conversion.
+const METRES_PER_KILOMETRE: f64 = 1000.0;
+/// SI mass conversion: kilograms per tonne.
+const KILOGRAMS_PER_TONNE: f64 = 1000.0;
+/// Existing normalization tolerance.
+const VECTOR_LENGTH_EPSILON: f64 = 1e-9;
+/// Existing player targeting formula, preserved by D17.
+const LOCK_TIME_FACTOR_SECONDS: f64 = 40_000.0;
+/// Existing player targeting minimum.
+const MIN_LOCK_TIME_SECONDS: f64 = 0.5;
+/// Existing player targeting maximum.
+const MAX_LOCK_TIME_SECONDS: f64 = 60.0;
+/// Existing missing-warp-state serialization default.
+const DEFAULT_WARP_FACTOR: i64 = 3000;
+/// Existing server damage-state placeholder policy.
+const DAMAGE_STATE_SHIELD_RECHARGE_TAU: f64 = 100_000.0;
+/// Existing destiny mass/agility integration scale.
+const MASS_AGILITY_SCALE: f64 = 1e6;
+/// Existing server integration floor.
+const MIN_MOVEMENT_TAU_SECONDS: f64 = 0.1;
+/// Carbonengine Ballpark::SetupWarpConstants.
+const MAX_WARP_DECELERATION: f64 = 2.0;
+/// Existing server fallback for missing celestial radii.
+const CELESTIAL_FALLBACK_RADIUS: f64 = 1000.0;
+/// Existing server rigid-celestial representation.
+const CELESTIAL_STATIC_MASS: f64 = 1e34;
+
+/// Carbonengine warp factor to AU per second.
 const WARP_FACTOR_TO_AU_PER_SECOND: f64 = 0.001;
+/// Carbonengine warp factor to acceleration.
 const WARP_FACTOR_TO_ACCELERATION: f64 = 1.0 / 1000.0;
+/// Carbonengine warp factor to deceleration.
 const WARP_FACTOR_TO_DECELERATION: f64 = 1.0 / 3000.0;
 
 pub type V3 = [f64; 3];
@@ -72,11 +105,32 @@ pub fn dist(a: V3, b: V3) -> f64 {
 }
 fn norm(a: V3) -> V3 {
     let l = len(a);
-    if l < 1e-9 {
+    if l < VECTOR_LENGTH_EPSILON {
         [1.0, 0.0, 0.0]
     } else {
         scale(a, 1.0 / l)
     }
+}
+
+/// Convert Unix milliseconds to a whole-second destiny stamp.
+pub fn destiny_stamp(unix_ms: i64) -> i64 { unix_ms / MILLISECONDS_PER_SECOND }
+/// Convert milliseconds to seconds.
+pub fn ms_to_seconds(ms: f64) -> f64 { ms / MILLISECONDS_PER_SECOND as f64 }
+/// Convert minutes to seconds without discarding fractional minutes.
+pub fn minutes_to_seconds(minutes: f64) -> f64 { minutes * SECONDS_PER_MINUTE as f64 }
+/// Convert seconds to milliseconds without discarding fractions.
+pub fn seconds_to_ms_f64(seconds: f64) -> f64 { seconds * MILLISECONDS_PER_SECOND as f64 }
+/// Convert seconds to whole milliseconds.
+pub fn seconds_to_ms(seconds: f64) -> u64 { seconds_to_ms_f64(seconds) as u64 }
+/// Convert kilograms to tonnes.
+pub fn kg_to_tonnes(kg: f64) -> f64 { kg / KILOGRAMS_PER_TONNE }
+/// Convert metres to kilometres.
+pub fn metres_to_km(metres: f64) -> f64 { metres / METRES_PER_KILOMETRE }
+/// Shared player and NPC targeting duration from effective dogma attributes.
+pub fn lock_time_ms(scan_resolution: f64, signature_radius: f64) -> u64 {
+    let signature = signature_radius.max(1.0).asinh();
+    seconds_to_ms((LOCK_TIME_FACTOR_SECONDS / (scan_resolution.max(1.0) * signature * signature))
+        .clamp(MIN_LOCK_TIME_SECONDS, MAX_LOCK_TIME_SECONDS))
 }
 
 /// Simulation clock in Unix milliseconds (not a Destiny event stamp).
@@ -86,7 +140,7 @@ pub fn now_ms() -> i64 {
 
 /// Destiny event stamp in whole Unix seconds.
 pub fn now_tick() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64
+    destiny_stamp(now_ms())
 }
 
 #[derive(Clone)]
@@ -111,6 +165,8 @@ pub struct Ball {
     pub char_id: Option<i64>,
     pub mode: u8,
     pub radius: f32,
+    /// Cached effective pilot-ship dogma signature radius for actor targeting; not serialized to destiny.
+    pub signature_radius: Option<f64>,
     pub mass: f64,
     pub max_vel: f32,
     pub agility: f32,
@@ -132,7 +188,7 @@ pub struct Ball {
     /// When an arrival cloak lapses (FILETIME), to tell a lapse from a later cloak.
     pub cloak_until: i64,
     /// Shield, armor and structure left, as fractions (damage state).
-    pub health: [f64; 3],
+    pub health: [f64; DAMAGE_LAYER_COUNT],
     /// For missiles: the ship that launched it (destiny's mOwnerId).
     pub launcher: i64,
     /// Extra slim item fields (jumps for gates, names...).
@@ -186,17 +242,17 @@ impl Ball {
                 o.extend_from_slice(&self.follow_id.to_le_bytes());
                 o.extend_from_slice(&self.follow_range.to_le_bytes());
                 o.extend_from_slice(&self.launcher.to_le_bytes());
-                o.extend_from_slice(&((self.last_ms / 1000) as i32).to_le_bytes()); // effectStamp: launch tick
+                o.extend_from_slice(&(destiny_stamp(self.last_ms) as i32).to_le_bytes()); // effectStamp: launch tick
                 for c in self.goto {
                     o.extend_from_slice(&c.to_le_bytes());
                 }
             }
             MODE_WARP => {
-                let w = self.warp.clone().unwrap_or(Warp { from: self.pos, to: self.goto, start: now_ms(), duration: 0.0, factor: 3000, min_range: 0.0 });
+                let w = self.warp.clone().unwrap_or(Warp { from: self.pos, to: self.goto, start: now_ms(), duration: 0.0, factor: DEFAULT_WARP_FACTOR, min_range: 0.0 });
                 for c in w.to {
                     o.extend_from_slice(&c.to_le_bytes());
                 }
-                o.extend_from_slice(&((w.start / 1000) as i32).to_le_bytes()); // effectStamp
+                o.extend_from_slice(&(destiny_stamp(w.start) as i32).to_le_bytes()); // effectStamp
                 o.extend_from_slice(&dist(w.to, w.from).to_le_bytes()); // total warp length
                 o.extend_from_slice(&(w.min_range as i64).to_le_bytes());
                 o.extend_from_slice(&w.factor.to_le_bytes());
@@ -209,7 +265,7 @@ impl Ball {
     pub fn damage_state(&self) -> Value {
         let [shield, armor, hull] = self.health;
         Value::tuple([
-            Value::tuple([Value::Float(shield), Value::Float(100000.0), Value::Int(crate::client::filetime_now())]),
+            Value::tuple([Value::Float(shield), Value::Float(DAMAGE_STATE_SHIELD_RECHARGE_TAU), Value::Int(crate::client::filetime_now())]),
             Value::Float(armor),
             Value::Float(hull),
         ])
@@ -247,7 +303,7 @@ impl Ball {
             let elapsed = (ms - w.start) as f64;
             if elapsed >= w.duration {
                 self.pos = w.to;
-                self.vel = [0.0; 3];
+                self.vel = V3::default();
                 self.warp = None;
                 self.mode = MODE_STOP;
                 self.speed_fraction = 0.0;
@@ -257,17 +313,17 @@ impl Ball {
             self.last_ms = ms;
             return;
         }
-        let dt = (ms - self.last_ms) as f64 / 1000.0;
-        let tau = (self.mass * self.agility as f64 / 1e6).max(0.1);
+        let dt = ms_to_seconds((ms - self.last_ms) as f64);
+        let tau = (self.mass * self.agility as f64 / MASS_AGILITY_SCALE).max(MIN_MOVEMENT_TAU_SECONDS);
         let speed = (self.max_vel * self.speed_fraction) as f64;
         let target = match self.mode {
             MODE_GOTO => scale(norm(self.goto), speed),
             MODE_FOLLOW | MODE_ORBIT => others.get(&self.follow_id).map(|&p| {
                 let d = sub(p, self.pos);
-                if len(d) <= self.follow_range as f64 + self.radius as f64 { [0.0; 3] }
+                if len(d) <= self.follow_range as f64 + self.radius as f64 { V3::default() }
                 else { scale(norm(d), speed) }
-            }).unwrap_or([0.0; 3]),
-            _ => [0.0; 3],
+            }).unwrap_or_default(),
+            _ => V3::default(),
         };
         let decay = (-dt / tau).exp();
         let delta = sub(self.vel, target);
@@ -280,7 +336,7 @@ impl Ball {
 /// Ballpark::SetupWarpConstants -> total warp duration in seconds.
 pub fn warp_duration(factor: f64, distance: f64) -> f64 {
     let accel = factor * WARP_FACTOR_TO_ACCELERATION;
-    let decel = (factor * WARP_FACTOR_TO_DECELERATION).min(2.0);
+    let decel = (factor * WARP_FACTOR_TO_DECELERATION).min(MAX_WARP_DECELERATION);
     let speed = (factor * WARP_FACTOR_TO_AU_PER_SECOND * AU).min((distance + 1.0) * accel * decel / (accel + decel));
     let accel_t = (speed / accel).ln() / accel;
     let cruise_t = (distance / speed) - (1.0 / accel) - (1.0 / decel) + (1.0 / speed);
@@ -434,14 +490,14 @@ impl World {
             .db
             .client
             .query(
-                "SELECT c.item_id, c.type_id, COALESCE(c.radius, t.radius, 1000)::float8, c.x, c.y, c.z,
+                "SELECT c.item_id, c.type_id, COALESCE(c.radius, t.radius, $2::float8)::float8, c.x, c.y, c.z,
                         COALESCE(s.owner_id, 1)::bigint, c.group_id::bigint,
                         g.dest_stargate_id::bigint, g.dest_solar_system_id::bigint
                  FROM sde.map_celestials c JOIN sde.inv_types t USING (type_id)
                  LEFT JOIN sde.sta_stations s ON s.station_id = c.item_id
                  LEFT JOIN sde.map_stargates g ON g.stargate_id = c.item_id
                  WHERE c.solar_system_id = $1",
-                &[&(system_id as i32)],
+                &[&(system_id as i32), &CELESTIAL_FALLBACK_RADIUS],
             )
             .await?;
         let tick = now_ms();
@@ -470,15 +526,16 @@ impl World {
                     corp_id: r.get(6),
                     alliance_id: -1,
                     char_id: None,
+                    signature_radius: None,
                     mode: MODE_RIGID,
                     radius: r.get::<_, f64>(2) as f32,
-                    mass: 1e34,
+                    mass: CELESTIAL_STATIC_MASS,
                     max_vel: 0.0,
                     agility: 1.0,
                     speed_fraction: 0.0,
                     pos: [r.get(3), r.get(4), r.get(5)],
-                    vel: [0.0; 3],
-                    goto: [0.0; 3],
+                    vel: V3::default(),
+                    goto: V3::default(),
                     follow_id: 0,
                     follow_range: 0.0,
                     free: false,
@@ -522,6 +579,10 @@ impl World {
     pub fn schedule(&self, system: i64, delay_ms: u64, f: impl FnOnce(&mut System) + Send + 'static) {
         self.post(system, move |s| s.schedule(delay_ms, f));
     }
+    /// Wait for a timer tick without loading a missing system.
+    pub async fn after(&self, system: i64, delay_ms: u64) -> bool {
+        actor::after(self.running(system), delay_ms).await
+    }
     pub async fn ball(&self, system: i64, id: i64) -> Option<Ball> {
         self.with(system, move |s| s.ball(id).cloned()).await.flatten()
     }
@@ -541,7 +602,7 @@ impl World {
     pub async fn request_entry(&self, system: i64, pilot: i64) -> Result<(), i64> {
         self.with(system, move |s| s.request_entry(pilot)).await.unwrap_or(Err(1))
     }
-    pub fn set_health(&self, system: i64, id: i64, health: [f64; 3]) {
+    pub fn set_health(&self, system: i64, id: i64, health: [f64; DAMAGE_LAYER_COUNT]) {
         self.post(system, move |s| s.set_health(id, health));
     }
     pub fn broadcast(&self, system: i64, about: i64, events: Vec<Value>) {
@@ -561,5 +622,26 @@ impl World {
     pub fn unobserve(&self, client: i64) {
         let system = self.observers.lock().unwrap().remove(&client);
         if let Some(system) = system { self.post(system, move |s| s.unobserve(client)); }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn seconds_to_milliseconds_preserves_fractions() {
+        assert_eq!(seconds_to_ms_f64(0.0015), 1.5);
+        assert_eq!(seconds_to_ms_f64(-0.0015), -1.5);
+        assert_eq!(seconds_to_ms(0.0015), 1);
+    }
+
+
+    #[test]
+    fn lock_time_clamps_floors_and_calculates_interior() {
+        assert_eq!(lock_time_ms(1.0, 1.0), 60_000);
+        assert_eq!(lock_time_ms(1e9, 1e9), 500);
+        assert_eq!(lock_time_ms(-10.0, 0.0), lock_time_ms(1.0, 1.0));
+        let expected = (40_000.0 / (200.0 * 50.0_f64.asinh().powi(2)) * 1000.0) as u64;
+        assert_eq!(lock_time_ms(200.0, 50.0), expected);
     }
 }

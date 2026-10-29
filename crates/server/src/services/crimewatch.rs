@@ -12,15 +12,18 @@
 //! A lost player ship writes a killmail (game.killmails) naming everyone who damaged it in the
 //! last 5 minutes; an illegal kill costs those aggressors more security status. Killing NPCs
 //! that carry a bounty slowly raises it.
+//! CONCORD responses use the crime system's actor timer; character expiry timers
+//! follow pilots across systems and stations on Tokio tasks. These timers and
+//! criminal flags are in memory and do not survive a server restart.
 
 use super::{db_err, keyval, Call, CallError, CallResult};
-use crate::client::{filetime_now, Client};
+use crate::client::{filetime_now, ms_from_filetime_ticks, Client};
 use crate::consts::{FILETIME_MINUTE, FILETIME_SECOND};
 use crate::db::Db;
-use crate::space::World;
+use crate::space::{seconds_to_ms, World};
 use marshal::Value;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use tracing::{info, warn};
 
 // crimewatch.const
@@ -32,9 +35,13 @@ const CRIMINAL_IDLE: i64 = 300;
 const CRIMINAL_TIMER: i64 = 303;
 const NPC_IDLE: i64 = 400;
 const DISAPPROVAL_IDLE: i64 = 500;
+/// Retained server policy for the weapons timer duration.
 const WEAPONS_TIMEOUT: i64 = 60 * FILETIME_SECOND;
+/// Retained server policy for the PvP timer duration.
 const PVP_TIMEOUT: i64 = 15 * FILETIME_MINUTE;
+/// Retained server policy for the criminal timer duration.
 const CRIMINAL_TIMEOUT: i64 = 15 * FILETIME_MINUTE;
+/// Retained server policy for the engagement duration.
 const ENGAGEMENT_DURATION: i64 = 5 * FILETIME_MINUTE;
 const SAFETY_LEVEL_FULL: i64 = 2;
 
@@ -42,12 +49,20 @@ const SAFETY_LEVEL_FULL: i64 = 2;
 const OUTLAW: f64 = -5.0;
 /// Systems at or above this security (0.5 once rounded) are high-sec, where CONCORD answers.
 const HIGH_SEC: f64 = 0.45;
+/// Existing CONCORD response formula's minimum security input, distinct from the high-sec threshold.
+const CONCORD_MIN_SECURITY: f64 = 0.5;
+/// Existing server CONCORD response delay at maximum security.
+const CONCORD_BASE_DELAY_SECONDS: f64 = 6.0;
+/// Existing server CONCORD response delay slope per security point.
+const CONCORD_DELAY_SLOPE_SECONDS: f64 = 28.0;
+/// Existing server grace period after a character timer's expiry.
+const CHARACTER_TIMER_GRACE_MS: u64 = 500;
 /// Fraction of the way to -10 an illegal aggression, and an illegal kill, cost.
 const AGGRESSION_PENALTY: f64 = 0.025;
 const KILL_PENALTY: f64 = 0.05;
 /// Fraction of the way to +10 an NPC kill with a bounty earns.
 const NPC_KILL_GAIN: f64 = 0.0005;
-/// Damage older than this doesn't put an attacker on the killmail.
+/// Retained server killmail window policy: older damage does not put an attacker on the killmail.
 const KILLMAIL_WINDOW: i64 = 5 * FILETIME_MINUTE;
 // notificationconst
 const NOTIFICATION_KILL_REPORT_VICTIM: i32 = 140;
@@ -85,6 +100,15 @@ struct State {
 fn state() -> MutexGuard<'static, State> {
     static STATE: OnceLock<Mutex<State>> = OnceLock::new();
     STATE.get_or_init(Default::default).lock().unwrap()
+}
+
+/// Owns a pending response until its timer runs or is discarded.
+struct PendingConcord(i64);
+
+impl Drop for PendingConcord {
+    fn drop(&mut self) {
+        state().concord.remove(&self.0);
+    }
 }
 
 /// When the pilot's weapons timer runs out, if it is running.
@@ -147,7 +171,7 @@ fn announce(world: &Arc<World>, char_id: i64, event: &'static str, running: i64,
     world.notify_pilot(char_id, event, vec![Value::Int(running), Value::Int(until)]);
     let world = world.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(((until - filetime_now()).max(0) / 10_000) as u64 + 500)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(ms_from_filetime_ticks((until - filetime_now()).max(0)) as u64 + CHARACTER_TIMER_GRACE_MS)).await;
         let current = {
             let st = state();
             st.pilots.get(&char_id).map(|p| match event {
@@ -224,7 +248,7 @@ fn clear_flag_later(db: Db, world: Arc<World>, char_id: i64, until: i64) {
     tokio::spawn(async move {
         let mut until = until;
         loop {
-            tokio::time::sleep(std::time::Duration::from_millis(((until - filetime_now()).max(0) / 10_000) as u64 + 500)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(ms_from_filetime_ticks((until - filetime_now()).max(0)) as u64 + CHARACTER_TIMER_GRACE_MS)).await;
             let current = state().pilots.get(&char_id).map(|p| p.criminal_until).unwrap_or(0);
             if current > filetime_now() {
                 until = current;
@@ -249,21 +273,30 @@ fn clear_flag_later(db: Db, world: Arc<World>, char_id: i64, until: i64) {
 
 /// CONCORD arrives (6 s in 1.0 systems, up to 20 s in 0.5) and destroys the criminal's ship.
 fn dispatch_concord(world: Arc<World>, system: i64, criminal: i64, security: f64) {
-    let delay = (6.0 + (1.0 - security.clamp(0.5, 1.0)) * 28.0) as u64;
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-        state().concord.remove(&criminal);
-        let ship = world.with(system, move |s| s.pilot_ball(criminal).map(|b| b.id)).await.flatten();
-        if let Some(ship) = ship {
+    let delay_seconds = (CONCORD_BASE_DELAY_SECONDS + (1.0 - security.clamp(CONCORD_MIN_SECURITY, 1.0)) * CONCORD_DELAY_SLOPE_SECONDS) as u64;
+    let pending = PendingConcord(criminal);
+    let weak_world = Arc::downgrade(&world);
+    world.schedule(system, seconds_to_ms(delay_seconds as f64), concord_response(pending, system, weak_world));
+}
+
+fn concord_response(pending: PendingConcord, system: i64, weak_world: Weak<World>) -> impl FnOnce(&mut crate::space::System) + Send + 'static {
+    move |s| {
+        let criminal = pending.0;
+        drop(pending);
+        if let Some(ship) = s.pilot_ball(criminal).map(|b| b.id) {
             info!("crimewatch: CONCORD destroyed ship {ship} of {criminal} in {system}");
-            world.notify_pilot(
+            s.notify_pilot(
                 criminal,
                 "OnRemoteMessage",
                 vec![Value::str("CustomNotify"), Value::dict([("notify", Value::unicode("统合部因你的犯罪行为摧毁了你的舰船。"))])],
             );
-            super::combat::destroy_player_ship(&world, system, ship, criminal).await;
+            s.defer(async move {
+                if let Some(world) = weak_world.upgrade() {
+                    super::combat::destroy_player_ship(&world, system, ship, criminal).await;
+                }
+            });
         }
-    });
+    }
 }
 
 /// `attacker`'s weapon did `amount` damage to a player's `ship`.
@@ -461,4 +494,43 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         ("warStatisticMgr", "GetKillMail") => killmails(c, None, int(0).unwrap_or(0), 1, None).await.map(|v| v.items().and_then(|k| k.first().cloned()).unwrap_or(Value::None)),
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::space::System;
+
+    #[test]
+    fn discarded_concord_callback_clears_marker() {
+        let criminal = -101;
+        assert!(state().concord.insert(criminal));
+        let callback = concord_response(PendingConcord(criminal), 1, Weak::new());
+        assert!(state().concord.contains(&criminal));
+        drop(callback);
+        assert!(!state().concord.contains(&criminal));
+    }
+
+    #[test]
+    fn dropping_system_clears_queued_concord_marker() {
+        let criminal = -102;
+        assert!(state().concord.insert(criminal));
+        let mut system = System::default();
+        system.schedule(1, concord_response(PendingConcord(criminal), 1, Weak::new()));
+        assert!(state().concord.contains(&criminal));
+        drop(system);
+        assert!(!state().concord.contains(&criminal));
+    }
+
+    #[test]
+    fn executed_concord_callback_allows_another_response() {
+        let criminal = -103;
+        assert!(state().concord.insert(criminal));
+        let mut system = System::default();
+        system.schedule(1, concord_response(PendingConcord(criminal), 1, Weak::new()));
+        system.tick(1);
+        assert!(state().concord.insert(criminal));
+        drop(system);
+        assert!(state().concord.remove(&criminal));
+    }
 }

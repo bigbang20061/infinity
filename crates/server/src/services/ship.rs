@@ -1,19 +1,23 @@
 //! Undocking, flying and docking: the `ship` service (bound per location) and
 //! the `beyonce` remote ballpark (bound per solar system).
-//! Movement runs in per-system actors; arrival cloak expiry is handled by the actor tick.
+//! Movement and jump waits run in per-system actors; arrival cloak expiry is handled by the actor tick.
+//! Local-chat invites use an outside-space delay for session settlement.
 //! Uses ship attributes and celestial data from the SDE and persists locations in game tables.
-//! Mirrors the client ship service and remote ballpark; NPC workers and actor timers are out of scope.
+//! Mirrors the client ship service and remote ballpark; NPC workers are out of scope.
 
 use super::{db_err, Call, CallError, CallResult};
 use crate::client::{short, Client};
-use crate::consts::{ATTR_MASS, ATTR_MAX_VELOCITY, FILETIME_SECOND, FLAG_HANGAR, TYPE_CAPSULE};
-use crate::space::{self, event, now_ms, now_tick, warp_duration, Ball, Warp, V3, CLOAK_RESTORE, MODE_FOLLOW, MODE_GOTO, MODE_ORBIT, MODE_STOP, MODE_WARP};
+use crate::consts::{ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_SIGNATURE_RADIUS, FILETIME_SECOND, FLAG_HANGAR, TYPE_CAPSULE};
+use crate::space::{self, event, now_ms, now_tick, seconds_to_ms_f64, warp_duration, Ball, Warp, V3, CLOAK_RESTORE, MODE_FOLLOW, MODE_GOTO, MODE_ORBIT, MODE_STOP, MODE_WARP};
 use marshal::Value;
 use tracing::{info, warn};
 
 const ATTR_AGILITY: i32 = 70;
 const ATTR_WARP_SPEED_MULTIPLIER: i32 = 600;
 const ATTR_BASE_WARP_SPEED: i32 = 1281;
+
+/// Server policy: ship radius in metres when the SDE has no radius.
+const DEFAULT_SHIP_RADIUS: f64 = 50.0;
 
 fn f(v: Option<&Value>) -> f64 {
     v.and_then(|v| v.as_float()).unwrap_or(0.0)
@@ -42,13 +46,14 @@ pub(super) async fn ship_ball(c: &Client, ship_id: i64, pos: [f64; 3]) -> Result
     let base_warp = r.get::<_, Option<f64>>(6).unwrap_or(3.0);
     let char_id = c.session.int("charid").unwrap_or(0);
     let corp = c.session.int("corpid").unwrap_or(0);
-    // Speed, mass and agility as fitted (skills, modules), when the ship is the pilot's.
+    // Movement and signature attributes as fitted (skills, modules), when the ship is the pilot's.
     let fit = super::fit::Fit::load(&c.db, char_id, ship_id).await?;
     let fitted = |attr: i32, base: f64| match fit.value(super::fit::Key::Ship, attr) {
         v if v > 0.0 => v,
         _ => base,
     };
     let mass = fitted(ATTR_MASS, mass);
+    let radius = r.get::<_, Option<f64>>(1).unwrap_or(DEFAULT_SHIP_RADIUS) as f32;
     let security = super::crimewatch::security_status(&c.db, char_id).await?;
     Ok(Ball {
         id: ship_id,
@@ -58,7 +63,8 @@ pub(super) async fn ship_ball(c: &Client, ship_id: i64, pos: [f64; 3]) -> Result
         alliance_id: c.session.int("allianceid").unwrap_or(-1),
         char_id: Some(char_id),
         mode: MODE_STOP,
-        radius: r.get::<_, Option<f64>>(1).unwrap_or(50.0) as f32,
+        radius,
+        signature_radius: Some(fitted(ATTR_SIGNATURE_RADIUS, radius as f64)),
         mass,
         max_vel: fitted(ATTR_MAX_VELOCITY, r.get::<_, Option<f64>>(3).unwrap_or(200.0)) as f32,
         agility: fitted(ATTR_AGILITY, r.get::<_, Option<f64>>(4).unwrap_or(3.0)) as f32,
@@ -191,6 +197,10 @@ fn special_fx(tick: i64, ship: i64, target: Option<i64>, other: Option<i64>, gui
 /// Stargate jump delay (ballparkCommon/jumpdelay.py: appConst.invulnerabilityJumping, ms):
 /// the gate animation plays this long before the session moves to the next system.
 const JUMP_DELAY_MS: u64 = 4000;
+/// Existing server policy: allow the session change to settle before inviting Local chat.
+const LOCAL_CHAT_INVITE_DELAY_MS: u64 = 2000;
+/// Existing server timing for stopping the wormhole effects.CloakRegardless effect.
+const WORMHOLE_EFFECT_STOP_DELAY_MS: u64 = 3000;
 /// The arrival cloak lasts this long unless the pilot moves first (s).
 const JUMP_CLOAK_SECONDS: i64 = 60;
 const UE_LOCID: i64 = 3;
@@ -283,7 +293,9 @@ pub(super) async fn jump_out_and_arrive(c: &mut Client, system: i64, ship: i64, 
         ]
     });
     c.pump().await.map_err(CallError::Internal)?;
-    tokio::time::sleep(std::time::Duration::from_millis(JUMP_DELAY_MS)).await;
+    if !c.world.after(system, JUMP_DELAY_MS).await {
+        return Err(CallError::Internal(anyhow::anyhow!("source system actor stopped during jump wait")));
+    }
 
     super::combat::reset(c);
     c.world.remove_ball(system, ship).await;
@@ -317,13 +329,13 @@ pub(super) async fn jump_out_and_arrive(c: &mut Client, system: i64, ship: i64, 
     // the session change has had time to land.
     let chat = c.chat.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(LOCAL_CHAT_INVITE_DELAY_MS)).await;
         chat.invite(char_id, &format!("local_{dest_system}"));
     });
     // effects.JumpOutWormhole hides the jumping ship with a repeating client-side
     // CloakRegardless effect; it ends only when told to, once the pilot sees the new system.
     if guid == "effects.JumpOutWormhole" {
-        c.world.schedule(dest_system, 3000, move |s| {
+        c.world.schedule(dest_system, WORMHOLE_EFFECT_STOP_DELAY_MS, move |s| {
             s.broadcast(
                 ship,
                 vec![special_fx_stop(now_tick(), ship, "effects.CloakRegardless")],
@@ -396,7 +408,7 @@ pub(super) async fn teleport(c: &mut Client, dest_system: i64, pos: V3) -> Resul
     ]);
     let chat = c.chat.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(LOCAL_CHAT_INVITE_DELAY_MS)).await;
         chat.invite(char_id, &format!("local_{dest_system}"));
     });
     info!(user = c.login.user_id, "ship {ship} teleported {system} -> {dest_system}");
@@ -556,7 +568,7 @@ pub(super) fn warp_to(c: &mut Client, object: Option<(V3, f64)>, point: V3, min_
         b.mode = MODE_WARP;
         b.goto = to;
         b.speed_fraction = 1.0;
-        b.warp = Some(Warp { from: b.pos, to, start: b.last_ms, duration: (align + warp_duration(b.warp_factor as f64, distance)) * 1000.0, factor: b.warp_factor, min_range });
+        b.warp = Some(Warp { from: b.pos, to, start: b.last_ms, duration: seconds_to_ms_f64(align + warp_duration(b.warp_factor as f64, distance)), factor: b.warp_factor, min_range });
         // Destiny only enters warp once aligned at 75% of max velocity, and thrust scales
         // with the speed fraction (Ball::IsAlignedForWarp, GotoThrust): warp at full throttle,
         // or a stopped ship sits aligning until the 180 s MAX_ALIGN_TICKS fallback.

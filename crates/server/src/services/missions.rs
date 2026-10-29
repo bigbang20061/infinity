@@ -60,6 +60,8 @@ const GENERIC_NPC_CORP: i64 = 1000127;
 const SITE_OFFSET: f64 = 15_000_000.0;
 /// A ship this close to a site's centre (m) is in it; NPCs spawn up to 32 km out.
 const SITE_RADIUS: f64 = 100_000.0;
+/// Server design: fallback station radius in metres when its ball is unavailable.
+const FALLBACK_STATION_RADIUS: f64 = 5000.0;
 /// Temporary item IDs for spawned NPCs.
 pub(super) static NEXT_NPC_ID: AtomicI64 = AtomicI64::new(9_000_000_000_000);
 
@@ -713,6 +715,7 @@ async fn ensure_site(c: &mut Client, m: &Mission) -> Result<(), CallError> {
             char_id: None,
             mode: MODE_STOP,
             radius: r.get::<_, f64>(2) as f32,
+            signature_radius: None,
             mass: r.get(3),
             max_vel: r.get::<_, Option<f64>>(4).unwrap_or(300.0) as f32,
             agility: r.get::<_, Option<f64>>(5).unwrap_or(3.0) as f32,
@@ -1190,7 +1193,7 @@ async fn warp_to_location(c: &mut Client, agent: &Agent, call: &Call<'_>) -> Cal
             if here != Some(system) {
                 return Ok(Value::None);
             }
-            let radius = c.world.with(system, move |s| s.ball(station).map(|b| b.radius as f64)).await.flatten().unwrap_or(5000.0);
+            let radius = c.world.with(system, move |s| s.ball(station).map(|b| b.radius as f64)).await.flatten().unwrap_or(FALLBACK_STATION_RADIUS);
             super::ship::warp_to(c, Some((pos, radius)), pos, range)
         }
         _ => Ok(Value::None),

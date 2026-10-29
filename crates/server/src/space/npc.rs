@@ -1,7 +1,7 @@
 //! Actor-owned NPC decisions and spawn groups, mirroring entity targeting and
 //! destiny Orbit/Stop events. Combat attributes are loaded by services from SDE;
-//! Weapon, repair and deferred timer effects share a sequential per-system worker,
-//! never running inside the actor.
+//! Weapon and repair effects use a sequential worker; deferred jobs run concurrently.
+//! Neither runs inside the actor.
 //! Brains and groups are transient; persistent NPC simulation is not supported.
 use super::*;
 use std::collections::HashSet;
@@ -9,8 +9,14 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// D9 once-per-second NPC thinking and initial staggering.
+const NPC_THINK_INTERVAL_MS: i64 = 1000;
+/// Existing server target-loss policy.
+const NPC_TARGET_LOSS_RANGE_FACTOR: f64 = 2.0;
+
 static NEXT_GROUP: AtomicU64 = AtomicU64::new(1);
 
+/// Server NPC targeting policy: sentinel owner permitting targets among all pilots.
 pub const HOSTILE_TO_ALL: i64 = -1;
 pub type NpcFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 /// Called by the worker, not the actor. Capture Db and Weak<World>, upgrading
@@ -26,6 +32,7 @@ pub struct NpcConfig {
     pub fly_range: f64,
     pub aggro_range: f64,
     pub rate_of_fire_ms: f64,
+    pub scan_resolution: f64,
     /// Shield amount, armor amount, cycle in milliseconds.
     pub repairs: (f64, f64, f64),
 }
@@ -52,17 +59,35 @@ impl NpcBrain {
 
 pub(super) enum EffectJob {
     Npc { effects: NpcEffects, action: NpcAction },
-    Deferred(Pin<Box<dyn Future<Output = ()> + Send>>),
 }
 pub(super) fn start_worker(system: &mut System) {
     let (tx, mut rx) = mpsc::unbounded_channel::<EffectJob>();
+    let (deferred_tx, mut deferred_rx) = mpsc::unbounded_channel::<NpcFuture>();
     system.effect_jobs = Some(tx);
+    system.deferred_jobs = Some(deferred_tx);
+    let worker = tokio::spawn(async move {
+        while let Some(EffectJob::Npc { effects, action }) = rx.recv().await {
+            effects(action).await;
+        }
+    });
     tokio::spawn(async move {
-        while let Some(job) = rx.recv().await {
-            match job {
-                EffectJob::Npc { effects, action } => effects(action).await,
-                EffectJob::Deferred(future) => future.await,
+        if let Err(error) = worker.await { tracing::warn!(%error, "space NPC worker failed"); }
+    });
+    tokio::spawn(async move {
+        let mut tasks = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                job = deferred_rx.recv() => match job {
+                    Some(job) => { tasks.spawn(job); }
+                    None => break,
+                },
+                result = tasks.join_next(), if !tasks.is_empty() => {
+                    if let Some(Err(error)) = result { tracing::warn!(%error, "space deferred job failed"); }
+                }
             }
+        }
+        while let Some(result) = tasks.join_next().await {
+            if let Err(error) = result { tracing::warn!(%error, "space deferred job failed"); }
         }
     });
 }
@@ -76,7 +101,7 @@ impl System {
     /// Attach only to a live ball. First think is staggered over the next second.
     pub fn add_npc(&mut self, id: i64, mut brain: NpcBrain) -> bool {
         if !self.contains(id) { return false; }
-        brain.next_think_ms = self.ms + id.rem_euclid(1000);
+        brain.next_think_ms = self.ms + id.rem_euclid(NPC_THINK_INTERVAL_MS);
         self.brains.insert(id, brain);
         true
     }
@@ -125,18 +150,30 @@ impl System {
         due.extend(self.brains.iter().filter(|(_, b)| self.ms >= b.next_think_ms).map(|(&id, _)| id));
         for &id in &due {
             let Some(mut brain) = self.brains.remove(&id) else { continue };
-            brain.next_think_ms = self.ms + 1000;
+            brain.next_think_ms = self.ms + NPC_THINK_INTERVAL_MS;
             self.think_npc(id, &mut brain);
             if self.contains(id) { self.brains.insert(id, brain); }
         }
         due.clear();
         self.due_brains = due;
     }
+    fn lose_npc_target(&mut self, id: i64, brain: &mut NpcBrain) {
+        if let Some((_, pilot, _)) = brain.target.take() {
+            self.notify_pilot(pilot, "OnTarget", vec![Value::str("otherlost"), Value::Int(id), Value::None]);
+            self.command(id, |b, stamp, _| {
+                b.mode = MODE_STOP;
+                b.speed_fraction = 0.0;
+                vec![event(stamp, "Stop", vec![Value::Int(b.id)])]
+            });
+        }
+        brain.announced = false;
+    }
     fn think_npc(&mut self, id: i64, brain: &mut NpcBrain) {
         let Some(me) = self.ball(id) else { return };
         let pos = me.pos;
         let current = brain.target.and_then(|(ship, _, _)| self.ball(ship))
-            .filter(|b| b.cloak == 0 && len(sub(b.pos, pos)) < brain.config.aggro_range * 2.0);
+            .filter(|b| b.cloak == 0 && b.mode != MODE_WARP && b.signature_radius.is_some()
+                && len(sub(b.pos, pos)) < brain.config.aggro_range * NPC_TARGET_LOSS_RANGE_FACTOR);
         let victim_id = current.map(|b| b.id);
         let (shield, armor, cycle) = brain.config.repairs;
         if (shield > 0.0 || armor > 0.0) && self.ms >= brain.next_repair_ms {
@@ -144,20 +181,13 @@ impl System {
             self.npc_effect(brain, NpcAction::Repair);
         }
         if victim_id.is_none() {
-            if let Some((_, pilot, _)) = brain.target.take() {
-                self.notify_pilot(pilot, "OnTarget", vec![Value::str("otherlost"), Value::Int(id), Value::None]);
-                self.command(id, |b, stamp, _| {
-                    b.mode = MODE_STOP;
-                    b.speed_fraction = 0.0;
-                    vec![event(stamp, "Stop", vec![Value::Int(b.id)])]
-                });
-            }
+            self.lose_npc_target(id, brain);
             let nearest = self.pilots().filter(|b| b.char_id.is_some_and(|pilot|
                 brain.owner == Some(HOSTILE_TO_ALL) || brain.owner == Some(pilot) || brain.aggressors.contains(&pilot))
-                && b.cloak == 0 && b.mode != MODE_WARP && len(sub(b.pos, pos)) <= brain.config.aggro_range)
+                && b.signature_radius.is_some() && b.cloak == 0 && b.mode != MODE_WARP && len(sub(b.pos, pos)) <= brain.config.aggro_range)
                 .min_by(|a, b| len(sub(a.pos, pos)).total_cmp(&len(sub(b.pos, pos))))
-                .map(|b| (b.id, b.char_id.unwrap()));
-            if let Some((ship, pilot)) = nearest {
+                .map(|b| (b.id, b.char_id.unwrap(), b.signature_radius.unwrap()));
+            if let Some((ship, pilot, signature)) = nearest {
                 let orbit = brain.config.fly_range;
                 self.command(id, move |b, stamp, _| {
                     b.mode = MODE_ORBIT;
@@ -167,22 +197,36 @@ impl System {
                     vec![event(stamp, "Orbit", vec![Value::Int(id), Value::Int(ship), Value::Float(orbit)]),
                         event(stamp, "SetSpeedFraction", vec![Value::Int(id), Value::Float(1.0)])]
                 });
-                let locked = self.ms + 3000;
+                let locked = self.ms.saturating_add(lock_time_ms(brain.config.scan_resolution, signature) as i64);
                 brain.target = Some((ship, pilot, locked));
                 brain.announced = false;
                 brain.next_shot_ms = locked;
+                self.schedule_at(locked, move |s| s.complete_npc_lock(id, ship, pilot, locked));
             }
             return;
         }
-        let (ship, pilot, locked) = brain.target.unwrap();
-        if !brain.announced && self.ms >= locked {
-            self.notify_pilot(pilot, "OnTarget", vec![Value::str("otheradd"), Value::Int(id)]);
-            brain.announced = true;
-        }
-        if self.ms >= brain.next_shot_ms {
+        let (ship, _, _) = brain.target.unwrap();
+        if brain.announced && self.ms >= brain.next_shot_ms {
             self.npc_effect(brain, NpcAction::Shot { me: self.ball(id).unwrap().clone(), victim: self.ball(ship).unwrap().clone() });
             brain.next_shot_ms = self.ms + brain.config.rate_of_fire_ms as i64;
         }
+    }
+    fn complete_npc_lock(&mut self, id: i64, ship: i64, pilot: i64, deadline: i64) {
+        let Some(mut brain) = self.brains.remove(&id) else { return };
+        let current = brain.target == Some((ship, pilot, deadline)) && !brain.announced;
+        let valid = current && self.ball(id).zip(self.ball(ship)).is_some_and(|(me, victim)|
+                victim.char_id == Some(pilot) && victim.signature_radius.is_some()
+                && victim.cloak == 0 && victim.mode != MODE_WARP
+                && len(sub(victim.pos, me.pos)) < brain.config.aggro_range * NPC_TARGET_LOSS_RANGE_FACTOR);
+        if valid {
+            self.notify_pilot(pilot, "OnTarget", vec![Value::str("otheradd"), Value::Int(id)]);
+            brain.announced = true;
+            self.npc_effect(&brain, NpcAction::Shot { me: self.ball(id).unwrap().clone(), victim: self.ball(ship).unwrap().clone() });
+            brain.next_shot_ms = self.ms + brain.config.rate_of_fire_ms as i64;
+        } else if current {
+            self.lose_npc_target(id, &mut brain);
+        }
+        self.brains.insert(id, brain);
     }
 }
 
@@ -194,7 +238,7 @@ mod tests {
     fn ball(id: i64, pilot: Option<i64>, x: f64) -> Ball {
         Ball {
             id, type_id: 1, owner_id: 1, corp_id: 1, alliance_id: -1,
-            char_id: pilot, mode: MODE_STOP, radius: 1.0, mass: 1e6,
+            char_id: pilot, signature_radius: pilot.map(|_| 1.0), mode: MODE_STOP, radius: 1.0, mass: 1e6,
             max_vel: 0.0, agility: 1.0, speed_fraction: 0.0,
             pos: [x, 0.0, 0.0], vel: [0.0; 3], goto: [0.0; 3],
             follow_id: 0, follow_range: 0.0, free: true, global: false,
@@ -212,7 +256,7 @@ mod tests {
         s.effect_jobs = Some(tx);
         s.insert(ball(1000, None, 0.0));
         s.add_npc(1000, NpcBrain::new(owner, NpcConfig {
-            fly_range: 20.0, aggro_range: 100.0, rate_of_fire_ms: 2500.0,
+            fly_range: 20.0, aggro_range: 100.0, rate_of_fire_ms: 2500.0, scan_resolution: 17_163.0,
             repairs: (0.0, 0.0, 5000.0),
         }, Arc::new(|_| panic!("effects must run outside the actor"))));
         (s, rx, notifications)
@@ -277,25 +321,109 @@ mod tests {
     fn lock_delay_and_shot_throttling() {
         let (mut s, mut jobs, _) = setup(Some(HOSTILE_TO_ALL));
         s.insert(ball(1, Some(10), 50.0));
-        for ms in [0, 1000, 2000] {
-            s.tick(ms);
-            assert!(jobs.try_recv().is_err());
-        }
-        s.tick(3000);
+        s.tick(0);
+        let deadline = lock_time_ms(17_163.0, 1.0) as i64;
+        s.tick(deadline - 1);
+        assert!(jobs.try_recv().is_err());
+        s.tick(deadline);
         assert!(matches!(jobs.try_recv().unwrap(), EffectJob::Npc { action: NpcAction::Shot { .. }, .. }));
         assert!(s.brains[&1000].announced);
-        for ms in [3100, 4000, 5000] {
-            s.tick(ms);
-            assert!(jobs.try_recv().is_err());
-        }
-        s.tick(6000);
+        s.tick(deadline + 2000);
+        assert!(jobs.try_recv().is_err());
+        s.tick(deadline + 3000);
         assert!(matches!(jobs.try_recv().unwrap(), EffectJob::Npc { action: NpcAction::Shot { .. }, .. }));
         assert!(jobs.try_recv().is_err());
     }
 
+    #[test]
+    fn stale_and_removed_targets_do_not_complete_locks() {
+        for remove_npc in [false, true] {
+            let (mut s, mut jobs, mut notifications) = setup(Some(HOSTILE_TO_ALL));
+            s.insert(ball(1, Some(10), 50.0));
+            s.tick(0);
+            let deadline = s.brains[&1000].target.unwrap().2;
+            if remove_npc { s.remove_ball(1000); } else { s.remove_ball(1); }
+            s.tick(deadline);
+            assert!(jobs.try_recv().is_err());
+            while let Ok((_, args)) = notifications.try_recv() {
+                assert_ne!(args[0].as_bytes(), Some(b"otheradd".as_slice()));
+            }
+        }
+        let (mut s, mut jobs, _) = setup(Some(HOSTILE_TO_ALL));
+        s.insert(ball(1, Some(10), 50.0));
+        s.tick(0);
+        let deadline = s.brains[&1000].target.unwrap().2;
+        s.brains.get_mut(&1000).unwrap().target = Some((1, 10, deadline + 100));
+        s.tick(deadline);
+        assert!(jobs.try_recv().is_err());
+    }
+
+    #[test]
+    fn failed_lock_reacquires_and_ignores_stale_completion() {
+        let (mut s, mut jobs, mut notifications) = setup(Some(HOSTILE_TO_ALL));
+        s.insert(ball(1, Some(10), 50.0));
+        s.tick(0);
+        let old_deadline = s.brains[&1000].target.unwrap().2;
+        s.brains.get_mut(&1000).unwrap().next_think_ms = old_deadline + 1;
+        s.command(1, |b, _, _| { b.cloak = 1; vec![] });
+        s.tick(old_deadline);
+        assert!(s.brains[&1000].target.is_none());
+        assert!(!s.brains[&1000].announced);
+        assert_eq!(s.ball(1000).unwrap().mode, MODE_STOP);
+        assert_eq!(notifications.try_recv().unwrap().1[0].as_bytes(), Some(b"otherlost".as_slice()));
+        assert!(jobs.try_recv().is_err());
+
+        s.command(1, |b, _, _| { b.cloak = 0; vec![] });
+        s.tick(old_deadline + 1);
+        let new_target = s.brains[&1000].target.unwrap();
+        assert!(new_target.2 > old_deadline);
+        s.complete_npc_lock(1000, 1, 10, old_deadline);
+        assert_eq!(s.brains[&1000].target, Some(new_target));
+        assert!(!s.brains[&1000].announced);
+        assert!(jobs.try_recv().is_err());
+        s.tick(new_target.2);
+        assert!(s.brains[&1000].announced);
+        assert_eq!(notifications.try_recv().unwrap().1[0].as_bytes(), Some(b"otheradd".as_slice()));
+        assert!(matches!(jobs.try_recv().unwrap(), EffectJob::Npc { action: NpcAction::Shot { .. }, .. }));
+    }
+
+    #[tokio::test]
+    async fn deferred_jobs_progress_while_npc_effects_remain_fifo() {
+        let mut s = System::default();
+        start_worker(&mut s);
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let release = Arc::new(Mutex::new(Some(release_rx)));
+        let effects: NpcEffects = Arc::new(move |_| {
+            let started_tx = started_tx.clone();
+            let release = release.lock().unwrap().take();
+            Box::pin(async move {
+                started_tx.send(()).unwrap();
+                if let Some(release) = release { let _ = release.await; }
+            })
+        });
+        let tx = s.effect_jobs.as_ref().unwrap();
+        assert!(tx.send(EffectJob::Npc { effects: effects.clone(), action: NpcAction::Repair }).is_ok());
+        assert!(tx.send(EffectJob::Npc { effects, action: NpcAction::Repair }).is_ok());
+        started_rx.recv().await.unwrap();
+        let (blocked_tx, blocked_rx) = tokio::sync::oneshot::channel();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        s.defer(async move { let _ = entered_tx.send(()); let _ = blocked_rx.await; });
+        entered_rx.await.unwrap();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        s.defer(async move { let _ = done_tx.send(()); });
+        done_rx.await.unwrap();
+        blocked_tx.send(()).unwrap();
+        assert!(started_rx.try_recv().is_err());
+        release_tx.send(()).unwrap();
+        started_rx.recv().await.unwrap();
+    }
+
     #[tokio::test]
     async fn timer_defers_async_work_without_polling_inside_actor() {
-        let (mut s, mut jobs, _) = setup(None);
+        let (mut s, _jobs, _) = setup(None);
+        let (tx, mut deferred_jobs) = mpsc::unbounded_channel();
+        s.deferred_jobs = Some(tx);
         let count = Arc::new(AtomicUsize::new(0));
         let deferred = count.clone();
         s.schedule(100, move |s| {
@@ -303,12 +431,10 @@ mod tests {
         });
         s.tick(100);
         assert_eq!(count.load(Ordering::Relaxed), 0);
-        let EffectJob::Deferred(future) = jobs.try_recv().unwrap() else {
-            panic!("expected deferred timer work");
-        };
+        let future = deferred_jobs.try_recv().unwrap();
         future.await;
         assert_eq!(count.load(Ordering::Relaxed), 1);
-        assert!(jobs.try_recv().is_err());
+        assert!(deferred_jobs.try_recv().is_err());
     }
     #[test]
     fn groups_clear_once_for_destroyed_removed_and_missing_members() {

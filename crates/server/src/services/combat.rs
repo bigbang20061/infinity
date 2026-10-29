@@ -17,17 +17,18 @@
 //! and repair themselves; a pilot's ship can be destroyed. Active modules apply their effects
 //! (hardeners through fit, propulsion speed via destiny, repairers each cycle), and a kill
 //! pays the NPC's bounty and leaves a wreck with loot.
-//! NPC decisions and missile impact timers run in the per-system actor, with weapon,
-//! repair and missile damage effects resolved by its worker outside the actor.
+//! Target locks, reloads, module cycles, pulses and missile impacts use system
+//! actor timers. Database-backed effects run on deferred workers outside the actor.
+//! Dropped cycle owners release their own in-memory activation markers without notifications.
 
 use super::dogma::load_items;
 use super::inventory::notify_item_change;
 use super::fit::{Fit, Key};
 use super::{db_err, rand01, user_error, Call, CallError, CallResult};
-use crate::client::{filetime_now, Client};
-use crate::consts::{ACCOUNT_CASH, ATTR_CAPACITY, ATTR_EXPLOSION_DELAY, ATTR_IS_ONLINE, ATTR_MASS, ATTR_MAX_RANGE, ATTR_MAX_VELOCITY, ATTR_QUANTITY, ATTR_SIGNATURE_RADIUS, EFFECT_AFTERBURNER, EFFECT_MICROWARPDRIVE, EFFECT_ONLINE, FILETIME_SECOND, FLAG_CARGO, FLAG_HANGAR, IX_FLAG, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD};
+use crate::client::{filetime_now, filetime_ticks_from_ms, Client};
+use crate::consts::{ACCOUNT_CASH, ATTR_CAPACITY, ATTR_EXPLOSION_DELAY, ATTR_IS_ONLINE, ATTR_MASS, ATTR_MAX_RANGE, ATTR_MAX_VELOCITY, ATTR_QUANTITY, ATTR_SIGNATURE_RADIUS, DAMAGE_TYPE_COUNT, EFFECT_AFTERBURNER, EFFECT_MICROWARPDRIVE, EFFECT_ONLINE, FILETIME_SECOND, FLAG_CARGO, FLAG_HANGAR, IX_FLAG, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD};
 use crate::db::Db;
-use crate::space::{dist, event, now_ms, now_tick, Ball, NotifyTx, NpcAction, NpcBrain, NpcConfig, NpcEffects, NpcFuture, World, MODE_MISSILE, MODE_WARP, V3};
+use crate::space::{dist, event, lock_time_ms, metres_to_km, ms_to_seconds, seconds_to_ms, now_ms, now_tick, Ball, NotifyTx, NpcAction, NpcBrain, NpcConfig, NpcEffects, NpcFuture, System, World, MODE_MISSILE, MODE_WARP, V3};
 use marshal::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -69,6 +70,59 @@ const ATTR_ARMOR_DAMAGE_AMOUNT: i32 = 84;
 const ATTR_STRUCTURE_DAMAGE_AMOUNT: i32 = 83;
 const UE_TYPEID: i64 = 4;
 
+/// Existing server reload fallback when dogma has no reload time.
+const DEFAULT_RELOAD_MS: f64 = 10_000.0;
+/// Existing server module-duration fallback.
+const DEFAULT_MODULE_DURATION_MS: f64 = 1000.0;
+/// Existing server minimum module cycle duration.
+const MIN_MODULE_DURATION_MS: f64 = 250.0;
+/// Existing missile flight-time clamp.
+const MIN_MISSILE_FLIGHT_SECONDS: f64 = 0.5;
+/// Existing missile flight-time clamp.
+const MAX_MISSILE_FLIGHT_SECONDS: f64 = 30.0;
+/// Existing missile reach tolerance.
+const MISSILE_REACH_ALLOWANCE_METRES: f64 = 2000.0;
+/// Server fallback missile velocity in metres per second when NPC charge dogma is missing it.
+const NPC_MISSILE_VELOCITY_MPS: f64 = 3_000.0;
+/// Server fallback missile flight time in milliseconds when NPC charge dogma is missing it.
+const NPC_MISSILE_FLIGHT_MS: f64 = 5_000.0;
+/// Server fallback explosion radius in metres when NPC charge dogma is missing it.
+const NPC_MISSILE_EXPLOSION_RADIUS_METRES: f64 = 40.0;
+/// Server policy for NPC turret reach beyond optimal, in multiples of falloff.
+const NPC_TURRET_REACH_FALLOFF_MULTIPLIER: f64 = 3.0;
+/// Existing turret falloff hit-chance formula.
+const TURRET_FALLOFF_CHANCE: f64 = 0.5;
+/// Existing turret wrecking-hit probability.
+const WRECKING_CHANCE: f64 = 0.01;
+/// Existing turret wrecking-hit damage multiplier.
+const WRECKING_DAMAGE_MULTIPLIER: f64 = 3.0;
+/// Existing turret normal-hit damage formula.
+const NORMAL_HIT_MULTIPLIER_OFFSET: f64 = 0.49;
+/// Existing combat-log quality IDs and thresholds.
+const HIT_MISS: i64 = 0;
+/// Existing combat-log grazing quality.
+const HIT_GRAZING: i64 = 1;
+/// Existing combat-log glancing quality.
+const HIT_GLANCING: i64 = 2;
+/// Existing combat-log normal quality.
+const HIT_NORMAL: i64 = 3;
+/// Existing combat-log good quality.
+const HIT_GOOD: i64 = 4;
+/// Existing combat-log excellent quality.
+const HIT_EXCELLENT: i64 = 5;
+/// Existing combat-log wrecking quality.
+const HIT_WRECKING: i64 = 6;
+/// Existing combat-log wrecking threshold.
+const HIT_WRECKING_THRESHOLD: f64 = 2.9;
+/// Existing combat-log grazing threshold.
+const HIT_GRAZING_THRESHOLD: f64 = 0.6;
+/// Existing combat-log glancing threshold.
+const HIT_GLANCING_THRESHOLD: f64 = 0.8;
+/// Existing combat-log normal threshold.
+const HIT_NORMAL_THRESHOLD: f64 = 1.0;
+/// Existing combat-log good threshold.
+const HIT_GOOD_THRESHOLD: f64 = 1.2;
+
 /// Temporary item IDs for missiles in flight.
 /// Missile balls; clear of NPCs (9.0e12), exploration sites (9.5e12), probes (9.6e12) and
 /// asteroids (9.7e12).
@@ -92,6 +146,8 @@ struct State {
     locking: HashMap<(i64, i64), u64>,
     /// moduleID -> stop flag of its running cycle
     active: HashMap<i64, Arc<AtomicBool>>,
+    /// Most recent activation, retained to invalidate deferred propulsion updates.
+    activation_generation: HashMap<i64, Arc<AtomicBool>>,
     /// ballID -> hit points left (NPCs)
     hp: HashMap<i64, Hp>,
     /// shipID -> (capacitor level, FILETIME it was measured)
@@ -181,7 +237,7 @@ async fn add_target(c: &mut Client, target: i64) -> CallResult {
     let range = fit.value(Key::Ship, ATTR_MAX_TARGET_RANGE);
     let gap = dist(ship.pos, t.pos) - t.radius as f64;
     if gap > range {
-        let text = format!("目标距离 {:.1} 公里，超出了你的锁定距离（{:.1} 公里）。", gap / 1000.0, range / 1000.0);
+        let text = format!("目标距离 {:.1} 公里，超出了你的锁定距离（{:.1} 公里）。", metres_to_km(gap), metres_to_km(range));
         return Err(user_error("CustomNotify", vec![("notify".into(), Value::unicode(text))]));
     }
     // The ship's limit, capped by the pilot's (Targeting skills).
@@ -191,21 +247,18 @@ async fn add_target(c: &mut Client, target: i64) -> CallResult {
     if targets_of(cx.char_id).len() >= max_targets.max(1) {
         return Err(user_error("CustomNotify", vec![("notify".into(), Value::unicode(format!("你最多只能同时锁定 {} 个目标。", max_targets.max(1))))]));
     }
-    // Lock time (s) = 40000 / (scanResolution * asinh(signatureRadius)^2)
-    let scan = fit.value(Key::Ship, ATTR_SCAN_RESOLUTION).max(1.0);
-    let sig = attr(&target_attrs, ATTR_SIGNATURE_RADIUS, t.radius as f64).max(1.0);
-    let seconds = (40_000.0 / (scan * sig.asinh().powi(2))).clamp(0.5, 60.0);
+    let delay = lock_time_ms(fit.value(Key::Ship, ATTR_SCAN_RESOLUTION), attr(&target_attrs, ATTR_SIGNATURE_RADIUS, t.radius as f64));
     let attempt = NEXT_LOCK.fetch_add(1, Ordering::Relaxed);
     state().locking.insert((cx.char_id, target), attempt);
-    debug!(user = c.login.user_id, "locking {target} in {seconds:.1}s");
+    debug!(user = c.login.user_id, "locking {target} in {delay}ms");
     let current = targets_of(cx.char_id);
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs_f64(seconds)).await;
+    let world = cx.world.clone();
+    world.schedule(cx.system_id, delay, move |s| {
         let still_wanted = {
             let mut st = state();
             st.locking.get(&(cx.char_id, target)) == Some(&attempt) && st.locking.remove(&(cx.char_id, target)).is_some()
         };
-        let present = cx.world.with(cx.system_id, move |s| s.contains(target)).await.unwrap_or(false);
+        let present = s.contains(ship_id) && s.contains(target);
         if still_wanted && present {
             state().targets.entry(cx.char_id).or_default().insert(target);
             cx.notify("OnTarget", vec![Value::str("add"), Value::Int(target)]);
@@ -447,10 +500,10 @@ async fn load_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
     }
     let reload_ms = match Fit::load(&c.db, owner, ship).await?.value(Key::Module(first), ATTR_RELOAD_TIME) {
         ms if ms > 0.0 => ms,
-        _ => 10_000.0,
+        _ => DEFAULT_RELOAD_MS,
     };
     let start = filetime_now();
-    let until = start + (reload_ms * 10_000.0) as i64;
+    let until = start + filetime_ticks_from_ms(reload_ms);
     let ids: Vec<i64> = loads.iter().map(|l| l.0).collect();
     {
         let mut st = state();
@@ -463,23 +516,42 @@ async fn load_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
     let timers = ids.iter().map(|i| attribute_change(owner, Value::Int(*i), ATTR_NEXT_ACTIVATION_TIME, Value::Int(until), Value::Int(start))).collect();
     c.notify("OnModuleAttributeChanges", vec![Value::List(timers)]);
     info!(user = c.login.user_id, "reloading {} module(s) with {type_id} in {reload_ms:.0} ms", ids.len());
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs_f64(reload_ms / 1000.0)).await;
-        if let Err(e) = apply_loads(&db, &notify, owner, ship, &loads).await {
-            warn!("reload of {ids:?} failed: {}", match e {
-                CallError::Internal(e) => format!("{e:#}"),
-                CallError::User { msg, .. } => msg,
-            });
-        }
-        let mut st = state();
-        for id in &ids {
-            if st.reloading.get(id) == Some(&until) {
-                st.reloading.remove(id);
+    let system = c.session.int("solarsystemid").unwrap();
+    c.world.schedule(system, seconds_to_ms(ms_to_seconds(reload_ms)), move |s| {
+        let (loads, rejected) = partition_reload(loads, &state().reloading, until);
+        s.defer(async move {
+            for &(_, _, type_id, now, have) in &rejected {
+                if let Err(e) = db.client.execute(
+                    "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity) VALUES ($1, $2, $3, $4, $5)",
+                    &[&type_id, &owner, &ship, &FLAG_CARGO, &(now - have)],
+                ).await {
+                    warn!("returning superseded reload to cargo failed: {e}");
+                }
             }
-        }
+            if let Err(e) = apply_loads(&db, &notify, owner, ship, &loads).await {
+                warn!("reload of {ids:?} failed: {}", match e {
+                    CallError::Internal(e) => format!("{e:#}"),
+                    CallError::User { msg, .. } => msg,
+                });
+            }
+            let mut st = state();
+            clear_reload_markers(&mut st.reloading, &ids, until);
+        });
     });
     Ok(Value::None)
 }
+type ReservedLoad = (i64, i32, i32, i32, i32);
+
+fn partition_reload(loads: Vec<ReservedLoad>, reloading: &HashMap<i64, i64>, until: i64) -> (Vec<ReservedLoad>, Vec<ReservedLoad>) {
+    loads.into_iter().partition(|load| reloading.get(&load.0) == Some(&until))
+}
+fn clear_reload_markers(reloading: &mut HashMap<i64, i64>, ids: &[i64], until: i64) {
+    for id in ids {
+        if reloading.get(id) == Some(&until) { reloading.remove(id); }
+    }
+}
+
+
 
 /// Put loaded charges in their modules and tell the client.
 async fn apply_loads(db: &Db, notify: &NotifyTx, owner: i64, ship: i64, loads: &[(i64, i32, i32, i32, i32)]) -> Result<(), CallError> {
@@ -835,7 +907,7 @@ pub(super) async fn destroy_player_ship(world: &World, system: i64, ship: i64, c
 
 /// Damage whatever `target` is: a player's ship or an NPC. `attacker` is the pilot
 /// responsible, if any (NPCs remember them; kills pay them).
-async fn damage(db: &Db, world: &World, system: i64, target: i64, target_pilot: Option<i64>, raw: [f64; 4], attacker: Option<i64>) -> Result<f64, CallError> {
+async fn damage(db: &Db, world: &World, system: i64, target: i64, target_pilot: Option<i64>, raw: [f64; DAMAGE_TYPE_COUNT], attacker: Option<i64>) -> Result<f64, CallError> {
     match target_pilot {
         Some(char_id) => damage_player(db, world, system, target, char_id, raw, attacker).await,
         None => damage_npc(db, world, system, target, raw, attacker).await,
@@ -954,6 +1026,7 @@ async fn reward_kill(db: &Db, world: &World, system: i64, npc: &Ball, killer: Op
         corp_id: npc.corp_id,
         alliance_id: -1,
         char_id: None,
+        signature_radius: None,
         mode: crate::space::MODE_RIGID,
         radius: wreck.get::<_, f64>(1) as f32,
         mass: 10_000.0,
@@ -1023,16 +1096,24 @@ fn repair_kind(effect: &str) -> Option<(usize, i32)> {
 }
 
 /// The ship's speed and mass as fitted now (propulsion running or not), for everyone's destiny.
-async fn apply_propulsion(cx: &Ctx) {
+async fn apply_propulsion(cx: &Ctx, master: i64, generation: Arc<AtomicBool>, active: bool) {
     let Ok(fit) = Fit::load(&cx.db, cx.char_id, cx.ship_id).await else { return };
-    let (speed, mass) = (fit.value(Key::Ship, ATTR_MAX_VELOCITY), fit.value(Key::Ship, ATTR_MASS));
-    cx.world.command(cx.system_id, cx.ship_id, move |b, t, _| {
+    let (speed, mass, signature) = (fit.value(Key::Ship, ATTR_MAX_VELOCITY), fit.value(Key::Ship, ATTR_MASS), fit.value(Key::Ship, ATTR_SIGNATURE_RADIUS));
+    let ship = cx.ship_id;
+    cx.world.post(cx.system_id, move |s| {
+        let mut st = state();
+        if !st.activation_generation.get(&master).is_some_and(|current| Arc::ptr_eq(current, &generation))
+            || st.active.contains_key(&master) != active { return; }
+        s.command(ship, move |b, t, _| {
         b.max_vel = speed as f32;
         b.mass = mass;
+        b.signature_radius = Some(signature);
         vec![
             event(t, "SetMaxSpeed", vec![Value::Int(b.id), Value::Float(speed)]),
             event(t, "SetBallMass", vec![Value::Int(b.id), Value::Float(mass)]),
         ]
+        });
+        if !active { st.activation_generation.remove(&master); }
     });
 }
 
@@ -1134,27 +1215,28 @@ async fn consume_charge(cx: &Ctx, module: &Module) -> Result<Option<i32>, CallEr
 /// The game's hit quality for the combat log: 0 miss .. 6 wrecking.
 fn hit_quality(multiplier: f64) -> i64 {
     match multiplier {
-        m if m <= 0.0 => 0,
-        m if m >= 2.9 => 6,
-        m if m < 0.6 => 1,
-        m if m < 0.8 => 2,
-        m if m < 1.0 => 3,
-        m if m < 1.2 => 4,
-        _ => 5,
+        m if m <= 0.0 => HIT_MISS,
+        m if m >= HIT_WRECKING_THRESHOLD => HIT_WRECKING,
+        m if m < HIT_GRAZING_THRESHOLD => HIT_GRAZING,
+        m if m < HIT_GLANCING_THRESHOLD => HIT_GLANCING,
+        m if m < HIT_NORMAL_THRESHOLD => HIT_NORMAL,
+        m if m < HIT_GOOD_THRESHOLD => HIT_GOOD,
+        _ => HIT_EXCELLENT,
     }
 }
 
 /// A turret's damage multiplier for one shot: miss (0), 0.49..1.49, or a 1% wrecking 3x,
 /// with the hit chance falling off past optimal range.
 fn turret_roll(gap: f64, optimal: f64, falloff: f64) -> f64 {
-    let chance = 0.5f64.powf(((gap - optimal).max(0.0) / falloff.max(1.0)).powi(2));
+    let ratio = (gap - optimal).max(0.0) / falloff.max(1.0);
+    let chance = TURRET_FALLOFF_CHANCE.powf(ratio * ratio);
     let roll = rand01();
     if roll >= chance {
         0.0
-    } else if roll < 0.01 {
-        3.0
+    } else if roll < WRECKING_CHANCE {
+        WRECKING_DAMAGE_MULTIPLIER
     } else {
-        roll + 0.49
+        roll + NORMAL_HIT_MULTIPLIER_OFFSET
     }
 }
 
@@ -1226,6 +1308,7 @@ async fn launch_missile(db: Db, world: Arc<World>, system: i64, from: Ball, targ
         corp_id: from.corp_id,
         alliance_id: -1,
         char_id: None,
+        signature_radius: None,
         mode: MODE_MISSILE,
         radius: size.get::<_, f64>(0) as f32,
         mass: size.get(1),
@@ -1253,7 +1336,7 @@ async fn launch_missile(db: Db, world: Arc<World>, system: i64, from: Ball, targ
     world.add_ship(system, missile).await.map_err(CallError::Internal)?;
     let signature = attr(&attributes(&db, target.type_id).await?, ATTR_SIGNATURE_RADIUS, target.radius as f64);
     let distance = dist(from.pos, target.pos);
-    let delay_ms = std::time::Duration::from_secs_f64((distance / m.velocity.max(1.0)).clamp(0.5, 30.0)).as_millis() as u64;
+    let delay_ms = seconds_to_ms((distance / m.velocity.max(1.0)).clamp(MIN_MISSILE_FLIGHT_SECONDS, MAX_MISSILE_FLIGHT_SECONDS));
     let (shooter_id, shooter_pilot) = (from.id, from.char_id);
     let (target_id, target_pilot) = (target.id, target.char_id);
     let (flight_range, aoe_cloud, raw, weapon, attacker) = (m.flight_range, m.aoe_cloud, m.raw, m.weapon, m.attacker);
@@ -1261,14 +1344,14 @@ async fn launch_missile(db: Db, world: Arc<World>, system: i64, from: Ball, targ
     world.schedule(system, delay_ms, move |s| {
         s.destroy_ball(missile_id);
         let present = s.contains(target_id);
-        let reached = distance <= flight_range + 2_000.0;
+        let reached = distance <= flight_range + MISSILE_REACH_ALLOWANCE_METRES;
         s.defer(async move {
             let Some(world) = world_ref.upgrade() else { return };
             let (dealt, quality) = if reached && present {
                 let application = (signature / aoe_cloud.max(1.0)).min(1.0);
-                (damage(&db, &world, system, target_id, target_pilot, raw.map(|d| d * application), attacker).await.unwrap_or(0.0), 3)
+                (damage(&db, &world, system, target_id, target_pilot, raw.map(|d| d * application), attacker).await.unwrap_or(0.0), HIT_NORMAL)
             } else {
-                (0.0, 0)
+                (0.0, HIT_MISS)
             };
             report_hit(&world, shooter_id, target_id, shooter_pilot, target_pilot, weapon, dealt, quality);
         });
@@ -1286,54 +1369,122 @@ async fn fire_missile(cx: &Ctx, fit: &Fit, module: &Module, charge: i32, target:
         raw: ATTR_DAMAGE.map(|id| fit.value(ch, id) * fit.value(Key::Char, ATTR_MISSILE_DAMAGE_MULTIPLIER).max(0.0)),
         aoe_cloud: fit.value(ch, ATTR_AOE_CLOUD_SIZE),
         velocity,
-        flight_range: velocity * fit.value(ch, ATTR_EXPLOSION_DELAY) / 1000.0,
+        flight_range: velocity * ms_to_seconds(fit.value(ch, ATTR_EXPLOSION_DELAY)),
         weapon: module.type_id,
         attacker: Some(cx.char_id),
     };
     launch_missile(cx.db.clone(), cx.world.clone(), cx.system_id, ship, t, cx.char_id, Some(module.id), missile).await
 }
 
-/// A module's activation: each cycle uses capacitor and, for weapons, fires; it ends when
-/// deactivated, out of capacitor, charges or target, or the repeat count runs out.
-async fn run_cycles(cx: Ctx, modules: Vec<Module>, effect: Effect, target: Option<i64>, repeat: i64, stop: Arc<AtomicBool>, first_duration: f64) {
-    let master = modules[0].id;
-    let started = filetime_now();
-    let mut charge_type = None;
-    let mut cycles = 0;
-    let mut duration_ms = first_duration;
-    let mut reason = "";
-    if effect.propulsion {
-        apply_propulsion(&cx).await;
+/// Owns the markers for one activation, even while a callback or worker is queued.
+struct ActivationOwner {
+    master: i64,
+    generation: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl Drop for ActivationOwner {
+    fn drop(&mut self) {
+        if !self.armed { return; }
+        let mut st = state();
+        if st.active.get(&self.master).is_some_and(|current| Arc::ptr_eq(current, &self.generation)) {
+            st.active.remove(&self.master);
+        }
+        if st.activation_generation.get(&self.master).is_some_and(|current| Arc::ptr_eq(current, &self.generation)) {
+            st.activation_generation.remove(&self.master);
+        }
     }
-    loop {
+}
+
+/// One activation moves between actor callbacks and its deferred phases.
+struct Cycle {
+    cx: Ctx,
+    modules: Vec<Module>,
+    effect: Effect,
+    target: Option<i64>,
+    repeat: i64,
+    stop: Arc<AtomicBool>,
+    owner: ActivationOwner,
+    started: i64,
+    charge_type: Option<i32>,
+    cycles: i64,
+    duration_ms: f64,
+    nominal_start: i64,
+}
+
+fn cycle_valid(s: &System, cycle: &Cycle) -> bool {
+    s.contains(cycle.cx.ship_id)
+        && cycle.target.is_none_or(|target| s.contains(target))
+        && state().active.get(&cycle.modules[0].id).is_some_and(|v| Arc::ptr_eq(v, &cycle.stop))
+}
+
+fn cycle_deadline(start: i64, duration_ms: f64) -> i64 {
+    start.saturating_add(seconds_to_ms(ms_to_seconds(duration_ms)) as i64)
+}
+
+fn cycle_is_final(stopped: bool, repeat: i64, cycles: i64) -> bool {
+    stopped || repeat <= 0 || cycles >= repeat
+}
+
+fn cycle_should_stop(finished: bool, stop: &AtomicBool) -> bool {
+    finished || stop.load(Ordering::Relaxed)
+}
+
+fn schedule_cycle_end(s: &mut System, start: i64, duration_ms: f64, f: impl FnOnce(&mut System, i64) + Send + 'static) {
+    let end = cycle_deadline(start, duration_ms);
+    s.schedule_at(end, move |s| f(s, end));
+}
+
+fn retire_activation(active: &mut HashMap<i64, Arc<AtomicBool>>, master: i64, stop: &Arc<AtomicBool>, publish: impl FnOnce()) -> bool {
+    if !active.get(&master).is_some_and(|current| Arc::ptr_eq(current, stop)) { return false; }
+    publish();
+    active.remove(&master);
+    true
+}
+
+
+fn cycle_start(s: &mut System, mut cycle: Cycle, nominal_start: i64) {
+    if !cycle_valid(s, &cycle) {
+        cycle_stop(s, cycle);
+        return;
+    }
+    cycle.nominal_start = nominal_start;
+    s.defer(async move { cycle_begin_work(cycle).await; });
+}
+
+async fn cycle_begin_work(mut cycle: Cycle) {
+    let nominal_start = cycle.nominal_start;
+    let Cycle { cx, modules, effect, target, repeat, stop, charge_type, cycles, duration_ms, .. } = &mut cycle;
+    let master = modules[0].id;
+    if *cycles == 0 && effect.propulsion {
+        apply_propulsion(cx, master, stop.clone(), true).await;
+    }
+    let reason = 'work: {
         // Effective attributes as they are now (charges change, modules go offline...).
         let fit = match Fit::load(&cx.db, cx.char_id, cx.ship_id).await {
             Ok(f) => f,
             Err(_) => {
-                reason = "fit unavailable";
-                break;
+                break 'work "fit unavailable";
             }
         };
-        duration_ms = effect.duration_attribute.map(|a| fit.value(Key::Module(master), a)).unwrap_or(duration_ms).max(250.0);
+        *duration_ms = effect.duration_attribute.map(|a| fit.value(Key::Module(master), a)).unwrap_or(*duration_ms).max(MIN_MODULE_DURATION_MS);
         let need: f64 = modules.iter().map(|m| fit.value(Key::Module(m.id), ATTR_CAPACITOR_NEED)).sum();
         if !drain_capacitor(&cx, &fit, need) {
-            reason = "out of capacitor";
             cx.notify("OnEffectMessage", vec![Value::str("NotEnoughCharge"), Value::Dict(vec![])]);
-            break;
+            break 'work "out of capacitor";
         }
         if let Some(kind) = effect.weapon {
             let target = target.unwrap_or(0);
             if !targets_of(cx.char_id).contains(&target) {
-                reason = "target lost";
-                break;
+                break 'work "target lost";
             }
             let mut fired = false;
-            for m in &modules {
+            for m in modules.iter() {
                 let charge = match consume_charge(&cx, m).await {
                     Ok(Some(t)) => t,
                     _ => continue,
                 };
-                charge_type = Some(charge);
+                *charge_type = Some(charge);
                 fired = true;
                 let r = match kind {
                     Weapon::Turret => fire_turret(&cx, &fit, m, target).await,
@@ -1347,20 +1498,18 @@ async fn run_cycles(cx: Ctx, modules: Vec<Module>, effect: Effect, target: Optio
                 }
             }
             if !fired {
-                reason = "out of charges";
-                break;
+                break 'work "out of charges";
             }
-            if cycles == 0 {
-                weapon_fx(&cx, &modules, &effect, Some(target), charge_type, true, duration_ms, repeat);
+            if *cycles == 0 {
+                weapon_fx(cx, modules, effect, Some(target), *charge_type, true, *duration_ms, *repeat);
             }
         }
-        if let (Some(guid), Some(rock)) = (effect.mining, target) {
+        if let (Some(guid), Some(rock)) = (effect.mining, *target) {
             if !targets_of(cx.char_id).contains(&rock) {
-                reason = "target lost";
-                break;
+                break 'work "target lost";
             }
-            if cycles == 0 {
-                let beam = modules.iter().map(|m| fire_fx(cx.ship_id, Some((m.id, m.type_id)), guid, Some(rock), None, true, duration_ms, repeat)).collect();
+            if *cycles == 0 {
+                let beam = modules.iter().map(|m| fire_fx(cx.ship_id, Some((m.id, m.type_id)), guid, Some(rock), None, true, *duration_ms, *repeat)).collect();
                 cx.world.broadcast(cx.system_id, cx.ship_id, beam);
             }
         }
@@ -1369,50 +1518,82 @@ async fn run_cycles(cx: Ctx, modules: Vec<Module>, effect: Effect, target: Optio
         if let Some((0, amount)) = repair {
             let _ = repair_player(&cx.db, &cx.world, cx.system_id, cx.ship_id, cx.char_id, 0, amount).await;
         }
-        cycles += 1;
-        tokio::time::sleep(std::time::Duration::from_secs_f64(duration_ms / 1000.0)).await;
+        *cycles += 1;
+        let duration = *duration_ms;
+        let world = cx.world.clone();
+        let system = cx.system_id;
+        world.post(system, move |s| {
+            schedule_cycle_end(s, nominal_start, duration, move |s, end| cycle_end(s, cycle, fit, repair, end));
+        });
+        return;
+    };
+    debug!("module {master} stopped: {reason}");
+    let world = cycle.cx.world.clone();
+    world.post(cycle.cx.system_id, move |s| cycle_stop(s, cycle));
+}
+
+fn cycle_end(s: &mut System, cycle: Cycle, fit: Fit, repair: Option<(usize, f64)>, end: i64) {
+    if !cycle_valid(s, &cycle) {
+        cycle_stop(s, cycle);
+        return;
+    }
+    let final_cycle = cycle_is_final(cycle.stop.load(Ordering::Relaxed), cycle.repeat, cycle.cycles);
+    s.defer(async move {
+        let cx = &cycle.cx;
+        let master = cycle.modules[0].id;
         if let Some((layer @ (1 | 2), amount)) = repair {
             let _ = repair_player(&cx.db, &cx.world, cx.system_id, cx.ship_id, cx.char_id, layer, amount).await;
         }
-        // A mining cycle yields at its end.
-        if let (Some(_), Some(rock)) = (effect.mining, target) {
+        let mut finished = final_cycle;
+        if let (Some(_), Some(rock)) = (cycle.effect.mining, cycle.target) {
             match super::mining::extract(&cx.db, &cx.world, &cx.notify, cx.char_id, cx.ship_id, cx.system_id, &fit, master, rock).await {
                 Ok(true) => {}
-                Ok(false) => {
-                    reason = "nothing more to mine";
-                    break;
-                }
+                Ok(false) => finished = true,
                 Err(e) => {
                     warn!("mining {master}: {}", match e {
                         CallError::Internal(e) => format!("{e:#}"),
                         CallError::User { msg, .. } => msg,
                     });
-                    reason = "mining failed";
-                    break;
+                    finished = true;
                 }
             }
         }
-        if stop.load(Ordering::Relaxed) || repeat <= 0 || cycles >= repeat {
-            break;
+        let world = cx.world.clone();
+        world.post(cx.system_id, move |s| {
+            if cycle_should_stop(finished, &cycle.stop) {
+                cycle_stop(s, cycle);
+            } else {
+                cycle_start(s, cycle, end);
+            }
+        });
+    });
+}
+
+fn cycle_stop(s: &mut System, cycle: Cycle) {
+    let Cycle { cx, modules, effect, target, repeat, stop, mut owner, started, charge_type, cycles, duration_ms, .. } = cycle;
+    let master = modules[0].id;
+    debug!("module {master} stopped after {cycles} cycles");
+    let mut st = state();
+    let retired = retire_activation(&mut st.active, master, &stop, || {
+        ship_effect(&cx, master, &effect, target, false, started, duration_ms, repeat);
+        if effect.weapon.is_some() {
+            if let Some(guid) = effect.guid.as_deref().and_then(|g| g.split(',').next()) {
+                let events = modules.iter().map(|m| fire_fx(cx.ship_id, Some((m.id, m.type_id)), guid, target, charge_type, false, duration_ms, repeat)).collect();
+                s.broadcast(cx.ship_id, events);
+            }
         }
-    }
-    debug!("module {master} stopped after {cycles} cycles {reason}");
-    {
-        let mut st = state();
-        if st.active.get(&master).is_some_and(|s| Arc::ptr_eq(s, &stop)) {
-            st.active.remove(&master);
+        if let Some(guid) = effect.mining {
+            let events = modules.iter().map(|m| fire_fx(cx.ship_id, Some((m.id, m.type_id)), guid, target, None, false, duration_ms, repeat)).collect();
+            s.broadcast(cx.ship_id, events);
         }
+    });
+    if retired && !effect.propulsion && st.activation_generation.get(&master).is_some_and(|current| Arc::ptr_eq(current, &stop)) {
+        st.activation_generation.remove(&master);
     }
-    ship_effect(&cx, master, &effect, target, false, started, duration_ms, repeat);
-    if effect.propulsion {
-        apply_propulsion(&cx).await;
-    }
-    if effect.weapon.is_some() {
-        weapon_fx(&cx, &modules, &effect, target, charge_type, false, duration_ms, repeat);
-    }
-    if let Some(guid) = effect.mining {
-        let beam = modules.iter().map(|m| fire_fx(cx.ship_id, Some((m.id, m.type_id)), guid, target, None, false, duration_ms, repeat)).collect();
-        cx.world.broadcast(cx.system_id, cx.ship_id, beam);
+    if retired { owner.armed = false; }
+    drop(st);
+    if retired && effect.propulsion {
+        s.defer(async move { apply_propulsion(&cx, master, stop, false).await; });
     }
 }
 
@@ -1487,14 +1668,14 @@ async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
         let fit = Fit::load(&cx.db, cx.char_id, cx.ship_id).await?;
         let range = fit.value(Key::Module(item_id), ATTR_MAX_RANGE);
         if gap.is_none_or(|g| g > range) {
-            return Err(user_error("CustomNotify", vec![("notify".into(), Value::unicode(format!("目标超出了采矿设备的范围（{:.1} 公里）。", range / 1000.0)))]));
+            return Err(user_error("CustomNotify", vec![("notify".into(), Value::unicode(format!("目标超出了采矿设备的范围（{:.1} 公里）。", metres_to_km(range))))]));
         }
     }
     if state().active.contains_key(&item_id) {
         return Ok(Value::None);
     }
     let fit = Fit::load(&cx.db, cx.char_id, cx.ship_id).await?;
-    let duration_ms = effect.duration_attribute.map(|a| fit.value(Key::Module(item_id), a)).unwrap_or(1000.0).max(250.0);
+    let duration_ms = effect.duration_attribute.map(|a| fit.value(Key::Module(item_id), a)).unwrap_or(DEFAULT_MODULE_DURATION_MS).max(MIN_MODULE_DURATION_MS);
     // The group fires together.
     let mut modules = vec![Module { id: item_id, type_id: module.type_id, flag: module.flag_id }];
     if effect.weapon.is_some() {
@@ -1505,10 +1686,21 @@ async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
         }
     }
     let stop = Arc::new(AtomicBool::new(false));
-    state().active.insert(item_id, stop.clone());
+    {
+        let mut st = state();
+        if st.active.contains_key(&item_id) { return Ok(Value::None); }
+        st.active.insert(item_id, stop.clone());
+        st.activation_generation.insert(item_id, stop.clone());
+    }
+    let owner = ActivationOwner { master: item_id, generation: stop.clone(), armed: true };
     ship_effect(&cx, item_id, &effect, target, true, filetime_now(), duration_ms, repeat);
     info!(user = c.login.user_id, "module {item_id} activated {effect_name} on {target:?} (x{}, {duration_ms:.0} ms, repeat {repeat})", modules.len());
-    tokio::spawn(run_cycles(cx, modules, effect, target, repeat, stop, duration_ms));
+    let world = cx.world.clone();
+    let cycle = Cycle { cx, modules, effect, target, repeat, stop, owner, started: filetime_now(), charge_type: None, cycles: 0, duration_ms, nominal_start: 0 };
+    world.post(cycle.cx.system_id, move |s| {
+        let now = s.now_ms();
+        cycle_start(s, cycle, now);
+    });
     Ok(Value::None)
 }
 
@@ -1544,9 +1736,9 @@ pub(super) fn pulse_effect(c: &mut Client, module: i64, effect_id: i64, target: 
     let effect = Effect { id: effect_id, guid: None, duration_attribute: None, weapon: None, repair: None, propulsion: false, mining: None };
     let started = filetime_now();
     ship_effect(&cx, module, &effect, target, true, started, duration_ms, 0);
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs_f64(duration_ms.max(0.0) / 1000.0)).await;
-        ship_effect(&cx, module, &effect, target, false, started, duration_ms, 0);
+    let world = cx.world.clone();
+    world.schedule(cx.system_id, seconds_to_ms(ms_to_seconds(duration_ms.max(0.0))), move |s| {
+        s.defer(async move { ship_effect(&cx, module, &effect, target, false, started, duration_ms, 0); });
     });
 }
 
@@ -1565,12 +1757,13 @@ fn deactivate(call: &Call<'_>) -> CallResult {
 struct NpcStats {
     /// (shield boost, armor repair) amount per repair cycle, and the cycle (ms).
     repairs: (f64, f64, f64),
+    scan_resolution: f64,
     fly_range: f64,
     aggro_range: f64,
     rate_of_fire_ms: f64,
     optimal: f64,
     falloff: f64,
-    damage: [f64; 4],
+    damage: [f64; DAMAGE_TYPE_COUNT],
     missile: Option<(i32, f64, HashMap<i32, f64>)>,
     fx: Option<String>,
 }
@@ -1597,6 +1790,7 @@ async fn npc_stats(db: &Db, type_id: i32) -> Result<NpcStats, CallError> {
     };
     let optimal = attr(&a, ATTR_MAX_RANGE, 10_000.0);
     Ok(NpcStats {
+        scan_resolution: attr(&a, ATTR_SCAN_RESOLUTION, 0.0),
         repairs: (
             attr(&a, ATTR_ENTITY_SHIELD_BOOST_AMOUNT, 0.0),
             attr(&a, ATTR_ENTITY_ARMOR_REPAIR_AMOUNT, 0.0),
@@ -1623,6 +1817,7 @@ pub async fn spawn_npc(db: Db, world: Arc<World>, system: i64, id: i64, type_id:
         }
     };
     let config = NpcConfig {
+        scan_resolution: stats.scan_resolution,
         fly_range: stats.fly_range,
         aggro_range: stats.aggro_range,
         rate_of_fire_ms: stats.rate_of_fire_ms,
@@ -1660,13 +1855,13 @@ async fn npc_shot(db: &Db, world: &Arc<World>, system: i64, id: i64, type_id: i3
     let gap = (dist(me.pos, victim.pos) - me.radius as f64 - victim.radius as f64).max(0.0);
     if let Some((charge, multiplier, c)) = &stats.missile {
         let (charge, multiplier) = (*charge, *multiplier);
-        let velocity = attr(c, ATTR_MAX_VELOCITY, 3_000.0).max(1.0);
-        let flight = velocity * attr(c, ATTR_EXPLOSION_DELAY, 5_000.0) / 1000.0;
+        let velocity = attr(c, ATTR_MAX_VELOCITY, NPC_MISSILE_VELOCITY_MPS).max(1.0);
+        let flight = velocity * ms_to_seconds(attr(c, ATTR_EXPLOSION_DELAY, NPC_MISSILE_FLIGHT_MS));
         if gap <= flight {
             let missile = Missile {
                 charge,
                 raw: ATTR_DAMAGE.map(|a| attr(c, a, 0.0) * multiplier),
-                aoe_cloud: attr(c, ATTR_AOE_CLOUD_SIZE, 40.0),
+                aoe_cloud: attr(c, ATTR_AOE_CLOUD_SIZE, NPC_MISSILE_EXPLOSION_RADIUS_METRES),
                 velocity,
                 flight_range: flight,
                 weapon: type_id,
@@ -1675,7 +1870,7 @@ async fn npc_shot(db: &Db, world: &Arc<World>, system: i64, id: i64, type_id: i3
             launch_missile(db.clone(), world.clone(), system, me.clone(), victim.clone(), me.owner_id, None, missile).await?;
         }
     }
-    if stats.damage.iter().any(|d| *d > 0.0) && gap <= stats.optimal + stats.falloff * 3.0 {
+    if stats.damage.iter().any(|d| *d > 0.0) && gap <= stats.optimal + stats.falloff * NPC_TURRET_REACH_FALLOFF_MULTIPLIER {
         if let Some(guid) = stats.fx.as_deref() {
             let fx = fire_fx(id, None, guid, Some(ship), None, true, stats.rate_of_fire_ms, 1);
             world.broadcast(system, id, vec![fx]);
@@ -1758,6 +1953,143 @@ fn npc_repair(world: &World, system: i64, id: i64, stats: &NpcStats) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn discarded_cycle_owners_release_only_their_generation() {
+        let master = -9011;
+        let generation = Arc::new(AtomicBool::new(false));
+        {
+            let mut st = state();
+            assert!(!st.active.contains_key(&master));
+            st.active.insert(master, generation.clone());
+            st.activation_generation.insert(master, generation.clone());
+        }
+        let owner = ActivationOwner { master, generation: generation.clone(), armed: true };
+        let mut system = System::default();
+        schedule_cycle_end(&mut system, 0, 1000.0, move |_, _| drop(owner));
+        drop(system);
+        {
+            let mut st = state();
+            assert!(!st.active.contains_key(&master));
+            assert!(!st.activation_generation.contains_key(&master));
+            st.active.insert(master, generation.clone());
+            st.activation_generation.insert(master, generation.clone());
+        }
+        let owner = ActivationOwner { master, generation: generation.clone(), armed: true };
+        let system = System::default();
+        system.defer(async move { drop(owner); });
+        {
+            let st = state();
+            assert!(!st.active.contains_key(&master));
+            assert!(!st.activation_generation.contains_key(&master));
+        }
+        {
+            let mut st = state();
+            st.active.insert(master, generation.clone());
+            st.activation_generation.insert(master, generation.clone());
+        }
+        let owner = ActivationOwner { master, generation: generation.clone(), armed: true };
+        let rejected_post = move |_: &mut System| drop(owner);
+        drop(rejected_post);
+        {
+            let st = state();
+            assert!(!st.active.contains_key(&master));
+            assert!(!st.activation_generation.contains_key(&master));
+        }
+
+        let replacement = Arc::new(AtomicBool::new(false));
+        {
+            let mut st = state();
+            st.active.insert(master, replacement.clone());
+            st.activation_generation.insert(master, replacement.clone());
+        }
+        let owner = ActivationOwner { master, generation, armed: true };
+        let mut system = System::default();
+        schedule_cycle_end(&mut system, 0, 1000.0, move |_, _| drop(owner));
+        drop(system);
+        let mut st = state();
+        assert!(Arc::ptr_eq(&st.active[&master], &replacement));
+        assert!(Arc::ptr_eq(&st.activation_generation[&master], &replacement));
+        st.active.remove(&master);
+        st.activation_generation.remove(&master);
+    }
+
+
+    #[test]
+    fn cycle_deadlines_and_deactivation() {
+        let mut s = System::default();
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let seen = completed.clone();
+        let flag = stop.clone();
+        schedule_cycle_end(&mut s, 1000, 500.0, move |s, end| {
+            seen.lock().unwrap().push((1, s.now_ms(), end));
+            assert!(!cycle_is_final(flag.load(Ordering::Relaxed), 3, 1));
+            // Model a continuation returning late from the worker.
+            s.schedule_at(1700, move |s| {
+                assert!(!cycle_should_stop(false, &flag));
+                schedule_cycle_end(s, end, 500.0, move |s, end| {
+                    seen.lock().unwrap().push((2, s.now_ms(), end));
+                    assert!(cycle_is_final(flag.load(Ordering::Relaxed), 3, 2));
+                    assert!(cycle_should_stop(false, &flag));
+                });
+            });
+        });
+        s.tick(1499);
+        assert!(completed.lock().unwrap().is_empty());
+        s.tick(1500);
+        s.tick(1700);
+        stop.store(true, Ordering::Relaxed);
+        s.tick(1999);
+        assert_eq!(*completed.lock().unwrap(), [(1, 1500, 1500)]);
+        s.tick(2000);
+        s.tick(3000);
+        assert_eq!(*completed.lock().unwrap(), [(1, 1500, 1500), (2, 2000, 2000)]);
+
+        let old = Arc::new(AtomicBool::new(false));
+        let replacement = Arc::new(AtomicBool::new(false));
+        let mut active = HashMap::from([(1, replacement.clone())]);
+        let mut published = false;
+        assert!(!retire_activation(&mut active, 1, &old, || published = true));
+        assert!(!published);
+        assert!(Arc::ptr_eq(&active[&1], &replacement));
+        assert!(retire_activation(&mut active, 1, &replacement, || published = true));
+        assert!(published);
+        assert!(active.is_empty());
+    }
+
+    #[test]
+    fn reload_reservation_survives_departure_and_preserves_new_marker() {
+        let mut s = System::default();
+        s.insert(Ball {
+            id: 42, type_id: 1, owner_id: 1, corp_id: 1, alliance_id: -1,
+            char_id: Some(1), signature_radius: Some(1.0), mode: crate::space::MODE_STOP, radius: 1.0, mass: 1.0,
+            max_vel: 1.0, agility: 1.0, speed_fraction: 0.0,
+            pos: [0.0; 3], vel: [0.0; 3], goto: [0.0; 3],
+            follow_id: 0, follow_range: 0.0, free: true, global: false,
+            massive: true, warp: None, warp_factor: 0, last_ms: 0,
+            cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new(),
+        });
+        let result = Arc::new(Mutex::new(None));
+        let captured = result.clone();
+        s.schedule_at(100, move |s| {
+            assert!(!s.contains(42));
+            let load = (7, 27, 8, 10, 2);
+            let mut markers = HashMap::from([(7, 100)]);
+            let (accepted, rejected) = partition_reload(vec![load], &markers, 100);
+            markers.insert(7, 200);
+            clear_reload_markers(&mut markers, &[7], 100);
+            *captured.lock().unwrap() = Some((accepted, rejected, markers));
+        });
+        s.remove_ball(42).unwrap();
+        s.tick(99);
+        assert!(result.lock().unwrap().is_none());
+        s.tick(100);
+        let result = result.lock().unwrap();
+        let (accepted, rejected, markers) = result.as_ref().unwrap();
+        assert_eq!(accepted, &vec![(7, 27, 8, 10, 2)]);
+        assert!(rejected.is_empty());
+        assert_eq!(markers.get(&7), Some(&200));
+    }
 
     #[test]
     fn hit_quality_bands() {

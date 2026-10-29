@@ -13,6 +13,8 @@
 //! memory holds the systems loaded since startup. Wormholes and spawned containers are put
 //! back in space when their system is loaded again. Startup moves legacy exploration and
 //! mission sites out of planets, along with exploration overlays and asteroids.
+//! Scan completion, probe recovery and site respawns use transient system actor timers;
+//! pending timers do not survive a restart.
 //!
 //! Protocol (client: scanSvc, sensorSuiteService, probescanning, explorationscanner):
 //! - scanMgr.SignalTrackerRegister() -> OnSignalTrackerFullState(systemID, (anomalies,
@@ -24,10 +26,10 @@
 //! - beyonce.CmdWarpToStuff('scan', targetID); wormholeMgr.WormholeJump(wormholeID).
 
 use super::{db_err, keyval, notify_error, off_surface, rand01, rand_dir, Call, CallError, CallResult};
-use crate::client::{filetime_now, Client};
+use crate::client::{filetime_now, filetime_ticks_from_seconds, Client};
 use crate::consts::{ATTR_EXPLOSION_DELAY, AU, FILETIME_SECOND, FLAG_CARGO, GROUP_ASTEROID_BELT, GROUP_PLANET, SKILL_ARCHAEOLOGY, SKILL_HACKING};
 use crate::db::Db;
-use crate::space::{dist, now_ms, Ball, World, MODE_RIGID, MODE_STOP, V3};
+use crate::space::{dist, kg_to_tonnes, minutes_to_seconds, now_ms, Ball, World, MODE_RIGID, MODE_STOP, V3};
 use marshal::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -69,14 +71,22 @@ const SKILL_ACQUISITION: i32 = 25811;
 const MAX_PROBES: usize = 8;
 /// A scan's certainty from covering probes: sum of (strength x falloff x ease) / this.
 const CERTAINTY_DIVISOR: f64 = 80.0;
+/// Server design: scan ease for both ends of a wormhole connection.
+const WORMHOLE_SCAN_EASE: f64 = 0.8;
+/// Server design: minimum cone direction length for stable normalization.
+const CONE_DIRECTION_MIN_LENGTH: f64 = 1e-9;
+/// Geometry: a cone's half-angle is its full angle divided by two.
+const CONE_HALF_ANGLE_DIVISOR: f64 = 2.0;
 /// Pilots jump through a wormhole within this distance of it (m).
 const WORMHOLE_JUMP_RANGE: f64 = 5000.0;
 /// After a jump, a pilot can't use the same connection again for this long (s).
 const POLARIZATION_SECS: i64 = 300;
-/// Cleared combat sites linger this long before a new one appears elsewhere.
-const CLEARED_SITE_LINGER_SECS: u64 = 30;
-/// Fully hacked data and relic sites linger this long (for looting).
-const HACKED_SITE_LINGER_SECS: u64 = 600;
+/// Existing server policy: cleared combat sites linger before replacement.
+const CLEARED_SITE_LINGER_MS: u64 = 30_000;
+/// Existing server policy: fully hacked sites linger for looting.
+const HACKED_SITE_LINGER_MS: u64 = 600_000;
+/// Existing server policy: recovered probes take this long to disappear.
+const PROBE_RECOVERY_DELAY_MS: u64 = 2000;
 /// Loot value per hackable container by tier (ISK).
 const CONTAINER_LOOT_VALUE: [f64; 4] = [1_500_000.0, 4_000_000.0, 10_000_000.0, 20_000_000.0];
 /// Sites sit this far off a planet (m).
@@ -511,10 +521,10 @@ async fn wormhole_pair(
         .map_err(db_err)?;
     let (life, mass, jump): (f64, f64, f64) = (a.get(0), a.get(1), a.get(2));
     let born = filetime_now();
-    let mut here = new_site(system, exploration_site_position(db, system).await?, Kind::Signature, STRENGTH_WORMHOLE, 0.8, taken);
+    let mut here = new_site(system, exploration_site_position(db, system).await?, Kind::Signature, STRENGTH_WORMHOLE, WORMHOLE_SCAN_EASE, taken);
     // The far side's target IDs are drawn from its own system's set when it is generated;
     // a clash there is harmless (results are per system).
-    let mut there = new_site(dest_system, exploration_site_position(db, dest_system).await?, Kind::Signature, STRENGTH_WORMHOLE, 0.8, &mut HashSet::new());
+    let mut there = new_site(dest_system, exploration_site_position(db, dest_system).await?, Kind::Signature, STRENGTH_WORMHOLE, WORMHOLE_SCAN_EASE, &mut HashSet::new());
     let base = Wormhole {
         type_id,
         dest_system,
@@ -1210,7 +1220,11 @@ async fn request_scans(c: &mut Client, call: &Call<'_>) -> CallResult {
     let ids: Vec<i64> = probe_ids.iter().map(|(id, _)| *id).collect();
     let (world, db) = (c.world.clone(), c.db.clone());
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(scan_ms as u64)).await;
+        if !world.after(system, scan_ms as u64).await {
+            return;
+        }
+        let job_world = world.clone();
+        world.post(system, move |s| s.defer(async move {
         let sites = system_sites(system);
         let mut results = vec![];
         let mut reported = HashSet::new();
@@ -1241,11 +1255,12 @@ async fn request_scans(c: &mut Client, call: &Call<'_>) -> CallResult {
             let before = st.reported.insert((char_id, system), reported.clone()).unwrap_or_default();
             before.difference(&reported).map(Value::str).collect()
         };
-        world.notify_pilot(
+        job_world.notify_pilot(
             char_id,
             "OnSystemScanStopped",
             vec![Value::list(ids.into_iter().map(Value::Int)), Value::List(results), Value::List(absent)],
         );
+        }));
     });
     Ok(Value::None)
 }
@@ -1260,12 +1275,14 @@ async fn recover_probes(c: &mut Client, call: &Call<'_>, destroy: bool) -> CallR
     };
     let mut back: HashMap<i32, i32> = HashMap::new();
     let mut done = vec![];
+    let mut recovered_by_system: HashMap<i64, Vec<i64>> = HashMap::new();
     {
         let mut st = state();
         for id in ids {
             if st.probes.get(&id).is_some_and(|p| p.char_id == char_id) {
                 let p = st.probes.remove(&id).unwrap();
                 *back.entry(p.type_id).or_default() += 1;
+                recovered_by_system.entry(p.system).or_default().push(id);
                 done.push(id);
             }
         }
@@ -1275,14 +1292,19 @@ async fn recover_probes(c: &mut Client, call: &Call<'_>, destroy: bool) -> CallR
             super::combat::deposit(c, char_id, ship, FLAG_CARGO, type_id, n, ship).await?;
         }
     }
-    let world = c.world.clone();
-    let gone = done.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(if destroy { 0 } else { 2 })).await;
-        for id in gone {
-            world.notify_pilot(char_id, "OnRemoveProbe", vec![Value::Int(id)]);
+    for (system, gone) in recovered_by_system {
+        if destroy {
+            for id in gone {
+                c.world.notify_pilot(char_id, "OnRemoveProbe", vec![Value::Int(id)]);
+            }
+        } else {
+            c.world.schedule(system, PROBE_RECOVERY_DELAY_MS, move |s| {
+                for id in gone {
+                    s.notify_pilot(char_id, "OnRemoveProbe", vec![Value::Int(id)]);
+                }
+            });
         }
-    });
+    }
     Ok(Value::list(done.into_iter().map(Value::Int)))
 }
 
@@ -1293,8 +1315,8 @@ async fn cone_scan(c: &mut Client, call: &Call<'_>) -> CallResult {
     let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) else { return Ok(Value::list([])) };
     let Some(hits) = c.world.with(system, move |s| {
         let me = s.ball(ship)?;
-        let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt().max(1e-9);
-        let half = (angle / 2.0).min(std::f64::consts::PI);
+        let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt().max(CONE_DIRECTION_MIN_LENGTH);
+        let half = (angle / CONE_HALF_ANGLE_DIVISOR).min(std::f64::consts::PI);
         let mut hits = vec![];
         for b in s.balls() {
             if b.id == ship || b.cloak != 0 {
@@ -1402,12 +1424,13 @@ async fn spawn_site_npcs(c: &mut Client, site: &Site) -> Result<(), CallError> {
 fn track_site_clearance(db: Db, world: Arc<World>, site_id: i64, system: i64, members: Vec<i64>) {
     let completion_world = world.clone();
     world.post(system, move |s| {
-        s.spawn_group(members, move |_| {
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(CLEARED_SITE_LINGER_SECS)).await;
-                if let Err(e) = replace_site(&db, &completion_world, site_id).await {
-                    warn!("replacing site {site_id}: {}", err_text(e));
-                }
+        s.spawn_group(members, move |s| {
+            s.schedule(CLEARED_SITE_LINGER_MS, move |s| {
+                s.defer(async move {
+                    if let Err(e) = replace_site(&db, &completion_world, site_id).await {
+                        warn!("replacing site {site_id}: {}", err_text(e));
+                    }
+                });
             });
         });
     });
@@ -1452,6 +1475,7 @@ async fn spawn_rats(c: &mut Client, system: i64, center: V3, faction: i64, group
             corp_id: corp,
             alliance_id: -1,
             char_id: None,
+            signature_radius: None,
             mode: MODE_STOP,
             radius: r.get::<_, f64>(1) as f32,
             mass: r.get(2),
@@ -1485,8 +1509,8 @@ async fn spawn_rats(c: &mut Client, system: i64, center: V3, faction: i64, group
 
 // ---------------------------------------------------------------- belt rats
 
-/// A cleared belt stays empty this long before a pilot warping in finds new rats.
-const BELT_RAT_RESPAWN_SECS: u64 = 15 * 60;
+/// Existing server policy: a cleared belt stays empty before rats respawn.
+const BELT_RAT_RESPAWN_MS: u64 = 900_000;
 
 /// Belt rat hull classes by security: a few frigates in high-sec, up to battleships in null.
 fn belt_classes(security: f64) -> &'static [&'static str] {
@@ -1500,7 +1524,7 @@ fn belt_classes(security: f64) -> &'static [&'static str] {
 }
 
 /// A pilot is warping to `belt`: unless its rats are still about (or it was cleared less
-/// than BELT_RAT_RESPAWN_SECS ago), the region's pirates spawn there. Other celestials
+/// than BELT_RAT_RESPAWN_MS ago), the region's pirates spawn there. Other celestials
 /// and wormhole space get none.
 pub async fn belt_rats(c: &mut Client, system: i64, belt: i64, center: V3) -> Result<(), CallError> {
     if state().belts.contains(&belt) {
@@ -1528,9 +1552,8 @@ pub async fn belt_rats(c: &mut Client, system: i64, belt: i64, center: V3) -> Re
     };
     info!(user = c.login.user_id, "belt {belt} in {system}: spawned {} rats", spawned.len());
     c.world.post(system, move |s| {
-        s.spawn_group(spawned, move |_s| {
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(BELT_RAT_RESPAWN_SECS)).await;
+        s.spawn_group(spawned, move |s| {
+            s.schedule(BELT_RAT_RESPAWN_MS, move |_| {
                 state().belts.remove(&belt);
             });
         });
@@ -1575,7 +1598,7 @@ async fn replace_site(db: &Db, world: &World, site_id: i64) -> Result<(), CallEr
 
 /// The wormhole age bucket (slimItem.wormholeAge: 0 new ... 3 about to close).
 fn wormhole_age(w: &Wormhole) -> i64 {
-    let left = 1.0 - (filetime_now() - w.born) as f64 / (w.life_minutes * 60.0 * FILETIME_SECOND as f64);
+    let left = 1.0 - (filetime_now() - w.born) as f64 / (minutes_to_seconds(w.life_minutes) * FILETIME_SECOND as f64);
     match left {
         l if l > 0.5 => 0,
         l if l > 0.25 => 1,
@@ -1611,6 +1634,7 @@ fn wormhole_ball(s: &Site, w: &Wormhole) -> Ball {
         corp_id: 1,
         alliance_id: -1,
         char_id: None,
+        signature_radius: None,
         mode: MODE_RIGID,
         radius: 3000.0,
         mass: 1e34,
@@ -1732,7 +1756,7 @@ async fn wormhole_jump(c: &mut Client, wormhole_id: i64) -> CallResult {
         return Err(notify_error("这个虫洞对你的舰船处于极化状态，暂时无法再次跃迁。"));
     }
     if mass > w.jump_mass {
-        return Err(notify_error(format!("你的舰船太重了，无法通过这个虫洞（最大 {:.0} 吨）。", w.jump_mass / 1000.0)));
+        return Err(notify_error(format!("你的舰船太重了，无法通过这个虫洞（最大 {:.0} 吨）。", kg_to_tonnes(w.jump_mass))));
     }
     // The far side: its K162 (or the hole this K162 answers) goes into space now.
     ensure_loaded(&c.db, &c.world, w.dest_system).await?;
@@ -1793,7 +1817,7 @@ async fn expire_wormholes(db: &Db, world: &World) -> Result<(), CallError> {
     let dead: Vec<i64> = state()
         .sites
         .values()
-        .filter(|s| s.wormhole.as_ref().is_some_and(|w| now - w.born > (w.life_minutes * 60.0) as i64 * FILETIME_SECOND))
+        .filter(|s| s.wormhole.as_ref().is_some_and(|w| now - w.born > filetime_ticks_from_seconds(minutes_to_seconds(w.life_minutes) as i64)))
         .map(|s| s.id)
         .collect();
     for id in dead {
@@ -1835,6 +1859,7 @@ fn container_ball(id: i64, type_id: i32, pos: V3, radius: f32, security_state: i
         corp_id: 1,
         alliance_id: -1,
         char_id: None,
+        signature_radius: None,
         mode: MODE_RIGID,
         radius,
         mass: 1e34,
@@ -2001,12 +2026,13 @@ pub(super) async fn container_hacked(db: &Db, world: &Arc<World>, container: i64
     let Some(site) = state().sites.get(&site_id).cloned() else { return Ok(()) };
     set_container_state(world, site.system, container, 2).await;
     if site.containers.as_ref().is_some_and(|c| c.iter().all(|id| site.hacked.contains(id))) {
-        let (db, world) = (db.clone(), world.clone());
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(HACKED_SITE_LINGER_SECS)).await;
-            if let Err(e) = replace_site(&db, &world, site_id).await {
-                warn!("replacing site {site_id}: {}", err_text(e));
-            }
+        let (db, completion_world) = (db.clone(), world.clone());
+        world.schedule(site.system, HACKED_SITE_LINGER_MS, move |s| {
+            s.defer(async move {
+                if let Err(e) = replace_site(&db, &completion_world, site_id).await {
+                    warn!("replacing site {site_id}: {}", err_text(e));
+                }
+            });
         });
     }
     Ok(())

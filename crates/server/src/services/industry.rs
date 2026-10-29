@@ -25,6 +25,9 @@ use marshal::Value;
 use std::collections::HashMap;
 use tracing::info;
 
+/// Existing server policy for completed industry job history, in days.
+const COMPLETED_JOB_HISTORY_DAYS: i64 = 90;
+
 // industry.const
 const MANUFACTURING: i32 = 1;
 const RESEARCH_TIME: i32 = 3;
@@ -959,7 +962,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             let completed = call.args.get(1).is_some_and(|v| matches!(v, Value::Bool(true)) || v.as_int().is_some_and(|i| i != 0));
             let rows = if completed {
                 c.db.client
-                    .query(&format!("{JOB_SELECT} WHERE owner_id = $1 AND (status = $2 OR completed_date >= $3) ORDER BY job_id"), &[&owner, &STATUS_INSTALLED, &(filetime_now() - 90 * FILETIME_DAY)])
+                    .query(&format!("{JOB_SELECT} WHERE owner_id = $1 AND (status = $2 OR completed_date >= $3) ORDER BY job_id"), &[&owner, &STATUS_INSTALLED, &(filetime_now() - COMPLETED_JOB_HISTORY_DAYS * FILETIME_DAY)])
                     .await
             } else {
                 c.db.client.query(&format!("{JOB_SELECT} WHERE owner_id = $1 AND status = $2 ORDER BY job_id"), &[&owner, &STATUS_INSTALLED]).await

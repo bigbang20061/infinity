@@ -15,6 +15,7 @@
 use super::{db_err, notify_error, rand01, Call, CallError, CallResult};
 use crate::client::Client;
 use crate::consts::{ATTR_MAX_RANGE, SKILL_ARCHAEOLOGY, SKILL_HACKING};
+use crate::space::{dist, metres_to_km};
 use marshal::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -462,12 +463,12 @@ pub async fn start(c: &mut Client, module: i64, target: Option<i64>) -> CallResu
     }
     let Some(gap) = c.world.with(system, move |s| {
         let (me, can) = (s.ball(ship)?, s.ball(container)?);
-        Some(((me.pos[0] - can.pos[0]).powi(2) + (me.pos[1] - can.pos[1]).powi(2) + (me.pos[2] - can.pos[2]).powi(2)).sqrt() - me.radius as f64 - can.radius as f64)
+        Some(dist(me.pos, can.pos) - me.radius as f64 - can.radius as f64)
     }).await.flatten() else {
         return Err(CallError::User { msg: "DeniedActivateTargetNotPresent".into(), dict: vec![] });
     };
     if gap > range {
-        return Err(notify_error(&format!("目标太远了（{:.1} 公里），分析仪的范围是 {:.1} 公里。", gap / 1000.0, range / 1000.0)));
+        return Err(notify_error(&format!("目标太远了（{:.1} 公里），分析仪的范围是 {:.1} 公里。", metres_to_km(gap), metres_to_km(range))));
     }
     let level: f64 = c
         .db
