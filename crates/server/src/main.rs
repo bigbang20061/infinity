@@ -103,6 +103,9 @@ async fn main() -> Result<()> {
         .init();
     let cfg = Arc::new(Config::from_env()?);
     let db = db::Db::connect(&cfg.database_url).await?;
+    if let Err(services::CallError::Internal(e)) = services::unbury_sites(&db).await {
+        tracing::warn!("moving sites out of planets failed: {e:#}");
+    }
     let hub = chat::Hub::new(&cfg.chat_domain);
     let world = space::World::new(db.clone(), cfg.system_capacity);
     tokio::spawn(services::expire_market_orders(db.clone(), world.clone()));

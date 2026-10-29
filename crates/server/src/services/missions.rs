@@ -263,20 +263,19 @@ async fn message(c: &Client, mission_id: i32, key: &str) -> Result<Option<i64>, 
         .get(0))
 }
 
-/// A mission site: a point well off a random planet of the system.
+/// A mission site: a point well off the surface of a random planet of the system.
 async fn site_position(c: &Client, system: i64) -> Result<V3, CallError> {
     let planet = c
         .db
         .client
         .query_opt(
-            "SELECT x, y, z FROM sde.map_celestials WHERE solar_system_id = $1 AND group_id = $2 ORDER BY random() LIMIT 1",
+            "SELECT x, y, z, COALESCE(radius, 0)::float8 FROM sde.map_celestials WHERE solar_system_id = $1 AND group_id = $2 ORDER BY random() LIMIT 1",
             &[&(system as i32), &GROUP_PLANET],
         )
         .await
         .map_err(db_err)?;
-    let base: V3 = planet.map(|p| [p.get(0), p.get(1), p.get(2)]).unwrap_or([0.0; 3]);
-    let d = rand_dir();
-    Ok([base[0] + d[0] * SITE_OFFSET, base[1] + d[1] * SITE_OFFSET * 0.1, base[2] + d[2] * SITE_OFFSET])
+    let (base, radius): (V3, f64) = planet.map(|p| ([p.get(0), p.get(1), p.get(2)], p.get(3))).unwrap_or(([0.0; 3], 0.0));
+    Ok(super::exploration::off_surface(base, radius, SITE_OFFSET))
 }
 
 /// Offer one of the build's kill missions at the agent's level, sited in the agent's system.
@@ -1302,6 +1301,9 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             }
             // Mission IDs switched off server-side (agents.IsMissionDisabled): none.
             "GetDisabledMissions" => Some(Ok(Value::list([]))),
+            // Show info on an NPC that isn't an agent (a corporation CEO, say): no agent
+            // details, which the info window skips.
+            "GetInfoServiceDetails" => Some(Ok(Value::None)),
             _ => None,
         };
     };
@@ -1311,13 +1313,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         Err(e) => return Some(Err(e)),
     };
     Some(match call.method {
-        // The agent's show-info tab: KeyVal(stationID, level, services, incompatible).
-        "GetInfoServiceDetails" => Ok(keyval([
-            ("stationID", if agent.station_id > 0 { Value::Int(agent.station_id) } else { Value::None }),
-            ("level", Value::Int(agent.level)),
-            ("services", Value::list([])),
-            ("incompatible", Value::None),
-        ])),
         "DoAction" => {
             let action = call.args.first().and_then(|v| v.as_int());
             do_action(c, agent, action).await

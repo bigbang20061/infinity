@@ -332,20 +332,87 @@ fn pirate_faction(faction: Option<i64>, region: i64) -> i64 {
     }
 }
 
-/// A random point well off a random planet of the system.
+/// A point `distance` above the surface of a body of `radius` at `center`, in a random
+/// direction kept near the system plane (its vertical part flattened to a fifth).
+pub(super) fn off_surface(center: V3, radius: f64, distance: f64) -> V3 {
+    let v = rand_dir();
+    let flat = [v[0], v[1] * 0.2, v[2]];
+    let len = (flat[0] * flat[0] + flat[1] * flat[1] + flat[2] * flat[2]).sqrt().max(1e-9);
+    let d = radius + distance;
+    [center[0] + flat[0] / len * d, center[1] + flat[1] / len * d, center[2] + flat[2] / len * d]
+}
+
+fn site_distance() -> f64 {
+    SITE_OFFSET.0 + rand01() * (SITE_OFFSET.1 - SITE_OFFSET.0)
+}
+
+/// A random point well off the surface of a random planet of the system.
 async fn site_position(db: &Db, system: i64) -> Result<V3, CallError> {
     let planet = db
         .client
         .query_opt(
-            "SELECT x, y, z FROM sde.map_celestials WHERE solar_system_id = $1 AND group_id = $2 ORDER BY random() LIMIT 1",
+            "SELECT x, y, z, COALESCE(radius, 0)::float8 FROM sde.map_celestials WHERE solar_system_id = $1 AND group_id = $2 ORDER BY random() LIMIT 1",
             &[&(system as i32), &GROUP_PLANET],
         )
         .await
         .map_err(db_err)?;
-    let base: V3 = planet.map(|p| [p.get(0), p.get(1), p.get(2)]).unwrap_or([AU, 0.0, 0.0]);
-    let d = SITE_OFFSET.0 + rand01() * (SITE_OFFSET.1 - SITE_OFFSET.0);
-    let v = rand_dir();
-    Ok([base[0] + v[0] * d, base[1] + v[1] * d * 0.2, base[2] + v[2] * d])
+    let (base, radius): (V3, f64) = planet.map(|p| ([p.get(0), p.get(1), p.get(2)], p.get(3))).unwrap_or(([AU, 0.0, 0.0], 0.0));
+    Ok(off_surface(base, radius, site_distance()))
+}
+
+/// Sites and mission sites are placed clear of planets' surfaces; ones made before that
+/// (measured from the centre, so inside large planets) are moved out at startup, with
+/// their scan overlay positions and any asteroids.
+pub async fn unbury_sites(db: &Db) -> Result<(), CallError> {
+    const CLEARANCE: f64 = 1_000_000.0;
+    // (table, key column, has overlay/asteroids)
+    for (table, key, exploration) in [("game.exploration_sites", "site_id", true), ("game.agent_missions", "(character_id, agent_id)", false)] {
+        let rows = db
+            .client
+            .query(
+                &format!(
+                    "SELECT {key}::text, s.x, s.y, s.z, p.x, p.y, p.z, COALESCE(p.radius, 0)::float8 FROM {table} s
+                     CROSS JOIN LATERAL (SELECT c.x, c.y, c.z, c.radius FROM sde.map_celestials c
+                                         WHERE c.solar_system_id = s.system_id AND c.group_id = $1
+                                         ORDER BY (c.x - s.x) ^ 2 + (c.y - s.y) ^ 2 + (c.z - s.z) ^ 2 LIMIT 1) p
+                     WHERE sqrt((p.x - s.x) ^ 2 + (p.y - s.y) ^ 2 + (p.z - s.z) ^ 2) < COALESCE(p.radius, 0) + $2"
+                ),
+                &[&GROUP_PLANET, &CLEARANCE],
+            )
+            .await
+            .map_err(db_err)?;
+        for r in rows {
+            let id: String = r.get(0);
+            let old: V3 = [r.get(1), r.get(2), r.get(3)];
+            let new = off_surface([r.get(4), r.get(5), r.get(6)], r.get(7), site_distance());
+            let delta = [new[0] - old[0], new[1] - old[1], new[2] - old[2]];
+            if exploration {
+                let site: i64 = id.parse().unwrap_or(0);
+                db.client
+                    .execute(
+                        "UPDATE game.exploration_sites SET x = x + $2, y = y + $3, z = z + $4,
+                                overlay_x = overlay_x + $2, overlay_y = overlay_y + $3, overlay_z = overlay_z + $4 WHERE site_id = $1",
+                        &[&site, &delta[0], &delta[1], &delta[2]],
+                    )
+                    .await
+                    .map_err(db_err)?;
+                db.client
+                    .execute("UPDATE game.asteroids SET x = x + $2, y = y + $3, z = z + $4 WHERE field_id = $1", &[&site, &delta[0], &delta[1], &delta[2]])
+                    .await
+                    .map_err(db_err)?;
+            } else {
+                db.client
+                    .execute(
+                        "UPDATE game.agent_missions SET x = x + $2, y = y + $3, z = z + $4 WHERE (character_id, agent_id)::text = $1",
+                        &[&id, &delta[0], &delta[1], &delta[2]],
+                    )
+                    .await
+                    .map_err(db_err)?;
+            }
+            info!("exploration: moved {table} {id} out of a planet");
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------- generation
@@ -1467,7 +1534,7 @@ pub async fn belt_rats(c: &mut Client, system: i64, belt: i64, center: V3) -> Re
     let is_belt = c
         .db
         .client
-        .query_opt("SELECT 1 FROM sde.map_celestials WHERE item_id = $1 AND group_id = $2", &[&(belt as i32), &GROUP_ASTEROID_BELT])
+        .query_opt("SELECT 1 FROM sde.map_celestials WHERE item_id = $1 AND group_id = $2", &[&belt, &GROUP_ASTEROID_BELT])
         .await
         .map_err(db_err)?
         .is_some();

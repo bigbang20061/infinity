@@ -330,7 +330,7 @@ async fn exhaust(db: &Db, world: &Arc<World>, id: i64) -> Result<(), CallError> 
     }
     let belt = db
         .client
-        .query_opt("SELECT x, y, z FROM sde.map_celestials WHERE item_id = $1 AND group_id = $2", &[&(rock.field as i32), &GROUP_ASTEROID_BELT])
+        .query_opt("SELECT x, y, z FROM sde.map_celestials WHERE item_id = $1 AND group_id = $2", &[&rock.field, &GROUP_ASTEROID_BELT])
         .await
         .map_err(db_err)?;
     if let Some(b) = belt {

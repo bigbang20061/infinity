@@ -271,12 +271,16 @@ impl Client {
             bound: is_object_call,
             bind_params: bind_params.as_ref(),
         };
-        debug!(
-            user = self.login.user_id,
-            "call {}{service}::{method}{}",
-            if is_object_call { "bound " } else { "" },
-            short(&marshal::Value::Tuple(args.clone()))
-        );
+        // The client asks these on every inventory listing (several a second in space).
+        const UNLOGGED: [&str; 2] = ["ListSoulBound", "ListServiceLifeDamage"];
+        if !UNLOGGED.contains(&method.as_str()) {
+            debug!(
+                user = self.login.user_id,
+                "call {}{service}::{method}{}",
+                if is_object_call { "bound " } else { "" },
+                short(&marshal::Value::Tuple(args.clone()))
+            );
+        }
         let result = services::dispatch(self, &call).await;
         // Session changes caused by the call reach the client before its response.
         self.flush().await?;

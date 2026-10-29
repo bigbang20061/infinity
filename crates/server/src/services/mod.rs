@@ -42,6 +42,7 @@ pub use contracts::settle_auctions;
 pub use fleets::logged_off as fleet_logged_off;
 pub use market::expire_orders as expire_market_orders;
 pub use bills::run_billing;
+pub use exploration::unbury_sites;
 
 use crate::client::{filetime_now, short, Client};
 use marshal::{DbRowDescriptor, DbType, Value};

@@ -90,7 +90,9 @@ const UE_TYPEID: i64 = 4;
 const SEC: i64 = 10_000_000;
 
 /// Temporary item IDs for missiles in flight.
-static NEXT_MISSILE_ID: AtomicI64 = AtomicI64::new(9_500_000_000_000);
+/// Missile balls; clear of NPCs (9.0e12), exploration sites (9.5e12), probes (9.6e12) and
+/// asteroids (9.7e12).
+static NEXT_MISSILE_ID: AtomicI64 = AtomicI64::new(9_800_000_000_000);
 static NEXT_LOCK: AtomicU64 = AtomicU64::new(1);
 
 fn rand01() -> f64 {
