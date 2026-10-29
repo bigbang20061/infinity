@@ -649,21 +649,18 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             let min_range = call.kwargs.get("minRange").and_then(|v| v.as_float()).unwrap_or(0.0);
             // 'char': a fleet member's ship.
             let by_pilot = a.first().and_then(|v| v.as_text()).as_deref() == Some("char");
-            let found = c.session.int("solarsystemid").and_then(|sys| c.world.balls_snapshot(sys)).and_then(|balls| {
-                if by_pilot {
-                    balls.values().find(|b| b.char_id == Some(target)).cloned()
-                } else {
-                    balls.get(&target).cloned()
-                }
-            });
-            let Some(o) = found else {
+            let found = c.session.int("solarsystemid").and_then(|sys| c.world.read(sys, |s| {
+                if by_pilot { s.pilot_ball(target) } else { s.ball(target) }
+                    .map(|b| (b.id, b.pos, b.radius as f64))
+            })).flatten();
+            let Some((id, pos, radius)) = found else {
                 return Some(Ok(Value::None));
             };
-            let warped = warp_to(c, Some((o.pos, o.radius as f64)), o.pos, min_range);
+            let warped = warp_to(c, Some((pos, radius)), pos, min_range);
             // Warping to an asteroid belt brings out its rats.
             if let (Ok(_), false, Some(system)) = (&warped, by_pilot, c.session.int("solarsystemid")) {
-                if let Err(e) = super::exploration::belt_rats(c, system, o.id, o.pos).await {
-                    warn!(user = c.login.user_id, "belt rats at {}: {}", o.id, super::exploration::err_text(e));
+                if let Err(e) = super::exploration::belt_rats(c, system, id, pos).await {
+                    warn!(user = c.login.user_id, "belt rats at {}: {}", id, super::exploration::err_text(e));
                 }
             }
             warped

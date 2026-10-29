@@ -774,8 +774,8 @@ fn despawn(c: &Client, char_id: i64, agent_id: i64) {
 fn objective_done(c: &Client, m: &Mission) -> bool {
     let me = c.session.int("charid").unwrap_or(0);
     let Some((system, npcs)) = sites().lock().unwrap().get(&(me, m.agent_id)).cloned() else { return false };
-    let balls = c.world.balls_snapshot(system).unwrap_or_default();
-    m.state == STATE_ACCEPTED && !npcs.iter().any(|id| balls.contains_key(id))
+    let any_remaining = c.world.read(system, |s| npcs.iter().any(|id| s.contains(*id))).unwrap_or(false);
+    m.state == STATE_ACCEPTED && !any_remaining
 }
 
 // ---------------------------------------------------------------- client shapes
@@ -1203,7 +1203,7 @@ async fn warp_to_location(c: &mut Client, agent: &Agent, call: &Call<'_>) -> Cal
             if here != Some(system) {
                 return Ok(Value::None);
             }
-            let radius = c.world.balls_snapshot(system).and_then(|b| b.get(&station).map(|s| s.radius as f64)).unwrap_or(5000.0);
+            let radius = c.world.read(system, |s| s.ball(station).map(|b| b.radius as f64)).flatten().unwrap_or(5000.0);
             super::ship::warp_to(c, Some((pos, radius)), pos, range)
         }
         _ => Ok(Value::None),
@@ -1218,8 +1218,7 @@ fn at_site(c: &Client, m: &Mission) -> bool {
     if system != m.system_id {
         return false;
     }
-    let balls = c.world.balls_snapshot(system).unwrap_or_default();
-    balls.get(&ship).is_some_and(|b| (0..3).map(|i| (b.pos[i] - m.pos[i]).powi(2)).sum::<f64>().sqrt() < SITE_RADIUS)
+    c.world.read(system, |s| s.ball(ship).is_some_and(|b| (0..3).map(|i| (b.pos[i] - m.pos[i]).powi(2)).sum::<f64>().sqrt() < SITE_RADIUS)).unwrap_or(false)
 }
 
 /// The steps of a kill mission, as missionObjectiveData objective items (strings).

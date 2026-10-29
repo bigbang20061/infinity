@@ -141,7 +141,7 @@ async fn shift_security(db: &Db, world: &World, char_id: i64, fraction: f64, tow
 
 /// Pilots in space in a system.
 fn pilots_in(world: &World, system: i64) -> Vec<i64> {
-    world.balls_snapshot(system).map(|b| b.values().filter_map(|b| b.char_id).collect()).unwrap_or_default()
+    world.read(system, |s| s.pilots().filter_map(|b| b.char_id).collect()).unwrap_or_default()
 }
 
 fn timer(state: i64, until: Option<i64>) -> Value {
@@ -259,7 +259,7 @@ fn dispatch_concord(world: Arc<World>, system: i64, criminal: i64, security: f64
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
         state().concord.remove(&criminal);
-        let ship = world.balls_snapshot(system).and_then(|b| b.values().find(|b| b.char_id == Some(criminal)).map(|b| b.id));
+        let ship = world.read(system, |s| s.pilot_ball(criminal).map(|b| b.id)).flatten();
         if let Some(ship) = ship {
             info!("crimewatch: CONCORD destroyed ship {ship} of {criminal} in {system}");
             world.notify_pilot(

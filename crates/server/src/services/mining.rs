@@ -409,9 +409,13 @@ fn tell(notify: &NotifyTx, text: &str) {
 #[allow(clippy::too_many_arguments)]
 pub async fn extract(db: &Db, world: &Arc<World>, notify: &NotifyTx, char_id: i64, ship: i64, system: i64, fit: &Fit, module: i64, target: i64) -> Result<bool, CallError> {
     let Some(rock) = state().rocks.get(&target).cloned() else { return Ok(false) };
-    let balls = world.balls_snapshot(system).unwrap_or_default();
-    let (Some(me), Some(it)) = (balls.get(&ship), balls.get(&target)) else { return Ok(false) };
-    if dist(me.pos, it.pos) - me.radius as f64 - it.radius as f64 > fit.value(Key::Module(module), ATTR_MAX_RANGE) {
+    let Some((gap, pilots)) = world.read(system, |s| {
+        let (me, it) = (s.ball(ship)?, s.ball(target)?);
+        let gap = dist(me.pos, it.pos) - me.radius as f64 - it.radius as f64;
+        let pilots: Vec<i64> = s.pilots().filter_map(|b| b.char_id.filter(|c| *c != char_id)).collect();
+        Some((gap, pilots))
+    }).flatten() else { return Ok(false) };
+    if gap > fit.value(Key::Module(module), ATTR_MAX_RANGE) {
         tell(notify, "目标超出了采矿设备的范围。");
         return Ok(false);
     }
@@ -469,8 +473,8 @@ pub async fn extract(db: &Db, world: &Arc<World>, notify: &NotifyTx, char_id: i6
         ])],
     ));
     // Others mining the same rock see it shrink.
-    for b in balls.values().filter(|b| b.char_id.is_some_and(|c| c != char_id)) {
-        world.notify_pilot(b.char_id.unwrap_or(0), "OnOreMinedByOther", vec![Value::Int(target), Value::Int(taken + wasted_units)]);
+    for pilot in pilots {
+        world.notify_pilot(pilot, "OnOreMinedByOther", vec![Value::Int(target), Value::Int(taken + wasted_units)]);
     }
     if left == 0 {
         exhaust(db, world, target).await?;
@@ -486,16 +490,17 @@ pub async fn extract(db: &Db, world: &Arc<World>, notify: &NotifyTx, char_id: i6
 /// miningScanMgr.perform_scan() -> [(asteroidID, typeID, quantity)] within reach.
 fn perform_scan(c: &Client) -> Value {
     let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) else { return Value::None };
-    let balls = c.world.balls_snapshot(system).unwrap_or_default();
-    let Some(me) = balls.get(&ship) else { return Value::None };
-    let rocks: Vec<(i64, Rock)> = state().rocks.iter().filter(|(_, r)| r.system == system).map(|(id, r)| (*id, r.clone())).collect();
-    Value::List(
-        rocks
-            .into_iter()
-            .filter(|(id, _)| balls.get(id).is_some_and(|b| dist(b.pos, me.pos) <= SCAN_RANGE))
-            .map(|(id, r)| Value::tuple([Value::Int(id), Value::Int(r.type_id as i64), Value::Int(r.quantity)]))
-            .collect(),
-    )
+    let rocks: Vec<(i64, i32, i64)> = state().rocks.iter().filter(|(_, r)| r.system == system).map(|(id, r)| (*id, r.type_id, r.quantity)).collect();
+    c.world.read(system, |s| {
+        let me = s.ball(ship)?;
+        Some(Value::List(
+            rocks
+                .into_iter()
+                .filter(|(id, _, _)| s.ball(*id).is_some_and(|b| dist(b.pos, me.pos) <= SCAN_RANGE))
+                .map(|(id, type_id, quantity)| Value::tuple([Value::Int(id), Value::Int(type_id as i64), Value::Int(quantity)]))
+                .collect(),
+        ))
+    }).flatten().unwrap_or(Value::None)
 }
 
 // ---------------------------------------------------------------- reprocessing

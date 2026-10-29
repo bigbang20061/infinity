@@ -1031,7 +1031,7 @@ fn full_state(system: i64) -> Value {
 
 /// Tell every pilot in `system` about sites that came or went.
 fn broadcast_sites(world: &World, system: i64, added: &[Site], removed: &[Site]) {
-    let pilots: Vec<i64> = world.balls_snapshot(system).unwrap_or_default().values().filter_map(|b| b.char_id).collect();
+    let pilots: Vec<i64> = world.read(system, |s| s.pilots().filter_map(|b| b.char_id).collect()).unwrap_or_default();
     for (kind, event, info) in [
         (Kind::Anomaly, "OnSignalTrackerAnomalyUpdate", anomaly_info as fn(&Site) -> Value),
         (Kind::Signature, "OnSignalTrackerSignatureUpdate", signature_info),
@@ -1333,26 +1333,28 @@ async fn cone_scan(c: &mut Client, call: &Call<'_>) -> CallResult {
     let n = |i: usize| call.args.get(i).and_then(|v| v.as_float()).unwrap_or(0.0);
     let (angle, range, dir) = (n(0), n(1), [n(2), n(3), n(4)]);
     let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) else { return Ok(Value::list([])) };
-    let balls = c.world.balls_snapshot(system).unwrap_or_default();
-    let Some(me) = balls.get(&ship) else { return Ok(Value::list([])) };
-    let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt().max(1e-9);
-    let half = (angle / 2.0).min(std::f64::consts::PI);
-    let mut hits = vec![];
-    for b in balls.values() {
-        if b.id == ship || b.cloak != 0 {
-            continue;
+    let Some(hits) = c.world.read(system, |s| {
+        let me = s.ball(ship)?;
+        let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt().max(1e-9);
+        let half = (angle / 2.0).min(std::f64::consts::PI);
+        let mut hits = vec![];
+        for b in s.balls() {
+            if b.id == ship || b.cloak != 0 {
+                continue;
+            }
+            let v = [b.pos[0] - me.pos[0], b.pos[1] - me.pos[1], b.pos[2] - me.pos[2]];
+            let d = dist(b.pos, me.pos);
+            if d > range || d < 1.0 {
+                continue;
+            }
+            let cos = (v[0] * dir[0] + v[1] * dir[1] + v[2] * dir[2]) / (d * len);
+            if half < std::f64::consts::PI && cos.clamp(-1.0, 1.0).acos() > half {
+                continue;
+            }
+            hits.push((b.id, b.type_id));
         }
-        let v = [b.pos[0] - me.pos[0], b.pos[1] - me.pos[1], b.pos[2] - me.pos[2]];
-        let d = dist(b.pos, me.pos);
-        if d > range || d < 1.0 {
-            continue;
-        }
-        let cos = (v[0] * dir[0] + v[1] * dir[1] + v[2] * dir[2]) / (d * len);
-        if half < std::f64::consts::PI && cos.clamp(-1.0, 1.0).acos() > half {
-            continue;
-        }
-        hits.push((b.id, b.type_id));
-    }
+        Some(hits)
+    }).flatten() else { return Ok(Value::list([])) };
     let types: Vec<i32> = hits.iter().map(|h| h.1).collect::<HashSet<_>>().into_iter().collect();
     let groups: HashMap<i32, i64> = c
         .db
@@ -1556,8 +1558,7 @@ pub async fn belt_rats(c: &mut Client, system: i64, belt: i64, center: V3) -> Re
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            let balls = world.balls_snapshot(system).unwrap_or_default();
-            if !spawned.iter().any(|id| balls.contains_key(id)) {
+            if !world.read(system, |s| spawned.iter().any(|id| s.contains(*id))).unwrap_or(false) {
                 break;
             }
         }
@@ -1579,8 +1580,7 @@ pub(super) fn err_text(e: CallError) -> String {
 async fn watch_site(db: Db, world: Arc<World>, site_id: i64, system: i64, npcs: Vec<i64>) {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        let balls = world.balls_snapshot(system).unwrap_or_default();
-        if !npcs.iter().any(|id| balls.contains_key(id)) {
+        if !world.read(system, |s| npcs.iter().any(|id| s.contains(*id))).unwrap_or(false) {
             break;
         }
     }
@@ -1766,18 +1766,19 @@ async fn wormhole_jump(c: &mut Client, wormhole_id: i64) -> CallResult {
     let Some((site, w)) = state().sites.get(&wormhole_id).and_then(|s| s.wormhole.clone().map(|w| (s.clone(), w))) else {
         return Err(notify_err("这个虫洞已经坍塌了。"));
     };
-    let balls = c.world.balls_snapshot(system).unwrap_or_default();
-    let (Some(me), Some(hole)) = (balls.get(&ship), balls.get(&wormhole_id)) else { return Ok(Value::None) };
-    if dist(me.pos, hole.pos) - hole.radius as f64 - me.radius as f64 > WORMHOLE_JUMP_RANGE {
+    let Some((gap, mass)) = c.world.read(system, |s| {
+        let (me, hole) = (s.ball(ship)?, s.ball(wormhole_id)?);
+        Some((dist(me.pos, hole.pos) - hole.radius as f64 - me.radius as f64, me.mass))
+    }).flatten() else { return Ok(Value::None) };
+    if gap > WORMHOLE_JUMP_RANGE {
         return Err(CallError::User { msg: "NotCloseEnoughToJump".into(), dict: vec![("maxdist".into(), Value::Int(WORMHOLE_JUMP_RANGE as i64))] });
     }
     if polarization(char_id, wormhole_id).is_some() {
         return Err(notify_err("这个虫洞对你的舰船处于极化状态，暂时无法再次跃迁。"));
     }
-    if me.mass > w.jump_mass {
+    if mass > w.jump_mass {
         return Err(notify_err(format!("你的舰船太重了，无法通过这个虫洞（最大 {:.0} 吨）。", w.jump_mass / 1000.0)));
     }
-    let mass = me.mass;
     // The far side: its K162 (or the hole this K162 answers) goes into space now.
     ensure_loaded(&c.db, &c.world, w.dest_system).await?;
     ensure_wormhole_ball(&c.db, &c.world, w.other).await?;

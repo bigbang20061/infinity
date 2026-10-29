@@ -472,11 +472,12 @@ pub async fn start(c: &mut Client, module: i64, target: Option<i64>) -> CallResu
     if skill != needed {
         return Err(notify_err(if site.relic { "这是遗迹容器，需要使用遗迹分析仪。" } else { "这是数据容器，需要使用数据分析仪。" }));
     }
-    let balls = c.world.balls_snapshot(system).unwrap_or_default();
-    let (Some(me), Some(can)) = (balls.get(&ship), balls.get(&container)) else {
+    let Some(gap) = c.world.read(system, |s| {
+        let (me, can) = (s.ball(ship)?, s.ball(container)?);
+        Some(((me.pos[0] - can.pos[0]).powi(2) + (me.pos[1] - can.pos[1]).powi(2) + (me.pos[2] - can.pos[2]).powi(2)).sqrt() - me.radius as f64 - can.radius as f64)
+    }).flatten() else {
         return Err(CallError::User { msg: "DeniedActivateTargetNotPresent".into(), dict: vec![] });
     };
-    let gap = ((me.pos[0] - can.pos[0]).powi(2) + (me.pos[1] - can.pos[1]).powi(2) + (me.pos[2] - can.pos[2]).powi(2)).sqrt() - me.radius as f64 - can.radius as f64;
     if gap > range {
         return Err(notify_err(&format!("目标太远了（{:.1} 公里），分析仪的范围是 {:.1} 公里。", gap / 1000.0, range / 1000.0)));
     }

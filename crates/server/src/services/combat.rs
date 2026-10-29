@@ -204,8 +204,7 @@ fn targets_of(char_id: i64) -> Vec<i64> {
 /// `OnTarget('add', targetID)`.
 async fn add_target(c: &mut Client, target: i64) -> CallResult {
     let Some(cx) = ctx(c) else { return Err(user_error("TargetingAttemptCancelled", vec![])) };
-    let balls = cx.world.balls_snapshot(cx.system_id).unwrap_or_default();
-    let (Some(ship), Some(t)) = (balls.get(&cx.ship_id), balls.get(&target)) else {
+    let Some((ship, t)) = cx.world.read(cx.system_id, |s| Some((s.ball(cx.ship_id)?.clone(), s.ball(target)?.clone()))).flatten() else {
         return Err(user_error("TargetingAttemptCancelled", vec![]));
     };
     let fit = Fit::load(&cx.db, cx.char_id, cx.ship_id).await?;
@@ -237,7 +236,7 @@ async fn add_target(c: &mut Client, target: i64) -> CallResult {
             let mut st = state();
             st.locking.get(&(cx.char_id, target)) == Some(&attempt) && st.locking.remove(&(cx.char_id, target)).is_some()
         };
-        let present = cx.world.balls_snapshot(cx.system_id).is_some_and(|b| b.contains_key(&target));
+        let present = cx.world.read(cx.system_id, |s| s.contains(target)).unwrap_or(false);
         if still_wanted && present {
             state().targets.entry(cx.char_id).or_default().insert(target);
             cx.notify("OnTarget", vec![Value::str("add"), Value::Int(target)]);
@@ -781,7 +780,7 @@ fn absorb(now: &mut [f64; 3], resonance: &[[f64; 4]; 3], raw: [f64; 4]) -> f64 {
 
 /// Damage an NPC (or any non-player ball); destroys it at zero structure.
 async fn damage_npc(db: &Db, world: &World, system: i64, target: i64, raw: [f64; 4], attacker: Option<i64>) -> Result<f64, CallError> {
-    let Some(ball) = world.balls_snapshot(system).and_then(|b| b.get(&target).cloned()) else { return Ok(0.0) };
+    let Some(ball) = world.ball(system, target).await else { return Ok(0.0) };
     if let Some(pilot) = attacker {
         state().aggressors.entry(target).or_default().insert(pilot);
     }
@@ -870,9 +869,8 @@ pub(super) fn destroy_player_ship(world: &World, system: i64, ship: i64, char_id
 
 /// Damage whatever `target` is: a player's ship or an NPC. `attacker` is the pilot
 /// responsible, if any (NPCs remember them; kills pay them).
-async fn damage(db: &Db, world: &World, system: i64, target: i64, raw: [f64; 4], attacker: Option<i64>) -> Result<f64, CallError> {
-    let pilot = world.balls_snapshot(system).and_then(|b| b.get(&target).and_then(|t| t.char_id));
-    match pilot {
+async fn damage(db: &Db, world: &World, system: i64, target: i64, target_pilot: Option<i64>, raw: [f64; 4], attacker: Option<i64>) -> Result<f64, CallError> {
+    match target_pilot {
         Some(char_id) => damage_player(db, world, system, target, char_id, raw, attacker).await,
         None => damage_npc(db, world, system, target, raw, attacker).await,
     }
@@ -1210,27 +1208,25 @@ fn damage_message(key: &str, other: i64, weapon: i32, damage: f64, quality: i64)
 }
 
 /// Tell both sides of a hit: the shooter (if a pilot) and the victim (if a pilot).
-fn report_hit(world: &World, system: i64, shooter: i64, target: i64, weapon: i32, damage: f64, quality: i64) {
-    let balls = world.balls_snapshot(system).unwrap_or_default();
-    if let Some(ch) = balls.get(&shooter).and_then(|b| b.char_id) {
+fn report_hit(world: &World, shooter: i64, target: i64, shooter_pilot: Option<i64>, target_pilot: Option<i64>, weapon: i32, damage: f64, quality: i64) {
+    if let Some(ch) = shooter_pilot {
         world.notify_pilot(ch, "OnDamageMessage", vec![damage_message("target", target, weapon, damage, quality)]);
     }
-    if let Some(ch) = balls.get(&target).and_then(|b| b.char_id) {
+    if let Some(ch) = target_pilot {
         world.notify_pilot(ch, "OnDamageMessage", vec![damage_message("source", shooter, weapon, damage, quality)]);
     }
 }
 
 /// One turret shot at `target`, with the fitted module's and its charge's effective attributes.
 async fn fire_turret(cx: &Ctx, fit: &Fit, module: &Module, target: i64) -> Result<(), CallError> {
-    let balls = cx.world.balls_snapshot(cx.system_id).unwrap_or_default();
-    let (Some(ship), Some(t)) = (balls.get(&cx.ship_id), balls.get(&target)) else { return Ok(()) };
+    let Some((ship, t)) = cx.world.read(cx.system_id, |s| Some((s.ball(cx.ship_id)?.clone(), s.ball(target)?.clone()))).flatten() else { return Ok(()) };
     let (m, ch) = (Key::Module(module.id), Key::Charge(module.id));
     let gap = (dist(ship.pos, t.pos) - t.radius as f64 - ship.radius as f64).max(0.0);
     let multiplier = turret_roll(gap, fit.value(m, ATTR_MAX_RANGE), fit.value(m, ATTR_FALLOFF));
     let base = fit.value(m, ATTR_DAMAGE_MULTIPLIER).max(0.0) * multiplier;
     let raw = ATTR_DAMAGE.map(|id| fit.value(ch, id) * base);
-    let dealt = if multiplier > 0.0 { damage(&cx.db, &cx.world, cx.system_id, target, raw, Some(cx.char_id)).await? } else { 0.0 };
-    report_hit(&cx.world, cx.system_id, cx.ship_id, target, module.type_id, dealt, hit_quality(multiplier));
+    let dealt = if multiplier > 0.0 { damage(&cx.db, &cx.world, cx.system_id, target, t.char_id, raw, Some(cx.char_id)).await? } else { 0.0 };
+    report_hit(&cx.world, cx.ship_id, target, ship.char_id, t.char_id, module.type_id, dealt, hit_quality(multiplier));
     Ok(())
 }
 
@@ -1294,21 +1290,20 @@ async fn launch_missile(db: Db, world: Arc<World>, system: i64, from: Ball, targ
         tokio::time::sleep(std::time::Duration::from_secs_f64((distance / m.velocity.max(1.0)).clamp(0.5, 30.0))).await;
         world.destroy_ball(system, missile_id);
         let reached = distance <= m.flight_range + 2_000.0;
-        let present = world.balls_snapshot(system).is_some_and(|b| b.contains_key(&target.id));
+        let present = world.read(system, |s| s.contains(target.id)).unwrap_or(false);
         let (dealt, quality) = if reached && present {
             let application = (signature / m.aoe_cloud.max(1.0)).min(1.0);
-            (damage(&db, &world, system, target.id, m.raw.map(|d| d * application), m.attacker).await.unwrap_or(0.0), 3)
+            (damage(&db, &world, system, target.id, target.char_id, m.raw.map(|d| d * application), m.attacker).await.unwrap_or(0.0), 3)
         } else {
             (0.0, 0)
         };
-        report_hit(&world, system, from.id, target.id, m.weapon, dealt, quality);
+        report_hit(&world, from.id, target.id, from.char_id, target.char_id, m.weapon, dealt, quality);
     });
     Ok(())
 }
 
 async fn fire_missile(cx: &Ctx, fit: &Fit, module: &Module, charge: i32, target: i64) -> Result<(), CallError> {
-    let balls = cx.world.balls_snapshot(cx.system_id).unwrap_or_default();
-    let (Some(ship), Some(t)) = (balls.get(&cx.ship_id).cloned(), balls.get(&target).cloned()) else { return Ok(()) };
+    let Some((ship, t)) = cx.world.read(cx.system_id, |s| Some((s.ball(cx.ship_id)?.clone(), s.ball(target)?.clone()))).flatten() else { return Ok(()) };
     let ch = Key::Charge(module.id);
     let velocity = fit.value(ch, ATTR_MISSILE_VELOCITY).max(1.0);
     let missile = Missile {
@@ -1483,19 +1478,22 @@ async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
         let Some(t) = target.filter(|t| targets_of(cx.char_id).contains(t)) else {
             return Err(user_error("DeniedActivateTargetNotPresent", vec![]));
         };
-        let balls = cx.world.balls_snapshot(cx.system_id).unwrap_or_default();
-        if balls.get(&cx.ship_id).is_some_and(|b| b.mode == MODE_WARP) {
+        let (in_warp, own_type, present, victim) = cx.world.read(cx.system_id, |s| {
+            let ship = s.ball(cx.ship_id);
+            let target = s.ball(t);
+            (ship.is_some_and(|b| b.mode == MODE_WARP), ship.map(|b| b.type_id).unwrap_or(0), target.is_some(), target.and_then(|b| b.char_id))
+        }).unwrap_or((false, 0, false, None));
+        if in_warp {
             return Err(user_error("DeniedActivateInWarp", vec![]));
         }
-        if !balls.contains_key(&t) {
+        if !present {
             return Err(user_error("DeniedActivateTargetNotPresent", vec![]));
         }
         if loaded(&cx.db, cx.ship_id, module.flag_id).await?.is_none_or(|(_, q)| q <= 0) {
             return Err(user_error("NoCharges", vec![("launcher", Value::tuple([Value::Int(UE_TYPEID), Value::Int(module.type_id as i64)]))]));
         }
         // Shooting another pilot is a matter for crimewatch.
-        if let Some(victim) = balls.get(&t).and_then(|b| b.char_id) {
-            let own_type = balls.get(&cx.ship_id).map(|b| b.type_id).unwrap_or(0);
+        if let Some(victim) = victim {
             super::crimewatch::aggress(&cx.db, &cx.world, cx.system_id, cx.char_id, own_type, module.type_id, victim, t).await?;
         }
     }
@@ -1506,10 +1504,11 @@ async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
         if !super::mining::is_rock(t) {
             return Err(user_error("CustomNotify", vec![("notify", Value::unicode("只能对小行星、冰矿或气云使用采矿设备。"))]));
         }
-        let balls = cx.world.balls_snapshot(cx.system_id).unwrap_or_default();
+        let gap = cx.world.read(cx.system_id, |s| {
+            s.ball(cx.ship_id).zip(s.ball(t)).map(|(a, b)| dist(a.pos, b.pos) - a.radius as f64 - b.radius as f64)
+        }).flatten();
         let fit = Fit::load(&cx.db, cx.char_id, cx.ship_id).await?;
         let range = fit.value(Key::Module(item_id), ATTR_MAX_RANGE);
-        let gap = balls.get(&cx.ship_id).zip(balls.get(&t)).map(|(a, b)| dist(a.pos, b.pos) - a.radius as f64 - b.radius as f64);
         if gap.is_none_or(|g| g > range) {
             return Err(user_error("CustomNotify", vec![("notify", Value::unicode(format!("目标超出了采矿设备的范围（{:.1} 公里）。", range / 1000.0)))]));
         }
@@ -1667,17 +1666,28 @@ async fn npc_ai(db: &Db, world: &Arc<World>, system: i64, id: i64, type_id: i32,
     let mut next_shot = 0i64;
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-        let Some(balls) = world.balls_snapshot(system) else { return Ok(()) };
-        let Some(me) = balls.get(&id) else { return Ok(()) };
         if !state().npcs.contains(&id) {
             return Ok(());
         }
-        npc_repair(world, system, id, &stats, &mut next_repair);
         // Pilots this NPC fights: its mission runner (or everyone) and anyone who has shot it.
         let enemies: HashSet<i64> = state().aggressors.get(&id).cloned().unwrap_or_default().into_iter().chain(owner).collect();
         let hostile = |ch: i64| owner == Some(HOSTILE_TO_ALL) || enemies.contains(&ch);
+        let Some((me, victim, nearest)) = world.read(system, |s| {
+            let me = s.ball(id)?;
+            let victim = target.and_then(|(ship, _, _)| s.ball(ship))
+                .filter(|b| b.cloak == 0 && dist(b.pos, me.pos) < stats.aggro_range * 2.0);
+            let nearest = if victim.is_none() {
+                s.pilots()
+                    .filter(|b| b.char_id.is_some_and(hostile) && b.cloak == 0 && b.mode != MODE_WARP && dist(b.pos, me.pos) <= stats.aggro_range)
+                    .min_by(|a, b| dist(a.pos, me.pos).partial_cmp(&dist(b.pos, me.pos)).unwrap_or(std::cmp::Ordering::Equal))
+            } else {
+                None
+            };
+            Some((me.clone(), victim.cloned(), nearest.cloned()))
+        }).flatten() else { return Ok(()) };
+        npc_repair(world, system, id, &stats, &mut next_repair);
         // Keep the current target while it is around, else take the nearest visible pilot.
-        let current = target.filter(|(ship, _, _)| balls.get(ship).is_some_and(|b| b.cloak == 0 && dist(b.pos, me.pos) < stats.aggro_range * 2.0));
+        let current = target.filter(|_| victim.is_some());
         if current.is_none() {
             if let Some((ship, pilot, _)) = target.take() {
                 world.notify_pilot(pilot, "OnTarget", vec![Value::str("otherlost"), Value::Int(id), Value::None]);
@@ -1688,10 +1698,6 @@ async fn npc_ai(db: &Db, world: &Arc<World>, system: i64, id: i64, type_id: i32,
                     vec![event(t, "Stop", vec![Value::Int(b.id)])]
                 });
             }
-            let nearest = balls
-                .values()
-                .filter(|b| b.char_id.is_some_and(hostile) && b.cloak == 0 && b.mode != MODE_WARP && dist(b.pos, me.pos) <= stats.aggro_range)
-                .min_by(|a, b| dist(a.pos, me.pos).partial_cmp(&dist(b.pos, me.pos)).unwrap_or(std::cmp::Ordering::Equal));
             if let Some(b) = nearest {
                 let (ship, pilot, orbit) = (b.id, b.char_id.unwrap_or(0), stats.fly_range);
                 world.command(system, id, |b, t, _| {
@@ -1722,7 +1728,7 @@ async fn npc_ai(db: &Db, world: &Arc<World>, system: i64, id: i64, type_id: i32,
         if now < next_shot {
             continue;
         }
-        let Some(victim) = balls.get(&ship) else { continue };
+        let Some(victim) = victim else { continue };
         let gap = (dist(me.pos, victim.pos) - me.radius as f64 - victim.radius as f64).max(0.0);
         if let Some((charge, multiplier, c)) = &stats.missile {
             let (charge, multiplier) = (*charge, *multiplier);
@@ -1747,8 +1753,8 @@ async fn npc_ai(db: &Db, world: &Arc<World>, system: i64, id: i64, type_id: i32,
                 world.broadcast(system, id, vec![fx]);
             }
             let multiplier = turret_roll(gap, stats.optimal, stats.falloff);
-            let dealt = if multiplier > 0.0 { damage(db, world, system, ship, stats.damage.map(|d| d * multiplier), None).await? } else { 0.0 };
-            report_hit(world, system, id, ship, type_id, dealt, hit_quality(multiplier));
+            let dealt = if multiplier > 0.0 { damage(db, world, system, ship, victim.char_id, stats.damage.map(|d| d * multiplier), None).await? } else { 0.0 };
+            report_hit(world, id, ship, me.char_id, victim.char_id, type_id, dealt, hit_quality(multiplier));
         }
         next_shot = now + (stats.rate_of_fire_ms * 10_000.0) as i64;
     }

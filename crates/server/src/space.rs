@@ -6,6 +6,10 @@
 //! send; the server integrates ships with destiny's model (exponential
 //! approach to target velocity with tau = mass * agility / 1e6, warp phases
 //! from Ballpark.cpp SetupWarpConstants) to know where things are.
+//!
+//! Celestials come from the SDE; dynamic balls stay in memory. Reads evolve
+//! lazily under the world lock and use closure-scoped access plus a pilot index.
+//! Each client observes at most one system. There is no autonomous tick yet.
 
 use crate::db::Db;
 use anyhow::Result;
@@ -298,13 +302,54 @@ fn add_balls_event(tick: i64, ball: &Ball) -> Value {
     event(tick, "AddBalls", vec![chunk])
 }
 
-struct System {
+#[derive(Default)]
+pub struct System {
     balls: HashMap<i64, Ball>,
+    /// charID -> current ship or capsule ball.
+    pilots: HashMap<i64, i64>,
     /// clientID -> (ego ship, push channel)
     observers: HashMap<i64, (i64, DestinyTx)>,
 }
 
 impl System {
+    pub fn ball(&self, id: i64) -> Option<&Ball> {
+        self.balls.get(&id)
+    }
+
+    pub fn balls(&self) -> impl Iterator<Item = &Ball> {
+        self.balls.values()
+    }
+
+    pub fn pilots(&self) -> impl Iterator<Item = &Ball> {
+        self.pilots.values().filter_map(|id| self.ball(*id))
+    }
+
+    pub fn pilot_ball(&self, char_id: i64) -> Option<&Ball> {
+        self.pilots.get(&char_id).and_then(|id| self.ball(*id))
+    }
+
+    pub fn contains(&self, id: i64) -> bool {
+        self.balls.contains_key(&id)
+    }
+
+    pub fn insert(&mut self, ball: Ball) {
+        self.take(ball.id);
+        if let Some(char_id) = ball.char_id {
+            self.pilots.insert(char_id, ball.id);
+        }
+        self.balls.insert(ball.id, ball);
+    }
+
+    pub fn take(&mut self, id: i64) -> Option<Ball> {
+        let ball = self.balls.remove(&id)?;
+        if let Some(char_id) = ball.char_id {
+            if self.pilots.get(&char_id) == Some(&id) {
+                self.pilots.remove(&char_id);
+            }
+        }
+        Some(ball)
+    }
+
     fn positions(&self) -> HashMap<i64, V3> {
         self.balls.iter().map(|(k, b)| (*k, b.pos)).collect()
     }
@@ -340,6 +385,8 @@ pub fn event(tick: i64, name: &str, args: Vec<Value>) -> Value {
 pub struct World {
     db: Db,
     systems: Mutex<HashMap<i64, System>>,
+    /// clientID -> observed system. Lock after `systems` when both are needed.
+    observers: Mutex<HashMap<i64, i64>>,
     /// Pilots allowed in space per solar system before jumps queue (0 = unlimited).
     capacity: usize,
     queues: Mutex<HashMap<i64, JumpQueue>>,
@@ -349,7 +396,10 @@ pub struct World {
 
 impl World {
     pub fn new(db: Db, capacity: usize) -> Arc<World> {
-        Arc::new(World { db, systems: Mutex::new(HashMap::new()), capacity, queues: Default::default(), pilots: Default::default() })
+        Arc::new(World {
+            db, systems: Mutex::new(HashMap::new()), observers: Default::default(),
+            capacity, queues: Default::default(), pilots: Default::default(),
+        })
     }
 
     pub fn register_pilot(&self, char_id: i64, tx: NotifyTx) {
@@ -461,7 +511,7 @@ impl World {
             )
             .await?;
         let tick = now_tick();
-        let mut balls = HashMap::new();
+        let mut system = System::default();
         for r in rows {
             let id: i64 = r.get(0);
             let mut slim = Vec::new();
@@ -478,8 +528,7 @@ impl World {
                 slim.push(("destinationSuppressionStageAndMaximum", pair()));
                 slim.push(("localSuppressionStageAndMaximum", pair()));
             }
-            balls.insert(
-                id,
+            system.insert(
                 Ball {
                     id,
                     type_id: r.get::<_, Option<i32>>(1).unwrap_or(0),
@@ -512,24 +561,22 @@ impl World {
                 },
             );
         }
-        info!("loaded solar system {system_id} with {} celestials", balls.len());
-        self.systems.lock().unwrap().entry(system_id).or_insert(System { balls, observers: HashMap::new() });
+        info!("loaded solar system {system_id} with {} celestials", system.balls.len());
+        self.systems.lock().unwrap().entry(system_id).or_insert(system);
         Ok(())
     }
 
-    /// Every ball in `system_id`, evolved to now.
-    pub fn balls_snapshot(&self, system_id: i64) -> Option<HashMap<i64, Ball>> {
-        let mut s = self.systems.lock().unwrap();
-        let sys = s.get_mut(&system_id)?;
-        sys.evolve_all(now_tick());
-        Some(sys.balls.clone())
+    /// Evolve to now and read a loaded system. The closure must be cheap:
+    /// no awaits, DB access or calls back into World.
+    pub fn read<R>(&self, system_id: i64, f: impl FnOnce(&System) -> R) -> Option<R> {
+        let mut systems = self.systems.lock().unwrap();
+        let system = systems.get_mut(&system_id)?;
+        system.evolve_all(now_tick());
+        Some(f(system))
     }
 
     pub async fn ball(&self, system_id: i64, id: i64) -> Option<Ball> {
-        let mut s = self.systems.lock().unwrap();
-        let sys = s.get_mut(&system_id)?;
-        sys.evolve_all(now_tick());
-        sys.balls.get(&id).cloned()
+        self.read(system_id, |system| system.ball(id).cloned()).flatten()
     }
 
     /// Put a ship ball into a system and tell everyone already there.
@@ -543,7 +590,7 @@ impl World {
         if ball.cloak == 0 {
             sys.broadcast(vec![add_balls_event(tick, &ball)]);
         }
-        sys.balls.insert(ball.id, ball);
+        sys.insert(ball);
         Ok(())
     }
 
@@ -553,7 +600,7 @@ impl World {
             let mut s = self.systems.lock().unwrap();
             let sys = s.get_mut(&system_id)?;
             sys.evolve_all(now_tick());
-            let b = sys.balls.remove(&id);
+            let b = sys.take(id);
             sys.observers.retain(|_, (ego, _)| *ego != id);
             if b.as_ref().is_some_and(|b| b.cloak == 0) {
                 sys.broadcast(vec![event(now_tick(), "RemoveBalls", vec![Value::list([Value::Int(id)])])]);
@@ -572,7 +619,7 @@ impl World {
         let sys = s.get_mut(&system_id)?;
         let tick = now_tick();
         sys.evolve_all(tick);
-        let b = sys.balls.remove(&id)?;
+        let b = sys.take(id)?;
         sys.broadcast(vec![
             event(tick, "TerminalPlayDestructionEffect", vec![Value::Int(id), Value::Int(3)]),
             event(tick, "RemoveBalls", vec![Value::list([Value::Int(id)])]),
@@ -634,6 +681,13 @@ impl World {
     pub async fn observe(&self, system_id: i64, client_id: i64, ego: i64, tx: DestinyTx) -> Result<Value> {
         self.ensure_loaded(system_id).await?;
         let mut s = self.systems.lock().unwrap();
+        if let Some(previous) = self.observers.lock().unwrap().insert(client_id, system_id) {
+            if previous != system_id {
+                if let Some(sys) = s.get_mut(&previous) {
+                    sys.observers.remove(&client_id);
+                }
+            }
+        }
         let sys = s.get_mut(&system_id).unwrap();
         let tick = now_tick();
         sys.evolve_all(tick);
@@ -673,8 +727,11 @@ impl World {
     }
 
     pub fn unobserve(&self, client_id: i64) {
-        for sys in self.systems.lock().unwrap().values_mut() {
-            sys.observers.remove(&client_id);
+        let mut systems = self.systems.lock().unwrap();
+        if let Some(system_id) = self.observers.lock().unwrap().remove(&client_id) {
+            if let Some(system) = systems.get_mut(&system_id) {
+                system.observers.remove(&client_id);
+            }
         }
     }
 
@@ -692,5 +749,83 @@ impl World {
             sys.broadcast_about(&snapshot, events);
         }
         Some(snapshot)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ball(id: i64, pilot: Option<i64>, x: f64) -> Ball {
+        Ball {
+            id, type_id: 1, owner_id: 1, corp_id: 1, alliance_id: -1,
+            char_id: pilot, mode: MODE_STOP, radius: 1.0, mass: 1e6,
+            max_vel: 100.0, agility: 1.0, speed_fraction: 0.0,
+            pos: [x, 0.0, 0.0], vel: [0.0; 3], goto: [0.0; 3],
+            follow_id: 0, follow_range: 0.0, free: true, global: false,
+            massive: true, warp: None, warp_factor: 0, last_tick: 0,
+            cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0,
+            slim: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn pilot_index_tracks_insert_take_and_capsule_before_ship_removal() {
+        let mut system = System::default();
+        system.insert(ball(1, None, 0.0));
+        system.insert(ball(2, Some(100), 0.0));
+        assert_eq!(system.pilot_ball(100).unwrap().id, 2);
+        assert_eq!(system.pilots().count(), 1);
+        assert!(system.contains(1));
+        assert_eq!(system.balls().count(), 2);
+
+        system.insert(ball(3, Some(100), 0.0));
+        assert_eq!(system.take(2).unwrap().char_id, Some(100));
+        assert_eq!(system.pilot_ball(100).unwrap().id, 3);
+        assert_eq!(system.pilots().count(), 1);
+        system.take(3).unwrap();
+        assert!(system.pilot_ball(100).is_none());
+        assert_eq!(system.pilots().count(), 0);
+        assert!(system.take(3).is_none());
+
+        system.insert(ball(4, Some(101), 0.0));
+        system.insert(ball(4, Some(102), 0.0));
+        assert!(system.pilot_ball(101).is_none());
+        assert_eq!(system.pilot_ball(102).unwrap().id, 4);
+        system.insert(ball(4, None, 0.0));
+        assert!(system.pilot_ball(102).is_none());
+        assert!(system.contains(4));
+    }
+
+    #[test]
+    fn nearest_hostile_via_pilot_index_matches_full_scan() {
+        let mut system = System::default();
+        system.insert(ball(1, None, 1.0));
+        system.insert(ball(2, Some(100), 2.0));
+        let mut cloaked = ball(3, Some(101), 3.0);
+        cloaked.cloak = 1;
+        system.insert(cloaked);
+        let mut warping = ball(4, Some(102), 4.0);
+        warping.mode = MODE_WARP;
+        system.insert(warping);
+        system.insert(ball(5, Some(103), 5.0));
+        system.insert(ball(6, Some(104), 9.0));
+        system.insert(ball(7, Some(105), 20.0));
+
+        fn nearest<'a>(balls: impl Iterator<Item = &'a Ball>, aggro: f64) -> Option<i64> {
+            balls
+                .filter(|b| b.char_id.is_some_and(|ch| ch != 100)
+                    && b.cloak == 0 && b.mode != MODE_WARP && len(b.pos) <= aggro)
+                .min_by(|a, b| len(a.pos).total_cmp(&len(b.pos)))
+                .map(|b| b.id)
+        }
+        for (range, expected) in [(4.0, None), (5.0, Some(5)), (30.0, Some(5))] {
+            let indexed = nearest(system.pilots(), range);
+            assert_eq!(indexed, nearest(system.balls(), range));
+            assert_eq!(indexed, expected);
+        }
+        system.take(5);
+        assert_eq!(nearest(system.pilots(), 30.0), Some(6));
+        assert_eq!(nearest(system.pilots(), 30.0), nearest(system.balls(), 30.0));
     }
 }
