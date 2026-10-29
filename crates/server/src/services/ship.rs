@@ -4,22 +4,16 @@
 //! Uses ship attributes and celestial data from the SDE and persists locations in game tables.
 //! Mirrors the client ship service and remote ballpark; NPC workers and actor timers are out of scope.
 
-use super::{Call, CallError, CallResult};
+use super::{db_err, Call, CallError, CallResult};
 use crate::client::{short, Client};
-use crate::services::charsel::FLAG_HANGAR;
+use crate::consts::{ATTR_MASS, ATTR_MAX_VELOCITY, FILETIME_SECOND, FLAG_HANGAR, TYPE_CAPSULE};
 use crate::space::{self, event, now_ms, now_tick, warp_duration, Ball, Warp, V3, CLOAK_RESTORE, MODE_FOLLOW, MODE_GOTO, MODE_ORBIT, MODE_STOP, MODE_WARP};
 use marshal::Value;
 use tracing::{info, warn};
 
-const ATTR_MASS: i32 = 4;
-const ATTR_MAX_VELOCITY: i32 = 37;
 const ATTR_AGILITY: i32 = 70;
 const ATTR_WARP_SPEED_MULTIPLIER: i32 = 600;
 const ATTR_BASE_WARP_SPEED: i32 = 1281;
-
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
 
 fn f(v: Option<&Value>) -> f64 {
     v.and_then(|v| v.as_float()).unwrap_or(0.0)
@@ -199,7 +193,6 @@ fn special_fx(tick: i64, ship: i64, target: Option<i64>, other: Option<i64>, gui
 const JUMP_DELAY_MS: u64 = 4000;
 /// The arrival cloak lasts this long unless the pilot moves first (s).
 const JUMP_CLOAK_SECONDS: i64 = 60;
-const SEC: i64 = 10_000_000;
 const UE_LOCID: i64 = 3;
 
 /// CmdStargateJump(fromStargateID, toStargateID, shipID): leave through the gate and
@@ -306,7 +299,7 @@ pub(super) async fn jump_out_and_arrive(c: &mut Client, system: i64, ship: i64, 
         )
         .await
         .map_err(db_err)?;
-    let cloak_until = crate::client::filetime_now() + JUMP_CLOAK_SECONDS * SEC;
+    let cloak_until = crate::client::filetime_now() + JUMP_CLOAK_SECONDS * FILETIME_SECOND;
     let mut ball = ship_ball(c, ship, pos).await?;
     ball.cloak = CLOAK_RESTORE;
     ball.cloak_until = cloak_until;
@@ -319,7 +312,7 @@ pub(super) async fn jump_out_and_arrive(c: &mut Client, system: i64, ship: i64, 
         ("regionid", Value::Int(region)),
     ]);
     // Arrival cloak: crimewatch timer now, lapse after JUMP_CLOAK_SECONDS unless broken.
-    c.notify("OnJumpCloakUpdated", vec![Value::Int(ship), Value::Int(cloak_until), Value::Int(JUMP_CLOAK_SECONDS * SEC)]);
+    c.notify("OnJumpCloakUpdated", vec![Value::Int(ship), Value::Int(cloak_until), Value::Int(JUMP_CLOAK_SECONDS * FILETIME_SECOND)]);
     // The client leaves the old Local itself; the new one arrives as an invite, sent once
     // the session change has had time to land.
     let chat = c.chat.clone();
@@ -409,8 +402,6 @@ pub(super) async fn teleport(c: &mut Client, dest_system: i64, pos: V3) -> Resul
     info!(user = c.login.user_id, "ship {ship} teleported {system} -> {dest_system}");
     Ok(())
 }
-
-const TYPE_CAPSULE: i32 = 670;
 
 /// The pilot's ship was destroyed in space (combat::damage_player): its fittings and
 /// cargo go with it and the pilot ejects in a capsule where it died.

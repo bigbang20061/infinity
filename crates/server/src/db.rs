@@ -1,5 +1,7 @@
 //! PostgreSQL access. One pipelined connection shared by all tasks.
+//! The shared account PLEX query returns whole PLEX; wire-unit conversion is the caller's policy.
 
+use crate::consts::{NPC_BID_RATIO, ROLE_PLAYER_LOGIN};
 use anyhow::{Context, Result};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
@@ -8,12 +10,6 @@ use tracing::{error, info};
 
 const GAME_SCHEMA: &str = include_str!("../sql/game_schema.sql");
 const MARKET_SEED: &str = include_str!("../sql/market_seed.sql");
-
-/// ROLE_PLAYER | ROLE_LOGIN (carbon/common/script/sys/serviceConst.py).
-pub const ROLE_PLAYER_LOGIN: i64 = 2305843009213693952 | 4611686018427387904;
-
-/// NPC buy orders pay this fraction of the NPC sell price.
-pub const NPC_BID_RATIO: f64 = 0.8;
 
 #[derive(Clone)]
 pub struct Db {
@@ -28,6 +24,11 @@ pub struct Account {
 }
 
 impl Db {
+    /// Account vault balance in whole PLEX, shared by the store and public gateway.
+    pub async fn plex_balance(client: &Client, user_id: i64) -> Result<i64, tokio_postgres::Error> {
+        Ok(client.query_one("SELECT plex_balance FROM game.accounts WHERE user_id = $1", &[&user_id]).await?.get(0))
+    }
+
     pub async fn connect(url: &str) -> Result<Db> {
         let mut delay = 1;
         let (client, conn) = loop {

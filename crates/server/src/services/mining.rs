@@ -18,27 +18,16 @@
 //! Reprocessing Efficiency and the item's own processing skill, less a 5% tax in ISK.
 
 use super::fit::{Fit, Key};
-use super::{keyval, Call, CallError, CallResult};
+use super::{db_err, keyval, notify_error, rand01, rand_dir, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
+use crate::consts::{ATTR_CAPACITY, ATTR_MAX_RANGE, FILETIME_SECOND, FLAG_CARGO, FLAG_HANGAR, GROUP_ASTEROID_BELT, IX_LOCATION_ID, IX_STACK_SIZE};
 use crate::db::Db;
-use crate::space::{now_ms, Ball, NotifyTx, World, MODE_RIGID, V3};
+use crate::space::{dist, now_ms, Ball, NotifyTx, World, MODE_RIGID, V3};
 use marshal::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use tracing::{info, warn};
 
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
-
-fn notify_err(msg: &str) -> CallError {
-    CallError::User { msg: "CustomNotify".into(), dict: vec![("notify".into(), Value::unicode(msg))] }
-}
-
-const SEC: i64 = 10_000_000;
-const GROUP_ASTEROID_BELT: i32 = 9;
-const ATTR_CAPACITY: i32 = 38;
-const ATTR_MAX_RANGE: i32 = 54;
 const ATTR_MINING_AMOUNT: i32 = 77;
 const ATTR_MINING_HOLD: i32 = 1556; // generalMiningHoldCapacity
 const ATTR_WASTE_MULTIPLIER: i32 = 3153;
@@ -47,8 +36,6 @@ const ATTR_CRIT_CHANCE: i32 = 5967;
 const ATTR_CRIT_BONUS: i32 = 5969;
 const ATTR_PROCESSING_SKILL: i32 = 790; // reprocessingSkillType
 const FLAG_MINING_HOLD: i32 = 134; // flagGeneralMiningHold
-const IX_LOCATION_ID: i64 = 3;
-const IX_STACK_SIZE: i64 = 9;
 const SKILL_REPROCESSING: i32 = 3385;
 const SKILL_REPROCESSING_EFFICIENCY: i32 = 3389;
 const SKILL_SCRAPMETAL: i32 = 12196;
@@ -59,20 +46,6 @@ const STATION_EFFICIENCY: f64 = 0.5;
 const STATION_TAX: f64 = 0.05;
 /// The ship mining scanner reaches this far (m).
 const SCAN_RANGE: f64 = 500_000.0;
-
-fn rand01() -> f64 {
-    (crate::handshake::rand_i64() as u64 >> 11) as f64 / (1u64 << 53) as f64
-}
-
-fn rand_dir() -> V3 {
-    let (z, a) = (rand01() * 2.0 - 1.0, rand01() * std::f64::consts::TAU);
-    let r = (1.0 - z * z).sqrt();
-    [r * a.cos(), z, r * a.sin()]
-}
-
-fn dist(a: V3, b: V3) -> f64 {
-    ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
-}
 
 // ---------------------------------------------------------------- fields
 
@@ -278,7 +251,7 @@ pub async fn ensure_fields(db: &Db, world: &Arc<World>, system: i64) -> Result<(
             .await
             .map_err(db_err)?
             .map(|r| r.get(0));
-        let regrow_at = depleted.flatten().map(|t| t + BELT_REGROW_SECS * SEC);
+        let regrow_at = depleted.flatten().map(|t| t + BELT_REGROW_SECS * FILETIME_SECOND);
         if regrow_at.is_some_and(|t| t > now) {
             schedule_regrow(db.clone(), world.clone(), system, belt, [b.get(1), b.get(2), b.get(3)], regrow_at.unwrap_or(now));
             continue;
@@ -304,7 +277,7 @@ async fn grow_belt(db: &Db, world: &World, system: i64, belt: i64, center: V3, s
 
 fn schedule_regrow(db: Db, world: Arc<World>, system: i64, belt: i64, center: V3, at: i64) {
     tokio::spawn(async move {
-        let wait = ((at - filetime_now()) / SEC).max(0) as u64;
+        let wait = ((at - filetime_now()) / FILETIME_SECOND).max(0) as u64;
         tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
         let result = async {
             let (security, jspace) = system_band(&db, system).await?;
@@ -336,7 +309,7 @@ async fn exhaust(db: &Db, world: &Arc<World>, id: i64) -> Result<(), CallError> 
     if let Some(b) = belt {
         let now = filetime_now();
         db.client.execute("UPDATE game.asteroid_fields SET depleted_at = $2 WHERE field_id = $1", &[&rock.field, &now]).await.map_err(db_err)?;
-        schedule_regrow(db.clone(), world.clone(), rock.system, rock.field, [b.get(0), b.get(1), b.get(2)], now + BELT_REGROW_SECS * SEC);
+        schedule_regrow(db.clone(), world.clone(), rock.system, rock.field, [b.get(0), b.get(1), b.get(2)], now + BELT_REGROW_SECS * FILETIME_SECOND);
         info!("mining: belt {} in {} mined out", rock.field, rock.system);
     }
     Ok(())
@@ -437,7 +410,7 @@ pub async fn extract(db: &Db, world: &Arc<World>, notify: &NotifyTx, char_id: i6
     units = units.min(rock.quantity);
     // Into the mining hold, or the cargo hold of ships without one.
     let hold = fit.value(Key::Ship, ATTR_MINING_HOLD);
-    let (flag, capacity) = if hold > 0.0 { (FLAG_MINING_HOLD, hold) } else { (super::combat::FLAG_CARGO, fit.value(Key::Ship, ATTR_CAPACITY)) };
+    let (flag, capacity) = if hold > 0.0 { (FLAG_MINING_HOLD, hold) } else { (FLAG_CARGO, fit.value(Key::Ship, ATTR_CAPACITY)) };
     let used: f64 = db
         .client
         .query_one(
@@ -626,9 +599,9 @@ async fn reprocessing(c: &mut Client, call: &Call<'_>) -> CallResult {
         // Reprocess(itemIDs, fromLocationID, ownerID, outputLocationID, outputFlagID)
         //   -> (reprocessed itemIDs, {typeID: quantity})
         "Reprocess" => {
-            let station = c.session.int("stationid").ok_or_else(|| notify_err("你必须停靠在空间站里才能进行精炼。"))?;
+            let station = c.session.int("stationid").ok_or_else(|| notify_error("你必须停靠在空间站里才能进行精炼。"))?;
             let out_location = call.args.get(3).and_then(|v| v.as_int()).unwrap_or(station);
-            let out_flag = call.args.get(4).and_then(|v| v.as_int()).map(|f| f as i32).unwrap_or(super::charsel::FLAG_HANGAR);
+            let out_flag = call.args.get(4).and_then(|v| v.as_int()).map(|f| f as i32).unwrap_or(FLAG_HANGAR);
             let items = reprocessable(c, &id_list(call.args.first())).await?;
             let mut done = vec![];
             let mut output: HashMap<i32, i64> = HashMap::new();

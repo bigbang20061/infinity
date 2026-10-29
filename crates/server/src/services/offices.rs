@@ -5,9 +5,10 @@
 //! inventory lists and moves them). Renting again before the period ends extends it;
 //! renewing is billed (services/bills).
 
-use super::corps::{ceo_of, is_player_corp, membership, ROLE_DIRECTOR};
-use super::{keyval, Call, CallError, CallResult};
+use super::corps::{ceo_of, is_player_corp, membership};
+use super::{db_err, keyval, notify_error, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
+use crate::consts::{ACCOUNT_CASH, FILETIME_DAY, RENTAL_DAYS, ROLE_DIRECTOR};
 use crate::db::Db;
 use crate::space::World;
 use marshal::Value;
@@ -16,21 +17,8 @@ use tracing::info;
 pub(super) const TYPE_OFFICE: i32 = 27;
 /// Offices a station has room for (the live server's capacity never shipped with the client or SDE).
 const STATION_OFFICE_SLOTS: i64 = 24;
-/// appConst.rentalPeriodOffice (days)
-pub(super) const RENTAL_DAYS: i64 = 30;
-pub(super) const DAY: i64 = 24 * 3600 * 10_000_000;
 /// appConst.corpRoleCanRentOffice
 const ROLE_CAN_RENT_OFFICE: i64 = 562_949_953_421_312;
-/// flagCorpSAG1; the other divisions follow it.
-pub(super) const FLAG_CORP_SAG1: i32 = 115;
-
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
-
-fn notify_error(text: &str) -> CallError {
-    CallError::User { msg: "CustomNotify".into(), dict: vec![("notify".into(), Value::unicode(text))] }
-}
 
 /// The rent for one period at `station`: dearer in busier, higher-security space.
 pub(super) async fn rent_price(db: &Db, station: i64) -> Result<f64, CallError> {
@@ -76,11 +64,11 @@ async fn announce(db: &Db, world: &World, corp: i64, office: i64) -> Result<(), 
 pub(super) async fn rent(db: &Db, world: &World, corp: i64, station: i64) -> Result<i64, CallError> {
     let price = rent_price(db, station).await?;
     let _trading = super::market::lock().await;
-    super::corpwallet::corp_debit(db, world, corp, super::corpwallet::MASTER, price).await?;
+    super::corpwallet::corp_debit(db, world, corp, ACCOUNT_CASH, price).await?;
     let now = filetime_now();
     if let Some(office) = office_at(db, corp, station).await? {
         db.client
-            .execute("UPDATE game.offices SET rented_until = GREATEST(rented_until, $2) + $3 WHERE office_id = $1", &[&office, &now, &(RENTAL_DAYS * DAY)])
+            .execute("UPDATE game.offices SET rented_until = GREATEST(rented_until, $2) + $3 WHERE office_id = $1", &[&office, &now, &(RENTAL_DAYS * FILETIME_DAY)])
             .await
             .map_err(db_err)?;
         return Ok(office);
@@ -97,7 +85,7 @@ pub(super) async fn rent(db: &Db, world: &World, corp: i64, station: i64) -> Res
     db.client
         .execute(
             "INSERT INTO game.offices (office_id, corporation_id, station_id, rented_until) VALUES ($1, $2, $3, $4)",
-            &[&office, &corp, &station, &(now + RENTAL_DAYS * DAY)],
+            &[&office, &corp, &station, &(now + RENTAL_DAYS * FILETIME_DAY)],
         )
         .await
         .map_err(db_err)?;

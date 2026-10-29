@@ -10,15 +10,14 @@
 //! Notifications (game.notifications) are what other systems post for a character
 //! (`notify`): a type, a sender and YAML data the client's formatter for that type reads.
 
-use super::{keyval, Call, CallError, CallResult};
+use super::{db_err, keyval, notify_error, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
+use crate::consts::FILETIME_MINUTE;
 use crate::db::Db;
 use crate::space::World;
 use marshal::Value;
 use std::io::Write;
 use tracing::info;
-
-const MINUTE: i64 = 600_000_000;
 
 // appConst.mailStatusMask* / mailLabel*
 const STATUS_READ: i32 = 1;
@@ -32,14 +31,6 @@ const LABEL_CORPORATION: i32 = 4;
 const FIRST_CUSTOM_LABEL: i32 = 16;
 /// appConst.mailMaxRecipients
 const MAX_RECIPIENTS: usize = 50;
-
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
-
-fn notify_error(text: &str) -> CallError {
-    CallError::User { msg: "CustomNotify".into(), dict: vec![("notify".into(), Value::unicode(text))] }
-}
 
 fn ids(v: Option<&Value>) -> Vec<i64> {
     v.and_then(|v| v.items()).unwrap_or(&[]).iter().filter_map(|i| i.as_int()).collect()
@@ -113,7 +104,7 @@ async fn send(c: &Client, call: &Call<'_>) -> CallResult {
             return Err(notify_error("你只能给自己的军团发送邮件。"));
         }
     }
-    let sent = filetime_now() / MINUTE * MINUTE;
+    let sent = filetime_now() / FILETIME_MINUTE * FILETIME_MINUTE;
     let to_text = to_chars.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
     let id: i64 = db
         .client

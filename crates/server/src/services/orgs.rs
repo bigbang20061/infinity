@@ -5,9 +5,10 @@
 //! bulletins, and its diplomats and directors its contacts and labels; for an alliance,
 //! those of its executor corporation do.
 
-use super::corps::{membership, ROLE_DIRECTOR};
-use super::{crowset, keyval, Call, CallError, CallResult};
+use super::corps::membership;
+use super::{crowset, db_err, keyval, notify_error, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
+use crate::consts::ROLE_DIRECTOR;
 use crate::db::Db;
 use marshal::{DbRowDescriptor, DbType, Value};
 
@@ -16,14 +17,6 @@ const ROLE_CHAT_MANAGER: i64 = 36_028_797_018_963_968;
 const ROLE_DIPLOMAT: i64 = 17_179_869_184;
 /// base_corporation.MAX_NUM_BULLETINS
 const MAX_BULLETINS: i64 = 10;
-
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
-
-fn notify_error(text: &str) -> CallError {
-    CallError::User { msg: "CustomNotify".into(), dict: vec![("notify".into(), Value::unicode(text))] }
-}
 
 /// Integer IDs from a list argument (or a single ID).
 fn ids(v: Option<&Value>) -> Vec<i64> {

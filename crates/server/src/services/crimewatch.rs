@@ -13,17 +13,15 @@
 //! last 5 minutes; an illegal kill costs those aggressors more security status. Killing NPCs
 //! that carry a bounty slowly raises it.
 
-use super::{keyval, Call, CallError, CallResult};
+use super::{db_err, keyval, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
+use crate::consts::{FILETIME_MINUTE, FILETIME_SECOND};
 use crate::db::Db;
 use crate::space::World;
 use marshal::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use tracing::{info, warn};
-
-const SEC: i64 = 10_000_000;
-const MINUTE: i64 = 60 * SEC;
 
 // crimewatch.const
 const WEAPONS_IDLE: i64 = 100;
@@ -34,10 +32,10 @@ const CRIMINAL_IDLE: i64 = 300;
 const CRIMINAL_TIMER: i64 = 303;
 const NPC_IDLE: i64 = 400;
 const DISAPPROVAL_IDLE: i64 = 500;
-const WEAPONS_TIMEOUT: i64 = 60 * SEC;
-const PVP_TIMEOUT: i64 = 15 * MINUTE;
-const CRIMINAL_TIMEOUT: i64 = 15 * MINUTE;
-const ENGAGEMENT_DURATION: i64 = 5 * MINUTE;
+const WEAPONS_TIMEOUT: i64 = 60 * FILETIME_SECOND;
+const PVP_TIMEOUT: i64 = 15 * FILETIME_MINUTE;
+const CRIMINAL_TIMEOUT: i64 = 15 * FILETIME_MINUTE;
+const ENGAGEMENT_DURATION: i64 = 5 * FILETIME_MINUTE;
 const SAFETY_LEVEL_FULL: i64 = 2;
 
 /// Security status at or below which anyone may shoot a pilot.
@@ -50,15 +48,11 @@ const KILL_PENALTY: f64 = 0.05;
 /// Fraction of the way to +10 an NPC kill with a bounty earns.
 const NPC_KILL_GAIN: f64 = 0.0005;
 /// Damage older than this doesn't put an attacker on the killmail.
-const KILLMAIL_WINDOW: i64 = 5 * MINUTE;
+const KILLMAIL_WINDOW: i64 = 5 * FILETIME_MINUTE;
 // notificationconst
 const NOTIFICATION_KILL_REPORT_VICTIM: i32 = 140;
 const NOTIFICATION_KILL_REPORT_FINAL_BLOW: i32 = 141;
 const NOTIFICATION_GROUP_WAR: i32 = 8;
-
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
 
 #[derive(Default)]
 struct Pilot {

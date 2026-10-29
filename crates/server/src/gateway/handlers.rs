@@ -80,7 +80,7 @@ async fn names_by_user(gw: &Gateway, caller: &Caller) -> Result<DynamicMessage> 
 async fn plex_balance(gw: &Gateway, caller: &Caller) -> Result<DynamicMessage> {
     let mut rsp = response_for("eve_public.plex.vault.api.BalanceRequest")?;
     let user = caller.user_id.context("no user")?;
-    let plex: i64 = db(gw)?.query_one("SELECT plex_balance FROM game.accounts WHERE user_id = $1", &[&user]).await?.get(0);
+    let plex = crate::db::Db::plex_balance(db(gw)?, user).await?;
     let mut balance = child(&rsp.descriptor(), "balance")?;
     set(&mut balance, "total_in_cents", PV::I64(plex * 100))?;
     set(&mut rsp, "balance", PV::Message(balance))?;

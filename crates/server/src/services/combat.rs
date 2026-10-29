@@ -23,46 +23,26 @@
 use super::dogma::load_items;
 use super::inventory::notify_item_change;
 use super::fit::{Fit, Key};
-use super::{Call, CallError, CallResult};
+use super::{db_err, rand01, user_error, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
+use crate::consts::{ACCOUNT_CASH, ATTR_CAPACITY, ATTR_EXPLOSION_DELAY, ATTR_IS_ONLINE, ATTR_MASS, ATTR_MAX_RANGE, ATTR_MAX_VELOCITY, ATTR_QUANTITY, ATTR_SIGNATURE_RADIUS, EFFECT_AFTERBURNER, EFFECT_MICROWARPDRIVE, EFFECT_ONLINE, FILETIME_SECOND, FLAG_CARGO, FLAG_HANGAR, IX_FLAG, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD};
 use crate::db::Db;
-use crate::space::{event, now_ms, now_tick, Ball, NotifyTx, NpcAction, NpcBrain, NpcConfig, NpcEffects, NpcFuture, World, MODE_MISSILE, MODE_WARP, V3};
+use crate::space::{dist, event, now_ms, now_tick, Ball, NotifyTx, NpcAction, NpcBrain, NpcConfig, NpcEffects, NpcFuture, World, MODE_MISSILE, MODE_WARP, V3};
 use marshal::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use tracing::{debug, info, warn};
 
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
-
-fn user_error(msg: &str, dict: Vec<(&str, Value)>) -> CallError {
-    CallError::User { msg: msg.into(), dict: dict.into_iter().map(|(k, v)| (k.to_string(), v)).collect() }
-}
-
-pub(super) const FLAG_CARGO: i32 = 5;
 const HI_SLOTS: std::ops::RangeInclusive<i32> = 27..=34;
-const LOCATION_JUNKYARD: i64 = 10;
-// inventory change keys (const.ix*)
-const IX_LOCATION_ID: i64 = 3;
-const IX_FLAG: i64 = 4;
-pub(super) const IX_STACK_SIZE: i64 = 9;
-// dogma attributes
-const ATTR_QUANTITY: i32 = 805;
-const ATTR_CAPACITY: i32 = 38;
 const ATTR_DAMAGE_MULTIPLIER: i32 = 64;
-const ATTR_MAX_RANGE: i32 = 54;
 const ATTR_FALLOFF: i32 = 158;
 const ATTR_DAMAGE: [i32; 4] = [114, 118, 117, 116]; // em, thermal, kinetic, explosive
 const ATTR_HP: [i32; 3] = [263, 265, 9]; // shield, armor, structure
 const ATTR_RESONANCE: [[i32; 4]; 3] = [[271, 274, 273, 272], [267, 270, 269, 268], [113, 110, 109, 111]];
-const ATTR_SIGNATURE_RADIUS: i32 = 552;
 const ATTR_SCAN_RESOLUTION: i32 = 564;
 const ATTR_MAX_TARGET_RANGE: i32 = 76;
 const ATTR_MAX_LOCKED_TARGETS: i32 = 192;
-const ATTR_MISSILE_VELOCITY: i32 = 37;
-const ATTR_EXPLOSION_DELAY: i32 = 281;
 const ATTR_AOE_CLOUD_SIZE: i32 = 654;
 const ATTR_CHARGE: i32 = 18; // capacitor level
 const ATTR_CAPACITOR_CAPACITY: i32 = 482;
@@ -87,23 +67,13 @@ const ATTR_ENTITY_ARMOR_REPAIR_DURATION: i32 = 630;
 const ATTR_SHIELD_BONUS: i32 = 68;
 const ATTR_ARMOR_DAMAGE_AMOUNT: i32 = 84;
 const ATTR_STRUCTURE_DAMAGE_AMOUNT: i32 = 83;
-const ATTR_MASS: i32 = 4;
 const UE_TYPEID: i64 = 4;
-const SEC: i64 = 10_000_000;
 
 /// Temporary item IDs for missiles in flight.
 /// Missile balls; clear of NPCs (9.0e12), exploration sites (9.5e12), probes (9.6e12) and
 /// asteroids (9.7e12).
 static NEXT_MISSILE_ID: AtomicI64 = AtomicI64::new(9_800_000_000_000);
 static NEXT_LOCK: AtomicU64 = AtomicU64::new(1);
-
-fn rand01() -> f64 {
-    (crate::handshake::rand_i64() as u64 >> 11) as f64 / (1u64 << 53) as f64
-}
-
-fn dist(a: V3, b: V3) -> f64 {
-    ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
-}
 
 // ---------------------------------------------------------------- state
 
@@ -212,14 +182,14 @@ async fn add_target(c: &mut Client, target: i64) -> CallResult {
     let gap = dist(ship.pos, t.pos) - t.radius as f64;
     if gap > range {
         let text = format!("目标距离 {:.1} 公里，超出了你的锁定距离（{:.1} 公里）。", gap / 1000.0, range / 1000.0);
-        return Err(user_error("CustomNotify", vec![("notify", Value::unicode(text))]));
+        return Err(user_error("CustomNotify", vec![("notify".into(), Value::unicode(text))]));
     }
     // The ship's limit, capped by the pilot's (Targeting skills).
     let pilot_limit = fit.value(Key::Char, ATTR_MAX_LOCKED_TARGETS);
     let ship_limit = fit.value(Key::Ship, ATTR_MAX_LOCKED_TARGETS);
     let max_targets = if pilot_limit > 0.0 { ship_limit.min(pilot_limit) } else { ship_limit } as usize;
     if targets_of(cx.char_id).len() >= max_targets.max(1) {
-        return Err(user_error("CustomNotify", vec![("notify", Value::unicode(format!("你最多只能同时锁定 {} 个目标。", max_targets.max(1))))]));
+        return Err(user_error("CustomNotify", vec![("notify".into(), Value::unicode(format!("你最多只能同时锁定 {} 个目标。", max_targets.max(1))))]));
     }
     // Lock time (s) = 40000 / (scanResolution * asinh(signatureRadius)^2)
     let scan = fit.value(Key::Ship, ATTR_SCAN_RESOLUTION).max(1.0);
@@ -545,7 +515,7 @@ async fn unload_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
         Some(v) => (v.as_int().unwrap_or(ship), None),
         None => (ship, None),
     };
-    let flag = flag.unwrap_or(if location == ship { FLAG_CARGO } else { crate::services::charsel::FLAG_HANGAR });
+    let flag = flag.unwrap_or(if location == ship { FLAG_CARGO } else { FLAG_HANGAR });
     for m in modules {
         for id in bank(&c.db, ship, m).await? {
             if let Some(module) = load_items(c, "i.item_id = $1 AND i.location_id = $2", &[&id, &ship]).await?.into_iter().next() {
@@ -688,7 +658,7 @@ fn drain_capacitor(cx: &Ctx, fit: &Fit, amount: f64) -> bool {
     let current = {
         let mut st = state();
         let (level, at) = st.capacitor.get(&cx.ship_id).copied().unwrap_or((max, now));
-        let current = recharge(level, max, tau, (now - at) as f64 / SEC as f64);
+        let current = recharge(level, max, tau, (now - at) as f64 / FILETIME_SECOND as f64);
         if current < amount {
             return false;
         }
@@ -730,7 +700,7 @@ async fn ship_stats(db: &Db, char_id: i64, ship: i64) -> Result<ShipStats, CallE
 pub fn ship_condition(ship: i64) -> Option<(f64, f64, f64)> {
     let st = state();
     let c = st.condition.get(&ship)?;
-    let shield = recharge(c.now[0], c.stats.max[0], c.stats.shield_tau_ms, (filetime_now() - c.shield_at) as f64 / SEC as f64);
+    let shield = recharge(c.now[0], c.stats.max[0], c.stats.shield_tau_ms, (filetime_now() - c.shield_at) as f64 / FILETIME_SECOND as f64);
     Some((shield, c.stats.max[1] - c.now[1], c.stats.max[2] - c.now[2]))
 }
 
@@ -829,7 +799,7 @@ async fn damage_player(db: &Db, world: &World, system: i64, ship: i64, char_id: 
     };
     let now = filetime_now();
     let old = cond.now;
-    cond.now[0] = recharge(cond.now[0], cond.stats.max[0], cond.stats.shield_tau_ms, (now - cond.shield_at) as f64 / SEC as f64);
+    cond.now[0] = recharge(cond.now[0], cond.stats.max[0], cond.stats.shield_tau_ms, (now - cond.shield_at) as f64 / FILETIME_SECOND as f64);
     cond.shield_at = now;
     let dealt = absorb(&mut cond.now, &cond.stats.resonance, raw);
     if let Some(attacker) = attacker {
@@ -879,7 +849,7 @@ async fn repair_player(db: &Db, world: &World, system: i64, ship: i64, char_id: 
     let Some(mut cond) = known else { return Ok(()) };
     let now = filetime_now();
     let old = cond.now;
-    cond.now[0] = recharge(cond.now[0], cond.stats.max[0], cond.stats.shield_tau_ms, (now - cond.shield_at) as f64 / SEC as f64);
+    cond.now[0] = recharge(cond.now[0], cond.stats.max[0], cond.stats.shield_tau_ms, (now - cond.shield_at) as f64 / FILETIME_SECOND as f64);
     cond.shield_at = now;
     cond.now[layer] = (cond.now[layer] + amount).min(cond.stats.max[layer]);
     let max = cond.stats.max;
@@ -924,7 +894,7 @@ async fn reward_kill(db: &Db, world: &World, system: i64, npc: &Ball, killer: Op
             .get(0);
         world.notify_pilot(pilot, "OnAccountChange", vec![Value::str("cash"), Value::Int(pilot), Value::Float(balance)]);
         if let Some((corp, _)) = corp_tax.filter(|_| tax > 0.0) {
-            super::corpwallet::corp_credit(db, world, corp, super::corpwallet::MASTER, tax).await?;
+            super::corpwallet::corp_credit(db, world, corp, ACCOUNT_CASH, tax).await?;
         }
         info!("{pilot} earned {bounty:.0} ISK bounty for {} ({tax:.0} corporation tax)", npc.type_id);
         super::crimewatch::npc_killed(db, world, pilot).await?;
@@ -1055,7 +1025,7 @@ fn repair_kind(effect: &str) -> Option<(usize, i32)> {
 /// The ship's speed and mass as fitted now (propulsion running or not), for everyone's destiny.
 async fn apply_propulsion(cx: &Ctx) {
     let Ok(fit) = Fit::load(&cx.db, cx.char_id, cx.ship_id).await else { return };
-    let (speed, mass) = (fit.value(Key::Ship, ATTR_MISSILE_VELOCITY), fit.value(Key::Ship, ATTR_MASS));
+    let (speed, mass) = (fit.value(Key::Ship, ATTR_MAX_VELOCITY), fit.value(Key::Ship, ATTR_MASS));
     cx.world.command(cx.system_id, cx.ship_id, move |b, t, _| {
         b.max_vel = speed as f32;
         b.mass = mass;
@@ -1310,7 +1280,7 @@ async fn fire_missile(cx: &Ctx, fit: &Fit, module: &Module, charge: i32, target:
     let ship_id = cx.ship_id;
     let Some((ship, t)) = cx.world.with(cx.system_id, move |s| Some((s.ball(ship_id)?.clone(), s.ball(target)?.clone()))).await.flatten() else { return Ok(()) };
     let ch = Key::Charge(module.id);
-    let velocity = fit.value(ch, ATTR_MISSILE_VELOCITY).max(1.0);
+    let velocity = fit.value(ch, ATTR_MAX_VELOCITY).max(1.0);
     let missile = Missile {
         charge,
         raw: ATTR_DAMAGE.map(|id| fit.value(ch, id) * fit.value(Key::Char, ATTR_MISSILE_DAMAGE_MULTIPLIER).max(0.0)),
@@ -1469,7 +1439,7 @@ async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
         duration_attribute: row.get(2),
         weapon: weapon_kind(&effect_name),
         repair: repair_kind(&effect_name),
-        propulsion: matches!(row.get::<_, i32>(0), super::fit::EFFECT_AFTERBURNER | super::fit::EFFECT_MICROWARPDRIVE),
+        propulsion: matches!(row.get::<_, i32>(0), EFFECT_AFTERBURNER | EFFECT_MICROWARPDRIVE),
         mining: match effect_name.as_str() {
             "miningLaser" => Some("effects.Mining"),
             "miningClouds" => Some("effects.CloudMining"),
@@ -1477,7 +1447,7 @@ async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
         },
     };
     if state().reloading.get(&item_id).is_some_and(|until| *until > filetime_now()) {
-        return Err(user_error("CantActivateReloadingModule", vec![("moduleTypeID", Value::tuple([Value::Int(UE_TYPEID), Value::Int(module.type_id as i64)]))]));
+        return Err(user_error("CantActivateReloadingModule", vec![("moduleTypeID".into(), Value::tuple([Value::Int(UE_TYPEID), Value::Int(module.type_id as i64)]))]));
     }
     if effect.weapon.is_some() {
         let Some(t) = target.filter(|t| targets_of(cx.char_id).contains(t)) else {
@@ -1496,7 +1466,7 @@ async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
             return Err(user_error("DeniedActivateTargetNotPresent", vec![]));
         }
         if loaded(&cx.db, cx.ship_id, module.flag_id).await?.is_none_or(|(_, q)| q <= 0) {
-            return Err(user_error("NoCharges", vec![("launcher", Value::tuple([Value::Int(UE_TYPEID), Value::Int(module.type_id as i64)]))]));
+            return Err(user_error("NoCharges", vec![("launcher".into(), Value::tuple([Value::Int(UE_TYPEID), Value::Int(module.type_id as i64)]))]));
         }
         // Shooting another pilot is a matter for crimewatch.
         if let Some(victim) = victim {
@@ -1508,7 +1478,7 @@ async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
             return Err(user_error("DeniedActivateTargetNotPresent", vec![]));
         };
         if !super::mining::is_rock(t) {
-            return Err(user_error("CustomNotify", vec![("notify", Value::unicode("只能对小行星、冰矿或气云使用采矿设备。"))]));
+            return Err(user_error("CustomNotify", vec![("notify".into(), Value::unicode("只能对小行星、冰矿或气云使用采矿设备。"))]));
         }
         let ship_id = cx.ship_id;
         let gap = cx.world.with(cx.system_id, move |s| {
@@ -1517,7 +1487,7 @@ async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
         let fit = Fit::load(&cx.db, cx.char_id, cx.ship_id).await?;
         let range = fit.value(Key::Module(item_id), ATTR_MAX_RANGE);
         if gap.is_none_or(|g| g > range) {
-            return Err(user_error("CustomNotify", vec![("notify", Value::unicode(format!("目标超出了采矿设备的范围（{:.1} 公里）。", range / 1000.0)))]));
+            return Err(user_error("CustomNotify", vec![("notify".into(), Value::unicode(format!("目标超出了采矿设备的范围（{:.1} 公里）。", range / 1000.0)))]));
         }
     }
     if state().active.contains_key(&item_id) {
@@ -1541,9 +1511,6 @@ async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
     tokio::spawn(run_cycles(cx, modules, effect, target, repeat, stop, duration_ms));
     Ok(Value::None)
 }
-
-const ATTR_IS_ONLINE: i32 = 2;
-const EFFECT_ONLINE: i64 = 16;
 
 /// Put a fitted module online or offline in space: remember it, and tell godma (the online
 /// effect's state drives the HUD button) and the client's dogma (isOnline).
@@ -1693,7 +1660,7 @@ async fn npc_shot(db: &Db, world: &Arc<World>, system: i64, id: i64, type_id: i3
     let gap = (dist(me.pos, victim.pos) - me.radius as f64 - victim.radius as f64).max(0.0);
     if let Some((charge, multiplier, c)) = &stats.missile {
         let (charge, multiplier) = (*charge, *multiplier);
-        let velocity = attr(c, ATTR_MISSILE_VELOCITY, 3_000.0).max(1.0);
+        let velocity = attr(c, ATTR_MAX_VELOCITY, 3_000.0).max(1.0);
         let flight = velocity * attr(c, ATTR_EXPLOSION_DELAY, 5_000.0) / 1000.0;
         if gap <= flight {
             let missile = Missile {

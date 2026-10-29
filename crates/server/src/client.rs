@@ -1,6 +1,7 @@
 //! One logged-in client: the machoNet packet loop after the handshake.
 
 use crate::conn::{Conn, Writer};
+use crate::consts::FILETIME_UNIX_EPOCH;
 use crate::db::Db;
 use crate::handshake::Login;
 use crate::macho::{cmd, Address, Packet, ERR_WRAPPEDEXCEPTION};
@@ -12,6 +13,11 @@ use marshal::Value;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+
+/// Windows FILETIME uses 100 ns ticks, hence 10,000 ticks per millisecond.
+const FILETIME_TICKS_PER_MS: i64 = 10_000;
+/// Windows FILETIME tick duration in nanoseconds.
+const FILETIME_TICK_NS: u32 = 100;
 
 pub struct Client {
     pub conn: Writer,
@@ -326,8 +332,25 @@ pub fn user_error(msg: &str, dict: Vec<(String, Value)>) -> Value {
     }
 }
 
+/// Convert Unix milliseconds to Windows FILETIME without losing integer precision.
+pub fn filetime_from_unix_ms(ms: i64) -> i64 {
+    FILETIME_UNIX_EPOCH + ms * FILETIME_TICKS_PER_MS
+}
+
 /// Windows FILETIME (100ns since 1601), the unit of `blue.os.GetWallclockTime()`.
 pub fn filetime_now() -> i64 {
     let unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-    116_444_736_000_000_000 + (unix.as_nanos() / 100) as i64
+    FILETIME_UNIX_EPOCH + (unix.as_nanos() / u128::from(FILETIME_TICK_NS)) as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unix_milliseconds_convert_to_filetime() {
+        assert_eq!(filetime_from_unix_ms(0), FILETIME_UNIX_EPOCH);
+        assert_eq!(filetime_from_unix_ms(1), FILETIME_UNIX_EPOCH + 10_000);
+        assert_eq!(filetime_from_unix_ms(-1), FILETIME_UNIX_EPOCH - 10_000);
+    }
 }

@@ -15,24 +15,21 @@
 //! kill missions, talk-to-agent and courier missions (finished at the next step's agent;
 //! courier cargo goes to the pilot's hangar on accepting), trade missions (bring the
 //! goods back) and agent interactions (a choice of answers). The live server's dungeon layouts never
-//! shipped with the client, so a site is a deadspace point near a planet of the
+//! shipped with the client, so a site is a deadspace point above a planet's surface in the
 //! agent's system, spawned with that dungeon faction's mission NPCs on first approach.
 //! The objective completes once the actor's spawned NPC group is cleared. Site
-//! records and group state are held in memory.
+//! records and group state are held in memory. Startup moves legacy buried mission sites
+//! clear of planets.
 
-use super::{keyval, Call, CallError, CallResult};
+use super::{db_err, keyval, rand01, rand_dir, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
-use crate::services::charsel::FLAG_HANGAR;
-use crate::space::{now_ms, Ball, MODE_STOP, V3};
+use crate::consts::{FLAG_CARGO, FLAG_HANGAR, IX_STACK_SIZE, TYPE_SOLAR_SYSTEM};
+use crate::space::{dist, now_ms, Ball, MODE_STOP, V3};
 use marshal::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use tracing::info;
-
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
 
 // appConst.agentMissionState*
 const STATE_OFFERED: i32 = 1;
@@ -57,8 +54,6 @@ const ACT_DELIVER: i64 = 7;
 const ACT_OPTION: i64 = 10;
 const AGENT_TYPE_BASIC: i64 = 2;
 const TYPE_CREDITS: i64 = 29;
-const TYPE_SOLAR_SYSTEM: i64 = 5;
-const GROUP_PLANET: i32 = 7;
 /// Owner of mission NPCs from dungeons without a faction (Guristas Pirates).
 const GENERIC_NPC_CORP: i64 = 1000127;
 /// Mission sites sit this far off a planet (m).
@@ -77,17 +72,6 @@ fn rewards(level: i64) -> (i64, i64) {
         4 => (2_800_000, 3_500),
         _ => (7_000_000, 8_000),
     }
-}
-
-fn rand01() -> f64 {
-    (crate::handshake::rand_i64() as u64 >> 11) as f64 / (1u64 << 53) as f64
-}
-
-/// A random unit vector.
-fn rand_dir() -> V3 {
-    let (z, a) = (rand01() * 2.0 - 1.0, rand01() * std::f64::consts::TAU);
-    let r = (1.0 - z * z).sqrt();
-    [r * a.cos(), z, r * a.sin()]
 }
 
 // ---------------------------------------------------------------- agents
@@ -265,18 +249,9 @@ async fn message(c: &Client, mission_id: i32, key: &str) -> Result<Option<i64>, 
 }
 
 /// A mission site: a point well off the surface of a random planet of the system.
-async fn site_position(c: &Client, system: i64) -> Result<V3, CallError> {
-    let planet = c
-        .db
-        .client
-        .query_opt(
-            "SELECT x, y, z, COALESCE(radius, 0)::float8 FROM sde.map_celestials WHERE solar_system_id = $1 AND group_id = $2 ORDER BY random() LIMIT 1",
-            &[&(system as i32), &GROUP_PLANET],
-        )
-        .await
-        .map_err(db_err)?;
-    let (base, radius): (V3, f64) = planet.map(|p| ([p.get(0), p.get(1), p.get(2)], p.get(3))).unwrap_or(([0.0; 3], 0.0));
-    Ok(super::exploration::off_surface(base, radius, SITE_OFFSET))
+async fn mission_site_position(c: &Client, system: i64) -> Result<V3, CallError> {
+    let (base, radius) = super::site_position(&c.db, system).await?.unwrap_or(([0.0; 3], 0.0));
+    Ok(super::off_surface(base, radius, SITE_OFFSET))
 }
 
 /// Offer one of the build's kill missions at the agent's level, sited in the agent's system.
@@ -297,7 +272,7 @@ async fn offer(c: &Client, agent: &Agent) -> Result<(), CallError> {
         .await
         .map_err(db_err)?
         .ok_or_else(|| CallError::Internal(anyhow::anyhow!("no level {level} kill missions")))?;
-    let pos = site_position(c, agent.system_id).await?;
+    let pos = mission_site_position(c, agent.system_id).await?;
     let (isk, lp) = rewards(agent.level);
     c.db.client
         .execute(
@@ -440,7 +415,7 @@ async fn offer_arc(c: &Client, agent: &Agent, mission_id: i32) -> Result<(), Cal
     };
     let cargo_type: Option<i32> = r.get(3);
     let cargo_qty: Option<i32> = cargo_type.map(|_| r.get::<_, Option<i32>>(4).unwrap_or(1).max(1));
-    let pos = site_position(c, agent.system_id).await?;
+    let pos = mission_site_position(c, agent.system_id).await?;
     c.db.client
         .execute(
             "INSERT INTO game.agent_missions (character_id, agent_id, mission_id, dungeon_id, faction_id, state, system_id, x, y, z,
@@ -512,7 +487,7 @@ async fn goods_at(c: &Client, station: i64, type_id: i32) -> Result<Vec<super::d
     super::dogma::load_items(
         c,
         "i.owner_id = $1 AND i.type_id = $2 AND ((i.location_id = $3 AND i.flag_id = $4) OR (i.location_id = $5 AND i.flag_id = $6))",
-        &[&me, &type_id, &station, &FLAG_HANGAR, &ship, &super::combat::FLAG_CARGO],
+        &[&me, &type_id, &station, &FLAG_HANGAR, &ship, &FLAG_CARGO],
     )
     .await
 }
@@ -533,7 +508,7 @@ async fn take_goods(c: &mut Client, station: i64, (type_id, qty): (i32, i32)) ->
             super::combat::remove_stack(c, item).await?;
         } else {
             c.db.client.execute("UPDATE game.items SET quantity = quantity - $2 WHERE item_id = $1", &[&item.item_id, &left]).await.map_err(db_err)?;
-            super::inventory::notify_item_change(c, item.item_id, vec![(super::combat::IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
+            super::inventory::notify_item_change(c, item.item_id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
             left = 0;
         }
     }
@@ -802,7 +777,7 @@ fn site_location(m: &Mission) -> Value {
         ("locationID", Value::Int(m.system_id)),
         ("locationType", Value::str("dungeon")),
         ("solarsystemID", Value::Int(m.system_id)),
-        ("typeID", Value::Int(TYPE_SOLAR_SYSTEM)),
+        ("typeID", Value::Int(TYPE_SOLAR_SYSTEM as i64)),
         ("coords", Value::tuple(m.pos.map(Value::Float))),
         ("agentID", Value::Int(m.agent_id)),
     ])
@@ -974,7 +949,7 @@ async fn journal_row(c: &Client, m: &Mission) -> Result<Value, CallError> {
             ("hint", Value::str("UI/Agents/Bookmarks/Encounter/Deadspace")),
             ("locationID", Value::Int(m.system_id)),
             ("itemID", Value::Int(m.system_id)),
-            ("typeID", Value::Int(TYPE_SOLAR_SYSTEM)),
+            ("typeID", Value::Int(TYPE_SOLAR_SYSTEM as i64)),
             ("x", Value::Float(m.pos[0])),
             ("y", Value::Float(m.pos[1])),
             ("z", Value::Float(m.pos[2])),
@@ -1231,7 +1206,7 @@ async fn at_site(c: &Client, m: &Mission) -> bool {
         return false;
     }
     let pos = m.pos;
-    c.world.with(system, move |s| s.ball(ship).is_some_and(|b| (0..3).map(|i| (b.pos[i] - pos[i]).powi(2)).sum::<f64>().sqrt() < SITE_RADIUS)).await.unwrap_or(false)
+    c.world.with(system, move |s| s.ball(ship).is_some_and(|b| dist(b.pos, pos) < SITE_RADIUS)).await.unwrap_or(false)
 }
 
 /// The steps of a kill mission, as missionObjectiveData objective items (strings).

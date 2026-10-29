@@ -2,7 +2,7 @@
 //! directional scanning, and wormholes.
 //!
 //! The live server's dungeon layouts never shipped with the client, so a site is a point
-//! off a planet tied to one of the build's dungeons for its name, faction and difficulty.
+//! off a planet's surface tied to one of the build's dungeons for its name, faction and difficulty.
 //! Combat sites fill with that faction's NPCs when first warped to and are replaced
 //! elsewhere after their spawn group clears and the site lingers briefly. Data and relic
 //! sites hold hackable containers (services/hacking) with loot. A wormhole leads to a
@@ -11,7 +11,8 @@
 //!
 //! Sites are generated per system on first visit and stored in game.exploration_sites;
 //! memory holds the systems loaded since startup. Wormholes and spawned containers are put
-//! back in space when their system is loaded again.
+//! back in space when their system is loaded again. Startup moves legacy exploration and
+//! mission sites out of planets, along with exploration overlays and asteroids.
 //!
 //! Protocol (client: scanSvc, sensorSuiteService, probescanning, explorationscanner):
 //! - scanMgr.SignalTrackerRegister() -> OnSignalTrackerFullState(systemID, (anomalies,
@@ -22,30 +23,21 @@
 //! - bound scanMgr.ConeScan(angle, range, x, y, z) -> [record(id, typeID, groupID)].
 //! - beyonce.CmdWarpToStuff('scan', targetID); wormholeMgr.WormholeJump(wormholeID).
 
-use super::{keyval, Call, CallError, CallResult};
+use super::{db_err, keyval, notify_error, off_surface, rand01, rand_dir, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
+use crate::consts::{ATTR_EXPLOSION_DELAY, AU, FILETIME_SECOND, FLAG_CARGO, GROUP_ASTEROID_BELT, GROUP_PLANET, SKILL_ARCHAEOLOGY, SKILL_HACKING};
 use crate::db::Db;
-use crate::space::{now_ms, Ball, World, MODE_RIGID, MODE_STOP, V3};
+use crate::space::{dist, now_ms, Ball, World, MODE_RIGID, MODE_STOP, V3};
 use marshal::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use tracing::{info, warn};
 
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
-
-fn notify_err(msg: impl Into<String>) -> CallError {
-    CallError::User { msg: "CustomNotify".into(), dict: vec![("notify".into(), Value::unicode(msg.into()))] }
-}
-
-const AU: f64 = 149_597_870_700.0;
-const SEC: i64 = 10_000_000;
 const GROUP_COSMIC_SIGNATURE: i64 = 502;
+/// Design policy: legacy sites closer than this to a planet's surface are moved (m).
+const SITE_REPAIR_CLEARANCE: f64 = 1_000_000.0;
 const GROUP_COSMIC_ANOMALY: i64 = 885;
-const GROUP_PLANET: i32 = 7;
-const GROUP_ASTEROID_BELT: i32 = 9;
 // probescanning.const scan groups
 const SCAN_GROUP_SIGNATURES: i64 = 3;
 const SCAN_GROUP_ANOMALIES: i64 = 8;
@@ -63,11 +55,8 @@ const ARCHETYPE_ORE: i64 = 27;
 const ARCHETYPE_ICE: i64 = 28;
 const ARCHETYPE_GAS: i64 = 30;
 const GROUP_SCATTER_CONTAINER: i32 = 1207;
-pub(super) const SKILL_HACKING: i32 = 21718;
-pub(super) const SKILL_ARCHAEOLOGY: i32 = 13278;
 const TYPE_K162: i32 = 30831;
 const ATTR_BASE_SENSOR_STRENGTH: i32 = 1371;
-const ATTR_PROBE_LIFETIME: i32 = 281;
 const ATTR_WH_TARGET_CLASS: i32 = 1381;
 const ATTR_WH_LIFE_MINUTES: i32 = 1382;
 const ATTR_WH_MASS: i32 = 1383;
@@ -97,22 +86,8 @@ const SITE_OFFSET: (f64, f64) = (8_000_000.0, 30_000_000.0);
 static NEXT_SITE_ID: AtomicI64 = AtomicI64::new(0);
 static NEXT_PROBE_ID: AtomicI64 = AtomicI64::new(9_600_000_000_000);
 
-fn rand01() -> f64 {
-    (crate::handshake::rand_i64() as u64 >> 11) as f64 / (1u64 << 53) as f64
-}
-
-fn rand_dir() -> V3 {
-    let (z, a) = (rand01() * 2.0 - 1.0, rand01() * std::f64::consts::TAU);
-    let r = (1.0 - z * z).sqrt();
-    [r * a.cos(), z, r * a.sin()]
-}
-
 fn pick<T: Clone>(items: &[T]) -> Option<T> {
     (!items.is_empty()).then(|| items[(rand01() * items.len() as f64) as usize % items.len()].clone())
-}
-
-fn dist(a: V3, b: V3) -> f64 {
-    ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
 }
 
 fn offset(p: V3, d: f64) -> V3 {
@@ -333,31 +308,14 @@ fn pirate_faction(faction: Option<i64>, region: i64) -> i64 {
     }
 }
 
-/// A point `distance` above the surface of a body of `radius` at `center`, in a random
-/// direction kept near the system plane (its vertical part flattened to a fifth).
-pub(super) fn off_surface(center: V3, radius: f64, distance: f64) -> V3 {
-    let v = rand_dir();
-    let flat = [v[0], v[1] * 0.2, v[2]];
-    let len = (flat[0] * flat[0] + flat[1] * flat[1] + flat[2] * flat[2]).sqrt().max(1e-9);
-    let d = radius + distance;
-    [center[0] + flat[0] / len * d, center[1] + flat[1] / len * d, center[2] + flat[2] / len * d]
-}
 
 fn site_distance() -> f64 {
     SITE_OFFSET.0 + rand01() * (SITE_OFFSET.1 - SITE_OFFSET.0)
 }
 
 /// A random point well off the surface of a random planet of the system.
-async fn site_position(db: &Db, system: i64) -> Result<V3, CallError> {
-    let planet = db
-        .client
-        .query_opt(
-            "SELECT x, y, z, COALESCE(radius, 0)::float8 FROM sde.map_celestials WHERE solar_system_id = $1 AND group_id = $2 ORDER BY random() LIMIT 1",
-            &[&(system as i32), &GROUP_PLANET],
-        )
-        .await
-        .map_err(db_err)?;
-    let (base, radius): (V3, f64) = planet.map(|p| ([p.get(0), p.get(1), p.get(2)], p.get(3))).unwrap_or(([AU, 0.0, 0.0], 0.0));
+async fn exploration_site_position(db: &Db, system: i64) -> Result<V3, CallError> {
+    let (base, radius) = super::site_position(db, system).await?.unwrap_or(([AU, 0.0, 0.0], 0.0));
     Ok(off_surface(base, radius, site_distance()))
 }
 
@@ -365,7 +323,6 @@ async fn site_position(db: &Db, system: i64) -> Result<V3, CallError> {
 /// (measured from the centre, so inside large planets) are moved out at startup, with
 /// their scan overlay positions and any asteroids.
 pub async fn unbury_sites(db: &Db) -> Result<(), CallError> {
-    const CLEARANCE: f64 = 1_000_000.0;
     // (table, key column, has overlay/asteroids)
     for (table, key, exploration) in [("game.exploration_sites", "site_id", true), ("game.agent_missions", "(character_id, agent_id)", false)] {
         let rows = db
@@ -378,7 +335,7 @@ pub async fn unbury_sites(db: &Db) -> Result<(), CallError> {
                                          ORDER BY (c.x - s.x) ^ 2 + (c.y - s.y) ^ 2 + (c.z - s.z) ^ 2 LIMIT 1) p
                      WHERE sqrt((p.x - s.x) ^ 2 + (p.y - s.y) ^ 2 + (p.z - s.z) ^ 2) < COALESCE(p.radius, 0) + $2"
                 ),
-                &[&GROUP_PLANET, &CLEARANCE],
+                &[&GROUP_PLANET, &SITE_REPAIR_CLEARANCE],
             )
             .await
             .map_err(db_err)?;
@@ -491,7 +448,7 @@ async fn combat_site(db: &Db, system: i64, info: &SystemInfo, kind: Kind, taken:
     };
     let gated = kind == Kind::Signature && !jspace;
     let Some(d) = pick_combat_dungeon(db, faction, range, gated, jspace).await? else { return Ok(None) };
-    let pos = site_position(db, system).await?;
+    let pos = exploration_site_position(db, system).await?;
     let ease = [1.0, 0.8, 0.6, 0.5, 0.4][(d.difficulty.clamp(1, 5) - 1) as usize];
     let mut site = new_site(system, pos, kind, STRENGTH_ALL, ease, taken);
     site.dungeon_id = Some(d.id);
@@ -554,10 +511,10 @@ async fn wormhole_pair(
         .map_err(db_err)?;
     let (life, mass, jump): (f64, f64, f64) = (a.get(0), a.get(1), a.get(2));
     let born = filetime_now();
-    let mut here = new_site(system, site_position(db, system).await?, Kind::Signature, STRENGTH_WORMHOLE, 0.8, taken);
+    let mut here = new_site(system, exploration_site_position(db, system).await?, Kind::Signature, STRENGTH_WORMHOLE, 0.8, taken);
     // The far side's target IDs are drawn from its own system's set when it is generated;
     // a clash there is harmless (results are per system).
-    let mut there = new_site(dest_system, site_position(db, dest_system).await?, Kind::Signature, STRENGTH_WORMHOLE, 0.8, &mut HashSet::new());
+    let mut there = new_site(dest_system, exploration_site_position(db, dest_system).await?, Kind::Signature, STRENGTH_WORMHOLE, 0.8, &mut HashSet::new());
     let base = Wormhole {
         type_id,
         dest_system,
@@ -926,7 +883,7 @@ async fn mining_site(db: &Db, system: i64, info: &SystemInfo, field: super::mini
         Field::Gas => (Kind::Signature, STRENGTH_LADAR, if jspace { 0.6 } else { 0.8 }),
         _ => (Kind::Anomaly, STRENGTH_GRAVIMETRIC, 1.0),
     };
-    let mut site = new_site(system, site_position(db, system).await?, kind, strength, ease, taken);
+    let mut site = new_site(system, exploration_site_position(db, system).await?, kind, strength, ease, taken);
     site.dungeon_id = Some(r.get(0));
     site.name_id = r.get(1);
     site.archetype = Some(archetype);
@@ -982,7 +939,7 @@ async fn hack_site(db: &Db, system: i64, info: &SystemInfo, relic: bool, taken: 
     };
     let Some(r) = r else { return Ok(None) };
     let strength = if relic { STRENGTH_MAGNETOMETRIC } else { STRENGTH_RADAR };
-    let mut site = new_site(system, site_position(db, system).await?, Kind::Signature, strength, ease, taken);
+    let mut site = new_site(system, exploration_site_position(db, system).await?, Kind::Signature, strength, ease, taken);
     site.dungeon_id = Some(r.get(0));
     site.name_id = r.get(1);
     site.archetype = Some(if relic { 44 } else { 45 });
@@ -1121,7 +1078,7 @@ pub async fn launch_probes(c: &mut Client, call: &Call<'_>) -> CallResult {
         .query_one(
             "SELECT COALESCE((SELECT value FROM sde.type_attributes WHERE type_id = $1 AND attribute_id = $2), 40),
                     COALESCE((SELECT value FROM sde.type_attributes WHERE type_id = $1 AND attribute_id = $3), 3600000)",
-            &[&type_id, &ATTR_BASE_SENSOR_STRENGTH, &ATTR_PROBE_LIFETIME],
+            &[&type_id, &ATTR_BASE_SENSOR_STRENGTH, &ATTR_EXPLOSION_DELAY],
         )
         .await
         .map_err(db_err)?;
@@ -1315,7 +1272,7 @@ async fn recover_probes(c: &mut Client, call: &Call<'_>, destroy: bool) -> CallR
     }
     if !destroy {
         for (type_id, n) in back {
-            super::combat::deposit(c, char_id, ship, super::combat::FLAG_CARGO, type_id, n, ship).await?;
+            super::combat::deposit(c, char_id, ship, FLAG_CARGO, type_id, n, ship).await?;
         }
     }
     let world = c.world.clone();
@@ -1618,7 +1575,7 @@ async fn replace_site(db: &Db, world: &World, site_id: i64) -> Result<(), CallEr
 
 /// The wormhole age bucket (slimItem.wormholeAge: 0 new ... 3 about to close).
 fn wormhole_age(w: &Wormhole) -> i64 {
-    let left = 1.0 - (filetime_now() - w.born) as f64 / (w.life_minutes * 60.0 * SEC as f64);
+    let left = 1.0 - (filetime_now() - w.born) as f64 / (w.life_minutes * 60.0 * FILETIME_SECOND as f64);
     match left {
         l if l > 0.5 => 0,
         l if l > 0.25 => 1,
@@ -1715,9 +1672,9 @@ pub(super) async fn scan_result_position(db: &Db, system: i64, char_id: i64, tar
 pub async fn warp_to_scan(c: &mut Client, target: &str, min_range: f64) -> CallResult {
     let (Some(system), Some(char_id)) = (c.session.int("solarsystemid"), c.session.int("charid")) else { return Ok(Value::None) };
     let site = system_sites(system).into_iter().find(|s| s.target == target);
-    let Some(site) = site else { return Err(notify_err("扫描结果已经消失。")) };
+    let Some(site) = site else { return Err(notify_error("扫描结果已经消失。")) };
     if site.kind == Kind::Signature && !is_scanned(&c.db, char_id, site.id).await? {
-        return Err(notify_err("你需要先将该信号扫描到 100% 才能跃迁过去。"));
+        return Err(notify_error("你需要先将该信号扫描到 100% 才能跃迁过去。"));
     }
     if site.wormhole.is_some() {
         ensure_wormhole_ball(&c.db, &c.world, site.id).await?;
@@ -1753,7 +1710,7 @@ fn connection(site: i64) -> Option<i64> {
 fn polarization(char_id: i64, site: i64) -> Option<(i64, i64)> {
     let connection = connection(site)?;
     let until = *state().polarized.get(&(char_id, connection))?;
-    (until > filetime_now()).then_some((until, POLARIZATION_SECS * SEC))
+    (until > filetime_now()).then_some((until, POLARIZATION_SECS * FILETIME_SECOND))
 }
 
 /// wormholeMgr.WormholeJump(wormholeID): through to the other side, next to its K162.
@@ -1762,7 +1719,7 @@ async fn wormhole_jump(c: &mut Client, wormhole_id: i64) -> CallResult {
         return Ok(Value::None);
     };
     let Some((site, w)) = state().sites.get(&wormhole_id).and_then(|s| s.wormhole.clone().map(|w| (s.clone(), w))) else {
-        return Err(notify_err("这个虫洞已经坍塌了。"));
+        return Err(notify_error("这个虫洞已经坍塌了。"));
     };
     let Some((gap, mass)) = c.world.with(system, move |s| {
         let (me, hole) = (s.ball(ship)?, s.ball(wormhole_id)?);
@@ -1772,20 +1729,20 @@ async fn wormhole_jump(c: &mut Client, wormhole_id: i64) -> CallResult {
         return Err(CallError::User { msg: "NotCloseEnoughToJump".into(), dict: vec![("maxdist".into(), Value::Int(WORMHOLE_JUMP_RANGE as i64))] });
     }
     if polarization(char_id, wormhole_id).is_some() {
-        return Err(notify_err("这个虫洞对你的舰船处于极化状态，暂时无法再次跃迁。"));
+        return Err(notify_error("这个虫洞对你的舰船处于极化状态，暂时无法再次跃迁。"));
     }
     if mass > w.jump_mass {
-        return Err(notify_err(format!("你的舰船太重了，无法通过这个虫洞（最大 {:.0} 吨）。", w.jump_mass / 1000.0)));
+        return Err(notify_error(format!("你的舰船太重了，无法通过这个虫洞（最大 {:.0} 吨）。", w.jump_mass / 1000.0)));
     }
     // The far side: its K162 (or the hole this K162 answers) goes into space now.
     ensure_loaded(&c.db, &c.world, w.dest_system).await?;
     ensure_wormhole_ball(&c.db, &c.world, w.other).await?;
-    let Some(exit) = state().sites.get(&w.other).map(|s| s.pos) else { return Err(notify_err("这个虫洞已经坍塌了。")) };
+    let Some(exit) = state().sites.get(&w.other).map(|s| s.pos) else { return Err(notify_error("这个虫洞已经坍塌了。")) };
     let pos = offset(exit, 4000.0 + rand01() * 2000.0);
     let jump = super::ship::Jump { through: wormhole_id, guid: "effects.JumpOutWormhole", other_type: Some(w.dest_class), dest_system: w.dest_system, pos };
     super::ship::jump_out_and_arrive(c, system, ship, char_id, jump).await?;
     info!(user = c.login.user_id, "ship {ship} jumped wormhole {} ({system} -> {})", site.target, w.dest_system);
-    state().polarized.insert((char_id, site.id.min(w.other)), filetime_now() + POLARIZATION_SECS * SEC);
+    state().polarized.insert((char_id, site.id.min(w.other)), filetime_now() + POLARIZATION_SECS * FILETIME_SECOND);
     // Both ends share the mass budget; past it the connection collapses.
     let collapsed = {
         let mut st = state();
@@ -1836,7 +1793,7 @@ async fn expire_wormholes(db: &Db, world: &World) -> Result<(), CallError> {
     let dead: Vec<i64> = state()
         .sites
         .values()
-        .filter(|s| s.wormhole.as_ref().is_some_and(|w| now - w.born > (w.life_minutes * 60.0) as i64 * SEC))
+        .filter(|s| s.wormhole.as_ref().is_some_and(|w| now - w.born > (w.life_minutes * 60.0) as i64 * FILETIME_SECOND))
         .map(|s| s.id)
         .collect();
     for id in dead {

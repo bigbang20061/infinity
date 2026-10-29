@@ -8,7 +8,7 @@
 //! (OnFleetJoin, OnFleetLeave, OnFleetMemberChanged...). A pilot who logs off leaves.
 //! Fleet warps, boosts, ads and the fleet finder aren't supported.
 
-use super::{keyval, Call, CallError, CallResult};
+use super::{keyval, notify_error, Call, CallError, CallResult};
 use crate::client::Client;
 use crate::space::World;
 use marshal::Value;
@@ -70,10 +70,6 @@ fn state() -> MutexGuard<'static, State> {
 
 fn next_id() -> i64 {
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
-}
-
-fn notify_error(text: &str) -> CallError {
-    CallError::User { msg: "CustomNotify".into(), dict: vec![("notify".into(), Value::unicode(text))] }
 }
 
 fn member_value(char_id: i64, m: &Member) -> Value {

@@ -2,8 +2,9 @@
 //! Formulas match characterskills/util.py: SP(level) = ceil(250 * rank * 2^(2.5(level-1))),
 //! SP/minute = primary + secondary / 2.
 
-use super::{keyval, Call, CallError, CallResult};
+use super::{db_err, keyval, Call, CallError, CallResult};
 use crate::client::{filetime_now, short, Client};
+use crate::consts::FILETIME_MINUTE;
 use marshal::Value;
 use std::collections::HashMap;
 use tracing::{info, warn};
@@ -14,13 +15,8 @@ pub const SKILL_HANDLER: &str = "skillHandler";
 const ATTR_PRIMARY: i32 = 180;
 const ATTR_SECONDARY: i32 = 181;
 const ATTR_RANK: i32 = 275;
-const FILETIME_PER_MINUTE: f64 = 60.0 * 10_000_000.0;
 /// Attribute IDs charisma..willpower.
 pub const CHAR_ATTRIBUTES: [i64; 5] = [164, 165, 166, 167, 168];
-
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
 
 pub fn sp_for_level(rank: f64, level: i64) -> i64 {
     if level <= 0 {
@@ -280,7 +276,7 @@ async fn save_queue(c: &Client, char_id: i64, queue: &Value, activate: bool) -> 
         let dest_sp = sp_for_level(st.rank, to_level);
         let rate = attrs.get(&st.primary).copied().unwrap_or(20.0) + attrs.get(&st.secondary).copied().unwrap_or(20.0) / 2.0;
         let (start, end) = if activate {
-            let end = t + (((dest_sp - start_sp).max(0) as f64 / rate) * FILETIME_PER_MINUTE) as i64;
+            let end = t + (((dest_sp - start_sp).max(0) as f64 / rate) * FILETIME_MINUTE as f64) as i64;
             let s = t;
             t = end;
             (Some(s), Some(end))

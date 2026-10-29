@@ -1,20 +1,15 @@
 //! dogmaIM (bound per location): item attribute/effect state for godma and
 //! clientDogmaLocation (eve/client/script/environment/godma.py ProcessAllInfo).
 
-use super::{item_descriptor, keyval, Call, CallError, CallResult};
+use super::{db_err, item_descriptor, keyval, Call, CallError, CallResult};
 use crate::client::{filetime_now, short, Client};
-use crate::services::charsel::{FLAG_HANGAR, FLAG_PILOT};
+use crate::consts::{ATTR_CAPACITY, ATTR_IS_ONLINE, ATTR_MASS, ATTR_QUANTITY, ATTR_RADIUS, ATTR_VOLUME, EFFECT_ONLINE, FLAG_HANGAR, FLAG_PILOT, TYPE_CHARACTER};
 use marshal::Value;
 use std::collections::BTreeMap;
 use tracing::warn;
 
-pub const TYPE_CHARACTER: i32 = 1373;
 const GROUP_CHARACTER: i64 = 1;
 const CATEGORY_OWNER: i64 = 1;
-
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
 
 /// An inventory item as the client's item DBRow expects it.
 pub struct Item {
@@ -103,19 +98,12 @@ async fn type_attributes(c: &Client, type_id: i32) -> Result<BTreeMap<i64, f64>,
     if let Some(r) = columns {
         for (i, attr) in [ATTR_MASS, ATTR_CAPACITY, ATTR_VOLUME, ATTR_RADIUS].into_iter().enumerate() {
             if let Some(v) = r.get::<_, Option<f64>>(i) {
-                attrs.entry(attr).or_insert(v);
+                attrs.entry(attr as i64).or_insert(v);
             }
         }
     }
     Ok(attrs)
 }
-
-const ATTR_MASS: i64 = 4;
-const ATTR_CAPACITY: i64 = 38;
-const ATTR_VOLUME: i64 = 161;
-const ATTR_RADIUS: i64 = 162;
-const EFFECT_ONLINE: i64 = 16;
-const ATTR_QUANTITY: i64 = 805;
 
 /// godma's activeEffects for an online module: {effectID: (itemID, charID, shipID, targetID,
 /// otherID, area, effectID, startTime, duration, repeat)}. godma counts an effect as running
@@ -186,8 +174,6 @@ async fn character_info(c: &Client) -> Result<Value, CallError> {
     Ok(info(item.row(), char_id, attrs, vec![]))
 }
 
-const ATTR_IS_ONLINE: i64 = 2;
-
 /// Fitted modules of `ship_id` that are online (game.items.online).
 async fn online_modules(c: &Client, ship_id: i64) -> Result<Vec<i64>, CallError> {
     Ok(c.db
@@ -257,12 +243,12 @@ async fn ship_info(c: &Client) -> Result<Vec<(Value, Value)>, CallError> {
             }
         }
         let active = if online.contains(&item.item_id) {
-            attrs.insert(ATTR_IS_ONLINE, 1.0);
+            attrs.insert(ATTR_IS_ONLINE as i64, 1.0);
             online_effect(item.item_id, char_id, ship_id)
         } else {
             vec![]
         };
-        attrs.entry(ATTR_MASS).or_insert(0.0); // mass is always present
+        attrs.entry(ATTR_MASS as i64).or_insert(0.0); // mass is always present
         if item.item_id == ship_id {
             attrs.insert(18, cap);
             attrs.insert(264, shield);
@@ -286,7 +272,7 @@ async fn ship_info(c: &Client) -> Result<Vec<(Value, Value)>, CallError> {
     for r in charges {
         let (flag, type_id, qty): (i32, i32, i32) = (r.get(0), r.get(1), r.get(2));
         let mut attrs = type_attributes(c, type_id).await?;
-        attrs.insert(ATTR_QUANTITY, qty as f64);
+        attrs.insert(ATTR_QUANTITY as i64, qty as f64);
         let key = Value::tuple([Value::Int(ship_id), Value::Int(flag as i64), Value::Int(type_id as i64)]);
         out.push((key.clone(), info_keyed(Value::None, key, attrs, vec![])));
     }

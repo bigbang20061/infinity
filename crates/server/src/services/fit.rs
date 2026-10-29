@@ -10,36 +10,26 @@
 //! LocationRequiredSkillModifier and OwnerRequiredSkillModifier, with the dogma
 //! operations applied in order and stacking penalties on non-stackable attributes.
 
-use super::CallError;
+use super::{db_err, CallError};
+use crate::consts::{ATTR_CAPACITY, ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_RADIUS, ATTR_SIGNATURE_RADIUS, ATTR_VOLUME, CATEGORY_SHIP, EFFECT_AFTERBURNER, EFFECT_MICROWARPDRIVE, TYPE_CHARACTER};
 use crate::db::Db;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
-
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
 
 pub const ATTR_SKILL_LEVEL: i32 = 280;
 /// requiredSkill1..6
 const ATTR_REQUIRED_SKILLS: [i32; 6] = [182, 183, 184, 1285, 1289, 1290];
 // Categories whose modifiers are exempt from stacking penalties.
-const CATEGORY_SHIP: i32 = 6;
 const CATEGORY_CHARGE: i32 = 8;
 const CATEGORY_SKILL: i32 = 16;
 const CATEGORY_IMPLANT: i32 = 20;
 const CATEGORY_SUBSYSTEM: i32 = 32;
-const EFFECT_PASSIVE: i32 = 0;
-const EFFECT_ACTIVE: i32 = 1;
-const EFFECT_ONLINE: i32 = 4;
-/// moduleBonusMicrowarpdrive / moduleBonusAfterburner
-pub const EFFECT_MICROWARPDRIVE: i32 = 6730;
-pub const EFFECT_AFTERBURNER: i32 = 6731;
-const ATTR_MASS: i32 = 4;
-const ATTR_CAPACITY: i32 = 38;
-const ATTR_VOLUME: i32 = 161;
-const ATTR_RADIUS: i32 = 162;
-const ATTR_MAX_VELOCITY: i32 = 37;
-const ATTR_SIGNATURE_RADIUS: i32 = 552;
+/// SDE dogma effect category: passive.
+const EFFECT_CATEGORY_PASSIVE: i32 = 0;
+/// SDE dogma effect category: active.
+const EFFECT_CATEGORY_ACTIVE: i32 = 1;
+/// SDE dogma effect category: online.
+const EFFECT_CATEGORY_ONLINE: i32 = 4;
 const ATTR_SPEED_FACTOR: i32 = 20;
 const ATTR_SPEED_BOOST_FACTOR: i32 = 567;
 const ATTR_MASS_ADDITION: i32 = 796;
@@ -224,7 +214,7 @@ pub struct Fit {
 impl Fit {
     /// Load the character, its skills, `ship`, its fitted modules and loaded charges.
     pub async fn load(db: &Db, char_id: i64, ship: i64) -> Result<Fit, CallError> {
-        let char_type: i32 = super::dogma::TYPE_CHARACTER;
+        let char_type: i32 = TYPE_CHARACTER;
         let ship_type: i32 = db
             .client
             .query_opt("SELECT type_id FROM game.items WHERE item_id = $1", &[&ship])
@@ -335,9 +325,9 @@ impl Fit {
         for (&source, node) in &self.nodes {
             for m in &node.data.modifiers {
                 let running = match m.category {
-                    EFFECT_PASSIVE => true,
-                    EFFECT_ONLINE => node.online,
-                    EFFECT_ACTIVE => node.active,
+                    EFFECT_CATEGORY_PASSIVE => true,
+                    EFFECT_CATEGORY_ONLINE => node.online,
+                    EFFECT_CATEGORY_ACTIVE => node.active,
                     _ => false,
                 };
                 if m.modified != attr || !running {

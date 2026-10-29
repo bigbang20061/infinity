@@ -1,8 +1,9 @@
 //! charUnboundMgr: character selection and creation before a character is
 //! chosen (loginCharacterselection/charselData.py, eve/client/script/ui/login).
 
-use super::{keyval, Call, CallError, CallResult};
+use super::{db_err, keyval, Call, CallError, CallResult};
 use crate::client::{short, Client};
+use crate::consts::{FAR_FUTURE, FLAG_HANGAR};
 use anyhow::Context;
 use marshal::Value;
 use tracing::{info, warn};
@@ -16,10 +17,6 @@ const NAME_ILLEGAL_CHARACTER: i64 = -5;
 const NAME_TOO_MANY_SPACES: i64 = -6;
 const NAME_CONSECUTIVE_SPACES: i64 = -7;
 const NAME_UNAVAILABLE: i64 = -101;
-
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
 
 fn arg_text(call: &Call<'_>, i: usize) -> String {
     call.args.get(i).and_then(|v| v.as_text()).map(|s| s.trim().to_string()).unwrap_or_default()
@@ -173,10 +170,6 @@ async fn own_character(c: &Client, call: &Call<'_>) -> Result<i64, CallError> {
     Ok(char_id)
 }
 
-/// inventory flags (inventorycommon.const)
-pub const FLAG_HANGAR: i32 = 4;
-pub const FLAG_PILOT: i32 = 57;
-
 /// Give the character a rookie ship in their station hangar if they have none.
 async fn ensure_ship(c: &Client, char_id: i64, race_id: i32, station_id: i64) -> Result<i64, CallError> {
     if let Some(r) = c
@@ -318,7 +311,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
                 ("maxCharacterSlots", Value::Int(CHARACTER_SLOTS)),
                 ("userName", Value::unicode(c.login.user_name.clone())),
                 ("creationDate", Value::Int(created)),
-                ("subscriptionEndTime", Value::Int(super::FAR_FUTURE)),
+                ("subscriptionEndTime", Value::Int(FAR_FUTURE)),
             ]);
             Ok(Value::tuple([
                 Value::list([user]),

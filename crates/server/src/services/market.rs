@@ -1,7 +1,7 @@
 //! marketProxy: regional order books (eve/client/script/ui/services/marketsvc.py).
 //!
 //! The book holds the NPC orders seeded at the starter stations (sql/market_seed.sql, and
-//! region-wide buy orders at db::NPC_BID_RATIO of those prices) and players' orders. NPC
+//! region-wide buy orders at consts::NPC_BID_RATIO of those prices) and players' orders. NPC
 //! stock and demand are unlimited, so fills never consume NPC orders.
 //!
 //! A trade happens at the resting order's price and delivers to the buyer's hangar in the
@@ -13,25 +13,19 @@
 //! counted on the stargate graph (sde.map_jumps) within the region.
 
 use super::dogma::{load_items_db, Item};
-use super::{crowset, keyval, Call, CallError, CallResult};
+use super::{crowset, db_err, keyval, notify_error, user_error, value_field, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
+use crate::consts::{ACCOUNT_CASH, FILETIME_DAY, FLAG_HANGAR, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD};
 use crate::db::Db;
-use crate::services::charsel::FLAG_HANGAR;
 use crate::space::World;
 use marshal::{DbRowDescriptor, DbType, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use tracing::{info, warn};
 
-const DAY: i64 = 864_000_000_000;
 const RANGE_STATION: i64 = -1;
 const RANGE_SOLAR_SYSTEM: i64 = 0;
 const RANGE_REGION: i64 = 32767;
-const LOCATION_JUNKYARD: i64 = 10;
-const IX_LOCATION_ID: i64 = 3;
-const IX_STACK_SIZE: i64 = 9;
-/// const.accountingKeyCash: the wallet division of personal orders and transactions.
-const ACCOUNT_CASH: i64 = 1000;
 /// marketutil.const.MAX_ORDER_PRICE
 const MAX_ORDER_PRICE: f64 = 9_223_372_036_854.0;
 /// Longest order the sell and buy windows offer (days).
@@ -57,18 +51,6 @@ const SKILL_WHOLESALE: i32 = 16596;
 const SKILL_MARGIN_TRADING: i32 = 16597;
 const SKILL_ACCOUNTING: i32 = 16622;
 const SKILL_TYCOON: i32 = 18580;
-
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
-
-fn user_error(msg: &str, dict: Vec<(String, Value)>) -> CallError {
-    CallError::User { msg: msg.into(), dict }
-}
-
-pub(super) fn notify_error(text: &str) -> CallError {
-    user_error("CustomNotify", vec![("notify".into(), Value::unicode(text))])
-}
 
 pub(super) fn round2(x: f64) -> f64 {
     (x * 100.0).round() / 100.0
@@ -107,7 +89,7 @@ const ORDER_COLUMNS: &str = "price, vol_remaining::bigint, type_id::bigint, rang
     min_volume::bigint, bid, COALESCE(issued, $1), duration::bigint, station_id, region_id, solar_system_id, constellation_id";
 
 fn today() -> i64 {
-    filetime_now() / DAY * DAY
+    filetime_now() / FILETIME_DAY * FILETIME_DAY
 }
 
 /// `GetOrders(typeID)` -> (asks, bids) in the session's region.
@@ -165,14 +147,6 @@ async fn best_asks(c: &Client, column: &str, id: i64, as_rows: bool) -> CallResu
             })
             .collect(),
     ))
-}
-
-/// Attribute of a client `utillib.KeyVal` (or dict).
-pub(super) fn attr<'a>(v: &'a Value, name: &str) -> Option<&'a Value> {
-    match v {
-        Value::Instance(_, state) => state.get(name),
-        _ => v.get(name),
-    }
 }
 
 // ---------------------------------------------------------------- trading
@@ -869,7 +843,7 @@ async fn expire(db: &Db, world: &World) -> Result<(), CallError> {
     let _trading = lock().await;
     let rows = db
         .client
-        .query(&format!("{ORDER_SELECT} WHERE o.char_id IS NOT NULL AND o.issued + o.duration::bigint * $2 <= $3"), &[&today(), &DAY, &filetime_now()])
+        .query(&format!("{ORDER_SELECT} WHERE o.char_id IS NOT NULL AND o.issued + o.duration::bigint * $2 <= $3"), &[&today(), &FILETIME_DAY, &filetime_now()])
         .await
         .map_err(db_err)?;
     for r in &rows {
@@ -933,7 +907,7 @@ async fn my_orders(c: &Client) -> CallResult {
                 Value::Int(o.duration),
                 Value::Bool(false),
                 Value::Float(o.escrow),
-                Value::Int(ACCOUNT_CASH),
+                Value::Int(ACCOUNT_CASH as i64),
                 Value::Int(jumps(g, here, o.at.system, UNREACHABLE).unwrap_or(UNREACHABLE)),
             ])
         })
@@ -951,7 +925,7 @@ async fn order_history(c: &Client) -> CallResult {
             "SELECT order_id, type_id::bigint, region_id, station_id, range::bigint, bid, price, vol_entered::bigint, vol_remaining::bigint,
                     issued, min_volume::bigint, duration::bigint, state::bigint, closed
              FROM game.market_order_history WHERE char_id = $1 AND closed >= $2 ORDER BY closed DESC LIMIT 1000",
-            &[&me, &(filetime_now() - 90 * DAY)],
+            &[&me, &(filetime_now() - 90 * FILETIME_DAY)],
         )
         .await
         .map_err(db_err)?;
@@ -994,7 +968,7 @@ async fn order_history(c: &Client) -> CallResult {
                 Value::Int(r.get(12)),
                 Value::Int(r.get(13)),
                 Value::Bool(false),
-                Value::Int(ACCOUNT_CASH),
+                Value::Int(ACCOUNT_CASH as i64),
             ])
         })
         .collect();
@@ -1004,7 +978,7 @@ async fn order_history(c: &Client) -> CallResult {
 /// `CharGetTransactions(fromDate)`: the character's fills, newest first (marketSvc.py).
 async fn transactions(c: &Client, from: Option<i64>) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
-    let from = from.unwrap_or(filetime_now() - 30 * DAY);
+    let from = from.unwrap_or(filetime_now() - 30 * FILETIME_DAY);
     let rows = c
         .db
         .client
@@ -1040,9 +1014,9 @@ async fn transactions(c: &Client, from: Option<i64>) -> CallResult {
                 Value::Int(r.get(5)),
                 Value::Int(r.get(6)),
                 Value::Int(r.get(7)),
-                Value::Int(ACCOUNT_CASH),
-                Value::Int(ACCOUNT_CASH),
-                Value::Int(ACCOUNT_CASH),
+                Value::Int(ACCOUNT_CASH as i64),
+                Value::Int(ACCOUNT_CASH as i64),
+                Value::Int(ACCOUNT_CASH as i64),
             ])
         })
         .collect();
@@ -1088,7 +1062,7 @@ async fn price_history(c: &Client, type_ids: &[i32]) -> Result<HashMap<i32, (Val
             "SELECT type_id, date / $3 * $3 AS day, min(price), max(price), sum(price * quantity) / sum(quantity), sum(quantity)::bigint, count(*)
              FROM game.market_transactions WHERE region_id = $1 AND type_id = ANY($2) AND date >= $4
              GROUP BY 1, 2 ORDER BY 1, 2",
-            &[&region, &type_ids.to_vec(), &DAY, &(today - 365 * DAY)],
+            &[&region, &type_ids.to_vec(), &FILETIME_DAY, &(today - 365 * FILETIME_DAY)],
         )
         .await
         .map_err(db_err)?;
@@ -1135,7 +1109,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             let items = call.args.get(1).and_then(|v| v.items()).map(|v| v.to_vec()).unwrap_or_default();
             let mut done = vec![];
             for item in &items {
-                let get = |k: &str| attr(item, k);
+                let get = |k: &str| value_field(item, k);
                 let type_id = get("typeID").and_then(|v| v.as_int()).unwrap_or(0);
                 let price = get("price").and_then(|v| v.as_float()).unwrap_or(0.0);
                 let quantity = get("quantity").and_then(|v| v.as_int()).unwrap_or(0);
@@ -1156,8 +1130,8 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             let duration = int(2).unwrap_or(0);
             let mut any = false;
             for item in &items {
-                let get = |k: &str| attr(item, k).and_then(|v| v.as_int()).unwrap_or(0);
-                let price = attr(item, "price").and_then(|v| v.as_float()).unwrap_or(0.0);
+                let get = |k: &str| value_field(item, k).and_then(|v| v.as_int()).unwrap_or(0);
+                let price = value_field(item, "price").and_then(|v| v.as_float()).unwrap_or(0.0);
                 match place_sell(c, get("itemID"), get("stationID"), get("typeID"), price, get("quantity"), duration).await {
                     Ok(made) => any |= made,
                     Err(e @ CallError::User { .. }) if items.len() == 1 => return Some(Err(e)),

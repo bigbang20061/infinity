@@ -7,44 +7,25 @@
 
 use super::dogma::{load_items, ship_state};
 use super::inventory::notify_item_change;
-use super::{keyval, Call, CallError, CallResult};
+use super::{db_err, keyval, user_error, value_field, Call, CallError, CallResult};
 use crate::client::Client;
-use crate::services::charsel::FLAG_HANGAR;
+use crate::consts::{CATEGORY_SHIP, FLAG_HANGAR, IX_SINGLETON, IX_STACK_SIZE};
 use marshal::Value;
 use tracing::info;
 
-const CATEGORY_SHIP: i64 = 6;
 const CATEGORY_BLUEPRINT: i64 = 9;
-const IX_STACK_SIZE: i64 = 9;
-const IX_SINGLETON: i64 = 10;
-
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
-
-fn user_error(msg: &str) -> CallError {
-    CallError::User { msg: msg.into(), dict: vec![] }
-}
-
-/// Attribute of a client `utillib.KeyVal` (or dict).
-fn attr<'a>(v: &'a Value, name: &str) -> Option<&'a Value> {
-    match v {
-        Value::Instance(_, state) => state.get(name),
-        _ => v.get(name),
-    }
-}
 
 /// Board(shipID, oldShipID) -> shipState: make an assembled ship in this station's hangar
 /// the active one (clientDogmaLocation.MakeShipActive).
 async fn board(c: &mut Client, ship_id: i64) -> CallResult {
     let char_id = c.session.int("charid").unwrap_or(0);
-    let Some(station) = c.session.int("stationid") else { return Err(user_error("CantBoardShipWhileInSpace")) };
-    let ship = load_items(c, "i.item_id = $1", &[&ship_id]).await?.into_iter().next().ok_or_else(|| user_error("ShipNotFound"))?;
-    if ship.category_id != CATEGORY_SHIP || ship.owner_id != char_id || ship.location_id != station {
-        return Err(user_error("CantBoardShipNotInHangar"));
+    let Some(station) = c.session.int("stationid") else { return Err(user_error("CantBoardShipWhileInSpace", vec![])) };
+    let ship = load_items(c, "i.item_id = $1", &[&ship_id]).await?.into_iter().next().ok_or_else(|| user_error("ShipNotFound", vec![]))?;
+    if ship.category_id != CATEGORY_SHIP as i64 || ship.owner_id != char_id || ship.location_id != station {
+        return Err(user_error("CantBoardShipNotInHangar", vec![]));
     }
     if !ship.singleton {
-        return Err(user_error("CantBoardUnassembledShip"));
+        return Err(user_error("CantBoardUnassembledShip", vec![]));
     }
     c.db.client
         .execute("UPDATE game.characters SET ship_id = $2 WHERE character_id = $1", &[&char_id, &ship_id])
@@ -67,7 +48,7 @@ async fn assemble(c: &mut Client, call: &Call<'_>) -> CallResult {
     let mut assembled = vec![];
     for id in ids {
         let Some(item) = load_items(c, "i.item_id = $1 AND i.owner_id = $2", &[&id, &char_id]).await?.into_iter().next() else { continue };
-        if item.category_id != CATEGORY_SHIP || item.singleton {
+        if item.category_id != CATEGORY_SHIP as i64 || item.singleton {
             continue;
         }
         // One hull off a stack becomes the ship; the rest stays packaged.
@@ -118,13 +99,13 @@ async fn repackage(c: &mut Client, call: &Call<'_>) -> CallResult {
     }
     for id in ids {
         if Some(id) == c.session.int("shipid") {
-            return Err(user_error("CantRepackageActiveShip"));
+            return Err(user_error("CantRepackageActiveShip", vec![]));
         }
         let Some(item) = load_items(c, "i.item_id = $1 AND i.owner_id = $2", &[&id, &char_id]).await?.into_iter().next() else { continue };
         if !item.singleton {
             continue;
         }
-        if item.category_id == CATEGORY_SHIP {
+        if item.category_id == CATEGORY_SHIP as i64 {
             let fitted: i64 = c
                 .db
                 .client
@@ -184,10 +165,10 @@ async fn fittings(c: &mut Client, call: &Call<'_>) -> CallResult {
             let mut saved = vec![];
             if let Some(Value::Dict(fits)) = call.args.get(1) {
                 for (temp, fit) in fits {
-                    let text = |k: &str| attr(fit, k).and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
-                    let ship_type = attr(fit, "shipTypeID").and_then(|v| v.as_int()).unwrap_or(0) as i32;
+                    let text = |k: &str| value_field(fit, k).and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
+                    let ship_type = value_field(fit, "shipTypeID").and_then(|v| v.as_int()).unwrap_or(0) as i32;
                     let (mut types, mut flags, mut qty) = (vec![], vec![], vec![]);
-                    for row in attr(fit, "fitData").and_then(|v| v.items()).unwrap_or_default() {
+                    for row in value_field(fit, "fitData").and_then(|v| v.items()).unwrap_or_default() {
                         if let Some([t, f, q]) = row.items() {
                             types.push(t.as_int().unwrap_or(0) as i32);
                             flags.push(f.as_int().unwrap_or(0) as i32);
@@ -316,7 +297,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         ("blueprintManager", "GetBlueprintData") => {
             let item = call.args.first().and_then(|v| v.as_int());
             match blueprints(c, char_id, item).await {
-                Ok(bps) => bps.into_iter().next().ok_or_else(|| user_error("BlueprintNotFound")),
+                Ok(bps) => bps.into_iter().next().ok_or_else(|| user_error("BlueprintNotFound", vec![])),
                 Err(e) => Err(e),
             }
         }

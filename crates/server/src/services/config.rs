@@ -1,20 +1,15 @@
 //! `config` service: the server side of the client's cfg Recordsets
 //! (eve/common/script/sys/eveCfg.py). Multi-fetchers return `(header, rows)`.
 
-use super::{Call, CallError, CallResult};
+use super::{db_err, Call, CallError, CallResult};
 use crate::client::{short, Client};
+use crate::consts::TYPE_CHARACTER;
 use marshal::Value;
 use tracing::warn;
 
-/// const.typeCharacterGallente etc. are all in groupCharacter; any one serves for player owners.
-const TYPE_CHARACTER: i64 = 1373;
 const TYPE_CORPORATION: i64 = 2;
 const TYPE_FACTION: i64 = 30;
 const TYPE_ALLIANCE: i64 = 16159;
-
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
 
 fn ids(v: Option<&Value>) -> Vec<i64> {
     match v {
@@ -40,7 +35,7 @@ pub async fn owners(c: &Client, ids: &[i64]) -> Result<Value, CallError> {
                        FROM sde.npc_characters WHERE character_id = ANY($1::bigint[])
              UNION ALL SELECT faction_id, name, $4::bigint, 0, NULL FROM sde.chr_factions WHERE faction_id = ANY($1::bigint[])
              UNION ALL SELECT alliance_id, name, $5::bigint, 0, NULL FROM game.alliances WHERE alliance_id = ANY($1::bigint[])",
-            &[&ids, &TYPE_CHARACTER, &TYPE_CORPORATION, &TYPE_FACTION, &TYPE_ALLIANCE],
+            &[&ids, &(TYPE_CHARACTER as i64), &TYPE_CORPORATION, &TYPE_FACTION, &TYPE_ALLIANCE],
         )
         .await
         .map_err(db_err)?;

@@ -7,23 +7,15 @@
 //! it is in and its coordinates. Shared (access-group) folders aren't supported: every
 //! folder is personal.
 
-use super::{keyval, Call, CallError, CallResult};
+use super::{db_err, keyval, notify_error, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
+use crate::consts::TYPE_SOLAR_SYSTEM;
 use crate::db::Db;
 use marshal::Value;
 
 /// appConst.ACCESS_PERSONAL
 const ACCESS_PERSONAL: i64 = 1;
-const TYPE_SOLAR_SYSTEM: i32 = 5;
 const MAX_NAME: usize = 100;
-
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
-
-fn notify_error(text: &str) -> CallError {
-    CallError::User { msg: "CustomNotify".into(), dict: vec![("notify".into(), Value::unicode(text))] }
-}
 
 fn text(v: Option<&Value>, max: usize) -> String {
     v.and_then(|v| v.as_text()).map(|t| t.chars().take(max).collect()).unwrap_or_default()

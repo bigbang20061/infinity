@@ -14,7 +14,7 @@
 //! that traded on the retail market, at one LP per 2,000 ISK of retail value plus 1,000 ISK
 //! per LP.
 
-use super::{keyval, rowset, Call, CallError, CallResult};
+use super::{db_err, keyval, notify_error, rowset, Call, CallError, CallResult};
 use crate::client::Client;
 use crate::db::Db;
 use crate::space::World;
@@ -30,14 +30,6 @@ const DECLINE_LOSS: f64 = -0.01;
 const ISK_VALUE_PER_LP: f64 = 2000.0;
 const ISK_PER_LP: i64 = 1000;
 const META_GROUP_FACTION: f64 = 4.0;
-
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
-
-fn notify_error(text: &str) -> CallError {
-    CallError::User { msg: "CustomNotify".into(), dict: vec![("notify".into(), Value::unicode(text))] }
-}
 
 pub async fn standing(db: &Db, char_id: i64, from: i64) -> Result<f64, CallError> {
     Ok(db

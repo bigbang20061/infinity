@@ -1,4 +1,7 @@
 //! Remote services the client calls (`sm.RemoteSvc(name).Method(...)`).
+//!
+//! Shared error builders, wire-field readers, randomness and surface-aware site placement
+//! live here. Each service retains its own fallback and offset policy.
 
 mod agency;
 mod alliances;
@@ -45,8 +48,20 @@ pub use bills::run_billing;
 pub use exploration::unbury_sites;
 
 use crate::client::{filetime_now, short, Client};
+use crate::consts::{FAR_FUTURE, GROUP_PLANET};
 use marshal::{DbRowDescriptor, DbType, Value};
+use crate::db::Db;
+use crate::space::V3;
 use tracing::warn;
+
+/// IEEE 754 binary64 has 53 significant bits; use the high bits of the random word.
+const RANDOM_SIGNIFICANT_BITS: u32 = f64::MANTISSA_DIGITS;
+/// Diameter of the unit sphere, mapping a unit random value to [-1, 1).
+const UNIT_SPHERE_DIAMETER: f64 = 2.0;
+/// Design policy: flatten random site directions toward the system plane.
+const SITE_DIRECTION_FLATTENING: f64 = 0.2;
+/// Design policy: guard normalization of a near-zero site direction.
+const SITE_DIRECTION_EPSILON: f64 = 1e-9;
 
 /// The pilot's ship was destroyed: eject (raised by combat through the pilot's notify channel).
 pub async fn ship_destroyed(c: &mut Client, args: &[Value]) {
@@ -82,6 +97,73 @@ impl From<anyhow::Error> for CallError {
 }
 
 pub type CallResult = Result<Value, CallError>;
+
+pub fn db_err(e: tokio_postgres::Error) -> CallError {
+    CallError::Internal(e.into())
+}
+
+/// Raise the client's named error with its substitution dictionary.
+pub fn user_error(msg: &str, dict: Vec<(String, Value)>) -> CallError {
+    CallError::User { msg: msg.into(), dict }
+}
+
+pub fn notify_error(text: impl Into<String>) -> CallError {
+    user_error("CustomNotify", vec![("notify".into(), Value::unicode(text.into()))])
+}
+
+/// A uniformly distributed binary64 value in [0, 1).
+pub fn rand01() -> f64 {
+    (crate::handshake::rand_i64() as u64 >> (u64::BITS - RANDOM_SIGNIFICANT_BITS)) as f64 / (1u64 << RANDOM_SIGNIFICANT_BITS) as f64
+}
+
+/// A random unit vector, uniform on the sphere.
+pub fn rand_dir() -> V3 {
+    let (z, a) = (rand01() * UNIT_SPHERE_DIAMETER - 1.0, rand01() * std::f64::consts::TAU);
+    let r = (1.0 - z * z).sqrt();
+    [r * a.cos(), z, r * a.sin()]
+}
+
+/// Read a field from a client `utillib.KeyVal` (or dict).
+pub fn value_field<'a>(v: &'a Value, name: &str) -> Option<&'a Value> {
+    match v {
+        Value::Instance(_, state) => state.get(name),
+        _ => v.get(name),
+    }
+}
+
+/// Choose a planet and its radius; callers retain their fallback and offset policy.
+pub async fn site_position(db: &Db, system: i64) -> Result<Option<(V3, f64)>, CallError> {
+    let planet = db.client.query_opt(
+        "SELECT x, y, z, COALESCE(radius, 0)::float8 FROM sde.map_celestials WHERE solar_system_id = $1 AND group_id = $2 ORDER BY random() LIMIT 1",
+        &[&(system as i32), &GROUP_PLANET],
+    ).await.map_err(db_err)?;
+    Ok(planet.map(|p| ([p.get(0), p.get(1), p.get(2)], p.get(3))))
+}
+
+/// A point `distance` above a body's surface, in a random direction near the system plane.
+pub(super) fn off_surface(center: V3, radius: f64, distance: f64) -> V3 {
+    let v = rand_dir();
+    let flat = [v[0], v[1] * SITE_DIRECTION_FLATTENING, v[2]];
+    let len = crate::space::dist(flat, [0.0; 3]).max(SITE_DIRECTION_EPSILON);
+    let d = radius + distance;
+    [center[0] + flat[0] / len * d, center[1] + flat[1] / len * d, center[2] + flat[2] / len * d]
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+
+    #[test]
+    fn surface_offset_includes_radius() {
+        let center = [1.0e9, -2.0e9, 3.0e9];
+        for radius in [0.0, 6_000_000.0, 1.0e12] {
+            let clearance = 1_000_000.0;
+            let actual = crate::space::dist(center, off_surface(center, radius, clearance));
+            let expected = radius + clearance;
+            assert!((actual - expected).abs() < expected * 1e-12, "{actual} != {expected}");
+        }
+    }
+}
 
 /// `utillib.KeyVal(**kw)`: attribute-access record.
 pub fn keyval<K: AsRef<[u8]>>(fields: impl IntoIterator<Item = (K, Value)>) -> Value {
@@ -120,8 +202,6 @@ pub fn item_descriptor() -> DbRowDescriptor {
     ])
     .with_virtual([("stacksize", "eve.common.script.sys.eveCfg.StackSize"), ("singleton", "eve.common.script.sys.eveCfg.Singleton")])
 }
-
-const FAR_FUTURE: i64 = 157_766_976_000_000_000; // 2100-12-31 as FILETIME
 
 /// `MachoBindObject(bindParams, call)` -> `(boundObject, result of call or None)`.
 async fn bind_object(c: &mut Client, call: &Call<'_>) -> CallResult {

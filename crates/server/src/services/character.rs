@@ -1,14 +1,10 @@
 //! Character-scoped services once in game: charMgr, account, station guests,
 //! online status and the skill handler.
 
-use super::{keyval, rowset, Call, CallError, CallResult};
+use super::{db_err, keyval, rowset, Call, CallError, CallResult};
 use crate::client::Client;
-use crate::services::dogma::TYPE_CHARACTER;
+use crate::consts::TYPE_CHARACTER;
 use marshal::Value;
-
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
 
 fn char_id(c: &Client) -> i64 {
     c.session.int("charid").unwrap_or(0)

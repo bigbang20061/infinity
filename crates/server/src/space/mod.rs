@@ -12,7 +12,9 @@
 //! whole seconds. NPC decisions, spawn groups and closure timers live in the actor;
 //! combat effects run on a per-system worker. Timers fire on ticks in deadline and
 //! scheduling order. Persistent timers and position snapshots are not supported.
+//! Shared vector distances are defined here for simulation and service callers.
 
+use crate::consts::{AU, FILETIME_SECOND};
 use crate::db::Db;
 use anyhow::Result;
 use marshal::{DbRowDescriptor, DbType, Value};
@@ -46,7 +48,6 @@ pub const CLOAK_RESTORE: u8 = 2;
 const DESTINY_FULLSTATE: u8 = 0;
 const DESTINY_BALLS: u8 = 1;
 
-const AU: f64 = 0.1495978707e12;
 const WARP_FACTOR_TO_AU_PER_SECOND: f64 = 0.001;
 const WARP_FACTOR_TO_ACCELERATION: f64 = 1.0 / 1000.0;
 const WARP_FACTOR_TO_DECELERATION: f64 = 1.0 / 3000.0;
@@ -64,6 +65,10 @@ fn scale(a: V3, s: f64) -> V3 {
 }
 fn len(a: V3) -> f64 {
     (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt()
+}
+/// Euclidean distance between two positions.
+pub fn dist(a: V3, b: V3) -> f64 {
+    len(sub(a, b))
 }
 fn norm(a: V3) -> V3 {
     let l = len(a);
@@ -192,7 +197,7 @@ impl Ball {
                     o.extend_from_slice(&c.to_le_bytes());
                 }
                 o.extend_from_slice(&((w.start / 1000) as i32).to_le_bytes()); // effectStamp
-                o.extend_from_slice(&len(sub(w.to, w.from)).to_le_bytes()); // total warp length
+                o.extend_from_slice(&dist(w.to, w.from).to_le_bytes()); // total warp length
                 o.extend_from_slice(&(w.min_range as i64).to_le_bytes());
                 o.extend_from_slice(&w.factor.to_le_bytes());
             }
@@ -289,7 +294,6 @@ pub type NotifyTx = mpsc::UnboundedSender<(String, Vec<Value>)>;
 
 /// Jump keys from the jump queue stay valid this long (s).
 pub const JUMP_KEY_LIFE: i64 = 60;
-const SEC: i64 = 10_000_000;
 
 /// Pilots waiting to jump into a full system, and the entry keys already issued.
 #[derive(Default)]
@@ -347,7 +351,7 @@ impl Pilots {
             let mut queues = self.queues.lock().unwrap();
             let q = queues.entry(system_id).or_default();
             let now = crate::client::filetime_now();
-            q.keys.retain(|_, issued| now - *issued < JUMP_KEY_LIFE * SEC);
+            q.keys.retain(|_, issued| now - *issued < JUMP_KEY_LIFE * FILETIME_SECOND);
             if q.keys.remove(&char_id).is_some() {
                 q.waiting.retain(|c| *c != char_id);
                 return Ok(());
@@ -380,7 +384,7 @@ impl Pilots {
             let mut queues = self.queues.lock().unwrap();
             let Some(q) = queues.get_mut(&system_id) else { return };
             let now = crate::client::filetime_now();
-            q.keys.retain(|_, issued| now - *issued < JUMP_KEY_LIFE * SEC);
+            q.keys.retain(|_, issued| now - *issued < JUMP_KEY_LIFE * FILETIME_SECOND);
             while !q.waiting.is_empty() && population + q.keys.len() < self.capacity {
                 let next = q.waiting.remove(0);
                 q.keys.insert(next, now);

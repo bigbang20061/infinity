@@ -6,6 +6,7 @@ mod retail;
 mod chat;
 mod client;
 mod conn;
+mod consts;
 mod db;
 mod framing;
 mod gateway;

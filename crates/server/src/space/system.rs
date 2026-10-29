@@ -110,7 +110,7 @@ impl System {
         if self.is_cold() { return; }
         self.pending = Some(HashMap::new());
         self.evolve_all(ms);
-        let filetime = ms * 10_000 + 116_444_736_000_000_000;
+        let filetime = crate::client::filetime_from_unix_ms(ms);
         let expired: Vec<_> = self.balls.values().filter(|b|
             b.cloak != 0 && b.cloak_until > 0 && b.cloak_until <= filetime).map(|b| b.id).collect();
         for id in expired { self.uncloak(id); }
@@ -346,7 +346,7 @@ mod tests {
         let mut s = System::default();
         let mut b = ball(1, Some(100), 0.0);
         b.cloak = CLOAK_RESTORE;
-        b.cloak_until = 116_444_736_000_000_000 + 1000 * 10_000;
+        b.cloak_until = crate::client::filetime_from_unix_ms(1000);
         s.insert(b);
         let mut own = watch(&mut s, 1, 1);
         let mut other = watch(&mut s, 2, 2);

@@ -6,24 +6,16 @@
 //! is attending. Online invitees hear of new, changed and cancelled events. Alliance events
 //! aren't supported.
 
-use super::{keyval, Call, CallError, CallResult};
+use super::{db_err, keyval, notify_error, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
+use crate::consts::ROLE_DIRECTOR;
 use marshal::{DbRowDescriptor, DbType, Value};
 
 // appConst.eventResponse*
 const RESPONSE_DELETED: i32 = 1;
 const RESPONSE_UNDECIDED: i32 = 3;
 const RESPONSE_ACCEPTED: i32 = 4;
-const ROLE_DIRECTOR: i64 = 1;
 const MAX_INVITEES: usize = 50;
-
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
-
-fn notify_error(text: &str) -> CallError {
-    CallError::User { msg: "CustomNotify".into(), dict: vec![("notify".into(), Value::unicode(text))] }
-}
 
 fn text(v: Option<&Value>, max: usize) -> String {
     v.and_then(|v| v.as_text()).map(|t| t.chars().take(max).collect()).unwrap_or_default()

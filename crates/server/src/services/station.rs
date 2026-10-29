@@ -1,7 +1,7 @@
 //! Services the client calls while entering / sitting in a station that only
 //! need empty-but-well-formed answers for now (no wars, agents, campaigns...).
 
-use super::{rowset, Call, CallError, CallResult};
+use super::{db_err, rowset, Call, CallError, CallResult};
 use crate::client::Client;
 use marshal::Value;
 
@@ -38,10 +38,6 @@ fn settings_info_code() -> Vec<u8> {
     i32le(&mut o, 1); // firstlineno
     s(&mut o, b""); // lnotab
     o
-}
-
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
 }
 
 /// Every NPC station as a rowset; the client indexes it by stationID (uisvc.GetStation).

@@ -10,8 +10,9 @@
 //! locations. Alliances are services/alliances. Shares, titles, wallets divisions, hangars
 //! and offices aren't supported.
 
-use super::{keyval, rowset, Call, CallError, CallResult};
+use super::{db_err, keyval, notify_error, rowset, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
+use crate::consts::{ROLE_DIRECTOR, TYPE_CHARACTER};
 use crate::db::Db;
 use crate::space::World;
 use marshal::{DbRowDescriptor, DbType, Value};
@@ -20,9 +21,7 @@ use tracing::info;
 /// appConst.corporationStartupCost
 const STARTUP_COST: f64 = 1_599_800.0;
 const SKILL_CORPORATION_MANAGEMENT: i32 = 3363;
-const TYPE_CHARACTER: i64 = 1373;
 // appConst.corpRole*
-pub(super) const ROLE_DIRECTOR: i64 = 1;
 const ROLE_PERSONNEL_MANAGER: i64 = 128;
 /// The CEO holds every role.
 const CEO_ROLES: i64 = i64::MAX;
@@ -38,14 +37,6 @@ const APP_INVITED_BY_CORPORATION: i32 = 8;
 const OPEN_APPLICATION: [i32; 4] = [APP_APPLIED, APP_RENEGOTIATED_BY_CHARACTER, APP_RENEGOTIATED_BY_CORPORATION, APP_INVITED_BY_CORPORATION];
 /// Player corporation IDs (idCheckers.IsPlayerCorporation).
 const FIRST_PLAYER_CORP: i64 = 98_000_000;
-
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
-
-fn notify_error(text: &str) -> CallError {
-    CallError::User { msg: "CustomNotify".into(), dict: vec![("notify".into(), Value::unicode(text))] }
-}
 
 pub fn is_player_corp(id: i64) -> bool {
     id >= FIRST_PLAYER_CORP
@@ -866,7 +857,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             Ok(rows) => {
                 let header = DbRowDescriptor::new([("ownerID", DbType::I4), ("ownerName", DbType::WStr), ("typeID", DbType::I2), ("gender", DbType::I2)]);
                 Ok(Value::list(rows.iter().map(|r| {
-                    header.row(&[Value::Int(r.get(0)), Value::unicode(r.get::<_, String>(1)), Value::Int(TYPE_CHARACTER), Value::Int(r.get(2))])
+                    header.row(&[Value::Int(r.get(0)), Value::unicode(r.get::<_, String>(1)), Value::Int(TYPE_CHARACTER as i64), Value::Int(r.get(2))])
                 })))
             }
             Err(e) => Err(db_err(e)),

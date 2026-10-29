@@ -13,14 +13,10 @@
 //! COMPLETED or SKIPPED reads as "tutorial unfinished", which hides the HUD's lock-and-fire
 //! buttons and the amplification matrix slot (shipUI, hudButtonsCont).
 
-use super::{Call, CallError, CallResult};
+use super::{db_err, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
 use marshal::Value;
 use tracing::{debug, info};
-
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
 
 /// storylines.common.airnpeconstants.AirNpeState.SKIPPED (ACTIVE = 1, COMPLETED = 2).
 const STATE_SKIPPED: i16 = 3;

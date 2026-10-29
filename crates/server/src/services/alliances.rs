@@ -12,9 +12,10 @@
 //! OnAlliance*Changed row updates. Wars, bills, sovereignty, capital systems and prime time
 //! aren't supported.
 
-use super::corps::{ceo_of, is_player_corp, membership, ROLE_DIRECTOR};
-use super::{crowset, keyval, Call, CallError, CallResult};
+use super::corps::{ceo_of, is_player_corp, membership};
+use super::{crowset, db_err, keyval, notify_error, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
+use crate::consts::{ACCOUNT_CASH, ROLE_DIRECTOR};
 use crate::db::Db;
 use crate::space::World;
 use marshal::{DbRowDescriptor, DbType, Value};
@@ -27,14 +28,6 @@ const APP_NEW: i32 = 1;
 const APP_ACCEPTED: i32 = 2;
 const APP_EFFECTIVE: i32 = 3;
 const APP_REJECTED: i32 = 4;
-
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
-
-fn notify_error(text: &str) -> CallError {
-    CallError::User { msg: "CustomNotify".into(), dict: vec![("notify".into(), Value::unicode(text))] }
-}
 
 fn text_arg(call: &Call<'_>, i: usize) -> String {
     call.args.get(i).and_then(|v| v.as_text()).map(|t| t.trim().to_string()).unwrap_or_default()
@@ -320,7 +313,7 @@ async fn create(c: &Client, call: &Call<'_>) -> CallResult {
         return Err(notify_error("该联盟名称或简称已被占用。"));
     }
     let _trading = super::market::lock().await;
-    super::corpwallet::corp_debit(db, world, corp, super::corpwallet::MASTER, CREATION_COST).await?;
+    super::corpwallet::corp_debit(db, world, corp, ACCOUNT_CASH, CREATION_COST).await?;
     let id: i64 = db
         .client
         .query_one(

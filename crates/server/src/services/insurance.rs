@@ -7,16 +7,15 @@
 //! (0.5) to Platinum (1.0); it runs for 12 weeks. Destroyed ships pay their owner and post an
 //! insurance payout notification.
 
-use super::{keyval, Call, CallError, CallResult};
+use super::{db_err, keyval, notify_error, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
+use crate::consts::{CATEGORY_SHIP, FILETIME_DAY};
 use crate::db::Db;
 use crate::space::World;
 use marshal::Value;
 use tracing::info;
 
-const DAY: i64 = 864_000_000_000;
 const CONTRACT_DAYS: i64 = 84;
-const CATEGORY_SHIP: i32 = 6;
 // insuranceConst
 const BASE_FRACTION: f64 = 0.4;
 const FRACTION_INCREMENT: f64 = 0.5;
@@ -27,14 +26,6 @@ const NOTIFICATION_ISSUED: i32 = 55;
 const NOTIFICATION_GROUP_INSURANCE: i32 = 11;
 /// The insurance company that signs contracts and payouts (Secure Commerce Commission).
 const INSURER: i64 = 1000132;
-
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
-
-fn notify_error(text: &str) -> CallError {
-    CallError::User { msg: "CustomNotify".into(), dict: vec![("notify".into(), Value::unicode(text))] }
-}
 
 /// What a ship type is insured for (the payout at fraction 1.0); 0 if it can't be insured.
 async fn value(db: &Db, type_id: i32) -> Result<f64, CallError> {
@@ -90,7 +81,7 @@ async fn insure(c: &Client, call: &Call<'_>) -> CallResult {
         .execute(
             "INSERT INTO game.insurance (ship_id, owner_id, type_id, fraction, start_date, end_date) VALUES ($1, $2, $3, $4, $5, $6)
              ON CONFLICT (ship_id) DO UPDATE SET owner_id = $2, type_id = $3, fraction = $4, start_date = $5, end_date = $6",
-            &[&ship, &me, &item.type_id, &fraction, &now, &(now + CONTRACT_DAYS * DAY)],
+            &[&ship, &me, &item.type_id, &fraction, &now, &(now + CONTRACT_DAYS * FILETIME_DAY)],
         )
         .await
         .map_err(db_err)?;

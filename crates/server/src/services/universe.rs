@@ -1,13 +1,9 @@
 //! Map, corporation and wallet-side services the neocom windows load from
 //! (eve/client/script/ui/shared/maps, mapView, neocom/corporation, wallet).
 
-use super::{rowset, Call, CallError, CallResult};
+use super::{db_err, rowset, Call, CallError, CallResult};
 use crate::client::Client;
 use marshal::Value;
-
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
 
 /// `carbon.common.script.sys.row.Row(header, line)`
 fn row(header: &[&str], line: Vec<Value>) -> Value {

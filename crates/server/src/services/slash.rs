@@ -6,18 +6,11 @@
 //! `SlashCmd('/')` answers with the command list in a UserError's `reason`
 //! (svc_slash.FetchRemoteCommandList evals what follows ': ').
 
-use super::{Call, CallError, CallResult};
+use super::{db_err, Call, CallError, CallResult};
 use crate::client::Client;
-use crate::services::charsel::FLAG_HANGAR;
+use crate::consts::{FLAG_CARGO, FLAG_HANGAR, GM_ROLES};
 use marshal::Value;
 use tracing::info;
-
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
-
-/// ROLE_GML | ROLE_GMH | ROLE_LEGIONEER | ROLE_WORLDMOD (carbon serviceConst).
-pub const GM_ROLES: i64 = 18014398509481984 | 9007199254740992 | 262144 | 4096;
 
 const COMMANDS: [(&str, &str); 9] = [
     ("tr", "/tr me <itemID|characterID|solarSystemID|stationID|celestialID> — teleport"),
@@ -134,7 +127,7 @@ async fn create(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
     let char_id = c.session.int("charid").unwrap_or(0);
     let (location, flag) = match (c.session.int("stationid"), c.session.int("shipid")) {
         (Some(station), _) => (station, FLAG_HANGAR),
-        (None, Some(ship)) => (ship, super::combat::FLAG_CARGO),
+        (None, Some(ship)) => (ship, FLAG_CARGO),
         _ => return Err(slash_error("nowhere to put it".into())),
     };
     super::combat::deposit(c, char_id, location, flag, type_id, qty, 0).await?;
