@@ -57,15 +57,6 @@ async fn public_info(c: &Client, id: i64) -> Result<Value, CallError> {
     ]))
 }
 
-async fn balance(c: &Client) -> Result<f64, CallError> {
-    Ok(c
-        .db
-        .query_one("SELECT balance::float8 FROM game.characters WHERE character_id = $1", &[&char_id(c)])
-        .await
-        .map_err(db_err)?
-        .get(0))
-}
-
 /// A character's stored paperdoll blob (`appearance` or `portrait`), as the client sent it.
 async fn doll_blob(c: &Client, id: i64, column: &str) -> Result<Value, CallError> {
     let row = c
@@ -226,11 +217,11 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         // ...the items at one of them...
         ("charMgr", "ListStationItems") => {
             let station = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
-            super::dogma::load_items(c, "i.location_id = $1 AND i.owner_id = $2", &[&station, &me]).await.map(|items| Value::list(items.iter().map(|i| i.row())))
+            crate::dao::items::loading::load_items(&c.db, crate::dao::items::loading::ItemQuery::LocationOwner(station, me)).await.map_err(db_err).map(|items| Value::list(items.iter().map(|i| i.row())))
         }
         // ...and everything the character owns, inside containers and ships too (asset search).
         ("charMgr", "ListIncludingContainers") => {
-            super::dogma::load_items(c, "i.owner_id = $1 AND i.item_id <> $1", &[&me]).await.map(|items| Value::list(items.iter().map(|i| i.row())))
+            crate::dao::items::loading::load_items(&c.db, crate::dao::items::loading::ItemQuery::OwnerExceptSelf(me)).await.map_err(db_err).map(|items| Value::list(items.iter().map(|i| i.row())))
         }
         // GetRepairQuotes(itemIDs) -> {itemID: [KeyVal(itemID, typeID, damage, maxHealth,
         // costToRepairOneUnitOfDamage)]}. Docking already repairs ships (combat::repair), so
@@ -319,7 +310,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             if is_corp {
                 Ok(Value::Float(0.0))
             } else {
-                balance(c).await.map(Value::Float)
+                super::wallets::balance(&c.db, char_id(c)).await.map(Value::Float)
             }
         }
         ("onlineStatus", "GetInitialState") => Ok(rowset(&["contactID", "online"], vec![])),

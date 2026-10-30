@@ -70,7 +70,7 @@ async fn insure(c: &Client, call: &Call<'_>) -> CallResult {
     let ship = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
     let amount = call.args.get(1).and_then(|v| v.as_float()).unwrap_or(0.0);
     let void_old = call.kwargs.get("voidOld").or(call.args.get(3)).is_some_and(|v| matches!(v, Value::Bool(true)) || v.as_int() == Some(1));
-    let Some(item) = super::dogma::load_items_db(db, "i.item_id = $1", &[&ship]).await?.pop() else {
+    let Some(item) = crate::dao::items::loading::load_items(db, crate::dao::items::loading::ItemQuery::Id(ship)).await.map_err(db_err)?.pop() else {
         return Err(CallError::User { msg: messages::MSG_INS_COULD_NOT_FIND_ITEM.into(), dict: vec![] });
     };
     if item.owner_id != me || !item.singleton || item.category_id != CATEGORY_SHIP as i64 {
@@ -88,7 +88,7 @@ async fn insure(c: &Client, call: &Call<'_>) -> CallResult {
     let type_id = item.type_id;
     db.transaction(
         |tx, outbox: &mut Outbox| Box::pin(async move {
-            super::market::debit(tx, outbox, me, amount).await?;
+            super::wallets::debit(tx, outbox, me, amount).await?;
             tx.execute(
                 "INSERT INTO game.insurance (ship_id, owner_id, type_id, fraction, start_date, end_date) VALUES ($1, $2, $3, $4, $5, $6)
                  ON CONFLICT (ship_id) DO UPDATE SET owner_id = $2, type_id = $3, fraction = $4, start_date = $5, end_date = $6",
@@ -116,7 +116,7 @@ pub async fn ship_destroyed(db: &Db, world: &World, ship: i64) -> Result<(), Cal
             let (owner, type_id, fraction, end): (i64, i32, f64, i64) = (r.get(0), r.get(1), r.get(2), r.get(3));
             if end < now { return Ok(None); }
             let payout = super::market::round2(value(tx, type_id).await? * fraction);
-            super::market::credit(tx, outbox, owner, payout).await?;
+            super::wallets::credit(tx, outbox, owner, payout).await?;
             let data = format!("{{amount: {payout}, itemID: {ship}, typeID: {type_id}, payout: 0}}");
             super::mail::notify(tx, outbox, owner, NOTIFICATION_PAYOUT, NOTIFICATION_GROUP_INSURANCE, INSURER, &data).await?;
             Ok(Some((owner, payout)))

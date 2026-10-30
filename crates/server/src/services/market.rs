@@ -12,10 +12,11 @@
 //! game.market_transactions (wallet transactions and price history). Ranges in jumps are
 //! counted on the stargate graph (sde.map_jumps) within the region.
 
-use super::dogma::{load_items_db, Item};
+use crate::dao::items::loading::{load_items, ItemQuery};
+use super::wallets::{balance, credit, debit, not_enough_money};
 use super::{crowset, db_err, keyval, notify_error, user_error, value_field, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
-use crate::consts::{ACCOUNT_CASH, FILETIME_DAY, FLAG_HANGAR, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD};
+use crate::consts::{ACCOUNT_CASH, FILETIME_DAY, FLAG_HANGAR};
 use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::{Effect, Outbox};
@@ -306,13 +307,6 @@ async fn check_order_slots(db: &(impl Executor + ?Sized), char_id: i64, skills: 
     Ok(())
 }
 
-async fn balance(db: &(impl Executor + ?Sized), char_id: i64) -> Result<f64, CallError> {
-    Ok(db.query_one("SELECT balance::float8 FROM game.characters WHERE character_id = $1", &[&char_id]).await.map_err(db_err)?.get(0))
-}
-
-fn not_enough_money(have: f64, amount: f64) -> CallError {
-    user_error(messages::MSG_NOT_ENOUGH_MONEY, vec![("balance".into(), Value::Float(have)), ("amount".into(), Value::Float(amount))])
-}
 
 async fn require_balance(db: &(impl Executor + ?Sized), char_id: i64, amount: f64) -> Result<(), CallError> {
     let have = balance(db, char_id).await?;
@@ -322,98 +316,8 @@ async fn require_balance(db: &(impl Executor + ?Sized), char_id: i64, amount: f6
     Ok(())
 }
 
-pub(super) async fn credit<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, char_id: i64, amount: f64) -> Result<(), CallError> {
-    if amount <= 0.0 {
-        return Ok(());
-    }
-    let balance: f64 = db
-        .query_one(
-            "UPDATE game.characters SET balance = balance + $2::float8::numeric WHERE character_id = $1 RETURNING balance::float8",
-            &[&char_id, &amount],
-        )
-        .await
-        .map_err(db_err)?
-        .get(0);
-    outbox.notify_pilot(char_id, "OnAccountChange", vec![Value::str("cash"), Value::Int(char_id), Value::Float(balance)]);
-    Ok(())
-}
 
-pub(super) async fn debit<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, char_id: i64, amount: f64) -> Result<(), CallError> {
-    if amount <= 0.0 {
-        return Ok(());
-    }
-    let row = db
-        .query_opt(
-            "UPDATE game.characters SET balance = balance - $2::float8::numeric
-             WHERE character_id = $1 AND balance >= $2::float8::numeric RETURNING balance::float8",
-            &[&char_id, &amount],
-        )
-        .await
-        .map_err(db_err)?;
-    match row {
-        Some(r) => {
-            outbox.notify_pilot(char_id, "OnAccountChange", vec![Value::str("cash"), Value::Int(char_id), Value::Float(r.get(0))]);
-            Ok(())
-        }
-        None => Err(not_enough_money(balance(db, char_id).await?, amount)),
-    }
-}
-
-/// Take `quantity` off a stack, deleting it when all of it goes, and tell its owner.
-pub(super) async fn take_items<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, item: Item, quantity: i32) -> Result<(), CallError> {
-    let owner = item.owner_id;
-    if quantity >= item.quantity {
-        db.execute("DELETE FROM game.items WHERE item_id = $1", &[&item.item_id]).await.map_err(db_err)?;
-        let old = item.location_id;
-        let gone = Item { location_id: LOCATION_JUNKYARD, ..item };
-        outbox.notify_pilot(owner, "OnItemChange", vec![gone.row(), Value::Dict(vec![(Value::Int(IX_LOCATION_ID), Value::Int(old))]), Value::None]);
-    } else {
-        db.execute("UPDATE game.items SET quantity = quantity - $2 WHERE item_id = $1", &[&item.item_id, &quantity]).await.map_err(db_err)?;
-        let left = Item { quantity: item.quantity - quantity, ..item };
-        let change = Value::Dict(vec![(Value::Int(IX_STACK_SIZE), Value::Int((left.quantity + quantity) as i64))]);
-        outbox.notify_pilot(owner, "OnItemChange", vec![left.row(), change, Value::None]);
-    }
-    Ok(())
-}
-
-/// Put `quantity` x `type_id` in `owner`'s hangar at `station`, onto a stack there if there is one.
-pub(super) async fn deliver<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, owner: i64, station: i64, type_id: i32, quantity: i32) -> Result<(), CallError> {
-    let stack = db
-        .query_opt(
-            "SELECT item_id, quantity FROM game.items WHERE location_id = $1 AND flag_id = $2 AND type_id = $3 AND owner_id = $4 AND NOT singleton LIMIT 1",
-            &[&station, &FLAG_HANGAR, &type_id, &owner],
-        )
-        .await
-        .map_err(db_err)?;
-    let (item_id, change) = match stack {
-        Some(r) => {
-            let (id, old): (i64, i32) = (r.get(0), r.get(1));
-            db.execute("UPDATE game.items SET quantity = quantity + $2 WHERE item_id = $1", &[&id, &quantity]).await.map_err(db_err)?;
-            (id, (IX_STACK_SIZE, old as i64))
-        }
-        None => {
-            let id: i64 = db
-                .query_one(
-                    "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity) VALUES ($1, $2, $3, $4, $5) RETURNING item_id",
-                    &[&type_id, &owner, &station, &FLAG_HANGAR, &quantity],
-                )
-                .await
-                .map_err(db_err)?
-                .get(0);
-            (id, (IX_LOCATION_ID, 0))
-        }
-    };
-    // Only a pilot docked there has that hangar loaded.
-    let docked: Option<i64> =
-        db.query_opt("SELECT station_id FROM game.characters WHERE character_id = $1", &[&owner]).await.map_err(db_err)?.and_then(|r| r.get(0));
-    if docked == Some(station) {
-        if let Some(item) = load_items_db(db, "i.item_id = $1", &[&item_id]).await?.pop() {
-            let change = Value::Dict(vec![(Value::Int(change.0), Value::Int(change.1))]);
-            outbox.notify_pilot(owner, "OnItemChange", vec![item.row(), change, Value::None]);
-        }
-    }
-    Ok(())
-}
+use super::items::{deliver, take_items};
 
 async fn record(db: &(impl Executor + ?Sized), type_id: i32, quantity: i32, price: f64, buyer: i64, seller: i64, at: &Station, now: i64) -> Result<(), CallError> {
     db
@@ -743,7 +647,7 @@ async fn place_sell(c: &Client, item_id: i64, station_id: i64, type_id: i64, pri
     let g = graph(db).await?;
     let now = filetime_now();
     db.transaction(|db, outbox: &mut Outbox<MarketEffect>| Box::pin(async move {
-    let item = load_items_db(db, "i.item_id = $1", &[&item_id]).await?.pop().ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
+    let item = load_items(db, ItemQuery::Id(item_id)).await.map_err(db_err)?.pop().ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
     if item.owner_id != me || item.location_id != station_id || item.flag_id != FLAG_HANGAR || item.type_id as i64 != type_id {
         return Err(notify_error(messages::MARKET_SELL_ITEM_MUST_BE_IN_STATION_HANGAR));
     }

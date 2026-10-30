@@ -7,7 +7,8 @@
 //! automatically from a wallet division (billMgr automatic payment settings). Billing runs
 //! every ten minutes. An office whose rent goes unpaid isn't taken away.
 
-use super::{active_corporation_member_ids, db_err, has_role_or_is_ceo, keyval, notify_error, Call, CallError, CallResult};
+use super::{db_err, has_role_or_is_ceo, keyval, notify_error, Call, CallError, CallResult};
+use crate::dao::characters::members;
 use crate::client::{filetime_now, Client};
 use crate::consts::{ACCOUNT_CASH, FILETIME_DAY, RENTAL_DAYS, ROLE_ACCOUNTANT, ROLE_DIRECTOR};
 use crate::db::Db;
@@ -59,7 +60,7 @@ pub(super) async fn bills(db: &Db, owner: i64, creditor: bool) -> CallResult {
 
 /// Tell `corp`'s online members their bills changed.
 async fn announce(db: &Db, world: &World, corp: i64) -> Result<(), CallError> {
-    for id in active_corporation_member_ids(db, corp).await? {
+    for id in members::active_ids(db, corp).await.map_err(db_err)? {
         world.notify_pilot(id, "OnBillReceived", vec![]);
     }
     Ok(())
@@ -76,11 +77,11 @@ pub(super) async fn pay(db: &Db, world: &World, bill: i64, corp: Option<i64>, ke
             };
             let (kind, debtor, creditor, amount, external): (i32, i64, i64, f64, Option<i64>) = (r.get(1), r.get(2), r.get(3), r.get(4), r.get(7));
             match corp {
-                Some(corp) => super::corpwallet::corp_debit(tx, outbox, corp, key, amount).await?,
-                None => super::market::debit(tx, outbox, debtor, amount).await?,
+                Some(corp) => super::wallets::corp_debit(tx, outbox, corp, key, amount).await?,
+                None => super::wallets::debit(tx, outbox, debtor, amount).await?,
             }
             if super::corps::is_player_corp(creditor) {
-                super::corpwallet::corp_credit(tx, outbox, creditor, ACCOUNT_CASH, amount).await?;
+                super::wallets::corp_credit(tx, outbox, creditor, ACCOUNT_CASH, amount).await?;
             }
             tx.execute("UPDATE game.bills SET status = $2 WHERE bill_id = $1", &[&bill, &PAID]).await.map_err(db_err)?;
             if kind == BILL_RENTAL {
@@ -92,7 +93,7 @@ pub(super) async fn pay(db: &Db, world: &World, bill: i64, corp: Option<i64>, ke
                 }
             }
             if let Some(corp) = corp {
-                for id in active_corporation_member_ids(tx, corp).await? {
+                for id in members::active_ids(tx, corp).await.map_err(db_err)? {
                     outbox.notify_pilot(id, "OnBillReceived", vec![]);
                 }
             }

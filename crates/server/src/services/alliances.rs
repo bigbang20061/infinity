@@ -326,7 +326,7 @@ async fn create(c: &Client, call: &Call<'_>) -> CallResult {
         |tx, outbox| {
             let (name, short_name, description, url) = (name.clone(), short_name.clone(), description.clone(), url.clone());
             Box::pin(async move {
-                super::corpwallet::corp_debit(tx, outbox, corp, ACCOUNT_CASH, CREATION_COST).await?;
+                super::wallets::corp_debit(tx, outbox, corp, ACCOUNT_CASH, CREATION_COST).await?;
                 let id: i64 = tx.query_one(
                     "INSERT INTO game.alliances (name, short_name, description, url, executor_corp_id, creator_corp_id, creator_char_id, created)
                      VALUES ($1, $2, $3, $4, $5, $5, $6, $7) RETURNING alliance_id",

@@ -193,9 +193,9 @@ async fn take_offer(c: &Client, corp: i64, offer: i64, count: i64) -> CallResult
             if lp_balance(tx, me, corp).await? < lp * count {
                 return Err(notify_error(messages::INSUFFICIENT_LOYALTY_POINTS));
             }
-            super::market::debit(tx, outbox, me, (isk * count) as f64).await?;
+            super::wallets::debit(tx, outbox, me, (isk * count) as f64).await?;
             add_lp(tx, outbox, me, corp, -lp * count).await?;
-            super::market::deliver(tx, outbox, me, station, type_id, count as i32).await?;
+            super::items::deliver(tx, outbox, me, station, type_id, count as i32).await?;
             Ok(())
         }),
         |value, outbox| async move { dispatch_world(value, outbox, world) },

@@ -479,15 +479,10 @@ async fn epic_arc_status(c: &Client) -> CallResult {
 
 /// Where a pilot can hand goods in at `station`: its hangar there, or its ship's cargo
 /// while docked there.
-async fn goods_at(c: &Client, station: i64, type_id: i32) -> Result<Vec<super::dogma::Item>, CallError> {
+async fn goods_at(c: &Client, station: i64, type_id: i32) -> Result<Vec<crate::dao::items::loading::Item>, CallError> {
     let me = c.session.int("charid").unwrap_or(0);
     let ship = if c.session.int("stationid") == Some(station) { c.session.int("shipid").unwrap_or(0) } else { 0 };
-    super::dogma::load_items(
-        c,
-        "i.owner_id = $1 AND i.type_id = $2 AND ((i.location_id = $3 AND i.flag_id = $4) OR (i.location_id = $5 AND i.flag_id = $6))",
-        &[&me, &type_id, &station, &FLAG_HANGAR, &ship, &FLAG_CARGO],
-    )
-    .await
+    crate::dao::items::loading::load_items(&c.db, crate::dao::items::loading::ItemQuery::OwnerTypeTwoLocations(me, type_id, station, FLAG_HANGAR, ship, FLAG_CARGO)).await.map_err(db_err)
 }
 
 async fn has_goods(c: &Client, station: i64, (type_id, qty): (i32, i32)) -> Result<bool, CallError> {
@@ -504,7 +499,7 @@ async fn take_goods(c: &mut Client, station: i64, (type_id, qty): (i32, i32)) ->
         }
         if item.quantity <= left {
             left -= item.quantity;
-            super::combat::remove_stack(&c.db, &mut outbox, item).await?;
+            super::items::remove_stack(&c.db, &mut outbox, item).await?;
         } else {
             c.db.execute("UPDATE game.items SET quantity = quantity - $2 WHERE item_id = $1", &[&item.item_id, &left]).await.map_err(db_err)?;
             super::inventory::notify_item_change(&c.db, &mut outbox, item.item_id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
@@ -570,7 +565,7 @@ async fn finish(c: &mut Client, m: &Mission, agent: &Agent, choice: Option<usize
             let (type_id, qty): (Option<i32>, Option<i32>) = (r.get(0), r.get(1));
             if let (Some(type_id), Some(qty)) = (type_id, qty) {
                 let mut outbox = crate::db::outbox::Outbox::default();
-                super::combat::deposit(&c.db, &mut outbox, me, agent.station_id, FLAG_HANGAR, type_id, qty.max(1), 0).await?;
+                super::items::deposit(&c.db, &mut outbox, me, agent.station_id, FLAG_HANGAR, type_id, qty.max(1), 0).await?;
                 crate::db::outbox::dispatch_client((), outbox, c)?;
             }
         }
@@ -1127,7 +1122,7 @@ async fn do_action(c: &mut Client, agent: &Agent, action: Option<i64>) -> CallRe
             if let (Kind::Courier, Some((type_id, qty))) = (m.kind, m.cargo) {
                 let me = c.session.int("charid").unwrap_or(0);
                 let mut outbox = crate::db::outbox::Outbox::default();
-                super::combat::deposit(&c.db, &mut outbox, me, agent.station_id, FLAG_HANGAR, type_id, qty, 0).await?;
+                super::items::deposit(&c.db, &mut outbox, me, agent.station_id, FLAG_HANGAR, type_id, qty, 0).await?;
                 crate::db::outbox::dispatch_client((), outbox, c)?;
             }
             info!(user = c.login.user_id, "agent {}: mission {} accepted", agent.id, m.mission_id);

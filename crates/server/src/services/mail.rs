@@ -92,7 +92,7 @@ async fn sync(c: &Client, last_id: i64) -> CallResult {
 
 /// Player members of a corporation.
 async fn corp_members(db: &Db, corp: i64) -> Result<Vec<i64>, CallError> {
-    Ok(super::active_corporation_member_ids(db, corp).await?.collect())
+    crate::dao::characters::members::active_ids(db, corp).await.map_err(db_err)
 }
 
 /// `SendMail(toCharacterIDs, toListID, toCorpOrAllianceID, title, body, isReplyTo, isForwardedFrom)` -> messageID.

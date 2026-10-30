@@ -13,7 +13,7 @@
 //! * `seasonalLoginCampaignManager` (loginrewards/client/seasonalLoginCampaignService.py):
 //!   the newest seasonal campaign in seasonalCampaignsLoginRewards, one claim per day.
 
-use super::dogma::load_items;
+use crate::dao::items::loading::{load_items, ItemQuery};
 use super::{db_err, keyval, Call, CallError, CallResult};
 use crate::client::{filetime_now, unix_seconds_from_filetime, Client};
 use crate::consts::FLAG_HANGAR;
@@ -422,7 +422,7 @@ async fn claim_tokens(c: &mut Client, call: &Call<'_>) -> CallResult {
     }
     if station.is_some() && station == c.session.int("stationid") && c.session.int("charid") == Some(char_id) {
         for (item_id, ..) in &created {
-            if let Some(item) = load_items(c, "i.item_id = $1", &[item_id]).await?.into_iter().next() {
+            if let Some(item) = load_items(&c.db, ItemQuery::Id(*item_id)).await.map_err(db_err)?.into_iter().next() {
                 c.notify("OnItemChange", vec![item.row(), Value::Dict(vec![(Value::Int(3), Value::Int(0))]), Value::None]);
             }
         }
@@ -644,7 +644,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         // get_account_balance(currency): PLEX in the vault; no other currencies.
         ("vaultManager", "get_account_balance") => {
             if call.args.first().and_then(|v| v.as_text()).as_deref() == Some(PLX) {
-                c.db.plex_balance(c.login.user_id).await.map_err(db_err).map(Value::Int)
+                crate::dao::accounts::balances::plex_balance(&c.db, c.login.user_id).await.map_err(db_err).map(Value::Int)
             } else {
                 Ok(Value::Int(0))
             }

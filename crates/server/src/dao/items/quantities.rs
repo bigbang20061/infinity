@@ -1,14 +1,13 @@
-//! Internal guarded quantity writes for inventory operations. These update `game.items`,
-//! the inventory table used by invCache; planning, transactions and notifications remain
-//! the caller's responsibility. This module does not handle other item mutations.
+//! Guarded item quantity updates and deletes in `game.items`.
+//! This DAO has no direct client mirror or wire contract; owning services supply those.
+//! Planning, transactions, refusals, notifications and World are caller concerns; other item mutations are not handled here.
 
 use std::collections::BTreeMap;
-use crate::db::executor::Executor;
-use super::{CallError, db_err, notify_error};
-use super::dogma::Item;
+use crate::db::{self, executor::Executor};
+use super::loading::Item;
 
 #[derive(Clone, Copy)]
-pub(super) struct QuantityChange {
+pub(crate) struct QuantityChange {
     pub expected_quantity: i32,
     pub quantity: Option<i32>,
     pub owner_id: i64,
@@ -18,12 +17,12 @@ pub(super) struct QuantityChange {
 }
 
 impl QuantityChange {
-    pub(super) fn new(item: &Item, quantity: Option<i32>) -> Self {
+    pub(crate) fn new(item: &Item, quantity: Option<i32>) -> Self {
         Self { expected_quantity: item.quantity, quantity, owner_id: item.owner_id, location_id: item.location_id, flag_id: item.flag_id, singleton: item.singleton }
     }
 }
 
-pub(super) async fn apply(db: &(impl Executor + ?Sized), changes: &BTreeMap<i64, QuantityChange>, refusal: &str) -> Result<(), CallError> {
+pub(crate) async fn apply(db: &(impl Executor + ?Sized), changes: &BTreeMap<i64, QuantityChange>) -> Result<bool, db::Error> {
     for (&id, change) in changes {
         let affected = match change.quantity {
             Some(quantity) => db.execute(
@@ -34,8 +33,8 @@ pub(super) async fn apply(db: &(impl Executor + ?Sized), changes: &BTreeMap<i64,
                 "DELETE FROM game.items WHERE item_id = $1 AND quantity = $2 AND owner_id = $3 AND location_id = $4 AND flag_id = $5 AND singleton = $6",
                 &[&id, &change.expected_quantity, &change.owner_id, &change.location_id, &change.flag_id, &change.singleton],
             ).await,
-        }.map_err(db_err)?;
-        if affected == 0 { return Err(notify_error(refusal)); }
+        }?;
+        if affected == 0 { return Ok(false); }
     }
-    Ok(())
+    Ok(true)
 }

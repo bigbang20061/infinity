@@ -18,8 +18,11 @@
 //! Contract lifecycle mutations and stack splits commit their database changes atomically;
 //! their notifications are delivered only after commit.
 
-use super::dogma::{load_items_db, Item};
-use super::market::{credit, debit, deliver, lock, round2, station, take_items};
+use crate::dao::items::loading::{load_items, Item, ItemQuery};
+use super::items::{deliver, take_items};
+use super::market::{lock, round2, station};
+use super::wallets::{credit, debit};
+use crate::dao::items::transfers;
 use super::{db_err, keyval, notify_error, user_error, value_id_list, value_text, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
 use crate::consts::{ACCOUNT_CASH, FILETIME_DAY, FILETIME_MINUTE, FLAG_HANGAR, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD};
@@ -320,7 +323,7 @@ pub(super) async fn show_items<X: Send>(db: &(impl Executor + ?Sized), outbox: &
     if docked_at(db, owner).await? != Some(station) {
         return Ok(());
     }
-    for item in load_items_db(db, "i.item_id = ANY($1)", &[&ids.to_vec()]).await? {
+    for item in load_items(db, ItemQuery::Ids(ids)).await.map_err(db_err)? {
         outbox.notify_pilot(owner, "OnItemChange", vec![item.row(), Value::Dict(vec![(Value::Int(IX_LOCATION_ID), Value::Int(from))]), Value::None]);
     }
     Ok(())
@@ -371,11 +374,7 @@ async fn escrowed_ids(db: &(impl Executor + ?Sized), contract_id: i64) -> Result
 /// Give the escrowed items (and whatever they hold) to `owner` at `location`/`flag`.
 async fn hand_over<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, contract_id: i64, owner: i64, location: i64, flag: i32) -> Result<(), CallError> {
     let ids = escrowed_ids(db, contract_id).await?;
-    db
-        .execute("UPDATE game.items SET owner_id = $2, location_id = $3, flag_id = $4 WHERE item_id = ANY($1)", &[&ids, &owner, &location, &flag])
-        .await
-        .map_err(db_err)?;
-    db.execute("UPDATE game.items SET owner_id = $2 WHERE location_id = ANY($1)", &[&ids, &owner]).await.map_err(db_err)?;
+    transfers::hand_over(db, &ids, owner, location, flag).await.map_err(db_err)?;
     show_items(db, outbox, owner, location, &ids, -contract_id).await
 }
 
@@ -505,7 +504,7 @@ async fn create(c: &Client, info: &Value) -> CallResult {
     // Every item must be in the issuer's hangar at the start station.
     let mut loaded = HashMap::new();
     for (id, qty) in groups.iter().flatten() {
-        let item = load_items_db(db, "i.item_id = $1", &[id]).await?.pop().ok_or_else(|| notify_error(messages::CONTRACT_ITEM_MISSING))?;
+        let item = load_items(db, ItemQuery::Id(*id)).await.map_err(db_err)?.pop().ok_or_else(|| notify_error(messages::CONTRACT_ITEM_MISSING))?;
         if item.owner_id != me || item.location_id != start_id || item.flag_id != FLAG_HANGAR {
             return Err(notify_error(messages::CONTRACT_ITEM_MUST_BE_IN_START_HANGAR));
         }
@@ -614,12 +613,7 @@ async fn accept(c: &Client, id: i64) -> CallResult {
                     let mut takes = vec![];
                     for w in &wanted {
                         let (type_id, qty): (i32, i32) = (w.get(0), w.get(1));
-                        let stacks = load_items_db(
-                            db,
-                            "i.owner_id = $1 AND i.location_id = $2 AND i.flag_id = $3 AND i.type_id = $4 ORDER BY i.quantity DESC, i.item_id",
-                            &[&me, &k.start, &FLAG_HANGAR, &type_id],
-                        )
-                        .await?;
+                        let stacks = load_items(db, ItemQuery::OwnerLocationFlagTypeDescending(me, k.start, FLAG_HANGAR, type_id)).await.map_err(db_err)?;
                         let have: i64 = stacks.iter().map(|s| if s.singleton { 1 } else { s.quantity as i64 }).sum();
                         if have < qty as i64 {
                             return Err(notify_error(messages::CONTRACT_REQUIRED_ITEMS_MISSING));
@@ -701,7 +695,7 @@ async fn complete(c: &Client, id: i64, status: i32) -> CallResult {
                         return Err(notify_error(messages::COURIER_DELIVERY_REQUIRES_ACCEPTOR));
                     }
                     let wrap = match k.package {
-                        Some(w) => load_items_db(db, "i.item_id = $1", &[&w]).await?.pop(),
+                        Some(w) => load_items(db, ItemQuery::Id(w)).await.map_err(db_err)?.pop(),
                         None => None,
                     };
                     let Some(wrap) = wrap.filter(|w| w.owner_id == me && w.location_id == k.end) else {
@@ -719,7 +713,7 @@ async fn complete(c: &Client, id: i64, status: i32) -> CallResult {
                     }
                     credit(db, outbox, k.issuer, round2(k.collateral + k.reward)).await?;
                     let wrap = match k.package {
-                        Some(w) => load_items_db(db, "i.item_id = $1", &[&w]).await?.pop(),
+                        Some(w) => load_items(db, ItemQuery::Id(w)).await.map_err(db_err)?.pop(),
                         None => None,
                     };
                     match wrap {
@@ -1109,9 +1103,9 @@ async fn escrow(c: &Client) -> CallResult {
 async fn items_in(c: &Client, location: i64, hangar_only: bool) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
     let items = if hangar_only {
-        load_items_db(&c.db, "i.owner_id = $1 AND i.location_id = $2 AND i.flag_id = $3", &[&me, &location, &FLAG_HANGAR]).await?
+        load_items(&c.db, ItemQuery::OwnerLocationFlag(me, location, FLAG_HANGAR)).await.map_err(db_err)?
     } else {
-        load_items_db(&c.db, "i.owner_id = $1 AND i.location_id = $2", &[&me, &location]).await?
+        load_items(&c.db, ItemQuery::OwnerLocation(me, location)).await.map_err(db_err)?
     };
     Ok(Value::list(items.iter().map(Item::row)))
 }
@@ -1123,7 +1117,7 @@ async fn split_stack(c: &Client, station_id: i64, item_id: i64, quantity: i64) -
     let _trading = lock().await;
     db.transaction(
         |db, outbox: &mut Outbox| Box::pin(async move {
-            let item = load_items_db(db, "i.item_id = $1", &[&item_id]).await?.pop().ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
+            let item = load_items(db, ItemQuery::Id(item_id)).await.map_err(db_err)?.pop().ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
             if item.owner_id != me || item.location_id != station_id || item.singleton || quantity < 1 || quantity >= item.quantity as i64 {
                 return Err(notify_error(messages::STACK_CANNOT_BE_SPLIT));
             }

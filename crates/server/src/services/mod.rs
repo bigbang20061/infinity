@@ -27,7 +27,7 @@ mod hacking;
 mod industry;
 mod insurance;
 mod inventory;
-pub(super) mod item_quantities;
+mod items;
 mod mail;
 mod market;
 mod npe;
@@ -42,6 +42,7 @@ mod slash;
 mod station;
 mod store;
 mod universe;
+mod wallets;
 
 pub use contracts::settle_auctions;
 pub use fleets::logged_off as fleet_logged_off;
@@ -186,11 +187,6 @@ pub(super) async fn has_role_or_is_ceo(db: &Db, char_id: i64, corp_id: i64, role
     Ok(my_corp == corp_id && (roles & role_mask != 0 || corps::ceo_of(db, corp_id).await? == Some(char_id)))
 }
 
-/// Iterate character IDs for all non-deleted members of `corp_id`; database errors propagate.
-pub(super) async fn active_corporation_member_ids(db: &(impl crate::db::executor::Executor + ?Sized), corp_id: i64) -> Result<impl Iterator<Item = i64>, CallError> {
-    let rows = db.query("SELECT character_id FROM game.characters WHERE corporation_id = $1 AND NOT deleted", &[&corp_id]).await.map_err(db_err)?;
-    Ok(rows.into_iter().map(|r| r.get(0)))
-}
 
 /// Choose a planet and its radius; callers retain their fallback and offset policy.
 pub async fn site_position(db: &Db, system: i64) -> Result<Option<(V3, f64)>, CallError> {

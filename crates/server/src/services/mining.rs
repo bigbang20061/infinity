@@ -358,7 +358,7 @@ async fn store(db: &Db, notify: &NotifyTx, owner: i64, ship: i64, flag: i32, typ
         .query_one("SELECT COALESCE(group_id, 0)::bigint, COALESCE(category_id, 0)::bigint FROM sde.inv_types WHERE type_id = $1", &[&type_id])
         .await
         .map_err(db_err)?;
-    let item = super::dogma::Item {
+    let item = crate::dao::items::loading::Item {
         item_id,
         type_id,
         owner_id: owner,
@@ -520,7 +520,7 @@ fn output_stack_quantity(current: Option<i32>, amount: i64) -> Result<i32, CallE
     current.unwrap_or(0).checked_add(amount).ok_or_else(output_overflow)
 }
 
-async fn quote(c: &Client, char_id: i64, item: &super::dogma::Item) -> Result<Option<Quote>, CallError> {
+async fn quote(c: &Client, char_id: i64, item: &crate::dao::items::loading::Item) -> Result<Option<Quote>, CallError> {
     let portion: i32 = c
         .db
         .query_one("SELECT GREATEST(COALESCE(portion_size, 1), 1) FROM sde.inv_types WHERE type_id = $1", &[&item.type_id])
@@ -574,11 +574,11 @@ fn quote_value(item_id: i64, q: &Quote) -> Value {
 }
 
 /// The pilot's items to reprocess: in its hangar at this station, or its ship here.
-async fn reprocessable(c: &Client, ids: &[i64]) -> Result<Vec<super::dogma::Item>, CallError> {
+async fn reprocessable(c: &Client, ids: &[i64]) -> Result<Vec<crate::dao::items::loading::Item>, CallError> {
     let char_id = c.session.int("charid").unwrap_or(0);
     let station = c.session.int("stationid").unwrap_or(0);
     let ship = c.session.int("shipid").unwrap_or(0);
-    super::dogma::load_items(c, "i.item_id = ANY($1) AND i.owner_id = $2 AND (i.location_id = $3 OR i.location_id = $4)", &[&ids.to_vec(), &char_id, &station, &ship]).await
+    crate::dao::items::loading::load_items(&c.db, crate::dao::items::loading::ItemQuery::IdsOwnerLocations(ids, char_id, station, ship)).await.map_err(db_err)
 }
 
 /// Bound reprocessingSvc (Moniker('reprocessingSvc', stationID)).
@@ -625,7 +625,7 @@ async fn reprocessing(c: &mut Client, call: &Call<'_>) -> CallResult {
                 |tx, outbox| {
                     let plan = Arc::clone(&plan);
                     Box::pin(async move {
-                    use super::item_quantities::{apply, QuantityChange};
+                    use crate::dao::items::quantities::{apply, QuantityChange};
                     let mut changes = BTreeMap::new();
                     for (item, leftover) in &plan.0 {
                         changes.insert(item.item_id, QuantityChange::new(item, (*leftover > 0).then_some(*leftover)));
@@ -634,9 +634,7 @@ async fn reprocessing(c: &mut Client, call: &Call<'_>) -> CallResult {
                     for (&type_id, &amount) in &plan.1 {
                         if amount <= 0 { continue; }
                         let quantity = output_stack_quantity(None, amount)?;
-                        let candidates = super::dogma::load_items_db(tx,
-                            "i.location_id = $1 AND i.flag_id = $2 AND i.type_id = $3 AND i.owner_id = $4 AND NOT i.singleton",
-                            &[&out_location, &out_flag, &type_id, &char_id]).await?;
+                        let candidates = crate::dao::items::loading::load_items(tx, crate::dao::items::loading::ItemQuery::LocationFlagTypeOwnerStack(out_location, out_flag, type_id, char_id)).await.map_err(db_err)?;
                         let stack = candidates.into_iter().next();
                         if let Some(item) = stack {
                             let current = changes.get(&item.item_id).map_or(Some(item.quantity), |change| change.quantity);
@@ -647,7 +645,7 @@ async fn reprocessing(c: &mut Client, call: &Call<'_>) -> CallResult {
                             inserts.insert(type_id, quantity);
                         }
                     }
-                    apply(tx, &changes, messages::INSUFFICIENT_ITEM_QUANTITY).await?;
+                    if !apply(tx, &changes).await.map_err(db_err)? { return Err(notify_error(messages::INSUFFICIENT_ITEM_QUANTITY)); }
                     for (&id, change) in &changes {
                         if change.quantity.is_some() {
                             super::inventory::notify_item_change(tx, outbox, id, vec![(IX_STACK_SIZE, Value::Int(change.expected_quantity as i64))]).await?;

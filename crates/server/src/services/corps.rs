@@ -13,6 +13,7 @@
 use super::{db_err, keyval, notify_error, row, rowset, trimmed_arg_text, value_id_list, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
 use crate::consts::{ACCOUNT_CASH, CORPORATION_TYPE_PLAYER, CORPORATION_UNLIMITED_MEMBER_LIMIT, CORP_DIVISION_NAME_COUNT, FILETIME_SECOND, FILETIME_UNIX_EPOCH, ORG_NAME_MAX_LENGTH, ORG_NAME_MIN_LENGTH, ORG_SHORT_NAME_MAX_LENGTH, ORG_SHORT_NAME_MIN_LENGTH, ROLE_DIRECTOR, TYPE_CHARACTER};
+use crate::dao::characters::roles::EFFECTIVE_ROLES_SQL;
 use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::{dispatch_world, Outbox};
@@ -67,10 +68,6 @@ const FIRST_PLAYER_CORP: i64 = 98_000_000;
 pub fn is_player_corp(id: i64) -> bool {
     id >= FIRST_PLAYER_CORP
 }
-
-/// Server title model: union the member's role bits with the roles of all held titles.
-pub(super) const EFFECTIVE_ROLES_SQL: &str = "(ch.corp_roles | COALESCE((SELECT bit_or(t.roles) FROM game.corp_titles t
-     WHERE t.corporation_id = ch.corporation_id AND ch.corp_title_mask & t.title_id <> 0), 0))";
 
 /// The corporation `char_id` is in, and their role mask (titles included).
 pub(super) async fn membership(db: &(impl Executor + ?Sized), char_id: i64) -> Result<(i64, i64), CallError> {
@@ -211,7 +208,7 @@ async fn found(c: &Client, call: &Call<'_>) -> CallResult {
         |tx, outbox| {
             let (name, ticker, description, url) = (name.clone(), ticker.clone(), description.clone(), url.clone());
             Box::pin(async move {
-                super::market::debit(tx, outbox, me, STARTUP_COST).await?;
+                super::wallets::debit(tx, outbox, me, STARTUP_COST).await?;
                 let id: i64 = tx.query_one(
                     "INSERT INTO game.corporations (name, ticker, description, url, tax_rate, ceo_id, creator_id, station_id, is_recruiting, friendly_fire,
                                                     shape1, shape2, shape3, color1, color2, color3, typeface, created)

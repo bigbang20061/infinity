@@ -12,7 +12,8 @@
 //! direct personal hangars at named SDE stations, including remote stations.
 //! Corporation, array and player-structure access is not modeled.
 
-use super::dogma::{load_items, load_items_db, ship_state, wire_quantity};
+use super::dogma::{ship_state, wire_quantity};
+use crate::dao::items::loading::{load_items, ItemQuery};
 use super::inventory::notify_item_change;
 use super::{db_err, keyval, user_error, value_field, value_id_list, value_ids, Call, CallError, CallResult};
 use crate::client::Client;
@@ -35,7 +36,7 @@ const MAX_BLUEPRINT_RESULTS: i64 = 10_000;
 async fn board(c: &mut Client, ship_id: i64) -> CallResult {
     let char_id = c.session.int("charid").unwrap_or(0);
     let Some(station) = c.session.int("stationid") else { return Err(user_error(messages::MSG_CANT_BOARD_SHIP_WHILE_IN_SPACE, vec![])) };
-    let ship = load_items(c, "i.item_id = $1", &[&ship_id]).await?.into_iter().next().ok_or_else(|| user_error(messages::MSG_SHIP_NOT_FOUND, vec![]))?;
+    let ship = load_items(&c.db, ItemQuery::Id(ship_id)).await.map_err(db_err)?.into_iter().next().ok_or_else(|| user_error(messages::MSG_SHIP_NOT_FOUND, vec![]))?;
     if ship.category_id != CATEGORY_SHIP as i64 || ship.owner_id != char_id || ship.location_id != station {
         return Err(user_error(messages::MSG_CANT_BOARD_SHIP_NOT_IN_HANGAR, vec![]));
     }
@@ -88,12 +89,12 @@ async fn assemble(c: &mut Client, call: &Call<'_>) -> CallResult {
                 let mut actions = Vec::new();
                 for id in ids {
                     if !sources.contains_key(&id) {
-                        let item = load_items_db(tx, "i.item_id = $1", &[&id]).await?.into_iter().next()
+                        let item = load_items(tx, ItemQuery::Id(id)).await.map_err(db_err)?.into_iter().next()
                             .ok_or_else(|| super::notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
                         let valid_source = if let Some(station) = station {
                             item.location_id == station && item.flag_id == FLAG_HANGAR
                         } else if Some(item.location_id) == active_ship && item.flag_id == FLAG_CARGO {
-                            let carrier = load_items_db(tx, "i.item_id = $1", &[&item.location_id]).await?.into_iter().next();
+                            let carrier = load_items(tx, ItemQuery::Id(item.location_id)).await.map_err(db_err)?.into_iter().next();
                             carrier.is_some_and(|carrier| carrier.owner_id == char_id && carrier.category_id == CATEGORY_SHIP as i64)
                         } else {
                             false
@@ -180,7 +181,7 @@ async fn repackage(c: &mut Client, call: &Call<'_>) -> CallResult {
         if Some(id) == active_ship {
             return Err(user_error(messages::MSG_CANT_REPACKAGE_ACTIVE_SHIP, vec![]));
         }
-        let item = load_items(c, "i.item_id = $1", &[&id]).await?.into_iter().next()
+        let item = load_items(&c.db, ItemQuery::Id(id)).await.map_err(db_err)?.into_iter().next()
             .ok_or_else(|| super::notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
         if item.owner_id != char_id || item.location_id != named_station || item.location_id != location || item.flag_id != FLAG_HANGAR
             || c.db.query_opt("SELECT 1 FROM sde.sta_stations WHERE station_id = $1::bigint", &[&named_station]).await.map_err(db_err)?.is_none() {

@@ -3,6 +3,8 @@
 
 use super::{db_err, item_descriptor, keyval, Call, CallError, CallResult};
 use crate::client::{filetime_now, short, Client};
+use crate::dao::items::loading::{load_items, Item, ItemQuery};
+use crate::dao::items::{charges, dogma as dogma_dao};
 use crate::consts::{ATTR_ARMOR_DAMAGE, ATTR_CAPACITOR_CAPACITY, ATTR_CAPACITY, ATTR_CHARGE, ATTR_HULL_DAMAGE, ATTR_IS_ONLINE, ATTR_MASS, ATTR_QUANTITY, ATTR_RADIUS, ATTR_SHIELD_CAPACITY, ATTR_SHIELD_CHARGE, ATTR_VOLUME, BLUEPRINT_COPY_QUANTITY, EFFECT_ONLINE, FLAG_HANGAR, FLAG_PILOT, SINGLETON_QUANTITY, TYPE_CHARACTER};
 use marshal::Value;
 use std::collections::BTreeMap;
@@ -31,20 +33,6 @@ pub(super) fn wire_quantity(singleton: bool, quantity: i64) -> i64 {
     if singleton { if quantity == BLUEPRINT_COPY_QUANTITY { BLUEPRINT_COPY_QUANTITY } else { SINGLETON_QUANTITY } } else { quantity }
 }
 
-/// An inventory item as the client's item DBRow expects it.
-#[derive(Clone)]
-pub struct Item {
-    pub item_id: i64,
-    pub type_id: i32,
-    pub owner_id: i64,
-    pub location_id: i64,
-    pub flag_id: i32,
-    pub quantity: i32,
-    pub singleton: bool,
-    pub group_id: i64,
-    pub category_id: i64,
-    pub custom_info: Option<String>,
-}
 
 impl Item {
     pub fn row(&self) -> Value {
@@ -63,40 +51,6 @@ impl Item {
     }
 }
 
-/// Items by `item_id = ANY(ids)` joined to their group/category.
-pub async fn load_items(c: &Client, where_sql: &str, params: &[&(dyn tokio_postgres::types::ToSql + Sync)]) -> Result<Vec<Item>, CallError> {
-    load_items_db(&c.db, where_sql, params).await
-}
-
-/// load_items for tasks without a client.
-pub async fn load_items_db(db: &(impl crate::db::executor::Executor + ?Sized), where_sql: &str, params: &[&(dyn tokio_postgres::types::ToSql + Sync)]) -> Result<Vec<Item>, CallError> {
-    let rows = db
-        .query(
-            &format!(
-                "SELECT i.item_id, i.type_id, i.owner_id, i.location_id, i.flag_id, i.quantity, i.singleton,
-                        t.group_id::bigint, t.category_id::bigint, i.custom_info
-                 FROM game.items i JOIN sde.inv_types t USING (type_id) WHERE {where_sql} ORDER BY i.item_id"
-            ),
-            params,
-        )
-        .await
-        .map_err(db_err)?;
-    Ok(rows
-        .iter()
-        .map(|r| Item {
-            item_id: r.get(0),
-            type_id: r.get(1),
-            owner_id: r.get(2),
-            location_id: r.get(3),
-            flag_id: r.get(4),
-            quantity: r.get(5),
-            singleton: r.get(6),
-            group_id: r.get::<_, Option<i64>>(7).unwrap_or(0),
-            category_id: r.get::<_, Option<i64>>(8).unwrap_or(0),
-            custom_info: r.get(9),
-        })
-        .collect())
-}
 
 async fn type_attributes(c: &Client, type_id: i32) -> Result<BTreeMap<i64, f64>, CallError> {
     let rows = c
@@ -104,7 +58,7 @@ async fn type_attributes(c: &Client, type_id: i32) -> Result<BTreeMap<i64, f64>,
         .query("SELECT attribute_id, value FROM sde.type_attributes WHERE type_id = $1", &[&type_id])
         .await
         .map_err(db_err)?;
-    let mut attrs: BTreeMap<i64, f64> = rows.iter().map(|r| (r.get::<_, i32>(0) as i64, r.get::<_, f64>(1))).collect();
+    let mut attrs: BTreeMap<i64, f64> = rows.iter().map(|r| (r.get::<_, i32>("attribute_id") as i64, r.get::<_, f64>("value"))).collect();
     // mass, capacity, volume and radius are type columns, not dogma attribute rows.
     let columns = c
         .db
@@ -112,8 +66,8 @@ async fn type_attributes(c: &Client, type_id: i32) -> Result<BTreeMap<i64, f64>,
         .await
         .map_err(db_err)?;
     if let Some(r) = columns {
-        for (i, attr) in [ATTR_MASS, ATTR_CAPACITY, ATTR_VOLUME, ATTR_RADIUS].into_iter().enumerate() {
-            if let Some(v) = r.get::<_, Option<f64>>(i) {
+        for (name, attr) in [("mass", ATTR_MASS), ("capacity", ATTR_CAPACITY), ("volume", ATTR_VOLUME), ("radius", ATTR_RADIUS)] {
+            if let Some(v) = r.get::<_, Option<f64>>(name) {
                 attrs.entry(attr as i64).or_insert(v);
             }
         }
@@ -161,7 +115,7 @@ fn info_keyed(item_row: Value, key: Value, attributes: BTreeMap<i64, f64>, activ
 async fn character_info(c: &Client) -> Result<Value, CallError> {
     let char_id = c.session.int("charid").ok_or_else(|| CallError::Internal(anyhow::anyhow!("no character selected")))?;
     let ship_id = c.session.int("shipid").unwrap_or(0);
-    let character_attrs = super::skills::character_attributes(c, char_id).await?;
+    let character_attrs = super::skills::attributes::character_attributes(c, char_id).await?;
     let mut attrs = type_attributes(c, TYPE_CHARACTER).await?;
     attrs.extend(character_attrs);
     let item = Item {
@@ -181,20 +135,15 @@ async fn character_info(c: &Client) -> Result<Value, CallError> {
 
 /// Fitted modules of `ship_id` that are online (game.items.online).
 async fn online_modules(c: &Client, ship_id: i64) -> Result<Vec<i64>, CallError> {
-    Ok(c.db
-        .query("SELECT item_id FROM game.items WHERE location_id = $1 AND online", &[&ship_id])
-        .await
-        .map_err(db_err)?
-        .iter()
-        .map(|r| r.get(0))
-        .collect())
+    Ok(dogma_dao::online(&c.db, ship_id).await.map_err(db_err)?
+        .into_iter().map(|r| r.item_id).collect())
 }
 
 /// `(instanceCache, instanceFlagQuantityCache, weaponBanks, heatStates)` for a ship being made
 /// active (clientDogmaLocation.MakeShipActive). instanceCache rows follow dgmAttributesByIdx:
 /// [itemID, isOnline, damage, charge, skillPoints, armorDamage, shieldCharge, isIncapacitated].
 pub async fn ship_state(c: &Client, ship_id: i64) -> Result<Value, CallError> {
-    let items = load_items(c, "i.location_id = $1 AND i.flag_id <> $2", &[&ship_id, &FLAG_HANGAR]).await?;
+    let items = load_items(&c.db, ItemQuery::LocationExceptFlag(ship_id, FLAG_HANGAR)).await.map_err(db_err)?;
     let online = online_modules(c, ship_id).await?;
     let instance = |key: Value, online: bool| {
         let row = [
@@ -220,7 +169,7 @@ pub async fn ship_state(c: &Client, ship_id: i64) -> Result<Value, CallError> {
 /// The active ship and everything fitted in it.
 async fn ship_info(c: &Client) -> Result<Vec<(Value, Value)>, CallError> {
     let Some(ship_id) = c.session.int("shipid") else { return Ok(vec![]) };
-    let items = load_items(c, "i.item_id = $1 OR (i.location_id = $1 AND i.flag_id <> $2)", &[&ship_id, &FLAG_HANGAR]).await?;
+    let items = load_items(&c.db, ItemQuery::IdOrLocationExceptFlag(ship_id, FLAG_HANGAR)).await.map_err(db_err)?;
     let online = online_modules(c, ship_id).await?;
     let mut out = Vec::new();
     // Runtime state the HUD reads: a full capacitor (with skills), and the ship's shield,
@@ -267,13 +216,9 @@ async fn ship_info(c: &Client) -> Result<Vec<(Value, Value)>, CallError> {
     // Loaded charges are sublocations, not items: godma (UpdateItem) files an entry keyed
     // (shipID, flagID, typeID) with no invItem under the ship, with its quantity attribute;
     // the HUD reads a launcher's charge from there.
-    let charges = c
-        .db
-        .query("SELECT flag_id, type_id, quantity FROM game.module_charges WHERE ship_id = $1 AND quantity > 0", &[&ship_id])
-        .await
-        .map_err(db_err)?;
+    let charges = charges::positive(&c.db, ship_id).await.map_err(db_err)?;
     for r in charges {
-        let (flag, type_id, qty): (i32, i32, i32) = (r.get(0), r.get(1), r.get(2));
+        let (flag, type_id, qty) = (r.flag_id, r.type_id, r.quantity);
         let mut attrs = type_attributes(c, type_id).await?;
         attrs.insert(ATTR_QUANTITY as i64, qty as f64);
         let key = Value::tuple([Value::Int(ship_id), Value::Int(flag as i64), Value::Int(type_id as i64)]);
@@ -319,7 +264,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
         "CharGetInfo" => character_info(c).await,
         "ItemGetInfo" => {
             let item_id = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
-            let items = load_items(c, "i.item_id = $1", &[&item_id]).await?;
+            let items = load_items(&c.db, ItemQuery::Id(item_id)).await.map_err(db_err)?;
             match items.into_iter().next() {
                 Some(item) => {
                     let attrs = type_attributes(c, item.type_id).await?;
@@ -344,10 +289,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
             let ship = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
             let module = call.args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
             let online = call.method == "SetModuleOnline";
-            c.db
-                .execute("UPDATE game.items SET online = $3 WHERE item_id = $1 AND location_id = $2", &[&module, &ship, &online])
-                .await
-                .map_err(db_err)?;
+            dogma_dao::set_online(&c.db, module, ship, online).await.map_err(db_err)?;
             Ok(Value::None)
         }
         _ => {

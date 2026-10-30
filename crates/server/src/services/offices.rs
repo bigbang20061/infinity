@@ -6,7 +6,8 @@
 //! renewing is billed (services/bills).
 
 use super::corps::is_player_corp;
-use super::{active_corporation_member_ids, db_err, has_role_or_is_ceo, keyval, notify_error, Call, CallError, CallResult};
+use super::{db_err, has_role_or_is_ceo, keyval, notify_error, Call, CallError, CallResult};
+use crate::dao::characters::members;
 use crate::client::{filetime_now, Client};
 use crate::consts::{ACCOUNT_CASH, FILETIME_DAY, RENTAL_DAYS, ROLE_DIRECTOR};
 use crate::db::Db;
@@ -64,7 +65,7 @@ pub(super) async fn office_owner(db: &Db, item: i64) -> Result<Option<i64>, Call
 }
 /// Tell the corporation's online members its offices changed.
 async fn announce(db: &Db, world: &World, corp: i64, office: i64) -> Result<(), CallError> {
-    for id in active_corporation_member_ids(db, corp).await? {
+    for id in members::active_ids(db, corp).await.map_err(db_err)? {
         world.notify_pilot(id, "OnOfficeRentalChange", vec![Value::Int(corp), Value::Int(office)]);
     }
     Ok(())
@@ -78,7 +79,7 @@ pub(super) async fn rent(db: &Db, world: &World, corp: i64, station: i64) -> Res
     let now = filetime_now();
     db.transaction(
         |tx, outbox| Box::pin(async move {
-            super::corpwallet::corp_debit(tx, outbox, corp, ACCOUNT_CASH, price).await?;
+            super::wallets::corp_debit(tx, outbox, corp, ACCOUNT_CASH, price).await?;
             if let Some(office) = office_at(tx, corp, station).await? {
                 tx.execute("UPDATE game.offices SET rented_until = GREATEST(rented_until, $2) + $3 WHERE office_id = $1", &[&office, &now, &(RENTAL_DAYS * FILETIME_DAY)])
                     .await.map_err(db_err)?;
@@ -92,7 +93,7 @@ pub(super) async fn rent(db: &Db, world: &World, corp: i64, station: i64) -> Res
                 "INSERT INTO game.offices (office_id, corporation_id, station_id, rented_until) VALUES ($1, $2, $3, $4)",
                 &[&office, &corp, &station, &(now + RENTAL_DAYS * FILETIME_DAY)],
             ).await.map_err(db_err)?;
-            for id in active_corporation_member_ids(tx, corp).await? {
+            for id in members::active_ids(tx, corp).await.map_err(db_err)? {
                 outbox.notify_pilot(id, "OnOfficeRentalChange", vec![Value::Int(corp), Value::Int(office)]);
             }
             Ok((office, true))

@@ -13,9 +13,11 @@
 //! aren't supported.
 
 use super::contracts::{field, show_items};
-use super::dogma::load_items_db;
+use crate::dao::items::loading::{load_items, Item, ItemQuery};
 use super::fit::{Fit, Key};
-use super::market::{debit, deliver, graph, jumps, lock, take_items};
+use super::items::{deliver, take_items};
+use super::market::{graph, jumps, lock};
+use super::wallets::debit;
 use super::{db_err, keyval, notify_error, rand01, user_error, value_id_list, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
 use crate::consts::{BLUEPRINT_COPY_QUANTITY, BLUEPRINT_INFINITE_RUNS, FILETIME_DAY, FILETIME_SECOND, FLAG_HANGAR, INDUSTRY_JOB_STATUS_INSTALLED, IX_LOCATION_ID, LOCATION_JUNKYARD};
@@ -685,12 +687,7 @@ async fn install(c: &Client, request: &Value) -> CallResult {
                 debit(tx, outbox, me, p.total_cost).await?;
                 for (type_id, quantity) in &p.materials {
                     let mut left = *quantity;
-                    let stacks = load_items_db(
-                        tx,
-                        "i.owner_id = $1 AND i.location_id = $2 AND i.flag_id = $3 AND i.type_id = $4 AND NOT i.singleton ORDER BY i.quantity, i.item_id",
-                        &[&me, &fac.id, &FLAG_HANGAR, type_id],
-                    )
-                    .await?;
+                    let stacks = load_items(tx, ItemQuery::OwnerLocationFlagTypeStackAscending(me, fac.id, FLAG_HANGAR, *type_id)).await.map_err(db_err)?;
                     for s in stacks {
                         if left == 0 {
                             break;
@@ -705,7 +702,7 @@ async fn install(c: &Client, request: &Value) -> CallResult {
                     let location: i64 =
                         tx.query_one("SELECT location_id FROM game.items WHERE item_id = $1", &[&bp.item_id]).await.map_err(db_err)?.get(0);
                     if bp.quantity > 1 {
-                        let stack = load_items_db(tx, "i.item_id = $1", &[&bp.item_id]).await?.pop().ok_or_else(|| user_error(messages::MSG_BLUEPRINT_NOT_FOUND, vec![]))?;
+                        let stack = load_items(tx, ItemQuery::Id(bp.item_id)).await.map_err(db_err)?.pop().ok_or_else(|| user_error(messages::MSG_BLUEPRINT_NOT_FOUND, vec![]))?;
                         take_items(tx, outbox, stack, 1).await?;
                         bp.item_id = tx
                             .query_one(
@@ -786,12 +783,12 @@ async fn install(c: &Client, request: &Value) -> CallResult {
 
 /// Remove a used-up blueprint copy.
 async fn destroy_blueprint<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, item_id: i64) -> Result<(), CallError> {
-    if let Some(item) = load_items_db(db, "i.item_id = $1", &[&item_id]).await?.pop() {
+    if let Some(item) = load_items(db, ItemQuery::Id(item_id)).await.map_err(db_err)?.pop() {
         let owner = item.owner_id;
         db.execute("DELETE FROM game.items WHERE item_id = $1", &[&item_id]).await.map_err(db_err)?;
         db.execute("DELETE FROM game.blueprints WHERE item_id = $1", &[&item_id]).await.map_err(db_err)?;
         let old = item.location_id;
-        let gone = super::dogma::Item { location_id: LOCATION_JUNKYARD, ..item };
+        let gone = Item { location_id: LOCATION_JUNKYARD, ..item };
         outbox.notify_pilot(owner, "OnItemChange", vec![gone.row(), Value::Dict(vec![(Value::Int(IX_LOCATION_ID), Value::Int(old))]), Value::None]);
     }
     Ok(())
