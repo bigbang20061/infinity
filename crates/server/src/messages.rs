@@ -550,8 +550,14 @@ pub(crate) const GM_HELP_SITES: &str = "/sites — list this system's anomalies 
 pub(crate) const GM_HELP_CREATE: &str = "/create <typeID|name> [qty] — into your hangar (docked) or cargo";
 /// Create-item command help.
 pub(crate) const GM_HELP_CREATE_ITEM: &str = "/createitem <typeID|name> [qty] — same as /create";
-/// ISK command help.
-pub(crate) const GM_HELP_ISK: &str = "/isk <amount> — add ISK to your wallet";
+/// Set ISK command help.
+pub(crate) const GM_HELP_SET_ISK: &str = "/setisk <amount> — set your wallet";
+/// Add ISK command help.
+pub(crate) const GM_HELP_ADD_ISK: &str = "/addisk <amount> — add ISK to your wallet";
+/// Set PLEX command help.
+pub(crate) const GM_HELP_SET_PLEX: &str = "/setplex <count> — set your PLEX vault";
+/// Add PLEX command help.
+pub(crate) const GM_HELP_ADD_PLEX: &str = "/addplex <count> — add PLEX to your vault";
 /// Heal command help.
 pub(crate) const GM_HELP_HEAL: &str = "/heal — repair your ship in space";
 /// Help command help.
@@ -560,8 +566,16 @@ pub(crate) const GM_HELP_HELP: &str = "/help — this list";
 pub(crate) const GM_TELEPORT_USAGE: &str = "usage: /tr me <itemID|characterID|solarSystemID>";
 /// Create command usage error.
 pub(crate) const GM_CREATE_USAGE: &str = "usage: /create <typeID|name> [qty]";
-/// ISK command usage error.
-pub(crate) const GM_ISK_USAGE: &str = "usage: /isk <amount>";
+/// Set ISK command usage error.
+pub(crate) const GM_SET_ISK_USAGE: &str = "usage: /setisk <amount>";
+/// Add ISK command usage error.
+pub(crate) const GM_ADD_ISK_USAGE: &str = "usage: /addisk <amount>";
+/// Set PLEX command usage error.
+pub(crate) const GM_SET_PLEX_USAGE: &str = "usage: /setplex <count>";
+/// Add PLEX command usage error.
+pub(crate) const GM_ADD_PLEX_USAGE: &str = "usage: /addplex <count>";
+/// Wallet numeric overflow.
+pub(crate) const GM_AMOUNT_TOO_LARGE: &str = "amount exceeds the wallet limit";
 /// No destination for a created item.
 pub(crate) const GM_NOWHERE_TO_PUT_ITEM: &str = "nowhere to put it";
 /// Docked ships repair automatically.
@@ -586,8 +600,18 @@ pub(crate) fn gm_teleported_in_system(id: i64, system: i64) -> String { format!(
 pub(crate) fn gm_target_not_found(id: i64) -> String { format!("can't find {id}") }
 /// Created item result.
 pub(crate) fn gm_created_item(qty: i32, name: &str, type_id: i32) -> String { format!("created {qty} x {name} ({type_id})") }
-/// Updated ISK balance.
-pub(crate) fn gm_balance(balance: f64) -> String { format!("balance {balance:.2} ISK") }
+/// Updated ISK balance, with a client projection when clamped.
+pub(crate) fn gm_balance(exact: &str, shown: Option<f64>) -> String {
+    let mut result = format!("balance {exact} ISK");
+    if let Some(shown) = shown { result.push_str(&format!(" (client shows {shown:.0})")); }
+    result
+}
+/// Updated PLEX vault, with a client projection when clamped.
+pub(crate) fn gm_plex_balance(exact: &str, shown: Option<i64>) -> String {
+    let mut result = format!("vault {exact} PLEX");
+    if let Some(shown) = shown { result.push_str(&format!(" (client shows {shown})")); }
+    result
+}
 /// One quoted command in the command list.
 pub(crate) fn gm_command_name(n: &str) -> String { format!("'{n}'") }
 /// Remote command list.

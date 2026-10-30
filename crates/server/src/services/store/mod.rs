@@ -12,6 +12,11 @@
 //!   points for the skill-point types the client lists in redeem/data.py.
 //! * `seasonalLoginCampaignManager` (loginrewards/client/seasonalLoginCampaignService.py):
 //!   the newest seasonal campaign in seasonalCampaignsLoginRewards, one claim per day.
+//!
+//! Account PLEX is stored exactly up to 36 digits in `game.accounts`; the DAO
+//! clamps its client-facing i64 projection. Balance notifications include `userid`.
+//! Purchases and redeeming use `game.store_purchases` and `game.redeem_tokens`.
+//! Clients cannot display oversized balances exactly.
 
 use crate::dao::items::loading::{load_items, ItemQuery};
 use super::{db_err, keyval, Call, CallError, CallResult};
@@ -51,6 +56,13 @@ fn period_start() -> String {
 
 
 // ---------------------------------------------------------------- PLEX and redeeming
+
+pub(super) fn notify_plex_balance(c: &mut Client, balance: i64) {
+    c.notify("OnAurumChangeFromVgs", vec![Value::dict([
+        ("userid", Value::Int(c.login.user_id)),
+        ("balance", Value::Int(balance)),
+    ])]);
+}
 
 /// Queue `quantity` x `type_id` on `user_id`'s redeeming queue.
 async fn grant_token(c: &Client, user_id: i64, type_id: i32, quantity: i64, label: &str) -> Result<(), CallError> {
