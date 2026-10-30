@@ -59,12 +59,6 @@ pub(crate) async fn insert_cargo(ex: &(impl Executor + ?Sized), ship: i64, flag:
     }
     Ok(ids)
 }
-pub(crate) async fn insert_return(ex: &(impl Executor + ?Sized), owner: i64, ship: i64, flag: i32, rows: &[(i32, i32)]) -> Result<(), Error> {
-    for &(kind, quantity) in rows {
-        ex.execute("INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity) VALUES ($1, $2, $3, $4, $5)", &[&kind, &owner, &ship, &flag, &quantity]).await?;
-    }
-    Ok(())
-}
 pub(crate) async fn apply_loads(ex: &(impl Executor + ?Sized), ship: i64, loads: &[(i64, i32, i32, i32, i32)]) -> Result<(), Error> {
     for &(_, flag, kind, quantity, _) in loads {
         ex.execute("INSERT INTO game.module_charges (ship_id, flag_id, type_id, quantity) VALUES ($1, $2, $3, $4)

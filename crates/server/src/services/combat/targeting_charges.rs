@@ -1,4 +1,6 @@
-//! Combat mechanics; state and routing live in the parent module.
+//! Combat targeting and ammunition loading; state and routing live in the parent module.
+//! Superseded reloads return charges to cargo through stack merging and post-commit notifications.
+//! In-flight reloads are held in memory and are not recovered after a restart.
 use super::*;
 
 // ---------------------------------------------------------------- targeting
@@ -282,18 +284,29 @@ pub(super) async fn load_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
                 *returns.entry(type_id).or_default() += i64::from(now) - i64::from(have);
             }
             let world_ref = &world;
+            let notify_ref = &notify;
             let result: Result<(), CallError> = db.transaction(
-                |tx, _: &mut Outbox| {
+                |tx, outbox: &mut Outbox| {
                     let returns = returns.clone();
                     Box::pin(async move {
                         let returns = returns.into_iter().map(|(type_id, quantity)| {
                             i32::try_from(quantity).map(|quantity| (type_id, quantity)).map_err(|_| notify_error(messages::INSUFFICIENT_AMMUNITION))
                         }).collect::<Result<Vec<_>, _>>()?;
-                        crate::dao::items::combat::insert_return(tx, owner, ship, FLAG_CARGO, &returns).await.map_err(db_err)?;
+                        for (type_id, quantity) in returns {
+                            deposit(tx, outbox, owner, ship, FLAG_CARGO, type_id, quantity, ship).await?;
+                        }
                         Ok(())
                     })
                 },
-                |value, outbox| async move { dispatch_world(value, outbox, world_ref) },
+                |value, outbox| async move {
+                    for entry in outbox.into_entries() {
+                        match entry {
+                            crate::db::outbox::Effect::Notification(n) => n.dispatch_sender(world_ref, notify_ref)?,
+                            crate::db::outbox::Effect::Operation(never) => match never {},
+                        }
+                    }
+                    Ok(value)
+                },
             ).await;
             if let Err(e) = result {
                 warn!("returning superseded reload to cargo failed: {}", match e {
@@ -353,7 +366,15 @@ pub(super) async fn apply_loads(db: &Db, world: &World, notify: &NotifyTx, owner
                 Ok(())
             })
         },
-        |value, outbox| async move { dispatch_world(value, outbox, world) },
+        |value, outbox| async move {
+            for entry in outbox.into_entries() {
+                match entry {
+                    crate::db::outbox::Effect::Notification(n) => n.dispatch_sender(world, notify)?,
+                    crate::db::outbox::Effect::Operation(never) => match never {},
+                }
+            }
+            Ok(value)
+        },
     ).await
 }
 
