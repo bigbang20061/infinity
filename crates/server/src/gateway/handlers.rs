@@ -3,6 +3,7 @@
 
 use super::{message, response_name, Caller, Gateway, UUID_LEN};
 use crate::cdn;
+use crate::consts::PLEX_HUNDREDTHS;
 use crate::dao::{accounts::balances, characters::persistence, skills::plans};
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -10,8 +11,6 @@ use prost_reflect::{DynamicMessage, MessageDescriptor, ReflectMessage, Value as 
 
 /// Server representation of the five equal insurgency stages.
 const INSURGENCY_STAGE_COUNT: u64 = 5;
-/// Gateway PLEX vault protocol: one PLEX is 100 hundredths.
-const PLEX_HUNDREDTHS: i64 = 100;
 /// RFC 4122 version field in the seventh UUID byte.
 const UUID_VERSION_INDEX: usize = 6;
 /// RFC 4122 variant field in the ninth UUID byte.

@@ -1,9 +1,36 @@
 //! Character wallet balance, credit, debit and recipient lookup in `game.characters`.
 //! This DAO has no direct client mirror or wire contract; owning services supply those.
 //! Transactions, refusals, notifications and World are caller concerns.
+//! Exact GM writes use decimal strings; client projections are lossy and clamped.
+//! Non-GM overflowing credits remain database errors; no decimal dependency is used.
 
 use crate::db::{executor::Executor, Error};
 use super::Balance;
+
+struct ExactBalance { exact: String, balance: f64 }
+impl ExactBalance {
+    fn from_row(row: &tokio_postgres::Row) -> Self {
+        Self { exact: row.get("exact"), balance: Balance::from_row(row).0 }
+    }
+}
+
+pub(crate) async fn set_exact(ex: &(impl Executor + ?Sized), char_id: i64, amount: &str) -> Result<(String, f64), Error> {
+    let row = ex.query_one(
+        "UPDATE game.characters SET balance = $2::text::numeric WHERE character_id = $1 RETURNING balance::text AS exact, balance::float8 AS balance",
+        &[&char_id, &amount],
+    ).await?;
+    let balance = ExactBalance::from_row(&row);
+    Ok((balance.exact, balance.balance))
+}
+
+pub(crate) async fn credit_exact(ex: &(impl Executor + ?Sized), char_id: i64, amount: &str) -> Result<(String, f64), Error> {
+    let row = ex.query_one(
+        "UPDATE game.characters SET balance = balance + $2::text::numeric WHERE character_id = $1 RETURNING balance::text AS exact, balance::float8 AS balance",
+        &[&char_id, &amount],
+    ).await?;
+    let balance = ExactBalance::from_row(&row);
+    Ok((balance.exact, balance.balance))
+}
 
 pub(crate) async fn balance(ex: &(impl Executor + ?Sized), char_id: i64) -> Result<f64, Error> {
     Ok(Balance::from_row(&ex.query_one("SELECT balance::float8 FROM game.characters WHERE character_id = $1", &[&char_id]).await?).0)

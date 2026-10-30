@@ -5,16 +5,26 @@
 //!
 //! `SlashCmd('/')` answers with the command list in a UserError's `reason`
 //! (svc_slash.FetchRemoteCommandList evals what follows ': ').
+//! Wallet commands write exact values through the character and account DAOs to
+//! `game.characters` and `game.accounts`; client wallet displays are clamped to
+//! their protocol limits. Corporation wallets and target writes are unsupported.
 
 use super::{db_err, Call, CallError, CallResult};
 use crate::client::Client;
-use crate::consts::{FLAG_CARGO, FLAG_HANGAR, GM_ROLES};
+use crate::consts::{CLIENT_MAX_ISK, CLIENT_MAX_PLEX, FLAG_CARGO, FLAG_HANGAR, GM_ROLES};
 use crate::messages;
 use marshal::Value;
 use tracing::info;
 
 /// Server design: clearance in metres when teleporting to an item.
 const TELEPORT_CLEARANCE: f64 = 5000.0;
+
+/// `game_schema.sql`: character balance is numeric(36, 2).
+const ISK_INTEGER_DIGITS: usize = 34;
+/// `game_schema.sql`: character balance is numeric(36, 2).
+const ISK_DECIMALS: usize = 2;
+/// `game_schema.sql`: account PLEX balance is numeric(36, 0).
+const PLEX_DIGITS: usize = 36;
 
 struct TypeRow { type_id: i32, name: String }
 impl TypeRow { fn from_row(r: &tokio_postgres::Row) -> Self { Self { type_id: r.get("type_id"), name: r.get("name") } } }
@@ -23,14 +33,17 @@ impl Celestial { fn from_row(r: &tokio_postgres::Row) -> Self { Self { x: r.get(
 struct SystemCelestial { solar_system_id: i64, celestial: Celestial }
 impl SystemCelestial { fn from_row(r: &tokio_postgres::Row) -> Self { Self { solar_system_id: r.get("solar_system_id"), celestial: Celestial::from_row(r) } } }
 
-const COMMANDS: [(&str, &str); 9] = [
+const COMMANDS: [(&str, &str); 12] = [
     ("tr", messages::GM_HELP_TELEPORT),
     ("wh", messages::GM_HELP_WORMHOLE),
     ("scanall", messages::GM_HELP_SCAN_ALL),
     ("sites", messages::GM_HELP_SITES),
     ("create", messages::GM_HELP_CREATE),
     ("createitem", messages::GM_HELP_CREATE_ITEM),
-    ("isk", messages::GM_HELP_ISK),
+    ("setisk", messages::GM_HELP_SET_ISK),
+    ("addisk", messages::GM_HELP_ADD_ISK),
+    ("setplex", messages::GM_HELP_SET_PLEX),
+    ("addplex", messages::GM_HELP_ADD_PLEX),
     ("heal", messages::GM_HELP_HEAL),
     ("help", messages::GM_HELP_HELP),
 ];
@@ -137,12 +150,78 @@ async fn create(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
     Ok(messages::gm_created_item(qty, &name, type_id))
 }
 
-async fn isk(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
-    let amount: f64 = args.first().and_then(|a| a.replace(',', "").parse().ok()).ok_or_else(|| slash_error(messages::GM_ISK_USAGE.into()))?;
-    let char_id = c.session.int("charid").unwrap_or(0);
-    let balance = crate::dao::wallets::characters::credit(&c.db, char_id, amount).await.map_err(db_err)?;
-    c.notify("OnAccountChange", vec![Value::str("cash"), Value::Int(char_id), Value::Float(balance)]);
-    Ok(messages::gm_balance(balance))
+fn parse_amount(args: &[&str], integer_digits: usize, decimals: usize) -> Option<String> {
+    let [arg] = args else { return None };
+    let amount = arg.replace(',', "");
+    let (integer, fraction) = match amount.split_once('.') {
+        Some((integer, fraction)) if decimals > 0 => (integer, Some(fraction)),
+        Some(_) => return None,
+        None => (amount.as_str(), None),
+    };
+    if integer.is_empty() || integer.len() > integer_digits || !integer.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if let Some(fraction) = fraction {
+        if fraction.is_empty() || fraction.len() > decimals || !fraction.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+    }
+    Some(amount)
+}
+
+fn exceeds_cap(exact: &str, cap: &str) -> bool {
+    let (integer, fraction) = exact.split_once('.').unwrap_or((exact, ""));
+    let integer = integer.trim_start_matches('0');
+    let cap = cap.trim_start_matches('0');
+    integer.len() > cap.len()
+        || (integer.len() == cap.len() && (integer > cap
+            || (integer == cap && fraction.bytes().any(|b| b != b'0'))))
+}
+
+fn wallet_error(error: crate::db::Error) -> CallError {
+    if matches!(&error, crate::db::Error::Postgres(e)
+        if e.code() == Some(&tokio_postgres::error::SqlState::NUMERIC_VALUE_OUT_OF_RANGE))
+    {
+        slash_error(messages::GM_AMOUNT_TOO_LARGE.into())
+    } else {
+        db_err(error)
+    }
+}
+
+async fn wallet(c: &mut Client, args: &[&str], command: &str) -> Result<String, CallError> {
+    let (usage, digits, decimals) = match command {
+        "setisk" => (messages::GM_SET_ISK_USAGE, ISK_INTEGER_DIGITS, ISK_DECIMALS),
+        "addisk" => (messages::GM_ADD_ISK_USAGE, ISK_INTEGER_DIGITS, ISK_DECIMALS),
+        "setplex" => (messages::GM_SET_PLEX_USAGE, PLEX_DIGITS, 0),
+        "addplex" => (messages::GM_ADD_PLEX_USAGE, PLEX_DIGITS, 0),
+        _ => unreachable!(),
+    };
+    let amount = parse_amount(args, digits, decimals).ok_or_else(|| slash_error(usage.into()))?;
+    let _guard = super::market::lock().await;
+    match command {
+        "setisk" | "addisk" => {
+            let char_id = c.session.int("charid").unwrap_or(0);
+            let (exact, balance) = if command == "setisk" {
+                crate::dao::wallets::characters::set_exact(&c.db, char_id, &amount).await
+            } else {
+                crate::dao::wallets::characters::credit_exact(&c.db, char_id, &amount).await
+            }.map_err(wallet_error)?;
+            c.notify("OnAccountChange", vec![Value::str("cash"), Value::Int(char_id), Value::Float(balance)]);
+            let shown = exceeds_cap(&exact, &format!("{CLIENT_MAX_ISK:.0}")).then_some(balance);
+            Ok(messages::gm_balance(&exact, shown))
+        }
+        "setplex" | "addplex" => {
+            let (exact, balance) = if command == "setplex" {
+                crate::dao::accounts::balances::set_plex(&c.db, c.login.user_id, &amount).await
+            } else {
+                crate::dao::accounts::balances::add_plex(&c.db, c.login.user_id, &amount).await
+            }.map_err(wallet_error)?;
+            super::store::notify_plex_balance(c, balance);
+            let shown = exceeds_cap(&exact, &CLIENT_MAX_PLEX.to_string()).then_some(balance);
+            Ok(messages::gm_plex_balance(&exact, shown))
+        }
+        _ => unreachable!(),
+    }
 }
 
 async fn heal(c: &mut Client) -> Result<String, CallError> {
@@ -176,10 +255,13 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "scanall" => super::exploration::gm_scan_all(c).await,
         "sites" => super::exploration::gm_sites(c).await,
         "create" | "createitem" => create(c, &args).await,
-        "isk" => isk(c, &args).await,
+        "setisk" | "addisk" | "setplex" | "addplex" => wallet(c, &args, &command).await,
         "heal" => heal(c).await,
         "help" => Ok(help()),
         other => Err(slash_error(messages::gm_unknown_command(other, &help()))),
     };
     Some(result.map(Value::unicode))
 }
+
+#[cfg(test)]
+mod tests;

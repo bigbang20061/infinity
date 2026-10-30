@@ -1,5 +1,9 @@
 //! storeManager catalogue and purchases for vgs/client/vgsClient.py.
-//! Uses SDE types and game retail prices and purchases; live catalogue data is unavailable.
+//! Uses SDE types and retail prices, `game.accounts`, `game.store_purchases` and
+//! `game.redeem_tokens`; live catalogue data is unavailable. Account PLEX is exact
+//! up to 36 digits in storage, with the client-facing i64 projection clamped by the
+//! DAO. Balance notifications include `userid`; clients cannot display oversized
+//! balances exactly.
 use super::*;
 use crate::dao::store::catalogue::{TYPE_INFO_COLUMNS, TYPE_INFO_JOINS};
 const PLX: &str = "PLX";
@@ -192,7 +196,7 @@ async fn buy_offer(c: &mut Client, call: &Call<'_>) -> CallResult {
     crate::dao::store::purchases::purchase(&c.db, c.login.user_id, offer_id as i32, qty as i32, cost).await.map_err(db_err)?;
     grant_token(c, recipient, offer.type_id, offer.quantity * qty, "UI/VirtualGoodsStore/StoreName").await?;
     info!(user = c.login.user_id, "store: bought offer {offer_id} ({}) x{qty} for {cost} PLEX", offer.name);
-    c.notify("OnAurumChangeFromVgs", vec![Value::dict([("balance", Value::Int(balance))])]);
+    notify_plex_balance(c, balance);
     if recipient == c.login.user_id {
         c.notify("OnRedeemingQueueUpdated", vec![]);
     }
