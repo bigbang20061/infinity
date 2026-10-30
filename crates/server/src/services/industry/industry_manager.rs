@@ -1,5 +1,5 @@
 //! `industryManager` dispatch for the client industry package, using industry jobs and blueprints.
-//! Corporation industry is not supported.
+//! Corporation industry is not supported; cancellation only succeeds while a job is installed.
 
 use super::*;
 
@@ -53,7 +53,8 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
                     j.status = STATUS_CANCELLED;
                     j.completed = Some(filetime_now());
                     j.completed_by = Some(me);
-                    match industry_dao::cancel_job(&c.db, &j, me).await {
+                    match industry_dao::cancel_job(&c.db, &j, me, INDUSTRY_JOB_STATUS_INSTALLED).await {
+                        Ok(0) => Err(notify_error(messages::INDUSTRY_PROJECT_CANNOT_CANCEL)),
                         Ok(_) => {
                             info!("industry: {me} cancelled job {}", j.id);
                             let mut outbox = Outbox::default();
