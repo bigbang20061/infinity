@@ -5,6 +5,7 @@
 //! Transactions, refusals, notifications and World are caller concerns.
 
 pub(crate) mod charges;
+pub(crate) mod clones;
 pub(crate) mod combat;
 pub(crate) mod creation;
 pub(crate) mod dogma;

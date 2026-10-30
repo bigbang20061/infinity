@@ -10,7 +10,7 @@
 use super::{crowset, db_err, notify_error, value_text, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
 use crate::consts::{FILETIME_HOUR, FLAG_HANGAR, TYPE_CAPSULE};
-use crate::db::executor::Executor;
+use crate::dao::{characters::clones as clone_dao, items::{clones as item_dao, creation}, skills::ships as skill_dao};
 use crate::db::outbox::{Effect, Outbox};
 use crate::messages;
 use marshal::{DbRowDescriptor, DbType, Value};
@@ -28,15 +28,6 @@ enum JumpEffect {
     Session { station: i64, system: i64, constellation: i64, region: i64, capsule: i64 },
 }
 
-async fn skill(c: &Client, me: i64, skill: i32) -> Result<i64, CallError> {
-    Ok(c.db
-        .query_opt("SELECT level FROM game.skills WHERE character_id = $1 AND type_id = $2", &[&me, &skill])
-        .await
-        .map_err(db_err)?
-        .map(|r| r.get::<_, i32>(0) as i64)
-        .unwrap_or(0))
-}
-
 /// The character's clones as `(jumpCloneID, ownerID, locationID, typeID, cloneName)` rows.
 async fn clone_rows(c: &Client, me: i64) -> Result<Value, CallError> {
     let header = DbRowDescriptor::new([
@@ -46,18 +37,17 @@ async fn clone_rows(c: &Client, me: i64) -> Result<Value, CallError> {
         ("typeID", DbType::I4),
         ("cloneName", DbType::WStr),
     ]);
-    let rows = c.db.query("SELECT clone_id, location_id, name FROM game.jump_clones WHERE owner_id = $1 ORDER BY clone_id", &[&me]).await.map_err(db_err)?;
+    let rows = clone_dao::clones(&c.db, me).await.map_err(db_err)?;
     let lines = rows
         .iter()
-        .map(|r| header.row(&[Value::Int(r.get(0)), Value::Int(me), Value::Int(r.get(1)), Value::Int(TYPE_CAPSULE as i64), Value::unicode(r.get::<_, String>(2))]))
+        .map(|r| header.row(&[Value::Int(r.clone_id), Value::Int(me), Value::Int(r.location_id), Value::Int(TYPE_CAPSULE as i64), Value::unicode(&r.name)]))
         .collect();
     Ok(crowset(&header, lines))
 }
 
 /// `GetCloneState` -> KeyVal(clones, implants, timeLastJump).
 async fn clone_state(c: &Client, me: i64) -> CallResult {
-    let last: Option<i64> =
-        c.db.query_one("SELECT last_clone_jump FROM game.characters WHERE character_id = $1", &[&me]).await.map_err(db_err)?.get(0);
+    let last = clone_dao::last_jump(&c.db, me).await.map_err(db_err)?;
     Ok(super::keyval([
         ("clones", clone_rows(c, me).await?),
         ("implants", crowset(&DbRowDescriptor::new([("jumpCloneID", DbType::I4), ("typeID", DbType::I4)]), vec![])),
@@ -69,18 +59,16 @@ async fn install(c: &Client, me: i64) -> CallResult {
     let Some(station) = c.session.int("stationid") else {
         return Err(notify_error(messages::STATION_DOCK_REQUIRED_FOR_JUMP_CLONE_INSTALL));
     };
-    let max = skill(c, me, SKILL_INFOMORPH_PSYCHOLOGY).await? + skill(c, me, SKILL_ADVANCED_INFOMORPH_PSYCHOLOGY).await?;
-    let rows = c.db.query("SELECT location_id FROM game.jump_clones WHERE owner_id = $1", &[&me]).await.map_err(db_err)?;
-    if rows.iter().any(|r| r.get::<_, i64>(0) == station) {
+    let max = skill_dao::level(&c.db, me, SKILL_INFOMORPH_PSYCHOLOGY).await.map_err(db_err)?.unwrap_or(0) as i64
+        + skill_dao::level(&c.db, me, SKILL_ADVANCED_INFOMORPH_PSYCHOLOGY).await.map_err(db_err)?.unwrap_or(0) as i64;
+    let rows = clone_dao::locations(&c.db, me).await.map_err(db_err)?;
+    if rows.contains(&station) {
         return Err(notify_error(messages::JUMP_CLONE_ALREADY_AT_STATION));
     }
     if rows.len() as i64 >= max {
         return Err(notify_error(&messages::jump_clone_limit(max)));
     }
-    let inserted = c.db.execute(
-        "INSERT INTO game.jump_clones (owner_id, location_id) SELECT $1, $2 WHERE NOT EXISTS (SELECT 1 FROM game.jump_clones WHERE owner_id = $1 AND location_id = $2)",
-        &[&me, &station],
-    ).await.map_err(db_err)?;
+    let inserted = clone_dao::install(&c.db, me, station).await.map_err(db_err)?;
     if inserted == 0 {
         return Err(notify_error(messages::JUMP_CLONE_ALREADY_AT_STATION));
     }
@@ -99,36 +87,25 @@ async fn jump(c: &mut Client, me: i64, dest: i64, clone_id: i64) -> CallResult {
     let db = c.db.clone();
     db.transaction(
         |tx, outbox: &mut Outbox<JumpEffect>| Box::pin(async move {
-            let last: Option<i64> = Executor::query_one(tx, "SELECT last_clone_jump FROM game.characters WHERE character_id = $1", &[&me]).await.map_err(db_err)?.get(0);
-            let level: i64 = Executor::query_opt(tx, "SELECT level FROM game.skills WHERE character_id = $1 AND type_id = $2", &[&me, &SKILL_INFOMORPH_SYNCHRONIZING]).await.map_err(db_err)?.map(|r| r.get::<_, i32>(0) as i64).unwrap_or(0);
+            let last = clone_dao::last_jump(tx, me).await.map_err(db_err)?;
+            let level = skill_dao::level(tx, me, SKILL_INFOMORPH_SYNCHRONIZING).await.map_err(db_err)?.unwrap_or(0) as i64;
             let cooldown = (BASE_JUMP_COOLDOWN_HOURS - level) * FILETIME_HOUR;
             if let Some(ready) = last.map(|l| l + cooldown).filter(|r| *r > now) {
                 let hours = (ready - now) as f64 / FILETIME_HOUR as f64;
                 return Err(notify_error(&messages::jump_clone_cooldown(hours)));
             }
-            let target = Executor::query_opt(tx,
-                "SELECT s.station_id::bigint, s.solar_system_id::bigint, s.constellation_id::bigint, s.region_id::bigint
-                 FROM game.jump_clones j JOIN sde.sta_stations s ON s.station_id::bigint = j.location_id
-                 WHERE j.clone_id = $1 AND j.owner_id = $2 AND j.location_id = $3",
-                &[&clone_id, &me, &dest],
-            ).await.map_err(db_err)?.ok_or_else(|| notify_error(messages::JUMP_CLONE_NOT_FOUND))?;
-            let (to, system, constellation, region): (i64, i64, i64, i64) = (target.get(0), target.get(1), target.get(2), target.get(3));
+            let target = clone_dao::target(tx, clone_id, me, dest).await.map_err(db_err)?.ok_or_else(|| notify_error(messages::JUMP_CLONE_NOT_FOUND))?;
+            let (to, system, constellation, region) = (target.station_id, target.solar_system_id, target.constellation_id, target.region_id);
             if to == station {
                 return Err(notify_error(messages::ALREADY_AT_JUMP_CLONE_DESTINATION));
             }
-            Executor::execute(tx, "DELETE FROM game.jump_clones WHERE clone_id = $1", &[&clone_id]).await.map_err(db_err)?;
-            Executor::execute(tx, "INSERT INTO game.jump_clones (owner_id, location_id) SELECT $1, $2 WHERE NOT EXISTS (SELECT 1 FROM game.jump_clones WHERE owner_id = $1 AND location_id = $2)", &[&me, &station]).await.map_err(db_err)?;
+            clone_dao::delete(tx, clone_id).await.map_err(db_err)?;
+            clone_dao::install(tx, me, station).await.map_err(db_err)?;
             if let Some(ship) = ship {
-                Executor::execute(tx, "DELETE FROM game.items WHERE item_id = $1 AND type_id = $2", &[&ship, &TYPE_CAPSULE]).await.map_err(db_err)?;
+                item_dao::delete_capsule(tx, ship, TYPE_CAPSULE).await.map_err(db_err)?;
             }
-            let capsule: i64 = Executor::query_one(tx,
-                "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton) VALUES ($1, $2, $3, $4, 1, true) RETURNING item_id",
-                &[&TYPE_CAPSULE, &me, &to, &FLAG_HANGAR],
-            ).await.map_err(db_err)?.get(0);
-            Executor::execute(tx,
-                "UPDATE game.characters SET ship_id = $2, station_id = $3, solar_system_id = $4, constellation_id = $5, region_id = $6, last_clone_jump = $7 WHERE character_id = $1",
-                &[&me, &capsule, &to, &system, &constellation, &region, &now],
-            ).await.map_err(db_err)?;
+            let capsule = creation::rookie_ship(tx, TYPE_CAPSULE, me, to, FLAG_HANGAR).await.map_err(db_err)?;
+            clone_dao::jump(tx, me, capsule, to, system, constellation, region, now).await.map_err(db_err)?;
             outbox.operation(JumpEffect::Session { station: to, system, constellation, region, capsule });
             outbox.notify_pilot(me, "OnJumpCloneCacheInvalidated", vec![]);
             Ok(to)
@@ -168,7 +145,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "GetPriceForClone" => Ok(Value::Float(0.0)),
         "InstallCloneInStation" => install(c, me).await,
         "InstallCloneInStructure" => Err(notify_error(messages::CLONE_STRUCTURE_INSTALL_UNSUPPORTED)),
-        "DestroyInstalledClone" => match c.db.execute("DELETE FROM game.jump_clones WHERE clone_id = $1 AND owner_id = $2", &[&int(0), &me]).await {
+        "DestroyInstalledClone" => match clone_dao::destroy(&c.db, int(0), me).await {
             Ok(_) => {
                 c.world.notify_pilot(me, "OnJumpCloneCacheInvalidated", vec![]);
                 Ok(Value::None)
@@ -178,11 +155,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         // SetJumpCloneName(cloneID, name)
         "SetJumpCloneName" => {
             let name = value_text(call.args.get(1), MAX_CLONE_NAME_LENGTH);
-            c.db
-                .execute("UPDATE game.jump_clones SET name = $3 WHERE clone_id = $1 AND owner_id = $2", &[&int(0), &me, &name])
-                .await
-                .map(|_| Value::None)
-                .map_err(db_err)
+            clone_dao::rename(&c.db, int(0), me, &name).await.map(|_| Value::None).map_err(db_err)
         }
         "CloneJump" => jump(c, me, int(0), int(1)).await,
         "ResetLastCloneJumpTime" => Ok(Value::None),
