@@ -4,6 +4,7 @@
 //! Session policy, transactions, refusals, notifications and World are caller concerns.
 
 pub(crate) mod attributes;
+pub(crate) mod combat;
 pub(crate) mod creation;
 pub(crate) mod crimewatch;
 pub(crate) mod members;

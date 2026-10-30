@@ -4,13 +4,13 @@
 use crate::db::{executor::Executor, Error};
 use tokio_postgres::Row;
 pub(crate) struct Charge { pub flag_id: i32, pub type_id: i32, pub quantity: i32 }
-impl Charge { fn from_row(r: &Row) -> Self { Self { flag_id: r.get("flag_id"), type_id: r.get("type_id"), quantity: r.get("quantity") } } }
+impl Charge { pub(super) fn from_row(r: &Row) -> Self { Self { flag_id: r.get("flag_id"), type_id: r.get("type_id"), quantity: r.get("quantity") } } }
 pub(crate) async fn positive(ex: &(impl Executor + ?Sized), ship: i64) -> Result<Vec<Charge>, Error> { Ok(ex.query("SELECT flag_id, type_id, quantity FROM game.module_charges WHERE ship_id = $1 AND quantity > 0", &[&ship]).await?.iter().map(Charge::from_row).collect()) }
 
 pub(crate) struct Loaded { pub type_id: i32, pub quantity: i32 }
-impl Loaded { fn from_row(r: &Row) -> Self { Self { type_id: r.get("type_id"), quantity: r.get("quantity") } } }
+impl Loaded { pub(super) fn from_row(r: &Row) -> Self { Self { type_id: r.get("type_id"), quantity: r.get("quantity") } } }
 pub(crate) struct Slave { pub slave_id: i64 }
-impl Slave { fn from_row(r: &Row) -> Self { Self { slave_id: r.get("slave_id") } } }
+impl Slave { pub(super) fn from_row(r: &Row) -> Self { Self { slave_id: r.get("slave_id") } } }
 pub(crate) struct Bank { pub master_id: i64, pub slave_id: i64 }
 impl Bank { fn from_row(r: &Row) -> Self { Self { master_id: r.get("master_id"), slave_id: r.get("slave_id") } } }
 pub(crate) async fn all(ex: &(impl Executor + ?Sized), ship: i64) -> Result<Vec<Charge>, Error> { Ok(ex.query("SELECT flag_id, type_id, quantity FROM game.module_charges WHERE ship_id = $1", &[&ship]).await?.iter().map(Charge::from_row).collect()) }

@@ -13,7 +13,7 @@ impl SlotCount { fn from_row(r: &Row) -> Self { Self { value: r.get("value") } }
 pub(crate) struct SlotFlag { pub flag_id: i32 }
 impl SlotFlag { fn from_row(r: &Row) -> Self { Self { flag_id: r.get("flag_id") } } }
 pub(crate) struct ItemId { pub item_id: i64 }
-impl ItemId { fn from_row(r: &Row) -> Self { Self { item_id: r.get("item_id") } } }
+impl ItemId { pub(super) fn from_row(r: &Row) -> Self { Self { item_id: r.get("item_id") } } }
 
 pub(crate) async fn capacity(ex: &(impl Executor + ?Sized), id: i64, attr: i32) -> Result<Option<Capacity>, Error> {
     Ok(ex.query_opt("SELECT COALESCE((SELECT value FROM sde.type_attributes a WHERE a.type_id = i.type_id AND a.attribute_id = $2),
