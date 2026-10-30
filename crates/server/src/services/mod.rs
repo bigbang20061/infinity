@@ -399,6 +399,9 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
             if let Some(r) = skills::dispatch(c, call).await {
                 return r;
             }
+            if let Some(r) = fixed::social(call) {
+                return r;
+            }
             if let Some(r) = character::dispatch(c, call).await {
                 return r;
             }

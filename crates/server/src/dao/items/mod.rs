@@ -11,4 +11,5 @@ pub(crate) mod inventory;
 pub(crate) mod loading;
 pub(crate) mod positions;
 pub(crate) mod quantities;
+pub(crate) mod social;
 pub(crate) mod transfers;

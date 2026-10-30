@@ -16,6 +16,13 @@ use tracing::info;
 /// Server design: clearance in metres when teleporting to an item.
 const TELEPORT_CLEARANCE: f64 = 5000.0;
 
+struct TypeRow { type_id: i32, name: String }
+impl TypeRow { fn from_row(r: &tokio_postgres::Row) -> Self { Self { type_id: r.get("type_id"), name: r.get("name") } } }
+struct Celestial { x: f64, y: f64, z: f64, radius: f64 }
+impl Celestial { fn from_row(r: &tokio_postgres::Row) -> Self { Self { x: r.get("x"), y: r.get("y"), z: r.get("z"), radius: r.get("radius") } } }
+struct SystemCelestial { solar_system_id: i64, celestial: Celestial }
+impl SystemCelestial { fn from_row(r: &tokio_postgres::Row) -> Self { Self { solar_system_id: r.get("solar_system_id"), celestial: Celestial::from_row(r) } } }
+
 const COMMANDS: [(&str, &str); 9] = [
     ("tr", messages::GM_HELP_TELEPORT),
     ("wh", messages::GM_HELP_WORMHOLE),
@@ -51,7 +58,7 @@ async fn resolve_type(c: &Client, arg: &str) -> Result<(i32, String), CallError>
         }
     }
     .map_err(db_err)?;
-    row.map(|r| (r.get(0), r.get(1))).ok_or_else(|| slash_error(messages::gm_unknown_type(arg)))
+    row.map(|r| { let r = TypeRow::from_row(&r); (r.type_id, r.name) }).ok_or_else(|| slash_error(messages::gm_unknown_type(arg)))
 }
 
 /// /tr me <destination>
@@ -77,42 +84,35 @@ async fn tr(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
         let p = c
             .db
             .query_opt(
-                "SELECT x, y, z, COALESCE(radius, 10000)::float8 FROM sde.map_celestials WHERE solar_system_id = $1
+                "SELECT x, y, z, COALESCE(radius, 10000)::float8 AS radius FROM sde.map_celestials WHERE solar_system_id = $1
                  ORDER BY group_id = 7 DESC, random() LIMIT 1",
                 &[&(id as i32)],
             )
             .await
             .map_err(db_err)?
             .ok_or_else(|| slash_error(messages::gm_unknown_system(id)))?;
-        let pos = [p.get::<_, f64>(0) + p.get::<_, f64>(3) + 100_000.0, p.get(1), p.get(2)];
+        let p = Celestial::from_row(&p);
+        let pos = [p.x + p.radius + 100_000.0, p.y, p.z];
         super::ship::teleport(c, id, pos).await?;
         return Ok(messages::gm_teleported_to_system(id));
     }
     // A station, planet, moon, gate...
     if let Some(p) = c
         .db
-        .query_opt("SELECT solar_system_id::bigint, x, y, z, COALESCE(radius, 5000)::float8 FROM sde.map_celestials WHERE item_id = $1", &[&id])
+        .query_opt("SELECT solar_system_id::bigint, x, y, z, COALESCE(radius, 5000)::float8 AS radius FROM sde.map_celestials WHERE item_id = $1", &[&id])
         .await
         .map_err(db_err)?
     {
-        let pos = [p.get::<_, f64>(1) + p.get::<_, f64>(4) + TELEPORT_CLEARANCE, p.get(2), p.get(3)];
-        super::ship::teleport(c, p.get(0), pos).await?;
+        let p = SystemCelestial::from_row(&p);
+        let pos = [p.celestial.x + p.celestial.radius + TELEPORT_CLEARANCE, p.celestial.y, p.celestial.z];
+        super::ship::teleport(c, p.solar_system_id, pos).await?;
         return Ok(messages::gm_teleported(id));
     }
     // A character in space, or an item floating somewhere.
-    let at = c
-        .db
-        .query_opt(
-            "SELECT i.location_id, i.x, i.y, i.z FROM game.items i
-             WHERE i.item_id = COALESCE((SELECT ship_id FROM game.characters WHERE character_id = $1), $1)
-               AND i.x IS NOT NULL",
-            &[&id],
-        )
-        .await
-        .map_err(db_err)?;
+    let at = crate::dao::items::social::position(&c.db, id).await.map_err(db_err)?;
     if let Some(r) = at {
-        let system: i64 = r.get(0);
-        let pos = [r.get::<_, f64>(1) + TELEPORT_CLEARANCE, r.get(2), r.get(3)];
+        let system = r.location_id;
+        let pos = [r.x + TELEPORT_CLEARANCE, r.y, r.z];
         let live = c.world.with(system, move |s| s.pilot_ball(id).or_else(|| s.ball(id)).map(|b| b.pos)).await.flatten();
         let pos = live.map(|p| [p[0] + TELEPORT_CLEARANCE, p[1], p[2]]).unwrap_or(pos);
         super::ship::teleport(c, system, pos).await?;
@@ -140,12 +140,7 @@ async fn create(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
 async fn isk(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
     let amount: f64 = args.first().and_then(|a| a.replace(',', "").parse().ok()).ok_or_else(|| slash_error(messages::GM_ISK_USAGE.into()))?;
     let char_id = c.session.int("charid").unwrap_or(0);
-    let balance: f64 = c
-        .db
-        .query_one("UPDATE game.characters SET balance = balance + $2::float8::numeric WHERE character_id = $1 RETURNING balance::float8", &[&char_id, &amount])
-        .await
-        .map_err(db_err)?
-        .get(0);
+    let balance = crate::dao::wallets::social::add(&c.db, char_id, amount).await.map_err(db_err)?;
     c.notify("OnAccountChange", vec![Value::str("cash"), Value::Int(char_id), Value::Float(balance)]);
     Ok(messages::gm_balance(balance))
 }
