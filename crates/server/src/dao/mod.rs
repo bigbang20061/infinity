@@ -16,6 +16,7 @@ pub(crate) mod calendar;
 pub(crate) mod characters;
 pub(crate) mod contracts;
 pub(crate) mod exploration;
+pub(crate) mod industry;
 pub(crate) mod insurance;
 pub(crate) mod items;
 pub(crate) mod mail;
