@@ -1,6 +1,11 @@
 //! Server side of the GPS login handshake, mirroring
 //! `GPSTransport.HandleClientAuthentication` in carbon/common/script/net/GPS.py,
 //! with the client's `evecrypto.placebo` crypto pack (start.ini: cryptoPack = Placebo).
+//!
+//! Credentials use `game.accounts` via `Db`. Authenticated account ownership is
+//! tracked in process-local `live_sessions`; predecessor cleanup completes before
+//! the final acknowledgement and `session_init`. Cross-process session coordination
+//! is unsupported.
 
 use crate::conn::Conn;
 use crate::db::Db;
@@ -72,10 +77,12 @@ fn text(v: Option<&Value>) -> Option<String> {
     v.and_then(|v| v.as_text()).map(|s| s.into_owned())
 }
 
-/// Run the handshake until a login completes. Status probes (`(None, 'QC')`)
-/// are answered and the handshake restarts on the same socket, exactly like
-/// the proxy's accept loop, because the client reuses the probed transport.
-pub async fn run(conn: &mut Conn, cfg: &Config, db: &Db, client_id: i64) -> Result<Option<Login>> {
+/// Run the handshake, answering status probes (`(None, 'QC')`) on the same
+/// socket. A returned triple contains the owned connection, authenticated
+/// identity and process-local ownership guard. If cancellation is observed after
+/// waiting, no final ack is sent; the caller closes the socket before dropping
+/// the guard. The guard may also be cancelled after the ack is sent.
+pub async fn run(mut conn: Conn, cfg: &Config, db: &Db, client_id: i64) -> Result<Option<(Conn, Login, crate::live_sessions::Registration)>> {
     loop {
         conn.send(&handshake_tuple(cfg, db.online_count())).await?;
 
@@ -153,11 +160,17 @@ pub async fn run(conn: &mut Conn, cfg: &Config, db: &Db, client_id: i64) -> Resu
             return Ok(None);
         };
         let session_id = rand_i64();
+        let login = Login { user_id: account.user_id, user_name, role: account.role, client_id, session_id, language_id };
+        let mut registration = crate::live_sessions::register(login.user_id);
+        registration.wait_for_predecessor().await;
+        if registration.is_cancelled() {
+            return Ok(Some((conn, login, registration)));
+        }
         let session_init = Value::dict([
             ("userid", Value::Int(account.user_id)),
             ("userType", Value::Int(account.user_type)),
             ("role", Value::Int(account.role)),
-            ("languageID", Value::str(&language_id)),
+            ("languageID", Value::str(&login.language_id)),
             ("address", Value::str(conn.peer.ip().to_string())),
             ("inDetention", Value::None),
             ("maxSessionTime", Value::None),
@@ -172,9 +185,14 @@ pub async fn run(conn: &mut Conn, cfg: &Config, db: &Db, client_id: i64) -> Resu
             ("live_updates", Value::list([])),
             ("client_hash", Value::None),
         ]);
-        conn.send(&ack).await?;
-        info!("user {user_name:?} (id {}) logged in from {}", account.user_id, conn.peer);
-        return Ok(Some(Login { user_id: account.user_id, user_name, role: account.role, client_id, session_id, language_id }));
+        if let Err(e) = conn.send(&ack).await {
+            // Drop the socket before completing registration to preserve the replacement barrier.
+            drop(conn);
+            drop(registration);
+            return Err(e);
+        }
+        info!("user {:?} (id {}) logged in from {}", login.user_name, login.user_id, conn.peer);
+        return Ok(Some((conn, login, registration)));
     }
 }
 

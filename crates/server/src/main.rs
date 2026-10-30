@@ -2,6 +2,8 @@
 //! The handshake mirrors the client's macho networking; state comes from the game
 //! database and SDE. On SIGINT or SIGTERM, listeners stop and changed pilot
 //! positions are flushed with a bounded wait; existing sessions are not drained.
+//! Authenticated account ownership is process-local; replacements wait for
+//! prior cleanup. Cross-process session coordination is not supported.
 
 mod cdn;
 mod retail;
@@ -15,6 +17,7 @@ mod framing;
 mod gateway;
 mod handshake;
 mod images;
+mod live_sessions;
 mod macho;
 mod messages;
 mod services;
@@ -169,10 +172,10 @@ async fn main() -> Result<()> {
         let (cfg, db, ids, hub, world) = (cfg.clone(), db.clone(), next_client_id.clone(), hub.clone(), world.clone());
         tokio::spawn(async move {
             let client_id = ids.fetch_add(1, Ordering::Relaxed);
-            let mut conn = conn::Conn::new(stream, peer);
+            let conn = conn::Conn::new(stream, peer);
             info!("connection from {peer} (clientID {client_id})");
-            let login = match handshake::run(&mut conn, &cfg, &db, client_id).await {
-                Ok(Some(login)) => login,
+            let (mut conn, login, mut registration) = match handshake::run(conn, &cfg, &db, client_id).await {
+                Ok(Some(triple)) => triple,
                 Ok(None) => {
                     info!("{peer} closed during handshake");
                     return;
@@ -182,11 +185,20 @@ async fn main() -> Result<()> {
                     return;
                 }
             };
+            if registration.is_cancelled() {
+                if let Err(e) = conn.send(&conn::usurped_close()).await {
+                    warn!("{peer} usurp close failed: {e:#}");
+                }
+                drop(conn);
+                drop(registration);
+                return;
+            }
             db.add_online(ONLINE_JOIN_DELTA);
-            if let Err(e) = client::Client::new(conn, cfg, db.clone(), hub, world, login).run().await {
+            if let Err(e) = client::Client::new(conn, cfg, db.clone(), hub, world, login).run(&mut registration).await {
                 error!("{peer} session ended with error: {e:#}");
             }
             db.add_online(ONLINE_LEAVE_DELTA);
+            drop(registration);
         });
     }
     drop(listener);

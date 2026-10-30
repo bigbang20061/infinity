@@ -4,6 +4,9 @@
 //! the client's slash service. This module reads no database and does not
 //! implement localisation, data-derived names, or protocol identifiers.
 
+/// Proxy usurp reason from `carbon/common/script/net/machoNet.py`.
+pub(crate) const SESSION_USURPED: &str = "The user's connection has been usurped on the proxy";
+
 // Alliances (services/alliances.rs)
 /// Alliance action requires a player-corporation CEO.
 pub(crate) const PLAYER_CORP_CEO_REQUIRED: &str = "只有玩家军团的 CEO 才能这样做。";
