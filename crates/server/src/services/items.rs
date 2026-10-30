@@ -2,7 +2,7 @@
 //! Uses game.items, game.characters and sde.inv_types through the item DAO.
 //! Callers own transactions; this helper does not implement general inventory policy.
 use super::{db_err, CallError};
-use super::inventory::{notify_item_change, notify_item_removed};
+use super::inventory::notify_item_change;
 use crate::consts::{FLAG_HANGAR, IX_FLAG, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD};
 use crate::dao::items::{inventory, transfers};
 use crate::dao::items::loading::{load_items, Item, ItemQuery};
@@ -37,11 +37,6 @@ pub(super) async fn deliver<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut
             outbox.notify_pilot(owner, "OnItemChange", vec![item.row(), change, Value::None]);
         }
     }
-    Ok(())
-}
-pub(super) async fn remove_stack<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, item: Item) -> Result<(), CallError> {
-    inventory::delete(db, item.item_id).await.map_err(db_err)?;
-    notify_item_removed(outbox, item);
     Ok(())
 }
 pub(super) async fn deposit<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, owner: i64, location: i64, flag: i32, type_id: i32, quantity: i32, from: i64) -> Result<(), CallError> {

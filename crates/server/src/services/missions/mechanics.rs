@@ -1,4 +1,5 @@
-//! Mission state, rewards and arc mechanics.
+//! Mission state, rewards and arc mechanics; completion commits before dispatching effects.
+//! Uses mission, character, item, loyalty and standing data; site simulation is separate.
 use super::*;
 /// (ISK, LP) rewards by agent level.
 fn rewards(level: i64) -> (i64, i64) {
@@ -223,23 +224,29 @@ pub(super) async fn has_goods(c: &Client, station: i64, (type_id, qty): (i32, i3
     Ok(goods_at(c, station, type_id).await?.iter().map(|i| i.quantity as i64).sum::<i64>() >= qty as i64)
 }
 
-/// Take `qty` of the goods from the hangar and cargo at `station`.
-async fn take_goods(c: &mut Client, station: i64, (type_id, qty): (i32, i32)) -> Result<(), CallError> {
+/// Take delivered goods using guarded item changes, retaining inventory notification order.
+async fn take_goods<X: Send>(db: &(impl crate::db::executor::Executor + ?Sized), outbox: &mut crate::db::outbox::Outbox<X>, me: i64, station: i64, ship: i64, (type_id, qty): (i32, i32)) -> Result<(), CallError> {
+    use crate::dao::items::{loading::{load_items, ItemQuery}, quantities::{self, QuantityChange}};
+    let items = load_items(db, ItemQuery::OwnerTypeTwoLocations(me, type_id, station, FLAG_HANGAR, ship, FLAG_CARGO)).await.map_err(db_err)?;
     let mut left = qty;
-    let mut outbox = crate::db::outbox::Outbox::default();
-    for item in goods_at(c, station, type_id).await? {
-        if left <= 0 {
-            break;
+    let mut changes = std::collections::BTreeMap::new();
+    for item in &items {
+        if left <= 0 { break; }
+        let take = item.quantity.min(left);
+        left -= take;
+        changes.insert(item.item_id, QuantityChange::new(item, (item.quantity > take).then_some(item.quantity - take)));
+    }
+    if left > 0 || !quantities::apply(db, &changes).await.map_err(db_err)? {
+        return Err(super::super::notify_error(messages::MISSION_DELIVER_TO_STATION_HANGAR));
+    }
+    for item in items {
+        if let Some(change) = changes.get(&item.item_id) {
+            if change.quantity.is_none() {
+                super::inventory::notify_item_removed(outbox, item);
+            } else {
+                super::inventory::notify_item_change(db, outbox, item.item_id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
+            }
         }
-        if item.quantity <= left {
-            left -= item.quantity;
-            super::items::remove_stack(&c.db, &mut outbox, item).await?;
-        } else {
-            crate::dao::items::transfers::take(&c.db, item.item_id, left).await.map_err(db_err)?;
-            super::inventory::notify_item_change(&c.db, &mut outbox, item.item_id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
-            left = 0;
-        }
-        crate::db::outbox::dispatch_client((), std::mem::take(&mut outbox), c)?;
     }
     Ok(())
 }
@@ -265,52 +272,95 @@ pub(super) async fn ready(c: &Client, m: &Mission, agent: &Agent) -> Result<bool
 /// branch an agent interaction picked).
 pub(super) async fn finish(c: &mut Client, m: &Mission, agent: &Agent, choice: Option<usize>) -> Result<(), CallError> {
     let me = c.session.int("charid").unwrap_or(0);
-    if matches!(m.kind, Kind::Courier | Kind::Trade) {
-        if let Some(cargo) = m.cargo {
-            take_goods(c, agent.station_id, cargo).await?;
-        }
-    }
-    remove(c, m.agent_id).await?;
-    if m.reward_isk > 0 {
-        let balance = crate::dao::missions::pay(&c.db, me, m.reward_isk).await.map_err(db_err)?.balance;
-        c.notify("OnAccountChange", vec![Value::str("cash"), Value::Int(me), Value::Float(balance)]);
-    }
-    // Loyalty points with the agent's corporation, and standings with agent, corporation and faction.
-    let mut outbox = crate::db::outbox::Outbox::default();
-    super::standings::add_lp(&c.db, &mut outbox, me, agent.corp_id, m.reward_lp).await?;
-    crate::db::outbox::dispatch_client((), outbox, c)?;
-    super::standings::mission_completed(&c.db, &c.world, me, agent.id, agent.corp_id, agent.faction_id, agent.level).await?;
-    if let Some(arc) = m.arc_id {
-        let item = c
-            .db
-            .query_opt(
-                "SELECT (data->'missionRewards'->'reward'->>'rewardTypeID')::int AS type_id, (data->'missionRewards'->'reward'->>'rewardQuantity')::int AS quantity
+    let ship = if c.session.int("stationid") == Some(agent.station_id) { c.session.int("shipid").unwrap_or(0) } else { 0 };
+    let cargo = if matches!(m.kind, Kind::Courier | Kind::Trade) { m.cargo } else { None };
+    let mut reward = None;
+    let mut unlocked = Vec::new();
+    if m.arc_id.is_some() {
+        let row = c.db.query_opt(
+            "SELECT (data->'missionRewards'->'reward'->>'rewardTypeID')::int AS type_id, (data->'missionRewards'->'reward'->>'rewardQuantity')::int AS quantity
                  FROM sde_native.missions WHERE key = $1::text AND (data->'missionRewards'->'reward'->>'rewardTypeID')::int <> $2",
-                &[&m.mission_id.to_string(), &(TYPE_CREDITS as i32)],
-            )
-            .await
-            .map_err(db_err)?;
-        if let Some(r) = item {
-            let r = sde_rows::Reward::from_row(&r);
-            let (type_id, qty) = (r.type_id, r.quantity);
-            if let (Some(type_id), Some(qty)) = (type_id, qty) {
-                let mut outbox = crate::db::outbox::Outbox::default();
-                super::items::deposit(&c.db, &mut outbox, me, agent.station_id, FLAG_HANGAR, type_id, qty.max(1), 0).await?;
-                crate::db::outbox::dispatch_client((), outbox, c)?;
-            }
+            &[&m.mission_id.to_string(), &(TYPE_CREDITS as i32)],
+        ).await.map_err(db_err)?;
+        if let Some(row) = row {
+            let r = sde_rows::Reward::from_row(&row);
+            reward = r.type_id.zip(r.quantity).map(|(type_id, qty)| (type_id, qty.max(1)));
         }
-        set_arc_state(c, arc, m.mission_id, "completed").await?;
         let next = arcs(c).await?.get(&m.mission_id).map(|s| s.next.clone()).unwrap_or_default();
-        let unlocked: Vec<i32> = match choice {
+        unlocked = match choice {
             Some(k) => next.get(k).or(next.last()).copied().into_iter().collect(),
             None => next,
         };
-        for n in unlocked {
-            set_arc_state(c, arc, n, "unlocked").await?;
-        }
     }
-    c.notify("OnAgentMissionChange", vec![Value::str("completed"), Value::Int(m.agent_id)]);
-    info!(user = c.login.user_id, "agent {}: mission {} completed at {}, {} ISK", m.agent_id, m.mission_id, agent.id, m.reward_isk);
+    let mission_id = m.mission_id;
+    let mission_agent = m.agent_id;
+    let arc = m.arc_id;
+    let offered_interaction = m.state == STATE_OFFERED && m.kind == Kind::Interaction;
+    let reward_isk = m.reward_isk;
+    let reward_lp = m.reward_lp;
+    let (agent_id, corp, faction, level, station) = (agent.id, agent.corp_id, agent.faction_id, agent.level, agent.station_id);
+    let stamp = filetime_now();
+    let arc_states = arc.map(|_| {
+        let mut states = vec![(mission_id, "completed", Some(stamp))];
+        states.extend(unlocked.into_iter().map(|id| (id, "unlocked", None)));
+        states.sort_by_key(|row| row.0);
+        std::sync::Arc::new(states)
+    });
+    let _lock = super::super::market::lock().await;
+    let db = c.db.clone();
+    db.transaction(
+        move |tx, outbox: &mut crate::db::outbox::Outbox<()>| {
+            let arc_states = arc_states.clone();
+            Box::pin(async move {
+                if let Some(cargo) = cargo {
+                    take_goods(tx, outbox, me, station, ship, cargo).await?;
+                }
+                if offered_interaction && crate::dao::missions::accept_offered(tx, me, mission_agent, mission_id, STATE_OFFERED, STATE_ACCEPTED, stamp).await.map_err(db_err)? == 0 {
+                    return Err(super::super::notify_error(messages::MISSION_DELIVER_TO_STATION_HANGAR));
+                }
+                if crate::dao::missions::remove_accepted(tx, me, mission_agent, mission_id, STATE_ACCEPTED).await.map_err(db_err)? == 0 {
+                    return Err(super::super::notify_error(messages::MISSION_DELIVER_TO_STATION_HANGAR));
+                }
+                outbox.operation(());
+                if reward_isk > 0 {
+                    let balance = crate::dao::missions::pay(tx, me, reward_isk).await.map_err(db_err)?.balance;
+                    outbox.notify_client("OnAccountChange", vec![Value::str("cash"), Value::Int(me), Value::Float(balance)]);
+                }
+                super::standings::add_lp(tx, outbox, me, corp, reward_lp).await?;
+                super::standings::mission_completed(tx, outbox, me, agent_id, corp, faction, level).await?;
+                if let Some(arc) = arc {
+                    if let Some((type_id, qty)) = reward {
+                        // Deposit selects its target stack itself, which may sort below consumed
+                        // stacks. The economy lock serializes economy operations; the transaction
+                        // runner retries deadlocks once.
+                        super::items::deposit(tx, outbox, me, station, FLAG_HANGAR, type_id, qty, 0).await?;
+                    }
+                    for &(id, state, state_stamp) in arc_states.as_ref().unwrap().iter() {
+                        if offered_interaction && id == mission_id && state == "completed" {
+                            crate::dao::missions::set_arc_state(tx, me, arc, id, "accepted", Some(stamp)).await.map_err(db_err)?;
+                        }
+                        crate::dao::missions::set_arc_state(tx, me, arc, id, state, state_stamp).await.map_err(db_err)?;
+                    }
+                }
+                outbox.notify_client("OnAgentMissionChange", vec![Value::str("completed"), Value::Int(mission_agent)]);
+                Ok(())
+            })
+        },
+        |(), outbox| {
+            let client = &mut *c;
+            async move {
+                let world = client.world.clone();
+                for entry in outbox.into_entries() {
+                    match entry {
+                        crate::db::outbox::Effect::Notification(notification) => notification.dispatch(&world, Some(&mut *client))?,
+                        crate::db::outbox::Effect::Operation(()) => despawn(client, me, mission_agent),
+                    }
+                }
+                Ok(())
+            }
+        },
+    ).await?;
+    info!(user = c.login.user_id, "agent {}: mission {} completed at {}, {} ISK", mission_agent, mission_id, agent_id, reward_isk);
     Ok(())
 }
 

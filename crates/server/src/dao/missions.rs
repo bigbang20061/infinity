@@ -71,8 +71,15 @@ pub(crate) async fn set_state(ex: &(impl Executor + ?Sized), character_id: i64, 
     ex.execute("UPDATE game.agent_missions SET state = $3, accepted_at = CASE WHEN $3 = 2 THEN $4 ELSE accepted_at END
              WHERE character_id = $1 AND agent_id = $2", &[&character_id, &agent_id, &state, &stamp]).await
 }
+pub(crate) async fn accept_offered(ex: &(impl Executor + ?Sized), character_id: i64, agent_id: i64, mission_id: i32, offered: i32, accepted: i32, stamp: i64) -> Result<u64, db::Error> {
+    ex.execute("UPDATE game.agent_missions SET state = $5, accepted_at = $6 WHERE character_id = $1 AND agent_id = $2 AND mission_id = $3 AND state = $4",
+        &[&character_id, &agent_id, &mission_id, &offered, &accepted, &stamp]).await
+}
 pub(crate) async fn remove(ex: &(impl Executor + ?Sized), character_id: i64, agent_id: i64) -> Result<u64, db::Error> {
     ex.execute("DELETE FROM game.agent_missions WHERE character_id = $1 AND agent_id = $2", &[&character_id, &agent_id]).await
+}
+pub(crate) async fn remove_accepted(ex: &(impl Executor + ?Sized), character_id: i64, agent_id: i64, mission_id: i32, state: i32) -> Result<u64, db::Error> {
+    ex.execute("DELETE FROM game.agent_missions WHERE character_id = $1 AND agent_id = $2 AND mission_id = $3 AND state = $4", &[&character_id, &agent_id, &mission_id, &state]).await
 }
 pub(crate) struct Balance { pub balance: f64 }
 impl Balance { fn from_row(r: &Row) -> Self { Self { balance: r.get("balance") } } }

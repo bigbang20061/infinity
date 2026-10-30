@@ -6,7 +6,8 @@
 //! corporation's and its faction's; declining or quitting one costs a little with the agent
 //! and its corporation. Gains and losses move a standing part of the way to +10 or -10, so
 //! they shrink as it approaches the limit. Agents above level 1 need an effective standing
-//! (the best of the three, unless any is -2 or worse) of 1, 3, 5 or 7.
+//! (the best of the three, unless any is -2 or worse) of 1, 3, 5 or 7. Mission
+//! changes use the caller's executor and outbox so completion dispatches after commit.
 //!
 //! Loyalty points (game.lp_balances) are paid per corporation by missions and spent in that
 //! corporation's LP store. The live stores' offer tables never shipped with the client or
@@ -20,7 +21,6 @@ use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::Outbox;
 use crate::messages;
-use crate::space::World;
 use marshal::Value;
 
 mod standing_mgr;
@@ -48,20 +48,19 @@ const AGENT_LEVEL_THREE: i64 = 3;
 /// Client standingsvc agent access: level four.
 const AGENT_LEVEL_FOUR: i64 = 4;
 
-pub async fn standing(db: &Db, char_id: i64, from: i64) -> Result<f64, CallError> {
+pub async fn standing(db: &(impl Executor + ?Sized), char_id: i64, from: i64) -> Result<f64, CallError> {
     Ok(crate::dao::characters::standings::standing(db, char_id, from).await.map_err(db_err)?.unwrap_or(0.0))
 }
 
 /// Move `from`'s standing toward the character `change` of the way to +10 (or -10 if negative).
-pub async fn modify(db: &Db, world: &World, char_id: i64, from: i64, change: f64) -> Result<(), CallError> {
+async fn modify(db: &(impl Executor + ?Sized), char_id: i64, from: i64, change: f64) -> Result<Option<f64>, CallError> {
     if from == 0 || change == 0.0 {
-        return Ok(());
+        return Ok(None);
     }
     let old = standing(db, char_id, from).await?;
     let new = if change > 0.0 { old + (STANDING_LIMIT - old) * change } else { old + (STANDING_LIMIT + old) * change }.clamp(-STANDING_LIMIT, STANDING_LIMIT);
     crate::dao::characters::standings::set(db, char_id, from, new).await.map_err(db_err)?;
-    world.notify_pilot(char_id, "OnStandingSet", vec![Value::Int(from), Value::Int(char_id), Value::Float(new)]);
-    Ok(())
+    Ok(Some(new))
 }
 
 /// standingsvc.GetEffectiveStandingWithAgent: the best of the agent's, its corporation's and
@@ -84,17 +83,30 @@ pub fn required_for_level(level: i64) -> f64 {
 }
 
 /// A mission was completed for an agent of `level`.
-pub async fn mission_completed(db: &Db, world: &World, char_id: i64, agent: i64, corp: i64, faction: i64, level: i64) -> Result<(), CallError> {
+pub async fn mission_completed<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, char_id: i64, agent: i64, corp: i64, faction: i64, level: i64) -> Result<(), CallError> {
     let gain = MISSION_CORP_GAIN * level.max(1) as f64;
-    modify(db, world, char_id, agent, gain * MISSION_AGENT_GAIN_MULTIPLIER).await?;
-    modify(db, world, char_id, corp, gain).await?;
-    modify(db, world, char_id, faction, gain / MISSION_FACTION_GAIN_DIVISOR).await
+    let changes = [(agent, gain * MISSION_AGENT_GAIN_MULTIPLIER), (corp, gain), (faction, gain / MISSION_FACTION_GAIN_DIVISOR)];
+    apply_mission_standings(db, outbox, char_id, &changes).await
 }
 
 /// A mission was declined or quit.
-pub async fn mission_declined(db: &Db, world: &World, char_id: i64, agent: i64, corp: i64) -> Result<(), CallError> {
-    modify(db, world, char_id, agent, DECLINE_LOSS).await?;
-    modify(db, world, char_id, corp, DECLINE_LOSS).await
+pub async fn mission_declined<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, char_id: i64, agent: i64, corp: i64) -> Result<(), CallError> {
+    apply_mission_standings(db, outbox, char_id, &[(agent, DECLINE_LOSS), (corp, DECLINE_LOSS)]).await
+}
+
+async fn apply_mission_standings<X: Send, const N: usize>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, char_id: i64, changes: &[(i64, f64); N]) -> Result<(), CallError> {
+    let mut order: [usize; N] = std::array::from_fn(|i| i);
+    order.sort_unstable_by_key(|&i| (changes[i].0, i));
+    let mut values = [None; N];
+    for i in order {
+        values[i] = modify(db, char_id, changes[i].0, changes[i].1).await?;
+    }
+    for (i, value) in values.into_iter().enumerate() {
+        if let Some(new) = value {
+            outbox.notify_pilot(char_id, "OnStandingSet", vec![Value::Int(changes[i].0), Value::Int(char_id), Value::Float(new)]);
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------- loyalty points
