@@ -20,6 +20,7 @@ pub(crate) mod insurance;
 pub(crate) mod items;
 pub(crate) mod mail;
 pub(crate) mod market;
+pub(crate) mod missions;
 pub(crate) mod offices;
 pub(crate) mod skills;
 pub(crate) mod store;
