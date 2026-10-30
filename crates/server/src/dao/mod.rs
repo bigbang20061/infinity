@@ -10,6 +10,7 @@
 pub(crate) mod accounts;
 pub(crate) mod characters;
 pub(crate) mod contracts;
+pub(crate) mod insurance;
 pub(crate) mod items;
 pub(crate) mod market;
 pub(crate) mod skills;
