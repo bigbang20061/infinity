@@ -8,7 +8,7 @@
 
 use super::{db_err, Call, CallError, CallResult};
 use crate::client::{short, Client};
-use crate::consts::{ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_SIGNATURE_RADIUS, FILETIME_SECOND, FLAG_HANGAR, TYPE_CAPSULE};
+use crate::consts::{ATTR_AGILITY, ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_SIGNATURE_RADIUS, FILETIME_SECOND, FLAG_HANGAR, TYPE_CAPSULE};
 use crate::db::outbox::{Effect, Outbox};
 use crate::dao::{characters::{ship as character_dao, selection}, items::{ship as item_dao, creation}};
 use crate::messages;
@@ -16,14 +16,38 @@ use crate::space::{self, event, now_ms, now_tick, seconds_to_ms_f64, warp_durati
 use marshal::Value;
 use tracing::{info, warn};
 
-struct CelestialRow { x: f64, y: f64, z: f64, radius: f64 }
-impl CelestialRow { fn from_row(r: &tokio_postgres::Row) -> Self { Self { x: r.get("x"), y: r.get("y"), z: r.get("z"), radius: r.get("radius") } } }
-struct GateRow { dest_solar_system_id: i64, _constellation_id: Option<i64>, _region_id: Option<i64>, x: f64, y: f64, z: f64, radius: f64 }
-impl GateRow { fn from_row(r: &tokio_postgres::Row) -> Self { Self { dest_solar_system_id: r.get("dest_solar_system_id"), _constellation_id: r.get("constellation_id"), _region_id: r.get("region_id"), x: r.get("x"), y: r.get("y"), z: r.get("z"), radius: r.get("radius") } } }
-struct SystemRow { constellation_id: i64, region_id: i64 }
-impl SystemRow { fn from_row(r: &tokio_postgres::Row) -> Self { Self { constellation_id: r.get("constellation_id"), region_id: r.get("region_id") } } }
+/// Existing gate and station radius fallback in metres.
+const DEFAULT_CELESTIAL_RADIUS: f64 = 5000.0;
 
-const ATTR_AGILITY: i32 = 70;
+fn gate_radius(celestial: Option<f64>, type_radius: Option<f64>) -> f64 {
+    celestial.or(type_radius).unwrap_or(DEFAULT_CELESTIAL_RADIUS)
+}
+
+fn required<T>(value: Option<T>, field: &str) -> Result<T, CallError> {
+    value.ok_or_else(|| CallError::Internal(anyhow::anyhow!("missing SDE {field}")))
+}
+
+fn ancestry(sde: &crate::sde::Sde, system: i64) -> Result<(i64, i64), CallError> {
+    let row = required(sde.map.system(system), "solar system")?;
+    Ok((required(row.constellation_id, "constellation ID")?, required(row.region_id, "region ID")?))
+}
+
+struct GateRow { dest_solar_system_id: i64, x: f64, y: f64, z: f64, radius: f64 }
+
+fn gate_destination(sde: &crate::sde::Sde, from: i64, to: i64, system: i64) -> Result<Option<GateRow>, CallError> {
+    let Some(gate) = sde.map.stargate(from) else { return Ok(None); };
+    if gate.solar_system_id != Some(system) || gate.dest_stargate_id != Some(to) { return Ok(None); }
+    let Some(dest_system) = gate.dest_solar_system_id else { return Ok(None); };
+    if sde.map.system(dest_system).is_none() { return Ok(None); }
+    let Some(celestial) = sde.map.celestial(to) else { return Ok(None); };
+    let Some(ty) = celestial.type_id.and_then(|id| i32::try_from(id).ok()).and_then(|id| sde.types.get(id)) else { return Ok(None); };
+    Ok(Some(GateRow {
+        dest_solar_system_id: dest_system,
+        x: required(celestial.x, "gate x")?, y: required(celestial.y, "gate y")?, z: required(celestial.z, "gate z")?,
+        radius: gate_radius(celestial.radius, ty.radius),
+    }))
+}
+
 const ATTR_WARP_SPEED_MULTIPLIER: i32 = 600;
 const ATTR_BASE_WARP_SPEED: i32 = 1281;
 
@@ -36,10 +60,11 @@ fn f(v: Option<&Value>) -> f64 {
 
 /// Build a free ship ball from the ship's type attributes.
 pub(super) async fn ship_ball(c: &Client, ship_id: i64, pos: [f64; 3]) -> Result<Ball, CallError> {
-    let r = item_dao::ball(&c.db, ship_id, ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_AGILITY, ATTR_WARP_SPEED_MULTIPLIER, ATTR_BASE_WARP_SPEED).await.map_err(db_err)?;
-    let mass = r.mass_attr.or(r.mass).unwrap_or(1_000_000.0);
-    let warp_mult = r.warp_mult.unwrap_or(1.0);
-    let base_warp = r.base_warp.unwrap_or(3.0);
+    let type_id = required(crate::dao::items::inventory::type_id(&c.db, ship_id).await.map_err(db_err)?, "ship item")?;
+    let r = required(c.sde.types.get(type_id), "ship type")?;
+    let mass = r.attribute(ATTR_MASS).or(r.mass).unwrap_or(1_000_000.0);
+    let warp_mult = r.attribute(ATTR_WARP_SPEED_MULTIPLIER).unwrap_or(1.0);
+    let base_warp = r.attribute(ATTR_BASE_WARP_SPEED).unwrap_or(3.0);
     let char_id = c.session.int("charid").unwrap_or(0);
     let corp = c.session.int("corpid").unwrap_or(0);
     // Movement and signature attributes as fitted (skills, modules), when the ship is the pilot's.
@@ -53,7 +78,7 @@ pub(super) async fn ship_ball(c: &Client, ship_id: i64, pos: [f64; 3]) -> Result
     let security = super::crimewatch::security_status(&c.db, char_id).await?;
     Ok(Ball {
         id: ship_id,
-        type_id: r.type_id,
+        type_id,
         owner_id: char_id,
         corp_id: corp,
         alliance_id: c.session.int("allianceid").unwrap_or(-1),
@@ -62,8 +87,8 @@ pub(super) async fn ship_ball(c: &Client, ship_id: i64, pos: [f64; 3]) -> Result
         radius,
         signature_radius: Some(fitted(ATTR_SIGNATURE_RADIUS, radius as f64)),
         mass,
-        max_vel: fitted(ATTR_MAX_VELOCITY, r.velocity.unwrap_or(200.0)) as f32,
-        agility: fitted(ATTR_AGILITY, r.agility.unwrap_or(3.0)) as f32,
+        max_vel: fitted(ATTR_MAX_VELOCITY, r.attribute(ATTR_MAX_VELOCITY).unwrap_or(200.0)) as f32,
+        agility: fitted(ATTR_AGILITY, r.attribute(ATTR_AGILITY).unwrap_or(3.0)) as f32,
         speed_fraction: 0.0,
         pos,
         vel: [0.0; 3],
@@ -163,21 +188,8 @@ async fn stargate_jump(c: &mut Client, from_gate: i64, to_gate: i64) -> CallResu
         return Err(CallError::User { msg: messages::MSG_JUMP_GATE_HAS_NO_DESTINATION.into(), dict: vec![] });
     };
     check_weapons_timer(c, messages::WEAPONS_TIMER_JUMP)?;
-    let dest = GateRow::from_row(&c
-        .db
-        .query_opt(
-            "SELECT g.dest_solar_system_id::bigint, s.constellation_id::bigint, s.region_id::bigint, c.x, c.y, c.z,
-                    COALESCE(c.radius, t.radius, 5000)::float8 AS radius
-             FROM sde.map_stargates g
-             JOIN sde.map_solar_systems s ON s.solar_system_id = g.dest_solar_system_id
-             JOIN sde.map_celestials c ON c.item_id = g.dest_stargate_id
-             JOIN sde.inv_types t ON t.type_id = c.type_id
-             WHERE g.stargate_id = $1 AND g.dest_stargate_id = $2 AND g.solar_system_id = $3",
-            &[&(from_gate as i32), &(to_gate as i32), &(system as i32)],
-        )
-        .await
-        .map_err(db_err)?
-        .ok_or_else(|| CallError::User { msg: messages::MSG_JUMP_GATE_HAS_NO_DESTINATION.into(), dict: vec![] })?);
+    let dest = gate_destination(&c.sde, from_gate, to_gate, system)?
+        .ok_or_else(|| CallError::User { msg: messages::MSG_JUMP_GATE_HAS_NO_DESTINATION.into(), dict: vec![] })?;
     let dest_system: i64 = dest.dest_solar_system_id;
 
     // In range of the gate?
@@ -213,12 +225,7 @@ pub(super) struct Jump {
 /// out the animation, then arrive cloaked in the destination system and move the session.
 pub(super) async fn jump_out_and_arrive(c: &mut Client, system: i64, ship: i64, char_id: i64, jump: Jump) -> Result<(), CallError> {
     let Jump { through, guid, other_type, dest_system, pos } = jump;
-    let dest = SystemRow::from_row(&c
-        .db
-        .query_one("SELECT constellation_id::bigint, region_id::bigint FROM sde.map_solar_systems WHERE solar_system_id = $1", &[&(dest_system as i32)])
-        .await
-        .map_err(db_err)?);
-    let (constellation, region) = (dest.constellation_id, dest.region_id);
+    let (constellation, region) = ancestry(&c.sde, dest_system)?;
     c.world.system(dest_system).await.map_err(CallError::Internal)?;
     // Room on the other side, or a place in its jump queue.
     if let Err(position) = c.world.request_entry(dest_system, char_id).await {
@@ -321,12 +328,7 @@ pub(super) async fn teleport(c: &mut Client, dest_system: i64, pos: V3) -> Resul
         c.world.add_ship(system, ball).await.map_err(CallError::Internal)?;
         return send_state(c).await;
     }
-    let dest = SystemRow::from_row(&c
-        .db
-        .query_one("SELECT constellation_id::bigint, region_id::bigint FROM sde.map_solar_systems WHERE solar_system_id = $1", &[&(dest_system as i32)])
-        .await
-        .map_err(db_err)?);
-    let (constellation, region) = (dest.constellation_id, dest.region_id);
+    let (constellation, region) = ancestry(&c.sde, dest_system)?;
     c.world.unobserve(c.login.client_id);
     character_dao::location(&c.db, char_id, dest_system, constellation, region).await.map_err(db_err)?;
     c.world.add_ship(dest_system, ball).await.map_err(CallError::Internal)?;
@@ -506,3 +508,5 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         _ => None,
     }
 }
+
+#[cfg(test)] mod tests;

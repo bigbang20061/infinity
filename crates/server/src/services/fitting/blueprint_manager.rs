@@ -17,10 +17,14 @@ const MAX_BLUEPRINT_RESULTS: i64 = 10_000;
 /// singletons of quantity -2. Research state comes from game.blueprints, and a blueprint
 /// in (a container in) a station has that station as its facility.
 async fn blueprints(c: &Client, owner: i64, item: Option<i64>) -> Result<Vec<Value>, CallError> {
-    let rows = fitting_dao::blueprints(&c.db, owner, CATEGORY_BLUEPRINT as i32, item).await.map_err(db_err)?;
+    let rows = fitting_dao::blueprints(&c.db, owner, item).await.map_err(db_err)?;
     Ok(rows
         .iter()
+        .filter(|r| c.sde.types.get(r.type_id).is_some_and(|t| t.category_id == Some(CATEGORY_BLUEPRINT as i32)))
         .map(|r| {
+            let station = c.sde.map.station(r.location_parent_id.unwrap_or(r.location_id));
+            let location_type = r.location_type_id.map(i64::from).or_else(|| station.and_then(|s| s.type_id));
+            let solar_system = station.and_then(|s| s.solar_system_id).or(r.location_parent_id).or(r.character_system_id);
             let singleton = r.singleton;
             let stored = r.quantity as i64;
             let quantity = wire_quantity(singleton, stored);
@@ -29,11 +33,11 @@ async fn blueprints(c: &Client, owner: i64, item: Option<i64>) -> Result<Vec<Val
                 ("typeID", Value::Int(r.type_id as i64)),
                 ("ownerID", Value::Int(r.owner_id)),
                 ("locationID", Value::Int(r.location_id)),
-                ("locationTypeID", r.location_type_id.map(|t| Value::Int(t as i64)).unwrap_or(Value::None)),
+                ("locationTypeID", location_type.map(Value::Int).unwrap_or(Value::None)),
                 ("locationFlagID", Value::Int(FLAG_HANGAR as i64)),
                 ("flagID", Value::Int(r.flag_id as i64)),
-                ("facilityID", r.station_id.map(Value::Int).unwrap_or(Value::None)),
-                ("solarSystemID", r.solar_system_id.map(Value::Int).unwrap_or(Value::None)),
+                ("facilityID", station.map(|s| Value::Int(s.station_id)).unwrap_or(Value::None)),
+                ("solarSystemID", solar_system.map(Value::Int).unwrap_or(Value::None)),
                 ("quantity", Value::Int(quantity)),
                 ("runs", Value::Int(r.runs)),
                 ("timeEfficiency", Value::Int(r.time_efficiency)),

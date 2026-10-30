@@ -1,5 +1,5 @@
 //! Insurance persistence for insuranceSvc (eve/client/script/ui/station/insurance).
-//! Uses game.insurance and game.retail_prices with sde.inv_types; policy and notifications
+//! Uses game.insurance and game.retail_prices; static type data, policy and notifications
 //! remain in the service. Corporate insurance is not supported there.
 
 use crate::db::{executor::Executor, Error};
@@ -27,15 +27,14 @@ impl Payout {
         Self { owner_id: row.get("owner_id"), type_id: row.get("type_id"), fraction: row.get("fraction"), end_date: row.get("end_date") }
     }
 }
-struct Price { value: f64 }
+pub(crate) struct Price { pub adjusted: Option<f64>, pub average: Option<f64> }
 impl Price {
-    fn from_row(row: &tokio_postgres::Row) -> Self { Self { value: row.get("value") } }
+    fn from_row(row: &tokio_postgres::Row) -> Self { Self { adjusted: row.get("adjusted"), average: row.get("average") } }
 }
 const CONTRACT_SELECT: &str = "SELECT ship_id, owner_id, fraction, start_date, end_date FROM game.insurance";
 
-pub(crate) async fn value(ex: &(impl Executor + ?Sized), type_id: i32, category: i32) -> Result<Option<f64>, Error> {
-    Ok(ex.query_opt("SELECT COALESCE(NULLIF(r.adjusted, 0), NULLIF(r.average, 0), t.base_price, 0)::float8 AS value
-             FROM sde.inv_types t LEFT JOIN game.retail_prices r USING (type_id) WHERE t.type_id = $1 AND t.category_id = $2", &[&type_id, &category]).await?.map(|r| Price::from_row(&r).value))
+pub(crate) async fn value(ex: &(impl Executor + ?Sized), type_id: i32) -> Result<Option<Price>, Error> {
+    Ok(ex.query_opt("SELECT adjusted::float8 AS adjusted, average::float8 AS average FROM game.retail_prices WHERE type_id = $1", &[&type_id]).await?.map(|r| Price::from_row(&r)))
 }
 pub(crate) async fn contract(ex: &(impl Executor + ?Sized), ship: i64) -> Result<Option<Contract>, Error> {
     Ok(ex.query_opt(&format!("{CONTRACT_SELECT} WHERE ship_id = $1"), &[&ship]).await?.map(|r| Contract::from_row(&r)))

@@ -10,7 +10,8 @@
 
 use super::{db_err, item_descriptor, keyval, Call, CallError, CallResult};
 use crate::client::{filetime_now, short, Client};
-use crate::dao::items::loading::{load_items, Item, ItemQuery};
+use crate::dao::items::loading::{Item, ItemQuery};
+use super::items::load_items;
 use crate::dao::items::{charges, dogma as dogma_dao};
 use crate::consts::{ATTR_ARMOR_DAMAGE, ATTR_CAPACITOR_CAPACITY, ATTR_CAPACITY, ATTR_CHARGE, ATTR_HULL_DAMAGE, ATTR_IS_ONLINE, ATTR_MASS, ATTR_QUANTITY, ATTR_RADIUS, ATTR_SHIELD_CAPACITY, ATTR_SHIELD_CHARGE, ATTR_VOLUME, BLUEPRINT_COPY_QUANTITY, EFFECT_ONLINE, FLAG_HANGAR, FLAG_PILOT, SINGLETON_QUANTITY, TYPE_CHARACTER};
 use marshal::Value;
@@ -141,7 +142,7 @@ async fn online_modules(c: &Client, ship_id: i64) -> Result<Vec<i64>, CallError>
 /// active (clientDogmaLocation.MakeShipActive). instanceCache rows follow dgmAttributesByIdx:
 /// [itemID, isOnline, damage, charge, skillPoints, armorDamage, shieldCharge, isIncapacitated].
 pub async fn ship_state(c: &Client, ship_id: i64) -> Result<Value, CallError> {
-    let items = load_items(&c.db, ItemQuery::LocationExceptFlag(ship_id, FLAG_HANGAR)).await.map_err(db_err)?;
+    let items = load_items(&c.db, &c.sde, ItemQuery::LocationExceptFlag(ship_id, FLAG_HANGAR)).await.map_err(db_err)?;
     let online = online_modules(c, ship_id).await?;
     let instance = |key: Value, online: bool| {
         let row = [
@@ -167,7 +168,7 @@ pub async fn ship_state(c: &Client, ship_id: i64) -> Result<Value, CallError> {
 /// The active ship and everything fitted in it.
 async fn ship_info(c: &Client) -> Result<Vec<(Value, Value)>, CallError> {
     let Some(ship_id) = c.session.int("shipid") else { return Ok(vec![]) };
-    let items = load_items(&c.db, ItemQuery::IdOrLocationExceptFlag(ship_id, FLAG_HANGAR)).await.map_err(db_err)?;
+    let items = load_items(&c.db, &c.sde, ItemQuery::IdOrLocationExceptFlag(ship_id, FLAG_HANGAR)).await.map_err(db_err)?;
     let online = online_modules(c, ship_id).await?;
     let mut out = Vec::new();
     // Runtime state the HUD reads: a full capacitor (with skills), and the ship's shield,
@@ -261,7 +262,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
         "CharGetInfo" => character_info(c).await,
         "ItemGetInfo" => {
             let item_id = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
-            let items = load_items(&c.db, ItemQuery::Id(item_id)).await.map_err(db_err)?;
+            let items = load_items(&c.db, &c.sde, ItemQuery::Id(item_id)).await.map_err(db_err)?;
             match items.into_iter().next() {
                 Some(item) => {
                     let attrs = type_attributes(c, item.type_id);

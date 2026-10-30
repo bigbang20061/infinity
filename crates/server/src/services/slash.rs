@@ -145,7 +145,7 @@ async fn create(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
         _ => return Err(slash_error(messages::GM_NOWHERE_TO_PUT_ITEM.into())),
     };
     let mut outbox = crate::db::outbox::Outbox::default();
-    super::items::deposit(&c.db, &mut outbox, char_id, location, flag, type_id, qty, 0).await?;
+    super::items::deposit(&c.db, &c.sde, &mut outbox, char_id, location, flag, type_id, qty, 0).await?;
     crate::db::outbox::dispatch_client((), outbox, c)?;
     Ok(messages::gm_created_item(qty, &name, type_id))
 }

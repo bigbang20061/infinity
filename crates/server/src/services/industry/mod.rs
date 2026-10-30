@@ -13,7 +13,8 @@
 //! aren't supported.
 
 use super::contracts::{field, show_items};
-use crate::dao::items::loading::{load_items, Item, ItemQuery};
+use crate::dao::items::loading::{Item, ItemQuery};
+use super::items::load_items;
 use crate::dao::industry::{self as industry_dao, Blueprint, Job};
 use super::fit::{Fit, Key};
 use super::items::{deliver, take_items};

@@ -223,7 +223,7 @@ pub(super) async fn epic_arc_status(c: &Client) -> CallResult {
 async fn goods_at(c: &Client, station: i64, type_id: i32) -> Result<Vec<crate::dao::items::loading::Item>, CallError> {
     let me = c.session.int("charid").unwrap_or(0);
     let ship = if c.session.int("stationid") == Some(station) { c.session.int("shipid").unwrap_or(0) } else { 0 };
-    crate::dao::items::loading::load_items(&c.db, crate::dao::items::loading::ItemQuery::OwnerTypeTwoLocations(me, type_id, station, FLAG_HANGAR, ship, FLAG_CARGO)).await.map_err(db_err)
+    crate::services::items::load_items(&c.db, &c.sde, crate::dao::items::loading::ItemQuery::OwnerTypeTwoLocations(me, type_id, station, FLAG_HANGAR, ship, FLAG_CARGO)).await.map_err(db_err)
 }
 
 pub(super) async fn has_goods(c: &Client, station: i64, (type_id, qty): (i32, i32)) -> Result<bool, CallError> {
@@ -231,9 +231,9 @@ pub(super) async fn has_goods(c: &Client, station: i64, (type_id, qty): (i32, i3
 }
 
 /// Take delivered goods using guarded item changes, retaining inventory notification order.
-async fn take_goods<X: Send>(db: &(impl crate::db::executor::Executor + ?Sized), outbox: &mut crate::db::outbox::Outbox<X>, me: i64, station: i64, ship: i64, (type_id, qty): (i32, i32)) -> Result<(), CallError> {
-    use crate::dao::items::{loading::{load_items, ItemQuery}, quantities::{self, QuantityChange}};
-    let items = load_items(db, ItemQuery::OwnerTypeTwoLocations(me, type_id, station, FLAG_HANGAR, ship, FLAG_CARGO)).await.map_err(db_err)?;
+async fn take_goods<X: Send>(db: &(impl crate::db::executor::Executor + ?Sized), sde: &crate::sde::Sde, outbox: &mut crate::db::outbox::Outbox<X>, me: i64, station: i64, ship: i64, (type_id, qty): (i32, i32)) -> Result<(), CallError> {
+    use crate::dao::items::{loading::ItemQuery, quantities::{self, QuantityChange}};
+    let items = crate::services::items::load_items(db, sde, ItemQuery::OwnerTypeTwoLocations(me, type_id, station, FLAG_HANGAR, ship, FLAG_CARGO)).await.map_err(db_err)?;
     let mut left = qty;
     let mut changes = std::collections::BTreeMap::new();
     for item in &items {
@@ -250,7 +250,7 @@ async fn take_goods<X: Send>(db: &(impl crate::db::executor::Executor + ?Sized),
             if change.quantity.is_none() {
                 super::inventory::notify_item_removed(outbox, item);
             } else {
-                super::inventory::notify_item_change(db, outbox, item.item_id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
+                super::inventory::notify_item_change(db, sde, outbox, item.item_id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
             }
         }
     }
@@ -314,12 +314,14 @@ pub(super) async fn finish(c: &mut Client, m: &Mission, agent: &Agent, choice: O
     });
     let _lock = super::super::market::lock().await;
     let db = c.db.clone();
+    let sde = c.sde.clone();
     db.transaction(
         move |tx, outbox: &mut crate::db::outbox::Outbox<()>| {
             let arc_states = arc_states.clone();
+            let sde = sde.clone();
             Box::pin(async move {
                 if let Some(cargo) = cargo {
-                    take_goods(tx, outbox, me, station, ship, cargo).await?;
+                    take_goods(tx, &sde, outbox, me, station, ship, cargo).await?;
                 }
                 if offered_interaction && crate::dao::missions::accept_offered(tx, me, mission_agent, mission_id, STATE_OFFERED, STATE_ACCEPTED, stamp).await.map_err(db_err)? == 0 {
                     return Err(super::super::notify_error(messages::MISSION_DELIVER_TO_STATION_HANGAR));
@@ -339,7 +341,7 @@ pub(super) async fn finish(c: &mut Client, m: &Mission, agent: &Agent, choice: O
                         // Deposit selects its target stack itself, which may sort below consumed
                         // stacks. The economy lock serializes economy operations; the transaction
                         // runner retries deadlocks once.
-                        super::items::deposit(tx, outbox, me, station, FLAG_HANGAR, type_id, qty, 0).await?;
+                        super::items::deposit(tx, &sde, outbox, me, station, FLAG_HANGAR, type_id, qty, 0).await?;
                     }
                     for &(id, state, state_stamp) in arc_states.as_ref().unwrap().iter() {
                         if offered_interaction && id == mission_id && state == "completed" {

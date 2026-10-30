@@ -18,7 +18,8 @@
 //! Purchases and redeeming use `game.store_purchases` and `game.redeem_tokens`.
 //! Clients cannot display oversized balances exactly.
 
-use crate::dao::items::loading::{load_items, ItemQuery};
+use crate::dao::items::loading::ItemQuery;
+use super::items::load_items;
 use super::{db_err, keyval, Call, CallError, CallResult};
 use crate::client::{filetime_now, unix_seconds_from_filetime, Client};
 use crate::consts::FLAG_HANGAR;

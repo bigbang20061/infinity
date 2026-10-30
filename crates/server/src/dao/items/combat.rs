@@ -4,8 +4,8 @@
 use crate::db::{executor::Executor, Error};
 use super::{charges::{Loaded, Slave}, transfers};
 use tokio_postgres::Row;
-pub(crate) struct Loot { pub type_id: i32, pub category_id: i32 }
-impl Loot { fn from_row(row: &Row) -> Self { Self { type_id: row.get("type_id"), category_id: row.get("category_id") } } }
+pub(crate) struct Loot { pub type_id: i32 }
+impl Loot { fn from_row(row: &Row) -> Self { Self { type_id: row.get("type_id") } } }
 
 pub(crate) async fn delete_charge(ex: &(impl Executor + ?Sized), ship: i64, flag: i32) -> Result<u64, Error> {
     ex.execute("DELETE FROM game.module_charges WHERE ship_id = $1 AND flag_id = $2", &[&ship, &flag]).await
@@ -16,10 +16,8 @@ pub(crate) async fn consume_charge(ex: &(impl Executor + ?Sized), ship: i64, fla
 pub(crate) async fn set_online(ex: &(impl Executor + ?Sized), item: i64, ship: i64, online: bool) -> Result<u64, Error> {
     ex.execute("UPDATE game.items SET online = $3 WHERE item_id = $1 AND location_id = $2 AND online <> $3", &[&item, &ship, &online]).await
 }
-pub(crate) async fn loot(ex: &(impl Executor + ?Sized), bounty: f64, picks: i64, charge: i32) -> Result<Vec<Loot>, Error> {
-    Ok(ex.query("SELECT t.type_id, t.category_id FROM sde.inv_types t JOIN game.retail_prices r USING (type_id)
-             WHERE t.published AND t.category_id IN (7, $3) AND r.average BETWEEN 1000 AND GREATEST($1::float8, 50000)
-             ORDER BY random() LIMIT $2", &[&bounty, &picks, &charge]).await?.iter().map(Loot::from_row).collect())
+pub(crate) async fn loot(ex: &(impl Executor + ?Sized), bounty: f64) -> Result<Vec<Loot>, Error> {
+    Ok(ex.query("SELECT type_id FROM game.retail_prices WHERE average BETWEEN 1000 AND GREATEST($1::float8, 50000)", &[&bounty]).await?.iter().map(Loot::from_row).collect())
 }
 pub(crate) async fn insert_loot(ex: &(impl Executor + ?Sized), kind: i32, owner: i64, wreck: i64, quantity: i32) -> Result<u64, Error> {
     ex.execute("INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity) VALUES ($1, $2, $3, 0, $4)", &[&kind, &owner, &wreck, &quantity]).await

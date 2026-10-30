@@ -11,3 +11,4 @@ pub(crate) mod factions;
 pub(crate) mod localization;
 pub(crate) mod map;
 pub(crate) mod types;
+pub(crate) mod wrecks;

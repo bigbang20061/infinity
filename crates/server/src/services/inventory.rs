@@ -1,10 +1,12 @@
 //! invbroker: inventory managers (bound per station / solar system) hand out
 //! bound inventories, which list and describe the items in a container
 //! (eve/client/script/environment/invCache.py, invCacheContainer).
-//! Item quantities are stored in `game.items`; merge plans are guarded against
-//! stale snapshots. Other inventory operations retain their existing semantics.
+//! Item quantities are stored in `game.items`; static item data comes from the loaded SDE.
+//! Merge plans are guarded against stale snapshots. Other inventory operations retain their existing semantics.
+//! Item capacity and contents are read from one game-item statement snapshot.
 
-use crate::dao::items::loading::{load_items, Item, ItemQuery};
+use crate::dao::items::loading::{Item, ItemQuery};
+use super::items::load_items;
 use crate::dao::items::inventory as inventory_dao;
 use crate::dao::items::quantities::{self, QuantityChange};
 use super::{db_err, keyval, notify_error, value_id_list, Call, CallError, CallResult};
@@ -13,6 +15,7 @@ use crate::consts::{ATTR_CAPACITY, CATEGORY_SHIP, FLAG_CARGO, FLAG_CORP_SAG1, FL
 use crate::db::executor::Executor;
 use crate::db::outbox::{dispatch_client, Outbox};
 use crate::messages;
+use crate::sde::Sde;
 use marshal::Value;
 use std::collections::BTreeMap;
 use tracing::warn;
@@ -53,13 +56,13 @@ async fn list(c: &Client, container: &Container, flags: Option<Vec<i64>>) -> Res
     match container {
         Container::Hangar { station_id, owner_id } => {
             let flags = flags.unwrap_or_else(|| vec![FLAG_HANGAR]);
-            load_items(&c.db, ItemQuery::LocationOwnerFlags(*station_id, *owner_id, &flags)).await.map_err(db_err)
+            load_items(&c.db, &c.sde, ItemQuery::LocationOwnerFlags(*station_id, *owner_id, &flags)).await.map_err(db_err)
         }
         // Another corporation's hangars stay closed.
         Container::Item(item_id) if super::offices::office_owner(&c.db, *item_id).await?.is_some_and(|corp| c.session.int("corpid") != Some(corp)) => Ok(vec![]),
         Container::Item(item_id) => match flags {
-            Some(flags) => load_items(&c.db, ItemQuery::LocationFlags(*item_id, &flags)).await.map_err(db_err),
-            None => load_items(&c.db, ItemQuery::Location(*item_id)).await.map_err(db_err),
+            Some(flags) => load_items(&c.db, &c.sde, ItemQuery::LocationFlags(*item_id, &flags)).await.map_err(db_err),
+            None => load_items(&c.db, &c.sde, ItemQuery::Location(*item_id)).await.map_err(db_err),
         },
     }
 }
@@ -70,7 +73,7 @@ async fn self_item(c: &Client, container: &Container) -> Result<Value, CallError
         Container::Hangar { station_id, .. } => *station_id,
         Container::Item(id) => *id,
     };
-    if let Some(item) = load_items(&c.db, ItemQuery::Id(id)).await.map_err(db_err)?.into_iter().next() {
+    if let Some(item) = load_items(&c.db, &c.sde, ItemQuery::Id(id)).await.map_err(db_err)?.into_iter().next() {
         return Ok(item.row());
     }
     if Some(id) == c.session.int("charid") {
@@ -89,40 +92,41 @@ async fn self_item(c: &Client, container: &Container) -> Result<Value, CallError
         .row());
     }
     // A station (or other static location) as an item.
-    let r = c
-        .db
-        .query_opt(
-            "SELECT c.type_id, s.owner_id::bigint, c.solar_system_id::bigint, c.group_id::bigint, t.category_id::bigint
-             FROM sde.map_celestials c JOIN sde.inv_types t USING (type_id)
-             LEFT JOIN sde.sta_stations s ON s.station_id = c.item_id WHERE c.item_id = $1",
-            &[&id],
-        )
-        .await
-        .map_err(db_err)?;
-    Ok(match r {
-        Some(r) => Item {
-            item_id: id,
-            type_id: r.get::<_, Option<i32>>("type_id").unwrap_or(0),
-            owner_id: r.get::<_, Option<i64>>("owner_id").unwrap_or(1),
-            location_id: r.get::<_, Option<i64>>("solar_system_id").unwrap_or(0),
-            flag_id: 0,
-            quantity: 1,
-            singleton: true,
-            group_id: r.get::<_, Option<i64>>("group_id").unwrap_or(0),
-            category_id: r.get::<_, Option<i64>>("category_id").unwrap_or(0),
+    let item = c.sde.map.celestial(id).and_then(|celestial| {
+        let type_id = i32::try_from(celestial.type_id?).ok()?;
+        let data = c.sde.types.get(type_id)?;
+        Some(Item {
+            item_id: id, type_id,
+            owner_id: c.sde.map.station(id).and_then(|station| station.owner_id).unwrap_or(1),
+            location_id: celestial.solar_system_id.unwrap_or(0),
+            flag_id: 0, quantity: 1, singleton: true,
+            group_id: celestial.group_id.unwrap_or(0),
+            category_id: i64::from(data.category_id.unwrap_or(0)),
             custom_info: None,
-        }
-        .row(),
-        None => Value::None,
-    })
+        }.row())
+    });
+    Ok(item.unwrap_or(Value::None))
+}
+
+fn item_capacity(items: &[Item], id: i64, data: impl Fn(i32) -> (Option<f64>, Option<f64>, Option<f64>)) -> (f64, f64) {
+    let Some(parent) = items.iter().find(|item| item.item_id == id) else { return (0.0, 0.0) };
+    let (attribute, physical, _) = data(parent.type_id);
+    // The former SQL COALESCE(sum(...), 0) returned positive zero for an empty sum.
+    let used = items.iter().filter(|item| item.location_id == parent.item_id).filter_map(|item| {
+        data(item.type_id).2.map(|volume| volume * f64::from(item.quantity.max(1)))
+    }).fold(0.0_f64, |total, value| total + value);
+    (attribute.or(physical).unwrap_or(0.0), used)
 }
 
 async fn capacity(c: &Client, container: &Container) -> Result<Value, CallError> {
     let (cap, used) = match container {
         Container::Hangar { .. } => (1e12, 0.0),
         Container::Item(id) => {
-            inventory_dao::capacity(&c.db, *id, ATTR_CAPACITY).await.map_err(db_err)?
-                .map(|r| (r.capacity, r.used)).unwrap_or((0.0, 0.0))
+            let items = load_items(&c.db, &c.sde, ItemQuery::IdOrLocation(*id)).await.map_err(db_err)?;
+            item_capacity(&items, *id, |type_id| {
+                let data = c.sde.types.get(type_id).unwrap();
+                (data.attribute(ATTR_CAPACITY), data.capacity, data.volume)
+            })
         }
     };
     Ok(keyval([("capacity", Value::Float(cap)), ("used", Value::Float(used))]))
@@ -140,8 +144,8 @@ pub fn is_fitting_flag(flag: i32) -> bool {
 }
 
 /// `OnItemChange(item, change, location)` for `item_id` as it is now in the database.
-pub async fn notify_item_change<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, item_id: i64, change: Vec<(i64, Value)>) -> Result<(), CallError> {
-    if let Some(item) = load_items(db, ItemQuery::Id(item_id)).await.map_err(db_err)?.into_iter().next() {
+pub async fn notify_item_change<X: Send>(db: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<X>, item_id: i64, change: Vec<(i64, Value)>) -> Result<(), CallError> {
+    if let Some(item) = load_items(db, sde, ItemQuery::Id(item_id)).await.map_err(db_err)?.into_iter().next() {
         let change = Value::Dict(change.into_iter().map(|(k, v)| (Value::Int(k), v)).collect());
         outbox.notify_client("OnItemChange", vec![item.row(), change, Value::None]);
     }
@@ -176,17 +180,10 @@ async fn destroy_item(c: &mut Client, item: Item) -> Result<(), CallError> {
 async fn free_slot(c: &Client, ship: i64, module_type: i32) -> Result<Option<i32>, CallError> {
     // (slot effect, ship slot-count attribute, first flag, max slots)
     const SLOTS: [(i32, i32, i32, i32); 5] = [(11, 12, 11, 8), (13, 13, 19, 8), (12, 14, 27, 8), (2663, 1137, 92, 8), (3772, 1367, 125, 8)];
-    let effects: Vec<i32> = c
-        .db
-        .query("SELECT effect_id FROM sde.type_effects WHERE type_id = $1", &[&module_type])
-        .await
-        .map_err(db_err)?
-        .iter()
-        .map(|r| r.get("effect_id"))
-        .collect();
-    let Some(&(_, count_attr, first, max)) = SLOTS.iter().find(|s| effects.contains(&s.0)) else { return Ok(None) };
-    let count = inventory_dao::slot_count(&c.db, ship, count_attr).await.map_err(db_err)?
-        .map(|r| r.value).unwrap_or(0.0);
+    let effects = c.sde.types.effects(module_type);
+    let Some(&(_, count_attr, first, max)) = SLOTS.iter().find(|s| effects.iter().any(|effect| effect.effect_id == s.0)) else { return Ok(None) };
+    let count = inventory_dao::type_id(&c.db, ship).await.map_err(db_err)?
+        .and_then(|type_id| c.sde.types.attribute(type_id, count_attr)).unwrap_or(0.0);
     let used: Vec<i32> = inventory_dao::slot_flags(&c.db, ship).await.map_err(db_err)?
         .into_iter().map(|r| r.flag_id).collect();
     Ok((first..first + (count as i32).min(max)).find(|f| !used.contains(f)))
@@ -196,7 +193,7 @@ async fn free_slot(c: &Client, ship: i64, module_type: i32) -> Result<Option<i32
 /// Returns the ID of the item now at the destination.
 async fn move_item(c: &mut Client, container: &Container, item_id: i64, flag: Option<i32>, qty: Option<i64>) -> Result<Option<i64>, CallError> {
     let char_id = c.session.int("charid").unwrap_or(0);
-    let Some(item) = load_items(&c.db, ItemQuery::Id(item_id)).await.map_err(db_err)?.into_iter().next() else { return Ok(None) };
+    let Some(item) = load_items(&c.db, &c.sde, ItemQuery::Id(item_id)).await.map_err(db_err)?.into_iter().next() else { return Ok(None) };
     if Some(item_id) == c.session.int("shipid") && matches!(container, Container::Item(_)) {
         return Err(CallError::User { msg: messages::MSG_CAN_NOT_PLACE_ACTIVE_SHIP_IN_ANOTHER_HANGAR.into(), dict: vec![] });
     }
@@ -220,7 +217,7 @@ async fn move_item(c: &mut Client, container: &Container, item_id: i64, flag: Op
                 (*id, corp, flag.filter(|f| (sag..sag + 7).contains(f)).unwrap_or(sag))
             }
             None => {
-                let is_ship = load_items(&c.db, ItemQuery::Id(*id)).await.map_err(db_err)?.first().is_some_and(|i| i.category_id == CATEGORY_SHIP as i64);
+                let is_ship = load_items(&c.db, &c.sde, ItemQuery::Id(*id)).await.map_err(db_err)?.first().is_some_and(|i| i.category_id == CATEGORY_SHIP as i64);
                 let default = if is_ship { FLAG_CARGO } else { FLAG_HANGAR };
                 (*id, char_id, flag.unwrap_or(default))
             }
@@ -236,14 +233,16 @@ async fn move_item(c: &mut Client, container: &Container, item_id: i64, flag: Op
     // Fitting takes one module off a stack; otherwise the requested quantity, or all of it.
     let take = if fitting { Some(1) } else { qty }.filter(|q| *q > 0 && !item.singleton && (*q as i32) < item.quantity);
     let db = c.db.clone();
+    let sde = c.sde.clone();
     db.transaction(
         move |tx, outbox: &mut Outbox| {
             let item = item.clone();
+            let sde = sde.clone();
             Box::pin(async move {
                 let moved_id = if let Some(q) = take {
                     let id = split_stack(tx, &item, q as i32, owner, location, flag, fitting).await?;
-                    notify_item_change(tx, outbox, item_id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
-                    notify_item_change(tx, outbox, id, vec![(IX_LOCATION_ID, Value::Int(item.location_id)), (IX_FLAG, Value::Int(item.flag_id as i64))]).await?;
+                    notify_item_change(tx, &sde, outbox, item_id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
+                    notify_item_change(tx, &sde, outbox, id, vec![(IX_LOCATION_ID, Value::Int(item.location_id)), (IX_FLAG, Value::Int(item.flag_id as i64))]).await?;
                     id
                 } else {
                     let singleton = item.singleton || fitting;
@@ -252,7 +251,7 @@ async fn move_item(c: &mut Client, container: &Container, item_id: i64, flag: Op
                     if singleton != item.singleton {
                         change.push((IX_SINGLETON, Value::Bool(item.singleton)));
                     }
-                    notify_item_change(tx, outbox, item_id, change).await?;
+                    notify_item_change(tx, &sde, outbox, item_id, change).await?;
                     item_id
                 };
                 Ok(Some(moved_id))
@@ -279,7 +278,7 @@ fn plan_merges(items: &[Item], ops: &[(i64, i64, i64)]) -> Result<BTreeMap<i64, 
     }).collect())
 }
 
-async fn apply_merges<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, items: Vec<Item>, ops: &[(i64, i64, i64)]) -> Result<(), CallError> {
+async fn apply_merges<X: Send>(db: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<X>, items: Vec<Item>, ops: &[(i64, i64, i64)]) -> Result<(), CallError> {
     let changes = plan_merges(&items, ops)?;
     if !quantities::apply(db, &changes).await.map_err(db_err)? { return Err(notify_error(messages::INSUFFICIENT_ITEM_QUANTITY)); }
     for item in items {
@@ -287,7 +286,7 @@ async fn apply_merges<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbo
             if change.quantity.is_none() {
                 notify_item_removed(outbox, item);
             } else {
-                notify_item_change(db, outbox, item.item_id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
+                notify_item_change(db, sde, outbox, item.item_id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
             }
         }
     }
@@ -296,13 +295,15 @@ async fn apply_merges<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbo
 
 async fn merge_operations(c: &mut Client, ops: Vec<(i64, i64, i64)>) -> Result<(), CallError> {
     let db = c.db.clone();
+    let sde = c.sde.clone();
     db.transaction(
         move |tx, outbox: &mut Outbox| {
             let ops = ops.clone();
+            let sde = sde.clone();
             Box::pin(async move {
                 let ids: Vec<i64> = ops.iter().flat_map(|&(source, dest, _)| [source, dest]).collect();
-                let items = load_items(tx, ItemQuery::Ids(&ids)).await.map_err(db_err)?;
-                apply_merges(tx, outbox, items, &ops).await
+                let items = load_items(tx, &sde, ItemQuery::Ids(&ids)).await.map_err(db_err)?;
+                apply_merges(tx, &sde, outbox, items, &ops).await
             })
         },
         |value, outbox| async move { dispatch_client(value, outbox, c) },
@@ -318,19 +319,21 @@ async fn stack_all(c: &mut Client, container: &Container, flag: Option<i64>) -> 
     }
     let container = container.clone();
     let db = c.db.clone();
+    let sde = c.sde.clone();
     db.transaction(
         move |tx, outbox: &mut Outbox| {
             let container = container.clone();
+            let sde = sde.clone();
             Box::pin(async move {
                 let flags: Option<Vec<i32>> = flag.map(|f| vec![f as i32]);
                 let items = match container {
                     Container::Hangar { station_id, owner_id } => {
                         let flags = flags.unwrap_or_else(|| vec![FLAG_HANGAR]);
-                        load_items(tx, ItemQuery::LocationOwnerFlags(station_id, owner_id, &flags)).await.map_err(db_err)?
+                        load_items(tx, &sde, ItemQuery::LocationOwnerFlags(station_id, owner_id, &flags)).await.map_err(db_err)?
                     }
                     Container::Item(id) => match flags {
-                        Some(flags) => load_items(tx, ItemQuery::LocationFlags(id, &flags)).await.map_err(db_err)?,
-                        None => load_items(tx, ItemQuery::Location(id)).await.map_err(db_err)?,
+                        Some(flags) => load_items(tx, &sde, ItemQuery::LocationFlags(id, &flags)).await.map_err(db_err)?,
+                        None => load_items(tx, &sde, ItemQuery::Location(id)).await.map_err(db_err)?,
                     },
                 };
                 let mut first: std::collections::HashMap<(i32, i32), i64> = Default::default();
@@ -341,7 +344,7 @@ async fn stack_all(c: &mut Client, container: &Container, flag: Option<i64>) -> 
                         None => { first.insert((item.type_id, item.flag_id), item.item_id); }
                     }
                 }
-                apply_merges(tx, outbox, items, &ops).await
+                apply_merges(tx, &sde, outbox, items, &ops).await
             })
         },
         |value, outbox| async move { dispatch_client(value, outbox, c) },
@@ -376,7 +379,7 @@ pub async fn broker(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "SplitStack" => {
             let item_id = call.args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
             let qty = call.args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as i32;
-            let Some(item) = (match load_items(&c.db, ItemQuery::Id(item_id)).await.map_err(db_err) {
+            let Some(item) = (match load_items(&c.db, &c.sde, ItemQuery::Id(item_id)).await.map_err(db_err) {
                 Ok(items) => items.into_iter().next(),
                 Err(e) => return Some(Err(e)),
             }) else {
@@ -386,14 +389,16 @@ pub async fn broker(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                 return Some(Ok(Value::None));
             }
             let db = c.db.clone();
+            let sde = c.sde.clone();
             let r = db.transaction(
                 move |tx, outbox: &mut Outbox| {
                     let item = item.clone();
+                    let sde = sde.clone();
                     Box::pin(async move {
                         let (owner, location, flag) = (item.owner_id, item.location_id, item.flag_id);
                         let id = split_stack(tx, &item, qty, owner, location, flag, false).await?;
-                        notify_item_change(tx, outbox, item_id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
-                        notify_item_change(tx, outbox, id, vec![(IX_LOCATION_ID, Value::Int(0))]).await?;
+                        notify_item_change(tx, &sde, outbox, item_id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
+                        notify_item_change(tx, &sde, outbox, id, vec![(IX_LOCATION_ID, Value::Int(0))]).await?;
                         Ok(Value::Int(id))
                     })
                 },
@@ -405,7 +410,7 @@ pub async fn broker(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "TrashItems" => {
             let ids = value_id_list(call.args.first());
             let r = async {
-                let items = load_items(&c.db, ItemQuery::IdsOwner(&ids, char_id)).await.map_err(db_err)?;
+                let items = load_items(&c.db, &c.sde, ItemQuery::IdsOwner(&ids, char_id)).await.map_err(db_err)?;
                 for item in items {
                     if Some(item.item_id) != c.session.int("shipid") {
                         destroy_item(c, item).await?;

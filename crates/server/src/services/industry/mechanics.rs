@@ -268,6 +268,7 @@ pub(super) async fn job_counts(db: &(impl Executor + ?Sized), installer: i64) ->
 /// `InstallJob(job.dump())` -> jobID.
 pub(super) async fn install(c: &Client, request: &Value) -> CallResult {
     let (db, world) = (&c.db, &*c.world);
+    let sde = &c.sde;
     let me = c.session.int("charid").unwrap_or(0);
     let int = |k: &str| request.get(k).filter(|v| !v.is_none()).and_then(|v| v.as_int());
     let activity_id = int("activityID").unwrap_or(0) as i32;
@@ -294,7 +295,9 @@ pub(super) async fn install(c: &Client, request: &Value) -> CallResult {
         |tx, outbox: &mut Outbox| {
             let requested = requested.clone();
             let fit = Arc::clone(&fit);
+            let sde = sde.clone();
             Box::pin(async move {
+                let sde = &*sde;
                 let mut bp = blueprint(tx, blueprint_id).await?;
                 if bp.owner != me {
                     return Err(user_error(messages::MSG_INDUSTRY_BLUEPRINT_ACCESS_DENIED, vec![]));
@@ -377,7 +380,7 @@ pub(super) async fn install(c: &Client, request: &Value) -> CallResult {
                 debit(tx, outbox, me, p.total_cost).await?;
                 for (type_id, quantity) in &p.materials {
                     let mut left = *quantity;
-                    let stacks = load_items(tx, ItemQuery::OwnerLocationFlagTypeStackAscending(me, fac.id, FLAG_HANGAR, *type_id)).await.map_err(db_err)?;
+                    let stacks = load_items(tx, sde, ItemQuery::OwnerLocationFlagTypeStackAscending(me, fac.id, FLAG_HANGAR, *type_id)).await.map_err(db_err)?;
                     for s in stacks {
                         if left == 0 {
                             break;
@@ -391,10 +394,10 @@ pub(super) async fn install(c: &Client, request: &Value) -> CallResult {
                 if !bp.singleton {
                     let location = industry_dao::item_location(tx, bp.item_id).await.map_err(db_err)?;
                     if bp.quantity > 1 {
-                        let stack = load_items(tx, ItemQuery::Id(bp.item_id)).await.map_err(db_err)?.pop().ok_or_else(|| user_error(messages::MSG_BLUEPRINT_NOT_FOUND, vec![]))?;
+                        let stack = load_items(tx, sde, ItemQuery::Id(bp.item_id)).await.map_err(db_err)?.pop().ok_or_else(|| user_error(messages::MSG_BLUEPRINT_NOT_FOUND, vec![]))?;
                         take_items(tx, outbox, stack, 1).await?;
                         bp.item_id = crate::dao::items::creation::rookie_ship(tx, bp.type_id, me, location, FLAG_HANGAR).await.map_err(db_err)?;
-                        show_items(tx, outbox, me, location, &[bp.item_id], LOCATION_JUNKYARD).await?;
+                        show_items(tx, sde, outbox, me, location, &[bp.item_id], LOCATION_JUNKYARD).await?;
                     } else {
                         industry_dao::make_singleton(tx, bp.item_id).await.map_err(db_err)?;
                     }
@@ -435,8 +438,8 @@ pub(super) async fn install(c: &Client, request: &Value) -> CallResult {
 }
 
 /// Remove a used-up blueprint copy.
-async fn destroy_blueprint<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, item_id: i64) -> Result<(), CallError> {
-    if let Some(item) = load_items(db, ItemQuery::Id(item_id)).await.map_err(db_err)?.pop() {
+async fn destroy_blueprint<X: Send>(db: &(impl Executor + ?Sized), sde: &crate::sde::Sde, outbox: &mut Outbox<X>, item_id: i64) -> Result<(), CallError> {
+    if let Some(item) = load_items(db, sde, ItemQuery::Id(item_id)).await.map_err(db_err)?.pop() {
         let owner = item.owner_id;
         industry_dao::delete_blueprint_item(db, item_id).await.map_err(db_err)?;
         let old = item.location_id;
@@ -448,18 +451,18 @@ async fn destroy_blueprint<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut 
 
 /// New blueprint copies in `owner`'s hangar at `station`.
 #[allow(clippy::too_many_arguments)]
-async fn make_copies<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, owner: i64, station: i64, type_id: i32, count: i32, me: i32, te: i32, runs: i32) -> Result<(), CallError> {
+async fn make_copies<X: Send>(db: &(impl Executor + ?Sized), sde: &crate::sde::Sde, outbox: &mut Outbox<X>, owner: i64, station: i64, type_id: i32, count: i32, me: i32, te: i32, runs: i32) -> Result<(), CallError> {
     let mut ids = vec![];
     for _ in 0..count {
         let id = industry_dao::insert_copy(db, type_id, owner, station, FLAG_HANGAR, BLUEPRINT_COPY_QUANTITY).await.map_err(db_err)?;
         set_blueprint(db, id, me, te, runs).await?;
         ids.push(id);
     }
-    show_items(db, outbox, owner, station, &ids, LOCATION_JUNKYARD).await
+    show_items(db, sde, outbox, owner, station, &ids, LOCATION_JUNKYARD).await
 }
 
 /// Deliver a finished job's output to the owner's hangar at the facility.
-async fn deliver_job<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, j: &mut Job, by: i64, invention_successful: i32, completed: i64) -> Result<(), CallError> {
+async fn deliver_job<X: Send>(db: &(impl Executor + ?Sized), sde: &crate::sde::Sde, outbox: &mut Outbox<X>, j: &mut Job, by: i64, invention_successful: i32, completed: i64) -> Result<(), CallError> {
     let bp = match blueprint(db, j.blueprint_id).await {
         Ok(bp) => Some(bp),
         Err(CallError::User { .. }) => None,
@@ -471,12 +474,12 @@ async fn deliver_job<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox
         (MANUFACTURING, Some(act)) => {
             if let Some(&(product, per_run, _)) = act.products.iter().find(|p| Some(p.0) == j.product_type).or(act.products.first()) {
                 let quantity = (per_run * j.runs as i64).min(i32::MAX as i64) as i32;
-                deliver(db, outbox, j.owner, j.facility, product, quantity).await?;
+                deliver(db, sde, outbox, j.owner, j.facility, product, quantity).await?;
             }
             if let Some(bp) = bp.filter(|b| b.copy) {
                 let left = bp.runs - j.runs;
                 if left <= 0 {
-                    destroy_blueprint(db, outbox, bp.item_id).await?;
+                    destroy_blueprint(db, sde, outbox, bp.item_id).await?;
                 } else {
                     set_blueprint(db, bp.item_id, bp.me, bp.te, left).await?;
                 }
@@ -494,7 +497,7 @@ async fn deliver_job<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox
         }
         (COPYING, _) => {
             let (me, te) = bp.as_ref().map(|b| (b.me, b.te)).unwrap_or((0, 0));
-            make_copies(db, outbox, j.owner, j.facility, j.blueprint_type, j.runs, me, te, j.licensed_runs).await?;
+            make_copies(db, sde, outbox, j.owner, j.facility, j.blueprint_type, j.runs, me, te, j.licensed_runs).await?;
         }
         (INVENTION, Some(act)) => {
             successful = invention_successful;
@@ -505,13 +508,13 @@ async fn deliver_job<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox
             if let Some(&(product, per_run, _)) = act.products.iter().find(|p| Some(p.0) == j.product_type).or(act.products.first()) {
                 if successful > 0 {
                     let runs = (per_run as i32 + d_runs).max(1);
-                    make_copies(db, outbox, j.owner, j.facility, product, successful, INVENTION_MATERIAL_EFFICIENCY + d_me, INVENTION_TIME_EFFICIENCY + d_te, runs).await?;
+                    make_copies(db, sde, outbox, j.owner, j.facility, product, successful, INVENTION_MATERIAL_EFFICIENCY + d_me, INVENTION_TIME_EFFICIENCY + d_te, runs).await?;
                 }
             }
             if let Some(bp) = bp {
                 let left = bp.runs - j.runs;
                 if left <= 0 {
-                    destroy_blueprint(db, outbox, bp.item_id).await?;
+                    destroy_blueprint(db, sde, outbox, bp.item_id).await?;
                 } else {
                     set_blueprint(db, bp.item_id, bp.me, bp.te, left).await?;
                 }
@@ -533,6 +536,7 @@ async fn deliver_job<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox
 
 pub(super) async fn complete(c: &Client, id: i64) -> Result<(), CallError> {
     let (db, world) = (&c.db, &*c.world);
+    let sde = &c.sde;
     let me = c.session.int("charid").unwrap_or(0);
     let _trading = lock().await;
     let j = job(db, id).await?;
@@ -550,8 +554,10 @@ pub(super) async fn complete(c: &Client, id: i64) -> Result<(), CallError> {
     let delivered = db.transaction(
         |tx, outbox: &mut Outbox| {
             let mut j = j.clone();
+            let sde = sde.clone();
             Box::pin(async move {
-                deliver_job(tx, outbox, &mut j, me, successful, completed).await?;
+                let sde = &*sde;
+                deliver_job(tx, sde, outbox, &mut j, me, successful, completed).await?;
                 Ok(j)
             })
         },

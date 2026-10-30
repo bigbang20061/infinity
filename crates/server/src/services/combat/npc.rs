@@ -20,15 +20,12 @@ pub(super) struct NpcStats {
 
 pub(super) async fn npc_stats(db: &Db, sde: &Sde, type_id: i32) -> Result<NpcStats, CallError> {
     let multiplier = attr(sde, type_id, ATTR_DAMAGE_MULTIPLIER, 1.0);
-    let fx: Option<String> = db
-        .query_opt(
-            "SELECT e.guid FROM sde.type_effects te JOIN sde.dogma_effects e USING (effect_id)
-             WHERE te.type_id = $1 AND e.effect_category = 2 AND e.guid LIKE 'effects.%' AND e.name <> 'missileLaunching' LIMIT 1",
-            &[&type_id],
-        )
-        .await
-        .map_err(db_err)?
-        .as_ref().map(GuidRow::from_row).map(|r| r.guid);
+    let fx = sde.types.effects(type_id).iter().filter_map(|entry| sde.dogma.effect(entry.effect_id))
+        .find(|effect| effect.effect_category == Some(2)
+            && effect.guid.as_deref().is_some_and(|guid| guid.starts_with("effects."))
+            && effect.name.as_deref().is_some_and(|name| name != "missileLaunching"))
+        .and_then(|effect| effect.guid.clone());
+    let _ = db;
     let missile_type = attr(sde, type_id, ATTR_ENTITY_MISSILE_TYPE, 0.0) as i32;
     let missile = if missile_type > 0 {
         Some((missile_type, attr(sde, type_id, ATTR_MISSILE_DAMAGE_MULTIPLIER, 1.0)))

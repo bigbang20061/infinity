@@ -358,7 +358,7 @@ async fn do_action(c: &mut Client, agent: &Agent, action: Option<i64>) -> CallRe
             if let (Kind::Courier, Some((type_id, qty))) = (m.kind, m.cargo) {
                 let me = c.session.int("charid").unwrap_or(0);
                 let mut outbox = crate::db::outbox::Outbox::default();
-                super::items::deposit(&c.db, &mut outbox, me, agent.station_id, FLAG_HANGAR, type_id, qty, 0).await?;
+                super::items::deposit(&c.db, &c.sde, &mut outbox, me, agent.station_id, FLAG_HANGAR, type_id, qty, 0).await?;
                 crate::db::outbox::dispatch_client((), outbox, c)?;
             }
             info!(user = c.login.user_id, "agent {}: mission {} accepted", agent.id, m.mission_id);

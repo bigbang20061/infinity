@@ -18,6 +18,17 @@ fn ore_bands_follow_security() {
 }
 
 #[test]
+fn ore_candidates_require_matching_group_category_and_exact_grade() {
+    let names = ["Veldspar"];
+    assert!(ore_candidate("Veldspar", "Veldspar", Some(CATEGORY_ASTEROID), &names));
+    assert!(ore_candidate("Veldspar II-Grade", "Veldspar", Some(CATEGORY_ASTEROID), &names));
+    assert!(ore_candidate("Veldspar III-Grade", "Veldspar", Some(CATEGORY_ASTEROID), &names));
+    assert!(!ore_candidate("Veldspar IV-Grade", "Veldspar", Some(CATEGORY_ASTEROID), &names));
+    assert!(!ore_candidate("Veldspar", "Veldspar", None, &names));
+    assert!(!ore_candidate("Scordite", "Scordite", Some(CATEGORY_ASTEROID), &names));
+}
+
+#[test]
 fn output_reuses_fully_consumed_source_quantity() {
     assert!(matches!(output_stack_quantity(None, 12), Ok(12)));
     assert!(matches!(output_stack_quantity(Some(3), 12), Ok(15)));

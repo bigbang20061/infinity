@@ -1,10 +1,6 @@
-//! Station reprocessing service and its SDE material queries.
+//! Station reprocessing service using canonical SDE materials and game prices.
 use super::*;
 use crate::services::inventory;
-struct Attribute { value: f64 }
-impl Attribute { fn from_row(r: &tokio_postgres::Row) -> Self { Self { value: r.get("value") } } }
-struct Portion { portion_size: i32 }
-impl Portion { fn from_row(r: &tokio_postgres::Row) -> Self { Self { portion_size: r.get("portion_size") } } }
 
 // ---------------------------------------------------------------- reprocessing
 
@@ -12,12 +8,7 @@ impl Portion { fn from_row(r: &tokio_postgres::Row) -> Self { Self { portion_siz
 /// Reprocessing (+3%), Reprocessing Efficiency (+2%) and their processing skill (+2%) per
 /// level; everything else Scrapmetal Processing (+2%).
 async fn skill_multiplier(c: &Client, char_id: i64, type_id: i32) -> Result<f64, CallError> {
-    let own_skill: Option<f64> = c
-        .db
-        .query_opt("SELECT value FROM sde.type_attributes WHERE type_id = $1 AND attribute_id = $2", &[&type_id, &ATTR_PROCESSING_SKILL])
-        .await
-        .map_err(db_err)?
-        .map(|r| Attribute::from_row(&r).value);
+    let own_skill = c.sde.types.attribute(type_id, ATTR_PROCESSING_SKILL);
     let skills = crate::dao::skills::levels::levels(&c.db, char_id).await.map_err(db_err)?;
     let level = |skill: i32| skills.iter().find(|r| r.type_id == skill).map(|r| r.level as f64).unwrap_or(0.0);
     Ok(match own_skill {
@@ -48,27 +39,25 @@ pub(super) fn output_stack_quantity(current: Option<i32>, amount: i64) -> Result
 }
 
 async fn quote(c: &Client, char_id: i64, item: &crate::dao::items::loading::Item) -> Result<Option<Quote>, CallError> {
-    let portion = Portion::from_row(&c
-        .db
-        .query_one("SELECT GREATEST(COALESCE(portion_size, 1), 1) AS portion_size FROM sde.inv_types WHERE type_id = $1", &[&item.type_id])
-        .await
-        .map_err(db_err)?).portion_size;
+    let portion = c.sde.types.get(item.type_id).ok_or_else(|| CallError::Internal(anyhow::anyhow!("missing type {}", item.type_id)))?.portion_size.unwrap_or(1).max(1);
     let quantity = if item.singleton { 1 } else { item.quantity };
     let batches = quantity / portion;
     if batches == 0 {
         return Ok(None);
     }
-    let materials = crate::dao::items::mining::materials(&c.db, item.type_id).await.map_err(db_err)?;
+    let materials = c.sde.types.materials(item.type_id);
     if materials.is_empty() {
         return Ok(None);
     }
+    let ids: Vec<_> = materials.iter().map(|m| m.material_type_id).collect();
+    let prices: HashMap<_, _> = crate::dao::items::mining::prices(&c.db, &ids).await.map_err(db_err)?.into_iter().map(|p| (p.type_id, p.average)).collect();
     let efficiency = (STATION_EFFICIENCY * skill_multiplier(c, char_id, item.type_id).await?).min(1.0);
     let mut result = Vec::new();
-    for r in &materials {
+    for r in materials {
         let total = r.quantity.unwrap_or(0).checked_mul(batches as i64).ok_or_else(output_overflow)?;
         let received = (total as f64 * efficiency).floor() as i64;
         if total > 0 {
-            result.push((r.material_type_id, received, total - received, received as f64 * r.average * STATION_TAX));
+            result.push((r.material_type_id, received, total - received, received as f64 * prices.get(&r.material_type_id).copied().unwrap_or(0.0) * STATION_TAX));
         }
     }
     let materials = result;
@@ -96,7 +85,7 @@ async fn reprocessable(c: &Client, ids: &[i64]) -> Result<Vec<crate::dao::items:
     let char_id = c.session.int("charid").unwrap_or(0);
     let station = c.session.int("stationid").unwrap_or(0);
     let ship = c.session.int("shipid").unwrap_or(0);
-    crate::dao::items::loading::load_items(&c.db, crate::dao::items::loading::ItemQuery::IdsOwnerLocations(ids, char_id, station, ship)).await.map_err(db_err)
+    crate::services::items::load_items(&c.db, &c.sde, crate::dao::items::loading::ItemQuery::IdsOwnerLocations(ids, char_id, station, ship)).await.map_err(db_err)
 }
 
 /// Bound reprocessingSvc (Moniker('reprocessingSvc', stationID)).
@@ -139,9 +128,11 @@ pub(super) async fn reprocessing(c: &mut Client, call: &Call<'_>) -> CallResult 
             }
             let plan = Arc::new((sources, output));
             let db = c.db.clone();
+            let sde = Arc::clone(&c.sde);
             let plan = db.transaction(
                 |tx, outbox| {
                     let plan = Arc::clone(&plan);
+                    let sde = Arc::clone(&sde);
                     Box::pin(async move {
                     use crate::dao::items::quantities::{apply, QuantityChange};
                     let mut changes = BTreeMap::new();
@@ -152,7 +143,7 @@ pub(super) async fn reprocessing(c: &mut Client, call: &Call<'_>) -> CallResult 
                     for (&type_id, &amount) in &plan.1 {
                         if amount <= 0 { continue; }
                         let quantity = output_stack_quantity(None, amount)?;
-                        let candidates = crate::dao::items::loading::load_items(tx, crate::dao::items::loading::ItemQuery::LocationFlagTypeOwnerStack(out_location, out_flag, type_id, char_id)).await.map_err(db_err)?;
+                        let candidates = crate::services::items::load_items(tx, &sde, crate::dao::items::loading::ItemQuery::LocationFlagTypeOwnerStack(out_location, out_flag, type_id, char_id)).await.map_err(db_err)?;
                         let stack = candidates.into_iter().next();
                         if let Some(item) = stack {
                             let current = changes.get(&item.item_id).map_or(Some(item.quantity), |change| change.quantity);
@@ -166,7 +157,7 @@ pub(super) async fn reprocessing(c: &mut Client, call: &Call<'_>) -> CallResult 
                     if !apply(tx, &changes).await.map_err(db_err)? { return Err(notify_error(messages::INSUFFICIENT_ITEM_QUANTITY)); }
                     for (&id, change) in &changes {
                         if change.quantity.is_some() {
-                            inventory::notify_item_change(tx, outbox, id, vec![(IX_STACK_SIZE, Value::Int(change.expected_quantity as i64))]).await?;
+                            inventory::notify_item_change(tx, &sde, outbox, id, vec![(IX_STACK_SIZE, Value::Int(change.expected_quantity as i64))]).await?;
                         } else {
                             let item = plan.0.iter().find(|(item, _)| item.item_id == id).expect("removed item is a source");
                             inventory::notify_item_removed(outbox, item.0.clone());
@@ -174,7 +165,7 @@ pub(super) async fn reprocessing(c: &mut Client, call: &Call<'_>) -> CallResult 
                     }
                     for (type_id, quantity) in inserts {
                         let id = crate::dao::items::transfers::insert(tx, type_id, char_id, out_location, out_flag, quantity).await.map_err(db_err)?;
-                        inventory::notify_item_change(tx, outbox, id, vec![(IX_LOCATION_ID, Value::Int(0)), (IX_FLAG, Value::Int(out_flag as i64))]).await?;
+                        inventory::notify_item_change(tx, &sde, outbox, id, vec![(IX_LOCATION_ID, Value::Int(0)), (IX_FLAG, Value::Int(out_flag as i64))]).await?;
                     }
                     if tax > 0.0 {
                         let balance = crate::dao::wallets::characters::debit(tx, char_id, tax).await.map_err(db_err)?.ok_or_else(|| notify_error(messages::INSUFFICIENT_ISK_FOR_REPROCESSING_TAX))?;

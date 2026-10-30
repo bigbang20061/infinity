@@ -25,8 +25,8 @@ use lifecycle::{accept, complete, create, delete_one, place_bid, settle_expired}
 use lists::{bidding_on, escrow, in_progress, items_in, list_for_owner, login_info, needing_attention, page_info, search, split_stack};
 
 use crate::dao::contracts::{Contract, query::{self, Filter}, shared};
-use crate::dao::items::loading::{load_items, Item, ItemQuery};
-use super::items::{deliver, take_items};
+use crate::dao::items::loading::{Item, ItemQuery};
+use super::items::{deliver, load_items, take_items};
 use super::market::{lock, round2, station};
 use super::wallets::{credit, debit};
 use crate::dao::items::transfers;
@@ -242,11 +242,11 @@ async fn listing(db: &Db, list: &[Contract]) -> CallResult {
 
 
 /// Tell `owner` about items now in their hangar at `station`, if they have it open.
-pub(super) async fn show_items<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, owner: i64, station: i64, ids: &[i64], from: i64) -> Result<(), CallError> {
+pub(super) async fn show_items<X: Send>(db: &(impl Executor + ?Sized), sde: &crate::sde::Sde, outbox: &mut Outbox<X>, owner: i64, station: i64, ids: &[i64], from: i64) -> Result<(), CallError> {
     if transfers::docked(db, owner).await.map_err(db_err)? != Some(station) {
         return Ok(());
     }
-    for item in load_items(db, ItemQuery::Ids(ids)).await.map_err(db_err)? {
+    for item in load_items(db, sde, ItemQuery::Ids(ids)).await.map_err(db_err)? {
         outbox.notify_pilot(owner, "OnItemChange", vec![item.row(), Value::Dict(vec![(Value::Int(IX_LOCATION_ID), Value::Int(from))]), Value::None]);
     }
     Ok(())
@@ -278,10 +278,10 @@ async fn escrowed_ids(db: &(impl Executor + ?Sized), contract_id: i64) -> Result
 }
 
 /// Give the escrowed items (and whatever they hold) to `owner` at `location`/`flag`.
-async fn hand_over<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, contract_id: i64, owner: i64, location: i64, flag: i32) -> Result<(), CallError> {
+async fn hand_over<X: Send>(db: &(impl Executor + ?Sized), sde: &crate::sde::Sde, outbox: &mut Outbox<X>, contract_id: i64, owner: i64, location: i64, flag: i32) -> Result<(), CallError> {
     let ids = escrowed_ids(db, contract_id).await?;
     transfers::hand_over(db, &ids, owner, location, flag).await.map_err(db_err)?;
-    show_items(db, outbox, owner, location, &ids, -contract_id).await
+    show_items(db, sde, outbox, owner, location, &ids, -contract_id).await
 }
 
 /// Lose the escrowed items (a courier package that no longer exists).
@@ -315,10 +315,10 @@ async fn num_outstanding(db: &(impl Executor + ?Sized), char_id: i64) -> Result<
 
 
 /// Settle expired auctions with bids, once a minute.
-pub async fn settle_auctions(db: Db, world: Arc<World>) {
+pub async fn settle_auctions(db: Db, sde: Arc<crate::sde::Sde>, world: Arc<World>) {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(AUCTION_MAINTENANCE_INTERVAL_SECONDS)).await;
-        if let Err(CallError::Internal(e)) = settle_expired(&db, &world).await {
+        if let Err(CallError::Internal(e)) = settle_expired(&db, &sde, &world).await {
             warn!("settling auctions failed: {e:#}");
         }
     }
@@ -346,7 +346,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "CompleteContract" => complete(c, int(0), int(1) as i32).await,
         "DeleteContract" => {
             let _trading = lock().await;
-            delete_one(&c.db, &c.world, me, int(0)).await.map(|_| Value::Bool(true))
+            delete_one(&c.db, &c.sde, &c.world, me, int(0)).await.map(|_| Value::Bool(true))
         }
         // DeleteMultipleContracts([contractID]) -> (deleted, failed)
         "DeleteMultipleContracts" => {
@@ -354,7 +354,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             let _trading = lock().await;
             let (mut deleted, mut failed) = (vec![], vec![]);
             for id in ids {
-                match delete_one(&c.db, &c.world, me, id).await {
+                match delete_one(&c.db, &c.sde, &c.world, me, id).await {
                     Ok(()) => deleted.push(Value::Int(id)),
                     Err(CallError::User { .. }) => failed.push(Value::Int(id)),
                     Err(e) => return Some(Err(e)),
@@ -366,7 +366,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "PlaceBid" => place_bid(c, int(0), call.args.get(1).and_then(|v| v.as_float()).unwrap_or(0.0)).await,
         // FinishAuction(contractID, isIssuer): expired auctions settle on their own; settle now if due.
         "FinishAuction" => {
-            let r = settle_expired(&c.db, &c.world).await;
+            let r = settle_expired(&c.db, &c.sde, &c.world).await;
             r.map(|_| Value::Bool(true))
         }
         "SearchContracts" => search(c, call.kwargs).await,

@@ -36,6 +36,7 @@ async fn offers(db: &Db, corp: i64) -> Result<Vec<(i32, i64, i64)>, CallError> {
 /// station hangar.
 async fn take_offer(c: &Client, corp: i64, offer: i64, count: i64) -> CallResult {
     let (db, world) = (&c.db, &*c.world);
+    let sde = &c.sde;
     let me = c.session.int("charid").unwrap_or(0);
     let Some(station) = c.session.int("stationid") else {
         return Err(notify_error(messages::STATION_DOCK_REQUIRED_FOR_LP_STORE));
@@ -46,15 +47,17 @@ async fn take_offer(c: &Client, corp: i64, offer: i64, count: i64) -> CallResult
     };
     let _trading = crate::services::market::lock().await;
     db.transaction(
-        |tx, outbox| Box::pin(async move {
+        |tx, outbox| {
+            let sde = sde.clone();
+            Box::pin(async move {
             if lp_balance(tx, me, corp).await? < lp * count {
                 return Err(notify_error(messages::INSUFFICIENT_LOYALTY_POINTS));
             }
             crate::services::wallets::debit(tx, outbox, me, (isk * count) as f64).await?;
             add_lp(tx, outbox, me, corp, -lp * count).await?;
-            crate::services::items::deliver(tx, outbox, me, station, type_id, count as i32).await?;
+            crate::services::items::deliver(tx, &sde, outbox, me, station, type_id, count as i32).await?;
             Ok(())
-        }),
+        })},
         |value, outbox| async move { dispatch_world(value, outbox, world) },
     ).await?;
     info!("lp store: {me} bought {count} x {type_id} from {corp} for {} LP and {} ISK", lp * count, isk * count);

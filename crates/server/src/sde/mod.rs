@@ -14,6 +14,7 @@ pub(crate) mod factions;
 pub(crate) mod localization;
 pub(crate) mod map;
 pub(crate) mod types;
+pub(crate) mod wrecks;
 
 use crate::db::Db;
 use std::time::Instant;
@@ -28,16 +29,17 @@ pub(crate) struct Sde {
     pub(crate) npc_corporations: corporations::NpcCorporations,
     #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) localization: localization::Localization,
+    pub(crate) wrecks: wrecks::Wrecks,
 }
 impl Sde {
     pub(crate) async fn load(db: &Db) -> anyhow::Result<Self> {
         let started = Instant::now();
-        let (mut types, dogma, map, factions, npc_corporations, localization) = tokio::try_join!(
+        let (mut types, dogma, map, factions, npc_corporations, localization, wrecks) = tokio::try_join!(
             types::Types::load(db), dogma::Dogma::load(db), map::Map::load(db),
-            factions::Factions::load(db), corporations::NpcCorporations::load(db), localization::Localization::load(db),
+            factions::Factions::load(db), corporations::NpcCorporations::load(db), localization::Localization::load(db), wrecks::Wrecks::load(db),
         )?;
         types.index_modifiers(&dogma);
         tracing::info!(types = types.len(), dogma_attributes = dogma.attribute_count(), dogma_effects = dogma.effect_count(), systems = map.systems().count(), stations = map.stations().count(), celestials = map.all_celestials().count(), factions = factions.len(), npc_corporations = npc_corporations.len(), localization = localization.len(), elapsed_ms = started.elapsed().as_millis(), "SDE loaded");
-        Ok(Self { types, dogma, map, factions, npc_corporations, localization })
+        Ok(Self { types, dogma, map, factions, npc_corporations, localization, wrecks })
     }
 }

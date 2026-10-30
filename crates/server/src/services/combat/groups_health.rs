@@ -315,26 +315,23 @@ pub(super) async fn reward_kill(db: &Db, world: &World, system: i64, npc: &Ball,
         info!("{pilot} earned {bounty:.0} ISK bounty for {} ({tax:.0} corporation tax)", npc.type_id);
         super::super::crimewatch::npc_killed(db, world, pilot).await?;
     }
-    let wreck = db
-        .query_opt(
-            "SELECT COALESCE(w.data->'raceIdToWreckTypeId'->>(COALESCE(t.race_id, 0)::text), w.data->'raceIdToWreckTypeId'->>'0')::int AS type_id,
-                    COALESCE(wt.radius, 100)::float8 AS radius
-             FROM sde.inv_types t JOIN sde_native.wrecks w ON w.key = t.group_id::text
-             LEFT JOIN sde.inv_types wt ON wt.type_id = COALESCE(w.data->'raceIdToWreckTypeId'->>(COALESCE(t.race_id, 0)::text), w.data->'raceIdToWreckTypeId'->>'0')::int
-             WHERE t.type_id = $1",
-            &[&npc.type_id],
-        )
-        .await
-        .map_err(db_err)?;
-    let Some(wreck) = wreck.as_ref().map(WreckRow::from_row) else { return Ok(()) };
-    let Some(wreck_type) = wreck.type_id else { return Ok(()) };
+    let sde = world.sde();
+    let Some(npc_type) = sde.types.get(npc.type_id) else { return Ok(()) };
+    let Some(wreck_type) = npc_type.group_id.and_then(|group| sde.wrecks.get(group, npc_type.race_id.unwrap_or(0))) else { return Ok(()) };
+    let radius = sde.types.get(wreck_type).and_then(|t| t.radius).unwrap_or(100.0);
     let owner = killer.unwrap_or(npc.owner_id);
     let wreck_id = crate::dao::items::creation::positioned(db, wreck_type, owner, system, npc.pos).await.map_err(db_err)?;
     // Loot: one or two modules or ammo stacks that traded on Serenity, worth up to the bounty.
     let picks = 1 + (rand01() * 2.0) as i64;
-    let loot = crate::dao::items::combat::loot(db, bounty, picks, CATEGORY_CHARGE).await.map_err(db_err)?;
-    for r in &loot {
-        let (type_id, category) = (r.type_id, r.category_id);
+    let mut loot: Vec<_> = crate::dao::items::combat::loot(db, bounty).await.map_err(db_err)?.into_iter()
+        .filter_map(|r| sde.types.get(r.type_id).and_then(|t| loot_category(t.published, t.category_id).map(|category| (r.type_id, category))))
+        .collect();
+    for i in 0..(picks as usize).min(loot.len()) {
+        let j = i + (rand01() * (loot.len() - i) as f64) as usize;
+        loot.swap(i, j);
+    }
+    loot.truncate(picks as usize);
+    for &(type_id, category) in &loot {
         let quantity: i32 = if category == CATEGORY_CHARGE { 20 + (rand01() * 100.0) as i32 } else { 1 };
         crate::dao::items::combat::insert_loot(db, type_id, owner, wreck_id, quantity).await.map_err(db_err)?;
     }
@@ -347,7 +344,7 @@ pub(super) async fn reward_kill(db: &Db, world: &World, system: i64, npc: &Ball,
         char_id: None,
         signature_radius: None,
         mode: crate::space::MODE_RIGID,
-        radius: wreck.radius as f32,
+        radius: radius as f32,
         mass: 10_000.0,
         max_vel: 0.0,
         agility: 1.0,
@@ -373,4 +370,14 @@ pub(super) async fn reward_kill(db: &Db, world: &World, system: i64, npc: &Ball,
     debug!("wreck {wreck_id} ({wreck_type}) with {} loot stacks", loot.len());
     Ok(())
 }
+
+/// `sde.inv_categories`: category 7 contains modules.
+const CATEGORY_MODULE: i32 = 7;
+fn loot_category(published: Option<bool>, category: Option<i32>) -> Option<i32> {
+    category.filter(|&id| published == Some(true) && (id == CATEGORY_MODULE || id == CATEGORY_CHARGE))
+}
+
+#[cfg(test)] mod loot_tests;
+
+
 

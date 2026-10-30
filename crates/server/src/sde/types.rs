@@ -9,28 +9,21 @@ use crate::{consts::{ATTR_CAPACITY, ATTR_MASS, ATTR_RADIUS, ATTR_VOLUME}, dao::s
 const EFFECT_SKILL: i32 = 132;
 
 pub(crate) struct TypeData {
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) type_id: i32,
     pub(crate) group_id: Option<i32>, pub(crate) category_id: Option<i32>,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) name: Option<String>,
     pub(crate) mass: Option<f64>, pub(crate) capacity: Option<f64>,
     pub(crate) volume: Option<f64>, pub(crate) radius: Option<f64>,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) portion_size: Option<i32>,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) base_price: Option<f64>,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) published: Option<bool>,
     #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) market_group_id: Option<i32>,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) race_id: Option<i32>,
     #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) icon_id: Option<i32>,
     attributes: Vec<(i32, f64)>, effects: Vec<TypeEffect>,
     modifiers: HashMap<i32, Vec<(usize, usize)>>,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     materials: Vec<TypeMaterial>,
 }
 pub(crate) struct TypeEffect {
@@ -38,13 +31,11 @@ pub(crate) struct TypeEffect {
     #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) is_default: bool
 }
-#[expect(dead_code, reason = "read by Phase 1 of #5")]
 pub(crate) struct TypeMaterial { pub(crate) material_type_id: i32, pub(crate) quantity: Option<i64> }
 pub(crate) struct Group {
     #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) group_id: i32,
     pub(crate) category_id: Option<i32>,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) name: Option<String>
 }
 #[expect(dead_code, reason = "read by Phase 1 of #5")]
@@ -61,7 +52,6 @@ impl TypeData {
     pub(crate) fn modifiers<'a>(&'a self, dogma: &'a super::dogma::Dogma, attr: i32) -> impl Iterator<Item = (&'a super::dogma::Effect, &'a super::dogma::Modifier)> + 'a {
         self.modifiers.get(&attr).into_iter().flatten().map(move |&(effect, modifier)| dogma.indexed_modifier(effect, modifier))
     }
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) fn materials(&self) -> &[TypeMaterial] { &self.materials }
 }
 #[derive(Default)]
@@ -107,7 +97,6 @@ impl Types {
     pub(crate) fn get(&self, id: i32) -> Option<&TypeData> { self.by_id.get(&id).map(|&i| &self.types[i]) }
     pub(crate) fn position(&self, id: i32) -> Option<usize> { self.by_id.get(&id).copied() }
     pub(crate) fn at_position(&self, index: usize) -> &TypeData { &self.types[index] }
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) fn iter(&self) -> impl Iterator<Item = &TypeData> { self.types.iter() }
     pub(crate) fn len(&self) -> usize { self.types.len() }
     pub(crate) fn group(&self, id: i32) -> Option<&Group> { self.groups.get(&id) }
@@ -120,8 +109,6 @@ impl Types {
     fn raw_attributes(&self, id: i32) -> &[(i32, f64)] { self.get(id).map(|t| t.attributes.as_slice()).or_else(|| self.orphans.get(&id).map(|c| c.attributes.as_slice())).unwrap_or(&[]) }
     pub(crate) fn attributes(&self, id: i32) -> impl Iterator<Item = (i32, f64)> + '_ { self.raw_attributes(id).iter().copied() }
     pub(crate) fn attribute(&self, id: i32, attribute: i32) -> Option<f64> { let attrs = self.raw_attributes(id); attrs.binary_search_by_key(&attribute, |a| a.0).ok().map(|i| attrs[i].1) }
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) fn effects(&self, id: i32) -> &[TypeEffect] { self.get(id).map(|t| t.effects()).or_else(|| self.orphans.get(&id).map(|c| c.effects.as_slice())).unwrap_or(&[]) }
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) fn materials(&self, id: i32) -> &[TypeMaterial] { self.get(id).map(|t| t.materials()).or_else(|| self.orphans.get(&id).map(|c| c.materials.as_slice())).unwrap_or(&[]) }
 }

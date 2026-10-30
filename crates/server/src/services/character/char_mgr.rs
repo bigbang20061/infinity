@@ -70,11 +70,11 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         // ...the items at one of them...
         ("charMgr", "ListStationItems") => {
             let station = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
-            crate::dao::items::loading::load_items(&c.db, crate::dao::items::loading::ItemQuery::LocationOwner(station, me)).await.map_err(db_err).map(|items| Value::list(items.iter().map(|i| i.row())))
+            crate::services::items::load_items(&c.db, &c.sde, crate::dao::items::loading::ItemQuery::LocationOwner(station, me)).await.map_err(db_err).map(|items| Value::list(items.iter().map(|i| i.row())))
         }
         // ...and everything the character owns, inside containers and ships too (asset search).
         ("charMgr", "ListIncludingContainers") => {
-            crate::dao::items::loading::load_items(&c.db, crate::dao::items::loading::ItemQuery::OwnerExceptSelf(me)).await.map_err(db_err).map(|items| Value::list(items.iter().map(|i| i.row())))
+            crate::services::items::load_items(&c.db, &c.sde, crate::dao::items::loading::ItemQuery::OwnerExceptSelf(me)).await.map_err(db_err).map(|items| Value::list(items.iter().map(|i| i.row())))
         }
         // The info window's private notes are scoped to this character.
         ("charMgr", "GetNote") => {

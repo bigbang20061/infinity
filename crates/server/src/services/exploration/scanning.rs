@@ -264,7 +264,7 @@ pub(super) async fn recover_probes(c: &mut Client, call: &Call<'_>, destroy: boo
     if !destroy {
         let mut outbox = Outbox::default();
         for (type_id, n) in back {
-            crate::services::items::deposit(&c.db, &mut outbox, char_id, ship, FLAG_CARGO, type_id, n, ship).await?;
+            crate::services::items::deposit(&c.db, &c.sde, &mut outbox, char_id, ship, FLAG_CARGO, type_id, n, ship).await?;
         }
         dispatch_client((), outbox, c)?;
     }

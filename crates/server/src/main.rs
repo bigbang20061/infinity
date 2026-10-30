@@ -129,7 +129,7 @@ async fn main() -> Result<()> {
     let sde = Arc::new(sde::Sde::load(&db).await?);
     let types = sde.types.len();
     info!(target: "infinity_server::db", "database ready ({types} types in SDE)");
-    services::recover_pending_reloads(&db).await.map_err(|error| match error {
+    services::recover_pending_reloads(&db, &sde).await.map_err(|error| match error {
         services::CallError::Internal(e) => e,
         services::CallError::User { msg, .. } => anyhow::anyhow!(msg),
     })?;
@@ -138,8 +138,8 @@ async fn main() -> Result<()> {
     }
     let hub = chat::Hub::new(&cfg.chat_domain);
     let world = space::World::new(db.clone(), sde.clone(), cfg.system_capacity);
-    tokio::spawn(services::expire_market_orders(db.clone(), world.clone()));
-    tokio::spawn(services::settle_auctions(db.clone(), world.clone()));
+    tokio::spawn(services::expire_market_orders(db.clone(), sde.clone(), world.clone()));
+    tokio::spawn(services::settle_auctions(db.clone(), sde.clone(), world.clone()));
     tokio::spawn(services::run_billing(db.clone(), world.clone()));
     let gateway_task = tokio::spawn(log_exit("public gateway", gateway::serve(cfg.gateway_bind.clone(), gateway::Gateway::new(db.clone(), cfg.cdn_url()))));
     let chat_task = tokio::spawn(log_exit("chat", chat::serve(cfg.chat_bind.clone(), hub.clone())));

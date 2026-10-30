@@ -14,14 +14,10 @@ pub(crate) struct Attribute {
 }
 pub(crate) struct Modifier { pub(crate) func: String, pub(crate) domain: String, pub(crate) op: i32, pub(crate) modified: i32, pub(crate) modifying: i32, pub(crate) group: Option<i32>, pub(crate) skill: Option<i32> }
 pub(crate) struct Effect {
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) effect_id: i32,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) name: Option<String>,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) guid: Option<String>,
     pub(crate) effect_category: Option<i32>,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) duration_attribute_id: Option<i32>,
     modifiers: Vec<Modifier>
 }
@@ -52,7 +48,6 @@ impl Dogma {
         Ok(result)
     }
     pub(crate) fn attribute(&self, id: i32) -> Option<&Attribute> { self.attribute_ids.get(&id).map(|&i| &self.attributes[i]) }
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) fn effect(&self, id: i32) -> Option<&Effect> { self.effect_ids.get(&id).map(|&i| &self.effects[i]) }
     pub(super) fn indexed_modifiers(&self, id: i32) -> impl Iterator<Item = (i32, usize, usize)> + '_ {
         self.effect_ids.get(&id).into_iter().flat_map(|&effect| {
@@ -65,7 +60,6 @@ impl Dogma {
     }
     #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) fn attributes_by_name<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a Attribute> { self.attribute_names.get(name).into_iter().flatten().map(|&i| &self.attributes[i]) }
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) fn effects_by_name<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a Effect> { self.effect_names.get(name).into_iter().flatten().map(|&i| &self.effects[i]) }
     pub(crate) fn attribute_count(&self) -> usize { self.attributes.len() }
     pub(crate) fn effect_count(&self) -> usize { self.effects.len() }

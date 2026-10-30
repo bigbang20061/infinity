@@ -12,7 +12,8 @@
 //! game.market_transactions (wallet transactions and price history). Ranges in jumps are
 //! counted on the stargate graph (sde.map_jumps) within the region.
 
-use crate::dao::items::loading::{load_items, ItemQuery};
+use crate::dao::items::loading::ItemQuery;
+use super::items::load_items;
 use crate::dao::market::trading;
 use crate::dao::market::orders::{self, Order, Station};
 use crate::dao::market::listings::{self, Area};
@@ -259,12 +260,12 @@ async fn close(db: &(impl Executor + ?Sized), o: &Order, state: i32, now: i64) -
 }
 
 /// Give a closed order's escrow back: a sell order's items, a buy order's ISK.
-async fn refund<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, o: &Order) -> Result<(), CallError> {
+async fn refund<X: Send>(db: &(impl Executor + ?Sized), sde: &crate::sde::Sde, outbox: &mut Outbox<X>, o: &Order) -> Result<(), CallError> {
     let Some(owner) = o.char_id else { return Ok(()) };
     if o.bid {
         credit(db, outbox, owner, round2(o.escrow)).await
     } else if o.vol_remaining > 0 {
-        deliver(db, outbox, owner, o.at.id, o.type_id, o.vol_remaining).await
+        deliver(db, sde, outbox, owner, o.at.id, o.type_id, o.vol_remaining).await
     } else {
         Ok(())
     }
@@ -317,7 +318,7 @@ async fn consume<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>,
 
 /// Sell up to `quantity` x `type_id` at `at` to the best bids paying at least `floor`.
 /// Returns how many sold.
-async fn hit_bids(db: &(impl Executor + ?Sized), outbox: &mut Outbox<MarketEffect>, g: &HashMap<i64, Vec<i64>>, seller: i64, at: &Station, type_id: i32, floor: f64, quantity: i32, now: i64) -> Result<i32, CallError> {
+async fn hit_bids(db: &(impl Executor + ?Sized), sde: &crate::sde::Sde, outbox: &mut Outbox<MarketEffect>, g: &HashMap<i64, Vec<i64>>, seller: i64, at: &Station, type_id: i32, floor: f64, quantity: i32, now: i64) -> Result<i32, CallError> {
     let rows = orders::bids(db, now / FILETIME_DAY * FILETIME_DAY, type_id, at.region, floor).await.map_err(db_err)?;
     let tax = skills(db, seller).await?.sales_tax;
     let mut left = quantity;
@@ -336,7 +337,7 @@ async fn hit_bids(db: &(impl Executor + ?Sized), outbox: &mut Outbox<MarketEffec
         let value = round2(bid.price * q as f64);
         credit(db, outbox, seller, round2(value * (1.0 - tax))).await?;
         if let Some(buyer) = bid.char_id {
-            deliver(db, outbox, buyer, at.id, type_id, q).await?;
+            deliver(db, sde, outbox, buyer, at.id, type_id, q).await?;
         }
         record(db, type_id, q, bid.price, bid.char_id.unwrap_or(bid.at.owner), seller, at, now).await?;
         consume(db, outbox, &mut bid, q, now).await?;
@@ -350,7 +351,7 @@ async fn hit_bids(db: &(impl Executor + ?Sized), outbox: &mut Outbox<MarketEffec
 /// than `cap`, paying from the wallet unless an order's escrow covers it.
 /// Returns (bought, spent).
 #[allow(clippy::too_many_arguments)]
-async fn lift_asks(db: &(impl Executor + ?Sized), outbox: &mut Outbox<MarketEffect>, g: &HashMap<i64, Vec<i64>>, buyer: i64, at: &Station, range: i64, type_id: i32, cap: f64, quantity: i32, from_wallet: bool, now: i64) -> Result<(i32, f64), CallError> {
+async fn lift_asks(db: &(impl Executor + ?Sized), sde: &crate::sde::Sde, outbox: &mut Outbox<MarketEffect>, g: &HashMap<i64, Vec<i64>>, buyer: i64, at: &Station, range: i64, type_id: i32, cap: f64, quantity: i32, from_wallet: bool, now: i64) -> Result<(i32, f64), CallError> {
     let rows = orders::asks(db, now / FILETIME_DAY * FILETIME_DAY, type_id, at.region, cap).await.map_err(db_err)?;
     let (mut left, mut spent) = (quantity, 0.0);
     for mut ask in rows {
@@ -374,7 +375,7 @@ async fn lift_asks(db: &(impl Executor + ?Sized), outbox: &mut Outbox<MarketEffe
             let tax = skills(db, seller).await?.sales_tax;
             credit(db, outbox, seller, round2(value * (1.0 - tax))).await?;
         }
-        deliver(db, outbox, buyer, ask.at.id, type_id, q).await?;
+        deliver(db, sde, outbox, buyer, ask.at.id, type_id, q).await?;
         record(db, type_id, q, ask.price, buyer, ask.char_id.unwrap_or(ask.at.owner), &ask.at, now).await?;
         consume(db, outbox, &mut ask, q, now).await?;
         outbox.operation(MarketEffect::Bought { buyer, quantity: q, type_id, station: ask.at.id, value, order: ask.id });
@@ -389,6 +390,7 @@ async fn lift_asks(db: &(impl Executor + ?Sized), outbox: &mut Outbox<MarketEffe
 #[allow(clippy::too_many_arguments)]
 async fn place_buy(c: &Client, station_id: i64, type_id: i64, price: f64, quantity: i64, range: i64, min_volume: i64, duration: i64) -> CallResult {
     let (db, world) = (&c.db, &*c.world);
+    let sde = &c.sde;
     let me = c.session.int("charid").unwrap_or(0);
     let price = valid_price(price)?;
     if quantity <= 0 || quantity > i32::MAX as i64 || !(0..=MAX_DURATION).contains(&duration) {
@@ -400,14 +402,15 @@ async fn place_buy(c: &Client, station_id: i64, type_id: i64, price: f64, quanti
     let at = station(db, station_id).await?;
     let g = graph(db).await?;
     let now = filetime_now();
-    db.transaction(|db, outbox: &mut Outbox<MarketEffect>| Box::pin(async move {
+    db.transaction(|db, outbox: &mut Outbox<MarketEffect>| { let sde = sde.clone(); Box::pin(async move {
+    let sde = &*sde;
     let skills = skills(db, me).await?;
     if duration > 0 {
         check_order_slots(db, me, &skills).await?;
         let escrow = round2(price * quantity as f64);
         require_balance(db, me, escrow + broker_fee(skills.broker_fee, escrow)).await?;
     }
-    let (bought, _) = lift_asks(db, outbox, g, me, &at, range, type_id, price, quantity, true, now).await?;
+    let (bought, _) = lift_asks(db, sde, outbox, g, me, &at, range, type_id, price, quantity, true, now).await?;
     let mut order = Order {
         id: 0,
         type_id,
@@ -438,13 +441,14 @@ async fn place_buy(c: &Client, station_id: i64, type_id: i64, price: f64, quanti
     outbox.operation(MarketEffect::Placed { buyer: true, owner: me, order: order.id, quantity: order.vol_remaining, type_id, price });
     tell_owner(outbox, &order, "Add");
     Ok(order_keyval(&order))
-    }), |value, outbox| async move { dispatch_market(value, outbox, world) }).await
+    })}, |value, outbox| async move { dispatch_market(value, outbox, world) }).await
 }
 
 /// One item of `PlaceMultiSellOrder`: sell to the bids now, and with a duration list the
 /// rest as a sell order. Returns whether anything sold or was listed.
 async fn place_sell(c: &Client, item_id: i64, station_id: i64, type_id: i64, price: f64, quantity: i64, duration: i64) -> Result<bool, CallError> {
     let (db, world) = (&c.db, &*c.world);
+    let sde = &c.sde;
     let me = c.session.int("charid").unwrap_or(0);
     let price = valid_price(price)?;
     if quantity <= 0 || !(0..=MAX_DURATION).contains(&duration) {
@@ -453,8 +457,9 @@ async fn place_sell(c: &Client, item_id: i64, station_id: i64, type_id: i64, pri
     let _trading = lock().await;
     let g = graph(db).await?;
     let now = filetime_now();
-    db.transaction(|db, outbox: &mut Outbox<MarketEffect>| Box::pin(async move {
-    let item = load_items(db, ItemQuery::Id(item_id)).await.map_err(db_err)?.pop().ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
+    db.transaction(|db, outbox: &mut Outbox<MarketEffect>| { let sde = sde.clone(); Box::pin(async move {
+    let sde = &*sde;
+    let item = load_items(db, sde, ItemQuery::Id(item_id)).await.map_err(db_err)?.pop().ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
     if item.owner_id != me || item.location_id != station_id || item.flag_id != FLAG_HANGAR || item.type_id as i64 != type_id {
         return Err(notify_error(messages::MARKET_SELL_ITEM_MUST_BE_IN_STATION_HANGAR));
     }
@@ -465,7 +470,7 @@ async fn place_sell(c: &Client, item_id: i64, station_id: i64, type_id: i64, pri
     let at = station(db, station_id).await?;
     let skills = skills(db, me).await?;
     if duration == 0 {
-        let sold = hit_bids(db, outbox, g, me, &at, type_id, price, quantity, now).await?;
+        let sold = hit_bids(db, sde, outbox, g, me, &at, type_id, price, quantity, now).await?;
         if sold == 0 {
             return Err(user_error(messages::MSG_MKT_ORDER_DID_NOT_MATCH, vec![]));
         }
@@ -492,7 +497,7 @@ async fn place_sell(c: &Client, item_id: i64, station_id: i64, type_id: i64, pri
     require_balance(db, me, broker_fee(skills.broker_fee, price * quantity as f64)).await?;
     // The items go into escrow first; what the bids don't take stays listed.
     take_items(db, outbox, item, quantity).await?;
-    let sold = hit_bids(db, outbox, g, me, &at, type_id, price, quantity, now).await?;
+    let sold = hit_bids(db, sde, outbox, g, me, &at, type_id, price, quantity, now).await?;
     let mut order = Order {
         id: 0,
         type_id,
@@ -516,19 +521,21 @@ async fn place_sell(c: &Client, item_id: i64, station_id: i64, type_id: i64, pri
     outbox.operation(MarketEffect::Placed { buyer: false, owner: me, order: order.id, quantity: order.vol_remaining, type_id, price });
     tell_owner(outbox, &order, "Add");
     Ok(true)
-    }), |value, outbox| async move { dispatch_market(value, outbox, world) }).await
+    })}, |value, outbox| async move { dispatch_market(value, outbox, world) }).await
 }
 
 /// `ModifyCharOrder`: reprice an open order, paying the modification fee (and topping up or
 /// releasing a buy order's escrow). A price that crosses the book trades at once.
 async fn modify(c: &Client, order_id: i64, new_price: f64) -> CallResult {
     let (db, world) = (&c.db, &*c.world);
+    let sde = &c.sde;
     let me = c.session.int("charid").unwrap_or(0);
     let new_price = valid_price(new_price)?;
     let _trading = lock().await;
     let g = graph(db).await?;
     let now = filetime_now();
-    db.transaction(|db, outbox: &mut Outbox<MarketEffect>| Box::pin(async move {
+    db.transaction(|db, outbox: &mut Outbox<MarketEffect>| { let sde = sde.clone(); Box::pin(async move {
+    let sde = &*sde;
     let mut o = my_order(db, me, order_id, now / FILETIME_DAY * FILETIME_DAY).await?;
     let skills = skills(db, me).await?;
     let volume = o.vol_remaining as f64;
@@ -546,12 +553,12 @@ async fn modify(c: &Client, order_id: i64, new_price: f64) -> CallResult {
     trading::reprice(db, o.id, o.price, o.escrow, o.issued).await.map_err(db_err)?;
     outbox.operation(MarketEffect::Repriced { owner: me, order: o.id, price: new_price });
     let traded = if o.bid {
-        let (bought, spent) = lift_asks(db, outbox, g, me, &o.at, o.range, o.type_id, o.price, o.vol_remaining, false, now).await?;
+        let (bought, spent) = lift_asks(db, sde, outbox, g, me, &o.at, o.range, o.type_id, o.price, o.vol_remaining, false, now).await?;
         // The escrow paid this order's price; cheaper asks leave change.
         credit(db, outbox, me, round2(o.price * bought as f64 - spent)).await?;
         bought
     } else {
-        hit_bids(db, outbox, g, me, &o.at, o.type_id, o.price, o.vol_remaining, now).await?
+        hit_bids(db, sde, outbox, g, me, &o.at, o.type_id, o.price, o.vol_remaining, now).await?
     };
     if traded > 0 {
         consume(db, outbox, &mut o, traded, now).await?;
@@ -559,48 +566,51 @@ async fn modify(c: &Client, order_id: i64, new_price: f64) -> CallResult {
         tell_owner(outbox, &o, "Modify");
     }
     Ok(Value::None)
-    }), |value, outbox| async move { dispatch_market(value, outbox, world) }).await
+    })}, |value, outbox| async move { dispatch_market(value, outbox, world) }).await
 }
 
 /// `CancelCharOrder`: close an open order and hand back its escrow (the broker's fee stays paid).
 async fn cancel(c: &Client, order_id: i64) -> CallResult {
     let (db, world) = (&c.db, &*c.world);
+    let sde = &c.sde;
     let me = c.session.int("charid").unwrap_or(0);
     let _trading = lock().await;
     let now = filetime_now();
-    db.transaction(|db, outbox: &mut Outbox<MarketEffect>| Box::pin(async move {
+    db.transaction(|db, outbox: &mut Outbox<MarketEffect>| { let sde = sde.clone(); Box::pin(async move {
+        let sde = &*sde;
         let o = my_order(db, me, order_id, now / FILETIME_DAY * FILETIME_DAY).await?;
         close(db, &o, STATE_CANCELLED, now).await?;
-        refund(db, outbox, &o).await?;
+        refund(db, sde, outbox, &o).await?;
         outbox.operation(MarketEffect::Cancelled { owner: me, order: o.id });
         tell_owner(outbox, &o, "Cancel");
         Ok(Value::None)
-    }), |value, outbox| async move { dispatch_market(value, outbox, world) }).await
+    })}, |value, outbox| async move { dispatch_market(value, outbox, world) }).await
 }
 
 /// Close players' orders past their duration, once a minute.
-pub async fn expire_orders(db: Db, world: Arc<World>) {
+pub async fn expire_orders(db: Db, sde: Arc<crate::sde::Sde>, world: Arc<World>) {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(ORDER_MAINTENANCE_INTERVAL_SECONDS)).await;
-        if let Err(CallError::Internal(e)) = expire(&db, &world).await {
+        if let Err(CallError::Internal(e)) = expire(&db, &sde, &world).await {
             warn!("expiring market orders failed: {e:#}");
         }
     }
 }
 
-async fn expire(db: &Db, world: &World) -> Result<(), CallError> {
+async fn expire(db: &Db, sde: &Arc<crate::sde::Sde>, world: &World) -> Result<(), CallError> {
     let _trading = lock().await;
     let now = filetime_now();
-    db.transaction(|db, outbox: &mut Outbox<MarketEffect>| Box::pin(async move {
+    db.transaction(|db, outbox: &mut Outbox<MarketEffect>| { let sde = sde.clone(); Box::pin(async move {
+        let sde = &*sde;
         let rows = orders::expired(db, now / FILETIME_DAY * FILETIME_DAY, FILETIME_DAY, now).await.map_err(db_err)?;
         for o in rows {
             close(db, &o, STATE_CLOSED, now).await?;
-            refund(db, outbox, &o).await?;
+            refund(db, sde, outbox, &o).await?;
             outbox.operation(MarketEffect::Expired { owner: o.char_id, order: o.id });
             tell_owner(outbox, &o, "Expiry");
         }
         Ok(())
-    }), |value, outbox| async move { dispatch_market(value, outbox, world) }).await?;
+    })}, |value, outbox| async move { dispatch_market(value, outbox, world) }).await?;
     Ok(())
 }
 

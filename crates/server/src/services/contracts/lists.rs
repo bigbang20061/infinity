@@ -130,9 +130,9 @@ pub(super) async fn escrow(c: &Client) -> CallResult {
 pub(super) async fn items_in(c: &Client, location: i64, hangar_only: bool) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
     let items = if hangar_only {
-        load_items(&c.db, ItemQuery::OwnerLocationFlag(me, location, FLAG_HANGAR)).await.map_err(db_err)?
+        load_items(&c.db, &c.sde, ItemQuery::OwnerLocationFlag(me, location, FLAG_HANGAR)).await.map_err(db_err)?
     } else {
-        load_items(&c.db, ItemQuery::OwnerLocation(me, location)).await.map_err(db_err)?
+        load_items(&c.db, &c.sde, ItemQuery::OwnerLocation(me, location)).await.map_err(db_err)?
     };
     Ok(Value::list(items.iter().map(Item::row)))
 }
@@ -140,11 +140,15 @@ pub(super) async fn items_in(c: &Client, location: i64, hangar_only: bool) -> Ca
 /// `SplitStack(stationID, itemID, quantity, forCorp, flag)` -> the new stack's itemID.
 pub(super) async fn split_stack(c: &Client, station_id: i64, item_id: i64, quantity: i64) -> CallResult {
     let (db, world) = (&c.db, &*c.world);
+    let sde = &c.sde;
     let me = c.session.int("charid").unwrap_or(0);
     let _trading = lock().await;
     db.transaction(
-        |db, outbox: &mut Outbox| Box::pin(async move {
-            let item = load_items(db, ItemQuery::Id(item_id)).await.map_err(db_err)?.pop().ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
+        |db, outbox: &mut Outbox| {
+            let sde = sde.clone();
+            Box::pin(async move {
+            let sde = &*sde;
+            let item = load_items(db, sde, ItemQuery::Id(item_id)).await.map_err(db_err)?.pop().ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
             if item.owner_id != me || item.location_id != station_id || item.singleton || quantity < 1 || quantity >= item.quantity as i64 {
                 return Err(notify_error(messages::STACK_CANNOT_BE_SPLIT));
             }
@@ -153,9 +157,9 @@ pub(super) async fn split_stack(c: &Client, station_id: i64, item_id: i64, quant
             let old_quantity = item.quantity;
             let left = Item { quantity: old_quantity - quantity, ..item };
             outbox.notify_pilot(me, "OnItemChange", vec![left.row(), Value::Dict(vec![(Value::Int(IX_STACK_SIZE), Value::Int(old_quantity as i64))]), Value::None]);
-            show_items(db, outbox, me, station_id, &[id], LOCATION_JUNKYARD).await?;
+            show_items(db, sde, outbox, me, station_id, &[id], LOCATION_JUNKYARD).await?;
             Ok(Value::Int(id))
-        }),
+        })},
         |value, outbox| async move { dispatch_world(value, outbox, world) },
     ).await
 }

@@ -83,6 +83,8 @@ pub const ATTR_VOLUME: i32 = 161;
 pub const ATTR_RADIUS: i32 = 162;
 /// SDE dgmAttributeTypes: maxVelocity (also used for missiles).
 pub const ATTR_MAX_VELOCITY: i32 = 37;
+/// SDE dgmAttributeTypes: agility.
+pub const ATTR_AGILITY: i32 = 70;
 /// SDE dgmAttributeTypes: signatureRadius.
 pub const ATTR_SIGNATURE_RADIUS: i32 = 552;
 /// SDE dgmAttributeTypes: maxRange.

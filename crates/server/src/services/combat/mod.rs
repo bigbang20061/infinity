@@ -17,7 +17,8 @@
 //! and repair themselves; a pilot's ship can be destroyed. Active modules apply their effects
 //! (hardeners through fit, propulsion speed via destiny, repairers each cycle), and a kill
 //! pays the NPC's bounty and leaves a wreck with loot.
-//! Raw NPC, charge, and target attributes come from the shared immutable SDE.
+//! NPC effects, charge dimensions and wreck mappings come from immutable SDE datasets;
+//! loot prices come from `game.retail_prices` and static eligibility is applied before sampling.
 //! Target locks, reloads, module cycles, pulses and missile impacts use system
 //! actor timers. Database-backed effects run on deferred workers outside the actor.
 //! Reload reservations survive interruptions and return to cargo during startup; reload
@@ -35,7 +36,8 @@
 //! eve/common/script/util/inventoryFlagsCommon.py:9-15,53-60,217-226 describes cargo,
 //! fleet and ammo holds. Remote, foreign and recursively nested containers are unsupported.
 
-use crate::dao::items::loading::{load_items, Item, ItemQuery};
+use crate::dao::items::loading::{Item, ItemQuery};
+use super::items::load_items;
 use super::inventory::{notify_item_change, notify_item_removed};
 use crate::dao::items::quantities::{self, QuantityChange};
 use super::fit::{Fit, Key};
@@ -228,16 +230,6 @@ fn ctx(c: &Client) -> Option<Ctx> {
         system_id: c.session.int("solarsystemid")?,
     })
 }
-struct ScalarRow { value: f64 }
-impl ScalarRow { fn from_row(row: &tokio_postgres::Row) -> Self { Self { value: row.get("value") } } }
-struct WreckRow { type_id: Option<i32>, radius: f64 }
-impl WreckRow { fn from_row(row: &tokio_postgres::Row) -> Self { Self { type_id: row.get("type_id"), radius: row.get("radius") } } }
-struct SizeRow { radius: f64, mass: f64 }
-impl SizeRow { fn from_row(row: &tokio_postgres::Row) -> Self { Self { radius: row.get("radius"), mass: row.get("mass") } } }
-struct EffectRow { effect_id: i32, guid: Option<String>, duration_attribute_id: Option<i32> }
-impl EffectRow { fn from_row(row: &tokio_postgres::Row) -> Self { Self { effect_id: row.get("effect_id"), guid: row.get("guid"), duration_attribute_id: row.get("duration_attribute_id") } } }
-struct GuidRow { guid: String }
-impl GuidRow { fn from_row(row: &tokio_postgres::Row) -> Self { Self { guid: row.get("guid") } } }
 
 
 fn attr(sde: &Sde, type_id: i32, id: i32, default: f64) -> f64 {
@@ -442,3 +434,4 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
 }
 
 #[cfg(test)] mod tests;
+

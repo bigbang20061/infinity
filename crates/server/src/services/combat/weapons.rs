@@ -232,11 +232,8 @@ pub(super) struct Missile {
 /// Launch a missile ball from `from` at `target`: it flies client-side; on impact it
 /// explodes and deals damage scaled by explosion radius vs. the target's signature.
 pub(super) async fn launch_missile(db: Db, world: Arc<World>, system: i64, from: Ball, target: Ball, owner: i64, module: Option<i64>, m: Missile) -> Result<(), CallError> {
-    let size = db
-        .query_one("SELECT COALESCE(radius, 1)::float8 AS radius, COALESCE(mass, 1)::float8 AS mass FROM sde.inv_types WHERE type_id = $1", &[&m.charge])
-        .await
-        .map_err(db_err)?;
-    let size = SizeRow::from_row(&size);
+    let size = world.sde().types.get(m.charge)
+        .ok_or_else(|| CallError::Internal(anyhow::anyhow!("unknown type {}", m.charge)))?;
     let mut slim = vec![("sourceShipID", Value::Int(from.id))];
     slim.push(("launchModules", Value::list(module.map(Value::Int))));
     let missile = Ball {
@@ -248,8 +245,8 @@ pub(super) async fn launch_missile(db: Db, world: Arc<World>, system: i64, from:
         char_id: None,
         signature_radius: None,
         mode: MODE_MISSILE,
-        radius: size.radius as f32,
-        mass: size.mass,
+        radius: size.radius.unwrap_or(1.0) as f32,
+        mass: size.mass.unwrap_or(1.0),
         max_vel: m.velocity as f32,
         agility: 1.0,
         speed_fraction: 1.0,
@@ -542,28 +539,26 @@ pub(super) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
     let target = call.args.get(2).and_then(|v| v.as_int());
     let repeat = call.args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
     let Some(cx) = ctx(c) else { return Ok(Value::None) };
-    let Some(module) = load_items(&c.db, ItemQuery::IdAt(item_id, cx.ship_id)).await.map_err(db_err)?.into_iter().next() else {
+    let Some(module) = load_items(&c.db, &c.sde, ItemQuery::IdAt(item_id, cx.ship_id)).await.map_err(db_err)?.into_iter().next() else {
         return Ok(Value::None);
     };
-    let row = cx
-        .db
-        .query_opt("SELECT effect_id, guid, duration_attribute_id FROM sde.dogma_effects WHERE name = $1", &[&effect_name])
-        .await
-        .map_err(db_err)?
-        .ok_or_else(|| CallError::Internal(anyhow::anyhow!("unknown effect {effect_name}")))?;
-    let row = EffectRow::from_row(&row);
-    let effect = Effect {
-        id: row.effect_id as i64,
-        guid: row.guid.filter(|g| !g.is_empty()),
-        duration_attribute: row.duration_attribute_id,
-        weapon: weapon_kind(&effect_name),
-        repair: repair_kind(&effect_name),
-        propulsion: matches!(row.effect_id, EFFECT_AFTERBURNER | EFFECT_MICROWARPDRIVE),
-        mining: match effect_name.as_str() {
-            "miningLaser" => Some("effects.Mining"),
-            "miningClouds" => Some("effects.CloudMining"),
-            _ => None,
-        },
+    let effect = {
+        let mut matches = cx.world.sde().dogma.effects_by_name(&effect_name);
+        let row = matches.next().ok_or_else(|| CallError::Internal(anyhow::anyhow!("unknown effect {effect_name}")))?;
+        if matches.next().is_some() { return Err(CallError::Internal(anyhow::anyhow!("multiple effects named {effect_name}"))); }
+        Effect {
+            id: row.effect_id as i64,
+            guid: row.guid.clone().filter(|g| !g.is_empty()),
+            duration_attribute: row.duration_attribute_id,
+            weapon: weapon_kind(&effect_name),
+            repair: repair_kind(&effect_name),
+            propulsion: matches!(row.effect_id, EFFECT_AFTERBURNER | EFFECT_MICROWARPDRIVE),
+            mining: match effect_name.as_str() {
+                "miningLaser" => Some("effects.Mining"),
+                "miningClouds" => Some("effects.CloudMining"),
+                _ => None,
+            },
+        }
     };
     if state().reloading.get(&item_id).is_some_and(|until| *until > filetime_now()) {
         return Err(user_error(messages::MSG_CANT_ACTIVATE_RELOADING_MODULE, vec![("moduleTypeID".into(), Value::tuple([Value::Int(UE_TYPEID), Value::Int(module.type_id as i64)]))]));
@@ -618,7 +613,7 @@ pub(super) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
     let mut modules = vec![Module { id: item_id, type_id: module.type_id, flag: module.flag_id }];
     if effect.weapon.is_some() {
         for slave in bank(&cx.db, cx.ship_id, item_id).await?.into_iter().skip(1) {
-            if let Some(m) = load_items(&c.db, ItemQuery::IdAt(slave, cx.ship_id)).await.map_err(db_err)?.into_iter().next() {
+            if let Some(m) = load_items(&c.db, &c.sde, ItemQuery::IdAt(slave, cx.ship_id)).await.map_err(db_err)?.into_iter().next() {
                 modules.push(Module { id: m.item_id, type_id: m.type_id, flag: m.flag_id });
             }
         }
@@ -674,4 +669,5 @@ pub(super) fn deactivate(call: &Call<'_>) -> CallResult {
     }
     Ok(Value::None)
 }
+
 

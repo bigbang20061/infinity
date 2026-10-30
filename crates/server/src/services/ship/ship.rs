@@ -5,15 +5,12 @@ async fn undock(c: &mut Client) -> CallResult {
     let (Some(station), Some(system), Some(ship)) = (c.session.int("stationid"), c.session.int("solarsystemid2"), c.session.int("shipid")) else {
         return Err(CallError::User { msg: messages::MSG_CANT_UNDOCK_NOT_IN_STATION.into(), dict: vec![] });
     };
-    let st = CelestialRow::from_row(&c.db
-        .query_one("SELECT x, y, z, COALESCE(radius, 5000)::float8 AS radius FROM sde.map_celestials WHERE item_id = $1", &[&station])
-        .await
-        .map_err(db_err)?);
-    let spos: [f64; 3] = [st.x, st.y, st.z];
+    let st = required(c.sde.map.celestial(station), "station celestial")?;
+    let spos: [f64; 3] = [required(st.x, "station x")?, required(st.y, "station y")?, required(st.z, "station z")?];
     // Leave along a fixed per-station heading.
     let a = (station % 360) as f64 * std::f64::consts::PI / 180.0;
     let dir = [a.cos(), 0.0, a.sin()];
-    let dist = st.radius + 2500.0;
+    let dist = st.radius.unwrap_or(DEFAULT_CELESTIAL_RADIUS) + 2500.0;
     let pos = [spos[0] + dir[0] * dist, spos[1], spos[2] + dir[2] * dist];
     let mut ball = ship_ball(c, ship, pos).await?;
     ball.vel = [dir[0] * ball.max_vel as f64, 0.0, dir[2] * ball.max_vel as f64];

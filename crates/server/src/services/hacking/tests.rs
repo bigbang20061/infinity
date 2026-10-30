@@ -27,3 +27,15 @@ fn boards_connect_entry_to_core() {
         assert!(neighbours(start).iter().any(|n| g.flippable(*n)));
     }
 }
+
+#[test]
+fn analyzer_skill_matches_postgres_integer_cast() {
+    assert_eq!(analyzer_skill(2.5).ok(), Some(2));
+    assert_eq!(analyzer_skill(3.5).ok(), Some(4));
+    assert_eq!(analyzer_skill(-2.5).ok(), Some(-2));
+    assert_eq!(analyzer_skill(i32::MIN as f64).ok(), Some(i32::MIN));
+    assert_eq!(analyzer_skill(i32::MAX as f64).ok(), Some(i32::MAX));
+    for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, i32::MIN as f64 - 1.0, i32::MAX as f64 + 1.0] {
+        assert!(matches!(analyzer_skill(value), Err(CallError::Internal(_))));
+    }
+}

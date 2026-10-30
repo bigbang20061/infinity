@@ -17,6 +17,7 @@
 //! criminal flags are in memory and do not survive a server restart.
 //! Killmail records, kill-report notifications and security penalties commit together;
 //! damage contributions remain in memory until that transaction commits.
+//! System security comes from the startup SDE map; character security is persisted in game data.
 mod corp_registry;
 mod crimewatch;
 mod war_statistic_mgr;
@@ -133,13 +134,8 @@ pub async fn security_status(db: &(impl Executor + ?Sized), char_id: i64) -> Res
     Ok(crate::dao::characters::crimewatch::security(db, char_id).await.map_err(db_err)?.unwrap_or(0.0))
 }
 
-async fn system_security(db: &Db, system: i64) -> Result<f64, CallError> {
-    Ok(db
-        .query_opt("SELECT COALESCE(security, 0)::float8 AS security FROM sde.map_solar_systems WHERE solar_system_id = $1::bigint", &[&system])
-        .await
-        .map_err(db_err)?
-        .map(|r| r.get("security"))
-        .unwrap_or(0.0))
+fn system_security(world: &World, system: i64) -> f64 {
+    world.sde().map.system(system).and_then(|s| s.security).unwrap_or(0.0)
 }
 
 /// Move a pilot's security status `fraction` of the way to `toward` (+10 or -10).
@@ -185,7 +181,7 @@ pub async fn aggress(db: &Db, world: &Arc<World>, system: i64, attacker: i64, at
         return Ok(());
     }
     let now = filetime_now();
-    let system_sec = system_security(db, system).await?;
+    let system_sec = system_security(world, system);
     let victim_sec = security_status(db, victim).await?;
     let legal = system_sec <= 0.0
         || is_criminal(victim, now)

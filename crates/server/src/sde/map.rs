@@ -11,13 +11,10 @@ pub(crate) struct SolarSystem {
     pub solar_system_id: i64,
     #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub name: Option<String>,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub constellation_id: Option<i64>,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub region_id: Option<i64>,
     #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub faction_id: Option<i64>,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub security: Option<f64>,
     #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub x: Option<f64>,
@@ -40,14 +37,12 @@ pub(crate) struct Constellation {
 }
 pub(crate) struct Stargate {
     pub stargate_id: i64,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub solar_system_id: Option<i64>,
     pub dest_stargate_id: Option<i64>,
     pub dest_solar_system_id: Option<i64>,
 }
 pub(crate) struct Station {
     pub station_id: i64,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub type_id: Option<i64>,
     pub owner_id: Option<i64>,
     pub solar_system_id: Option<i64>,
@@ -86,7 +81,6 @@ pub(crate) struct Map {
     stargates: Vec<Stargate>,
     stations: Vec<Station>,
     celestials: Vec<Celestial>,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     system_index: HashMap<i64, usize>,
     #[expect(dead_code, reason = "read by Phase 1 of #5")]
     region_index: HashMap<i64, usize>,
@@ -94,7 +88,6 @@ pub(crate) struct Map {
     constellation_index: HashMap<i64, usize>,
     stargate_index: HashMap<i64, usize>,
     station_index: HashMap<i64, usize>,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     celestial_index: HashMap<i64, usize>,
     system_celestials: HashMap<i64, Vec<usize>>,
     #[expect(dead_code, reason = "read by Phase 1 of #5")]
@@ -132,7 +125,6 @@ impl Map {
         for destinations in adjacency.values_mut() { destinations.sort_unstable(); destinations.dedup(); }
         Ok(Self { systems, regions, constellations, stargates, stations, celestials, system_index, region_index, constellation_index, stargate_index, station_index, celestial_index, system_celestials, system_stations, owner_stations, jumps: adjacency })
     }
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) fn system(&self, id: i64) -> Option<&SolarSystem> { self.system_index.get(&id).map(|&i| &self.systems[i]) }
     #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) fn region(&self, id: i64) -> Option<&Region> { self.region_index.get(&id).map(|&i| &self.regions[i]) }
@@ -140,7 +132,6 @@ impl Map {
     pub(crate) fn constellation(&self, id: i64) -> Option<&Constellation> { self.constellation_index.get(&id).map(|&i| &self.constellations[i]) }
     pub(crate) fn stargate(&self, id: i64) -> Option<&Stargate> { self.stargate_index.get(&id).map(|&i| &self.stargates[i]) }
     pub(crate) fn station(&self, id: i64) -> Option<&Station> { self.station_index.get(&id).map(|&i| &self.stations[i]) }
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) fn celestial(&self, id: i64) -> Option<&Celestial> { self.celestial_index.get(&id).map(|&i| &self.celestials[i]) }
     pub(crate) fn systems(&self) -> impl Iterator<Item = &SolarSystem> { self.systems.iter() }
     pub(crate) fn stations(&self) -> impl Iterator<Item = &Station> { self.stations.iter() }
