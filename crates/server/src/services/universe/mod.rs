@@ -1,7 +1,7 @@
 //! Map, corporation and wallet-side services the neocom windows load from
 //! (eve/client/script/ui/shared/maps, mapView, neocom/corporation, wallet).
-//! Corporation rows come from `sde.crp_npc_corporations` or `game.corporations`;
-//! character corporation lookup uses `game.characters` and `sde.npc_characters`.
+//! Corporation rows come from the startup SDE dataset or `game.corporations`;
+//! character corporation lookup uses `game.characters` and the startup NPC dataset.
 //! Public corporation rows include `allowWar` (false for NPC corporations).
 //! NPC corporation trading is not modelled: `GetCorpInfo` returns an empty list.
 //! Many map, wallet and war queries likewise return empty fallback data.
@@ -80,17 +80,17 @@ const CORP_HEADER: &[&str] = &[
 
 /// A corporation row: NPC corporations from the SDE, player corporations from game.corporations.
 async fn corporation(c: &Client, corp_id: i64) -> Result<Value, CallError> {
-    let r = crate::dao::characters::routing::npc_corporation(&c.db, corp_id, CORPORATION_UNLIMITED_MEMBER_LIMIT).await.map_err(db_err)?;
-    let Some(r) = r else {
+    let Some(r) = c.sde.npc_corporations.get(corp_id) else {
         return Ok(super::corps::corporation_line(&c.db, corp_id).await?.map(|line| row(Value::list(CORP_HEADER.iter().map(|h| Value::str(*h))), line)).unwrap_or(Value::None));
     };
+    let member_count = crate::dao::characters::routing::npc_member_count(&c.db, corp_id).await.map_err(db_err)?;
     let opt = |v: Option<i64>| v.map(Value::Int).unwrap_or(Value::None);
-    let s = |v: Option<String>| Value::unicode(v.unwrap_or_default());
+    let s = |v: Option<&str>| Value::unicode(v.unwrap_or_default());
     let mut line = vec![
         Value::Int(corp_id),
-        s(r.name),
-        s(r.description),
-        s(r.ticker),
+        s(r.name.as_deref()),
+        s(r.description.as_deref()),
+        s(r.ticker.as_deref()),
         Value::unicode(""),
         Value::Float(r.tax_rate.unwrap_or(0.0)),
         Value::Float(0.0),
@@ -105,8 +105,8 @@ async fn corporation(c: &Client, corp_id: i64) -> Result<Value, CallError> {
         Value::None,
         opt(r.faction_id),
         Value::Int(NPC_CORPORATION_SHARES),
-        Value::Int(r.member_count),
-        Value::Int(r.member_limit),
+        Value::Int(member_count),
+        Value::Int(r.member_limit.unwrap_or(CORPORATION_UNLIMITED_MEMBER_LIMIT)),
         Value::None,
         Value::None,
     ];

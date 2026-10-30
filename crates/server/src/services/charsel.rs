@@ -85,25 +85,20 @@ async fn name_code(c: &Client, name: &str) -> Result<i64, CallError> {
 
 /// (school corporation, station, solar system, constellation, region) for a new character.
 async fn starting_location(c: &Client, school_id: Option<i64>, race_id: i64) -> Result<(i64, i64, i64, i64, i64), CallError> {
-    let row = c
-        .db
-        .query_opt(
-            "WITH school AS (
-                 SELECT data FROM sde_native.schools
-                 WHERE ($1::bigint IS NOT NULL AND key = $1::bigint::text)
-                    OR ($1::bigint IS NULL AND (data->>'raceID')::int = $2::int)
-                 ORDER BY key::int LIMIT 1)
-             SELECT (school.data->>'corporationID')::bigint AS corporation_id, st.station_id::bigint, st.solar_system_id::bigint,
-                    st.constellation_id::bigint, st.region_id::bigint
-             FROM school, jsonb_array_elements_text(school.data->'startingStations') s(id)
-             JOIN sde.sta_stations st ON st.station_id = s.id::int
-             ORDER BY random() LIMIT 1",
-            &[&school_id, &(race_id as i32)],
-        )
-        .await
-        .map_err(db_err)?
-        .context("no starting station for school/race")?;
-    Ok((row.get("corporation_id"), row.get("station_id"), row.get("solar_system_id"), row.get("constellation_id"), row.get("region_id")))
+    let school = match school_id {
+        Some(id) => c.sde.characters.school(id),
+        None => c.sde.characters.schools_for_race(race_id as i32).next(),
+    }.context("no starting station for school/race")?;
+    let stations = || school.starting_stations.iter().filter_map(|&id| c.sde.map.station(id));
+    let count = stations().count();
+    let station = stations().nth((super::rand01() * count as f64) as usize).context("no starting station for school/race")?;
+    Ok((
+        school.corporation_id.context("school has no corporation")?,
+        station.station_id,
+        station.solar_system_id.context("starting station has no solar system")?,
+        station.constellation_id.context("starting station has no constellation")?,
+        station.region_id.context("starting station has no region")?,
+    ))
 }
 
 async fn character_rows(c: &Client) -> Result<Vec<Value>, CallError> {
@@ -179,13 +174,7 @@ async fn ensure_ship(c: &Client, char_id: i64, race_id: i32, station_id: i64) ->
     if let Some(ship_id) = characters::selection::ship_id(&c.db, char_id).await.map_err(db_err)? {
         return Ok(ship_id);
     }
-    let ship_type: i32 = c
-        .db
-        .query_opt("SELECT ship_type_id FROM sde.chr_races WHERE race_id = $1 AND ship_type_id IS NOT NULL", &[&race_id])
-        .await
-        .map_err(db_err)?
-        .map(|r| r.get("ship_type_id"))
-        .unwrap_or(FALLBACK_ROOKIE_SHIP);
+    let ship_type = c.sde.characters.race(race_id as i64).and_then(|race| race.ship_type_id).unwrap_or(FALLBACK_ROOKIE_SHIP);
     let ship_id = items::creation::rookie_ship(&c.db, ship_type, char_id, station_id, FLAG_HANGAR).await.map_err(db_err)?;
     characters::selection::set_ship(&c.db, char_id, ship_id).await.map_err(db_err)?;
     info!(user = c.login.user_id, "issued rookie ship {ship_id} (type {ship_type}) to character {char_id}");

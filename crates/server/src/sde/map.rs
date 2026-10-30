@@ -9,17 +9,13 @@ use crate::{dao::sde::map as dao, db::Db};
 
 pub(crate) struct SolarSystem {
     pub solar_system_id: i64,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub name: Option<String>,
     pub constellation_id: Option<i64>,
     pub region_id: Option<i64>,
     pub faction_id: Option<i64>,
     pub security: Option<f64>,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub x: Option<f64>,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub y: Option<f64>,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub z: Option<f64>,
 }
 pub(crate) struct Region {
@@ -77,7 +73,6 @@ pub(crate) struct Map {
     system_celestials: HashMap<i64, Vec<usize>>,
     #[expect(dead_code, reason = "read by Phase 1 of #5")]
     system_stations: HashMap<i64, Vec<usize>>,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     owner_stations: HashMap<i64, Vec<usize>>,
     jumps: HashMap<i64, Vec<i64>>,
 }
@@ -121,7 +116,6 @@ impl Map {
     pub(crate) fn celestials(&self, system: i64) -> impl Iterator<Item = &Celestial> { self.system_celestials.get(&system).into_iter().flatten().map(|&i| &self.celestials[i]) }
     #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) fn stations_in_system(&self, system: i64) -> impl Iterator<Item = &Station> { self.system_stations.get(&system).into_iter().flatten().map(|&i| &self.stations[i]) }
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) fn stations_by_owner(&self, owner: i64) -> impl Iterator<Item = &Station> { self.owner_stations.get(&owner).into_iter().flatten().map(|&i| &self.stations[i]) }
     pub(crate) fn jumps(&self, system: i64) -> &[i64] { self.jumps.get(&system).map_or(&[], Vec::as_slice) }
 }

@@ -4,11 +4,12 @@
 
 use crate::{dao, db::Db};
 
-#[expect(dead_code, reason = "read by Phase 1 of #5")]
 pub(crate) struct NpcCorporation {
     pub corporation_id: i64,
     pub name: Option<String>,
     pub ticker: Option<String>,
+    pub lower_name: Option<String>,
+    pub upper_ticker: Option<String>,
     pub description: Option<String>,
     pub tax_rate: Option<f64>,
     pub ceo_id: Option<i64>,
@@ -31,7 +32,6 @@ impl NpcCorporations {
         self.rows.binary_search_by_key(&id, |row| row.corporation_id).ok().map(|index| &self.rows[index])
     }
 
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) fn iter(&self) -> impl Iterator<Item = &NpcCorporation> { self.rows.iter() }
     pub(crate) fn len(&self) -> usize { self.rows.len() }
 }

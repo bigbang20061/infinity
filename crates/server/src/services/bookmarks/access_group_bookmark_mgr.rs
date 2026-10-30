@@ -1,31 +1,27 @@
 //! accessGroupBookmarkMgr for `eve/client/script/ui/shared/bookmarks/bookmarkSvc.py`.
 //! Uses personal bookmark tables and SDE locations; shared access-group folders are unsupported.
 use super::*;
-struct StaticLocation { system: i64, type_id: i32, pos: [f64; 3] }
-impl StaticLocation {
-    fn from_row(r: &tokio_postgres::Row) -> Self {
-        Self { system: r.get("solar_system_id"), type_id: r.get("type_id"), pos: [r.get("x"), r.get("y"), r.get("z")] }
-    }
-}
 
 /// `BookmarkStaticLocation(itemID, folderID, name, comment, expiry, subfolderID=)`: a region,
 /// constellation, solar system or station.
 async fn static_location(c: &Client, call: &Call<'_>) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
     let item = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
-    let r = c
-        .db
-        .query_opt(
-            "SELECT s.solar_system_id::bigint, s.type_id, c.x, c.y, c.z FROM sde.sta_stations s JOIN sde.map_celestials c ON c.item_id = s.station_id::bigint
-             WHERE s.station_id::bigint = $1
-             UNION ALL SELECT solar_system_id::bigint, $2, 0, 0, 0 FROM sde.map_solar_systems WHERE solar_system_id::bigint = $1",
-            &[&item, &TYPE_SOLAR_SYSTEM],
-        )
-        .await
-        .map_err(db_err)?;
+    let map = &c.world.sde().map;
+    let r = map.station(item).and_then(|station| {
+        map.celestial(item).map(|celestial| (
+            station.solar_system_id.expect("station solar_system_id is NULL"),
+            station.type_id.expect("station type_id is NULL") as i32,
+            [
+                celestial.x.expect("celestial x is NULL"),
+                celestial.y.expect("celestial y is NULL"),
+                celestial.z.expect("celestial z is NULL"),
+            ],
+        ))
+    }).or_else(|| map.system(item).map(|system| (system.solar_system_id, TYPE_SOLAR_SYSTEM, [0.0; 3])));
     // Regions and constellations bookmark the solar system the pilot is in.
     let (system, type_id, pos) = match r {
-        Some(r) => { let r = StaticLocation::from_row(&r); (r.system, Some(r.type_id), r.pos) },
+        Some((system, type_id, pos)) => (system, Some(type_id), pos),
         None => (c.session.int("solarsystemid2").unwrap_or(0), Some(TYPE_SOLAR_SYSTEM), [0.0; 3]),
     };
     let folder = call.args.get(1).and_then(|v| v.as_int()).unwrap_or(0);

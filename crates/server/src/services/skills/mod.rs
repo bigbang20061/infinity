@@ -1,6 +1,6 @@
 //! Skill service routing and shared mechanics, mirroring characterskills/util.py.
-//! Uses game.skills, game.skill_queue, game.characters, sde.chr_bloodlines,
-//! sde.chr_races and sde.type_attributes through its submodules.
+//! Uses game.skills, game.skill_queue, game.characters and startup SDE bloodline,
+//! race and type attribute data through its submodules.
 //! Attribute modifiers and several skill handler features are not modelled.
 use super::{db_err, keyval, Call, CallError, CallResult};
 use crate::client::Client;

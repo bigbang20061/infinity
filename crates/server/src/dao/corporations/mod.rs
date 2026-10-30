@@ -3,7 +3,7 @@
 //! `eve/client/script/ui/services/corporation` and enlistment calls.
 //! Sources include `game.corporations`, `game.characters`, `game.corp_applications`,
 //! `game.corp_titles`, `game.corp_enlistment_factions`, employment history, items,
-//! skills and SDE corporation and school data.
+//! skills. Static corporation and school data is resolved by services from SDE.
 //! Service validation, wire conversion, transactions and notifications are not handled here;
 //! corporation shares are not supported.
 

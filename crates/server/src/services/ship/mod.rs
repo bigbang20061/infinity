@@ -356,8 +356,11 @@ pub async fn lose_ship(c: &mut Client, ship: i64, pos: [f64; 3]) -> Result<(), C
     }
     let corp = c.session.int("corpid").unwrap_or(0);
     let db = c.db.clone();
+    let sde = c.sde.clone();
     db.transaction(
-        |tx, outbox: &mut Outbox<()>| Box::pin(async move {
+        |tx, outbox: &mut Outbox<()>| {
+            let sde = sde.clone();
+            Box::pin(async move {
             if !item_dao::lock_reload_ship(tx, ship).await.map_err(db_err)? {
                 return Ok(None);
             }
@@ -369,7 +372,7 @@ pub async fn lose_ship(c: &mut Client, ship: i64, pos: [f64; 3]) -> Result<(), C
                 lost.push((r.type_id, r.flag_id, false, r.quantity as i64));
             }
             let home = if lost_type == Some(TYPE_CAPSULE) {
-                let r = character_dao::home(tx, char_id).await.map_err(db_err)?;
+                let r = super::character::home_station::home(tx, &sde, char_id).await?;
                 Some((r.station_id, r.solar_system_id, r.constellation_id, r.region_id))
             } else { None };
             item_dao::delete_lost(tx, ship).await.map_err(db_err)?;
@@ -385,7 +388,8 @@ pub async fn lose_ship(c: &mut Client, ship: i64, pos: [f64; 3]) -> Result<(), C
             }
             outbox.operation(());
             Ok(Some((capsule, home, lost_type, lost)))
-        }),
+            })
+        },
         |result, outbox| async move {
             let Some((capsule, home, lost_type, lost)) = result else { return Ok(()) };
             for entry in outbox.into_entries() {

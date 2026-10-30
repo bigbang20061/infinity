@@ -6,7 +6,6 @@ use crate::{dao, db::Db};
 
 pub(crate) struct Faction {
     pub faction_id: i64,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub name: Option<String>,
     pub lower_name: Option<String>,
     pub corporation_id: Option<i64>,
@@ -25,7 +24,6 @@ impl Factions {
         self.rows.binary_search_by_key(&id, |row| row.faction_id).ok().map(|index| &self.rows[index])
     }
 
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) fn iter(&self) -> impl Iterator<Item = &Faction> { self.rows.iter() }
     pub(crate) fn len(&self) -> usize { self.rows.len() }
 }

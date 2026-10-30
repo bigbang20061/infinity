@@ -1,5 +1,5 @@
 //! Bills (billMgr; bound allianceRegistry's GetBills/PayBill): what corporations, alliances
-//! and characters owe, in game.bills.
+//! and characters owe, in game.bills, using startup SDE station data for office landlords.
 //!
 //! Office rent is the one bill issued: a week before an office's rental period ends its
 //! corporation is billed the station's rent, due when the period ends; paying extends the
@@ -104,8 +104,8 @@ async fn run(db: &Db, world: &World) -> Result<(), CallError> {
     let due = bills_dao::due(db, now, BILL_AHEAD, BILL_RENTAL, UNPAID).await.map_err(db_err)?;
     for r in due {
         let (office, corp, station, until) = (r.office_id, r.corporation_id, r.station_id, r.rented_until);
-        let landlord = r.owner_id.unwrap_or(1_000_001);
-        let amount = super::offices::rent_price(db, station).await?;
+        let landlord = world.sde().map.station(station).and_then(|st| st.owner_id).unwrap_or(1_000_001);
+        let amount = super::offices::rent_price(world.sde(), station);
         bills_dao::issue(db, BILL_RENTAL, corp, landlord, amount, until, office, station, now).await.map_err(db_err)?;
         info!("bills: billed {corp} {amount:.0} ISK rent for office {office}");
         announce(db, world, corp).await?;

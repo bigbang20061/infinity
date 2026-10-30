@@ -1,6 +1,6 @@
 //! Corporation role, title and leadership mechanics for corpRegistry.
 //! Mirrors eve/client/script/ui/services/corporation, using game corporations,
-//! characters, skills and titles; shares remain unsupported.
+//! characters, skills and titles, and startup SDE schools and NPC corporations; shares remain unsupported.
 
 use super::*;
 use crate::dao::corporations::roles as role_dao;
@@ -168,7 +168,7 @@ pub(super) async fn potential_ceos(db: &Db, corp: i64, ceo: i64) -> Result<Vec<i
 /// `ResignFromCEO(newCeoID=None)`. Without a successor it returns the members who could be
 /// one for the CEO to pick from; a CEO alone closes the corporation, and a CEO without
 /// eligible successors closes it and sends everyone back to their school corporations.
-pub(super) async fn resign_ceo(db: &Db, world: &World, me: i64, successor: Option<i64>) -> CallResult {
+pub(super) async fn resign_ceo(db: &Db, sde: &Arc<Sde>, world: &World, me: i64, successor: Option<i64>) -> CallResult {
     let (corp, _) = membership(db, me).await?;
     if !is_player_corp(corp) || ceo_of(db, corp).await? != Some(me) {
         return Err(CallError::User { msg: messages::MSG_ONLY_CEO_CAN_RESIGN.into(), dict: vec![] });
@@ -196,7 +196,7 @@ pub(super) async fn resign_ceo(db: &Db, world: &World, me: i64, successor: Optio
         None => {
             let others: Vec<i64> = members(db, corp, registry::MemberFilter::Exclude, &[me]).await?.iter().map(|r| r.character_id).collect();
             if others.is_empty() {
-                leave(db, world, me).await?;
+                leave(db, sde, world, me).await?;
                 return Ok(Value::None);
             }
             let candidates = potential_ceos(db, corp, me).await?;
@@ -204,15 +204,17 @@ pub(super) async fn resign_ceo(db: &Db, world: &World, me: i64, successor: Optio
                 return Ok(Value::list(candidates.into_iter().map(Value::Int)));
             }
             let now = filetime_now();
+            let sde = sde.clone();
             db.transaction(
                 |tx, outbox| {
                     let others = others.clone();
+                    let sde = sde.clone();
                     Box::pin(async move {
                         for other in others {
-                            let school = school_corp(tx, other).await?;
-                            set_corp(tx, outbox, other, school, 0, now).await?;
+                            let school = school_corp(tx, &sde, other).await?;
+                            set_corp(tx, &sde, outbox, other, school, 0, now).await?;
                         }
-                        leave_inner(tx, outbox, me, now).await
+                        leave_inner(tx, &sde, outbox, me, now).await
                     })
                 },
                 |value, outbox| async move { dispatch_world(value, outbox, world) },
