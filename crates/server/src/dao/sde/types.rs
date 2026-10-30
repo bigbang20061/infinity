@@ -10,6 +10,7 @@ pub(crate) struct TypeRow {
     pub(crate) group_id: Option<i32>,
     pub(crate) category_id: Option<i32>,
     pub(crate) name: Option<String>,
+    pub(crate) lower_name: Option<String>,
     pub(crate) mass: Option<f64>,
     pub(crate) capacity: Option<f64>,
     pub(crate) volume: Option<f64>,
@@ -28,6 +29,7 @@ impl TypeRow {
             group_id: row.get("group_id"),
             category_id: row.get("category_id"),
             name: row.get("name"),
+            lower_name: row.get("lower_name"),
             mass: row.get("mass"),
             capacity: row.get("capacity"),
             volume: row.get("volume"),
@@ -42,12 +44,13 @@ impl TypeRow {
     }
 }
 pub(crate) async fn types(ex: &(impl Executor + ?Sized)) -> Result<Vec<TypeRow>, db::Error> {
-    Ok(ex.query("SELECT type_id, group_id, category_id, name, mass::float8 AS mass, capacity::float8 AS capacity, volume::float8 AS volume, radius::float8 AS radius, portion_size, base_price::float8 AS base_price, published, market_group_id, race_id, icon_id FROM sde.inv_types ORDER BY type_id", &[]).await?.iter().map(TypeRow::from_row).collect())
+    Ok(ex.query("SELECT type_id, group_id, category_id, name, lower(name) AS lower_name, mass::float8 AS mass, capacity::float8 AS capacity, volume::float8 AS volume, radius::float8 AS radius, portion_size, base_price::float8 AS base_price, published, market_group_id, race_id, icon_id FROM sde.inv_types ORDER BY type_id", &[]).await?.iter().map(TypeRow::from_row).collect())
 }
 pub(crate) struct GroupRow {
     pub(crate) group_id: i32,
     pub(crate) category_id: Option<i32>,
     pub(crate) name: Option<String>,
+    pub(crate) lower_name: Option<String>,
 }
 impl GroupRow {
     fn from_row(row: &Row) -> Self {
@@ -55,11 +58,12 @@ impl GroupRow {
             group_id: row.get("group_id"),
             category_id: row.get("category_id"),
             name: row.get("name"),
+            lower_name: row.get("lower_name"),
         }
     }
 }
 pub(crate) async fn groups(ex: &(impl Executor + ?Sized)) -> Result<Vec<GroupRow>, db::Error> {
-    Ok(ex.query("SELECT group_id, category_id, name FROM sde.inv_groups ORDER BY group_id", &[]).await?.iter().map(GroupRow::from_row).collect())
+    Ok(ex.query("SELECT group_id, category_id, name, lower(name) AS lower_name FROM sde.inv_groups ORDER BY group_id", &[]).await?.iter().map(GroupRow::from_row).collect())
 }
 pub(crate) struct CategoryRow {
     pub(crate) category_id: i32,

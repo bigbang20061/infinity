@@ -6,12 +6,11 @@
 //! (GetMissionObjectiveInfo) and journal bookmarks (GetMyJournalDetails).
 //!
 //! Agents come from the retail agent list (crate::retail). Basic agents offer the
-//! build's own kill missions (sde_native.missions, BasicKillMission) whose dungeon
-//! difficulty matches the agent's level.
+//! shared SDE's kill missions whose dungeon difficulty matches the agent's level.
 //! `GetDisabledMissions` returns an empty list. Agent info uses the retail agent
 //! list; unbound or non-agent info requests return None.
 //!
-//! Epic arcs (sde_native.epicarcs) chain missions across agents: an arc's first step is
+//! Epic arcs in the shared SDE chain missions across agents: an arc's first step is
 //! offered by its agent to anyone who hasn't begun it, and each completed step unlocks
 //! the next ones (an agent-interaction step unlocks the branch the pilot chose). Steps are
 //! kill missions, talk-to-agent and courier missions (finished at the next step's agent;
@@ -22,7 +21,6 @@
 //! The objective completes once the actor's spawned NPC group is cleared. Site
 //! records and group state are held in memory. Startup moves legacy buried mission sites
 //! clear of planets.
-mod sde_rows;
 mod agent_mgr;
 mod mechanics;
 mod mission_tracker_mgr;

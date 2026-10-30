@@ -1,8 +1,8 @@
 //! Mission state, offers, rewards and arc mechanics; completion commits before dispatching
 //! effects. The client renders dungeon objectives in
 //! `agentinteraction/objectivesteps.py:103-104,123-125,137-142`.
-//! Mission and dungeon candidates and messages come from runtime `sde_native` tables;
-//! placement uses the shared SDE. Mission, character, item, loyalty and standing state is
+//! Mission and dungeon candidates, messages and placement use the shared SDE.
+//! Mission, character, item, loyalty and standing state is
 //! stored in the game database; site simulation is separate.
 //! Rewards and placement are server policy, not a client-provided generator; complete
 //! live-server mission layouts and mechanics are not reproduced.
@@ -18,12 +18,12 @@ fn rewards(level: i64) -> (i64, i64) {
     }
 }
 
-fn mission_from(r: crate::dao::missions::MissionRow) -> Mission {
+fn mission_from(r: crate::dao::missions::MissionRow, data: &crate::sde::missions::Mission) -> Mission {
     Mission {
         agent_id: r.agent_id,
         mission_id: r.mission_id,
-        name_id: r.name_id.unwrap_or(0),
-        briefing_id: r.briefing_id.unwrap_or(0),
+        name_id: data.name_id.unwrap_or(0),
+        briefing_id: data.message("messages.mission.briefing").unwrap_or(0),
         dungeon_id: r.dungeon_id,
         faction_id: r.faction_id,
         state: r.state,
@@ -41,7 +41,8 @@ fn mission_from(r: crate::dao::missions::MissionRow) -> Mission {
 
 pub(super) async fn missions_of(c: &Client, agent_id: Option<i64>) -> Result<Vec<Mission>, CallError> {
     let me = c.session.int("charid").unwrap_or(0);
-    Ok(crate::dao::missions::missions_of(&c.db, me, agent_id).await.map_err(db_err)?.into_iter().map(mission_from).collect())
+    Ok(crate::dao::missions::missions_of(&c.db, me, agent_id).await.map_err(db_err)?.into_iter()
+        .filter_map(|r| c.sde.missions.get(r.mission_id).map(|data| mission_from(r, data))).collect())
 }
 
 pub(super) async fn mission_with(c: &Client, agent_id: i64) -> Result<Option<Mission>, CallError> {
@@ -50,10 +51,8 @@ pub(super) async fn mission_with(c: &Client, agent_id: i64) -> Result<Option<Mis
 
 /// A mission message ID of this mission (`messages.mission.accepted.agentsays`...).
 pub(super) async fn message(c: &Client, mission_id: i32, key: &str) -> Result<Option<i64>, CallError> {
-    Ok(sde_rows::Message::from_row(&c.db
-        .query_one("SELECT (data->'messages'->>$2)::bigint AS message_id FROM sde_native.missions WHERE key = $1::int::text", &[&mission_id, &key])
-        .await
-        .map_err(db_err)?).id)
+    let mission = c.sde.missions.get(mission_id).ok_or_else(|| CallError::Internal(anyhow::anyhow!("missing mission {mission_id}")))?;
+    Ok(mission.message(key))
 }
 
 /// A mission site: a point well off the surface of a random planet of the system.
@@ -62,78 +61,40 @@ fn mission_site_position(c: &Client, system: i64) -> V3 {
     super::off_surface(base, radius, SITE_OFFSET)
 }
 
+fn eligible_kill(m: &crate::sde::missions::Mission, dungeon: &crate::sde::dungeons::Dungeon, level: i32) -> bool {
+    m.template.as_deref() == Some("agent.missionTemplatizedContent_BasicKillMission")
+        && dungeon.difficulty == Some(i64::from(level)) && m.has_name
+        && m.has_message("messages.mission.briefing")
+}
+
 /// Offer one of the build's kill missions at the agent's level, sited in the agent's system.
 pub(super) async fn offer(c: &Client, agent: &Agent) -> Result<(), CallError> {
     let me = c.session.int("charid").unwrap_or(0);
     let level = agent.level.clamp(1, 5) as i32;
-    let pick = c
-        .db
-        .query_opt(
-            "SELECT m.key::int AS mission_id, (m.data->'killMission'->>'dungeonID')::int AS dungeon_id, COALESCE((d.data->>'factionID')::bigint, 0) AS faction_id
-             FROM sde_native.missions m JOIN sde_native.dungeons d ON d.key = m.data->'killMission'->>'dungeonID'
-             WHERE m.data->>'contentTemplate' = 'agent.missionTemplatizedContent_BasicKillMission'
-               AND (d.data->>'difficulty')::int = $1 AND m.data ? 'nameID' AND m.data->'messages' ? 'messages.mission.briefing'
-             ORDER BY random() LIMIT 1",
-            &[&level],
-        )
-        .await
-        .map_err(db_err)?
-        .ok_or_else(|| CallError::Internal(anyhow::anyhow!("no level {level} kill missions")))?;
-    let pick = sde_rows::Pick::from_row(&pick);
+    let candidates: Vec<_> = c.sde.missions.iter().filter_map(|m| {
+        let dungeon = c.sde.dungeons.get(i64::from(m.dungeon_id?))?;
+        eligible_kill(m, dungeon, level).then_some((m, dungeon))
+    }).collect();
+    let (pick, dungeon) = candidates.get((rand01() * candidates.len() as f64) as usize)
+        .copied().ok_or_else(|| CallError::Internal(anyhow::anyhow!("no level {level} kill missions")))?;
+    let dungeon_id = pick.dungeon_id.unwrap_or(0);
+    let faction_id = dungeon.faction_id.unwrap_or(0);
     let pos = mission_site_position(c, agent.system_id);
     let (isk, lp) = rewards(agent.level);
     crate::dao::missions::offer(&c.db, &crate::dao::missions::Offer {
-        character_id: me, agent_id: agent.id, mission_id: pick.mission_id, dungeon_id: pick.dungeon_id,
-        faction_id: pick.faction_id, state: STATE_OFFERED, system_id: agent.system_id, pos,
+        character_id: me, agent_id: agent.id, mission_id: pick.mission_id, dungeon_id,
+        faction_id, state: STATE_OFFERED, system_id: agent.system_id, pos,
         reward_isk: isk, reward_lp: lp, offered_at: filetime_now(),
     }).await.map_err(db_err)?;
-    info!(user = c.login.user_id, "agent {}: offered mission {} (dungeon {})", agent.id, pick.mission_id, pick.dungeon_id);
+    info!(user = c.login.user_id, "agent {}: offered mission {} (dungeon {})", agent.id, pick.mission_id, dungeon_id);
     Ok(())
 }
 
 // ---------------------------------------------------------------- epic arcs
 
-/// One step of an epic arc.
-pub(super) struct ArcStep {
-    arc: i64,
-    agent: i64,
-    next: Vec<i32>,
-    pub(super) fail: Option<i32>,
-    /// The arc begins here (no step leads to it).
-    start: bool,
-}
-
-/// Every arc step by mission ID (sde_native.epicarcs), loaded once.
-pub(super) async fn arcs(c: &Client) -> Result<&'static HashMap<i32, ArcStep>, CallError> {
-    static ARCS: OnceLock<HashMap<i32, ArcStep>> = OnceLock::new();
-    if let Some(a) = ARCS.get() {
-        return Ok(a);
-    }
-    let rows = c
-        .db
-        .query(
-            "SELECT e.key::bigint AS arc_id, m.key::int AS mission_id, (m.value->>'agentID')::bigint AS agent_id, COALESCE(m.value->'nextMissions', '[]'::jsonb)::text AS next_missions,
-                    (m.value->>'failMissionID')::int AS fail_mission_id
-             FROM sde_native.epicarcs e, jsonb_each(e.data->'missions') m",
-            &[],
-        )
-        .await
-        .map_err(db_err)?;
-    let mut steps: HashMap<i32, ArcStep> = HashMap::new();
-    for r in &rows {
-        let r = sde_rows::ArcStepRow::from_row(r);
-        let next: Vec<i32> = r.next.trim_matches(|c| c == '[' || c == ']').split(',').filter_map(|n| n.trim().parse().ok()).collect();
-        steps.insert(r.mission_id, ArcStep { arc: r.arc_id, agent: r.agent_id.unwrap_or(0), next, fail: r.fail, start: true });
-    }
-    let followers: HashSet<i32> = steps.values().flat_map(|s| s.next.iter().copied()).collect();
-    for (id, s) in steps.iter_mut() {
-        s.start = !followers.contains(id);
-    }
-    Ok(ARCS.get_or_init(|| steps))
-}
 
 pub(super) async fn is_arc_agent(c: &Client, agent_id: i64) -> Result<bool, CallError> {
-    Ok(arcs(c).await?.values().any(|s| s.agent == agent_id))
+    Ok(c.sde.missions.steps().any(|s| s.agent == agent_id))
 }
 
 /// The arc step this agent has for us next: the start of an arc we haven't begun, or a
@@ -143,9 +104,7 @@ pub(super) async fn next_arc_step(c: &Client, agent_id: i64) -> Result<Option<i3
     let rows = crate::dao::missions::arc_progress(&c.db, me).await.map_err(db_err)?;
     let begun: HashSet<i64> = rows.iter().map(|r| r.arc_id).collect();
     let unlocked: HashSet<i32> = rows.iter().filter(|r| r.state == "unlocked").map(|r| r.mission_id).collect();
-    let mut mine: Vec<(&i32, &ArcStep)> = arcs(c).await?.iter().filter(|(_, s)| s.agent == agent_id).collect();
-    mine.sort_by_key(|(id, _)| **id);
-    Ok(mine.into_iter().find(|(id, s)| unlocked.contains(id) || (s.start && !begun.contains(&s.arc))).map(|(id, _)| *id))
+    Ok(c.sde.missions.steps().find(|s| s.agent == agent_id && (unlocked.contains(&s.mission_id) || (s.start && !begun.contains(&s.arc)))).map(|s| s.mission_id))
 }
 
 pub(super) async fn set_arc_state(c: &Client, arc: i64, mission: i32, state: &str) -> Result<(), CallError> {
@@ -159,28 +118,16 @@ pub(super) async fn set_arc_state(c: &Client, arc: i64, mission: i32, state: &st
 /// rewards come from the mission's own data.
 pub(super) async fn offer_arc(c: &Client, agent: &Agent, mission_id: i32) -> Result<(), CallError> {
     let me = c.session.int("charid").unwrap_or(0);
-    let steps = arcs(c).await?;
-    let Some(step) = steps.get(&mission_id) else { return Ok(()) };
-    let r = c
-        .db
-        .query_one(
-            "SELECT m.data->>'contentTemplate' AS template, COALESCE((m.data->'killMission'->>'dungeonID')::int, 0) AS dungeon_id,
-                    COALESCE((d.data->>'factionID')::bigint, (m.data->>'factionID')::bigint, 0) AS faction_id,
-                    (m.data->'courierMission'->>'objectiveTypeID')::int AS cargo_type, (m.data->'courierMission'->>'objectiveQuantity')::int AS cargo_qty,
-                    CASE WHEN (m.data->'missionRewards'->'reward'->>'rewardTypeID')::int = $2
-                         THEN (m.data->'missionRewards'->'reward'->>'rewardQuantity')::bigint ELSE 0 END AS reward_isk,
-                    COALESCE((m.data->>'fixedLpRewardOmega')::bigint, 0) AS reward_lp
-             FROM sde_native.missions m LEFT JOIN sde_native.dungeons d ON d.key = m.data->'killMission'->>'dungeonID'
-             WHERE m.key = $1::text",
-            &[&mission_id.to_string(), &(TYPE_CREDITS as i32)],
-        )
-        .await
-        .map_err(db_err)?;
-    let r = sde_rows::ArcOfferRow::from_row(&r);
-    let kind = Kind::of_template(&r.template.unwrap_or_default());
+    let Some(step) = c.sde.missions.step(mission_id) else { return Ok(()) };
+    let r = c.sde.missions.get(mission_id).ok_or_else(|| CallError::Internal(anyhow::anyhow!("missing mission {mission_id}")))?;
+    let dungeon_id = r.dungeon_id.unwrap_or(0);
+    let faction_id = r.dungeon_id.and_then(|id| c.sde.dungeons.get(i64::from(id))).and_then(|d| d.faction_id).or(r.faction_id).unwrap_or(0);
+    let reward_isk = if r.reward_type == Some(TYPE_CREDITS as i32) { r.reward_quantity.expect("credit reward quantity is NULL") } else { 0 };
+    let reward_lp = r.reward_lp.unwrap_or(0);
+    let kind = Kind::of_template(r.template.as_deref().unwrap_or_default());
     // Talk-to-agent and courier steps end at the agent of the step that follows.
     let dest = match kind {
-        Kind::Talk | Kind::Courier => step.next.first().and_then(|n| steps.get(n)).map(|s| s.agent).filter(|a| *a != agent.id),
+        Kind::Talk | Kind::Courier => step.next.first().and_then(|n| c.sde.missions.step(*n)).map(|s| s.agent).filter(|a| *a != agent.id),
         _ => None,
     };
     let cargo_type = r.cargo_type;
@@ -188,9 +135,9 @@ pub(super) async fn offer_arc(c: &Client, agent: &Agent, mission_id: i32) -> Res
     let pos = mission_site_position(c, agent.system_id);
     crate::dao::missions::offer_arc(&c.db, &crate::dao::missions::ArcOffer {
         offer: crate::dao::missions::Offer {
-            character_id: me, agent_id: agent.id, mission_id, dungeon_id: r.dungeon_id,
-            faction_id: r.faction_id, state: STATE_OFFERED, system_id: agent.system_id, pos,
-            reward_isk: r.reward_isk, reward_lp: r.reward_lp, offered_at: filetime_now(),
+            character_id: me, agent_id: agent.id, mission_id, dungeon_id,
+            faction_id, state: STATE_OFFERED, system_id: agent.system_id, pos,
+            reward_isk, reward_lp, offered_at: filetime_now(),
         },
         kind: kind.code(), arc_id: step.arc, dest_agent: dest, cargo_type, cargo_qty,
     }).await.map_err(db_err)?;
@@ -205,9 +152,10 @@ pub(super) async fn epic_arc_status(c: &Client) -> CallResult {
     let rows = crate::dao::missions::arc_status(&c.db, me).await.map_err(db_err)?;
     let mut by_arc: Vec<(i64, Vec<(Value, Value)>)> = vec![];
     for r in rows {
+        let Some(data) = c.sde.missions.get(r.mission_id) else { continue };
         let arc = r.arc_id;
         let stamp = |v: Option<i64>| v.map(Value::Int).unwrap_or(Value::None);
-        let status = keyval([("acceptedDate", stamp(r.accepted_at)), ("completedDate", stamp(r.completed_at)), ("quitDate", stamp(r.quit_at)), ("nameID", stamp(r.name_id))]);
+        let status = keyval([("acceptedDate", stamp(r.accepted_at)), ("completedDate", stamp(r.completed_at)), ("quitDate", stamp(r.quit_at)), ("nameID", stamp(data.name_id))]);
         match by_arc.last_mut() {
             Some((a, list)) if *a == arc => list.push((Value::Int(r.mission_id as i64), status)),
             _ => by_arc.push((arc, vec![(Value::Int(r.mission_id as i64), status)])),
@@ -283,16 +231,13 @@ pub(super) async fn finish(c: &mut Client, m: &Mission, agent: &Agent, choice: O
     let mut reward = None;
     let mut unlocked = Vec::new();
     if m.arc_id.is_some() {
-        let row = c.db.query_opt(
-            "SELECT (data->'missionRewards'->'reward'->>'rewardTypeID')::int AS type_id, (data->'missionRewards'->'reward'->>'rewardQuantity')::int AS quantity
-                 FROM sde_native.missions WHERE key = $1::text AND (data->'missionRewards'->'reward'->>'rewardTypeID')::int <> $2",
-            &[&m.mission_id.to_string(), &(TYPE_CREDITS as i32)],
-        ).await.map_err(db_err)?;
-        if let Some(row) = row {
-            let r = sde_rows::Reward::from_row(&row);
-            reward = r.type_id.zip(r.quantity).map(|(type_id, qty)| (type_id, qty.max(1)));
+        if let Some(data) = c.sde.missions.get(m.mission_id) {
+            if let (Some(type_id), Some(quantity)) = (data.reward_type.filter(|id| *id != TYPE_CREDITS as i32), data.reward_quantity) {
+                let qty = i32::try_from(quantity).map_err(|_| CallError::Internal(anyhow::anyhow!("mission reward quantity out of range")))?;
+                reward = Some((type_id, qty.max(1)));
+            }
         }
-        let next = arcs(c).await?.get(&m.mission_id).map(|s| s.next.clone()).unwrap_or_default();
+        let next = c.sde.missions.step(m.mission_id).map(|s| s.next.clone()).unwrap_or_default();
         unlocked = match choice {
             Some(k) => next.get(k).or(next.last()).copied().into_iter().collect(),
             None => next,
@@ -397,3 +342,5 @@ pub(super) async fn remove(c: &Client, agent_id: i64) -> Result<(), CallError> {
     Ok(())
 }
 
+
+#[cfg(test)] mod tests;

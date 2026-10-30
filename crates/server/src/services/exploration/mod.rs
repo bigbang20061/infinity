@@ -11,8 +11,8 @@
 //! random system of its target class, where a K162 leads back; both ends share one mass
 //! budget and lifetime.
 //!
-//! Static placement uses the shared SDE; generation also queries `sde` and `sde_native`
-//! tables in the runtime database. Sites are stored in `game.exploration_sites`;
+//! Static placement and generation use the shared startup SDE. Sites are stored in
+//! `game.exploration_sites`;
 //! memory holds the systems loaded since startup. Wormholes and spawned containers are put
 //! back in space when their system is loaded again. Startup moves legacy exploration and
 //! mission sites out of planets, along with exploration overlays and asteroids.
@@ -301,11 +301,6 @@ struct DungeonPick {
     name_id: Option<i64>,
     difficulty: i64,
 }
-impl DungeonPick { fn from_row(r: &tokio_postgres::Row) -> Self { Self { id: r.get("id"), name_id: r.get("name_id"), difficulty: r.get("difficulty") } } }
-struct ProbeAttributes { base: f64, lifetime_ms: f64 }
-impl ProbeAttributes { fn from_row(r: &tokio_postgres::Row) -> Self { Self { base: r.get("base"), lifetime_ms: r.get("lifetime_ms") } } }
-struct LocalizedName { text: Option<String> }
-impl LocalizedName { fn from_row(r: &tokio_postgres::Row) -> Self { Self { text: r.get("text") } } }
 
 
 
@@ -403,17 +398,9 @@ pub async fn launch_probes(c: &mut Client, call: &Call<'_>) -> CallResult {
     if take <= 0 {
         return Ok(Value::None);
     }
-    let attrs = c
-        .db
-        .query_one(
-            "SELECT COALESCE((SELECT value FROM sde.type_attributes WHERE type_id = $1 AND attribute_id = $2), 40) AS base,
-                    COALESCE((SELECT value FROM sde.type_attributes WHERE type_id = $1 AND attribute_id = $3), 3600000) AS lifetime_ms",
-            &[&type_id, &ATTR_BASE_SENSOR_STRENGTH, &ATTR_EXPLOSION_DELAY],
-        )
-        .await
-        .map_err(db_err)?;
-    let attrs = ProbeAttributes::from_row(&attrs);
-    let (base, lifetime_ms) = (attrs.base, attrs.lifetime_ms);
+    let attrs = &c.world.sde().types;
+    let base = attrs.attribute(type_id, ATTR_BASE_SENSOR_STRENGTH).unwrap_or(40.0);
+    let lifetime_ms = attrs.attribute(type_id, ATTR_EXPLOSION_DELAY).unwrap_or(3_600_000.0);
     let (skill, _) = probe_skills(&c.db, char_id).await?;
     let pos = c.world.ball(system, ship).await.map(|b| b.pos).unwrap_or([0.0; 3]);
     let expiry = filetime_now() + (lifetime_ms * 10_000.0) as i64;
@@ -457,13 +444,8 @@ pub async fn belt_rats(c: &mut Client, system: i64, belt: i64, center: V3) -> Re
     if state().belts.contains(&belt) {
         return Ok(());
     }
-    let is_belt = c
-        .db
-        .query_opt("SELECT 1 FROM sde.map_celestials WHERE item_id = $1 AND group_id = $2", &[&belt, &GROUP_ASTEROID_BELT])
-        .await
-        .map_err(db_err)?
-        .is_some();
-    let info = system_info(&c.db, system).await?;
+    let is_belt = c.world.sde().map.celestial(belt).is_some_and(|body| body.group_id == Some(i64::from(GROUP_ASTEROID_BELT)));
+    let info = system_info(c.world.sde(), system)?;
     if !is_belt || (1..=6).contains(&info.class) || !state().belts.insert(belt) {
         return Ok(());
     }
@@ -519,7 +501,7 @@ pub async fn warp_to_scan(c: &mut Client, target: &str, min_range: f64) -> CallR
     }
     if let Some(field) = site.mining_field() {
         if site.containers.is_none() {
-            let info = system_info(&c.db, system).await?;
+            let info = system_info(c.world.sde(), system)?;
             let jspace = (1..=6).contains(&info.class);
             let rocks = super::mining::grow_field(&c.db, &c.world, system, site.id, site.pos, field, info.security, jspace).await?;
             if let Some(s) = state().sites.get_mut(&site.id) {
@@ -664,15 +646,7 @@ pub(super) async fn gm_sites(c: &mut Client) -> Result<String, CallError> {
     ensure_loaded(&c.db, &c.world, system).await?;
     let mut lines = vec![];
     for s in system_sites(system) {
-        let name: Option<String> = match s.name_id {
-            Some(id) => c
-                .db
-                .query_opt("SELECT data->>'text' AS text FROM sde_native.localization_fsd_zh WHERE key = $1::text", &[&id.to_string()])
-                .await
-                .map_err(db_err)?
-                .and_then(|r| LocalizedName::from_row(&r).text),
-            None => None,
-        };
+        let name = s.name_id.and_then(|id| c.world.sde().localization.chinese(id)).unwrap_or_default();
         let what = match (&s.wormhole, s.strength_attr) {
             (Some(w), _) => messages::gm_wormhole_site(w.type_id, w.dest_system, w.dest_class),
             (None, STRENGTH_RADAR) => messages::GM_SITE_DATA.into(),
@@ -680,7 +654,7 @@ pub(super) async fn gm_sites(c: &mut Client) -> Result<String, CallError> {
             _ => messages::GM_SITE_COMBAT.into(),
         };
         let kind = if s.kind == Kind::Anomaly { messages::GM_SITE_ANOMALY } else { messages::GM_SITE_SIGNATURE };
-        lines.push(messages::gm_site_row(&s.target, kind, &what, &name.unwrap_or_default()));
+        lines.push(messages::gm_site_row(&s.target, kind, &what, name));
     }
     lines.sort();
     Ok(lines.join("\n"))

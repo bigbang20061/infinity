@@ -1,5 +1,40 @@
-//! Mission site and NPC mechanics.
+//! Mission site and NPC mechanics, mirroring agent encounters in
+//! `eve/client/script/ui/shared/agencyNew/` and using startup SDE types and factions.
+//! Sites are transient; authored dungeon layouts and persistent site state are unsupported.
 use super::*;
+use crate::services::sql_pattern::matches_pattern;
+use crate::consts::{ATTR_AGILITY, ATTR_MAX_VELOCITY, CATEGORY_ENTITY};
+
+struct Npc<'a> {
+    type_id: i32,
+    name: &'a str,
+    radius: f64,
+    mass: f64,
+    velocity: Option<f64>,
+    agility: Option<f64>,
+    generic: bool,
+}
+
+
+fn candidate_group(name: &str, faction: &str) -> Option<bool> {
+    let generic = matches_pattern(name, "mission generic%");
+    let first_word = faction.split(' ').next().unwrap_or("");
+    // SQL lower maps per character, so ASCII prefix/suffix plus the SQL-folded
+    // faction (or its first word) equals lower of the complete pattern.
+    (generic
+        || matches_pattern(name, &format!("mission {faction} %"))
+        || matches_pattern(name, &format!("deadspace {first_word}%")))
+        .then_some(generic)
+}
+
+fn preferred<'a, 'b>(rows: &'a [Npc<'b>], class: &str) -> Vec<&'a Npc<'b>> {
+    let fits: Vec<_> = rows.iter().filter(|r| group_has_class(r.name, class)).collect();
+    if fits.iter().any(|r| !r.generic) {
+        fits.into_iter().filter(|r| !r.generic).collect()
+    } else {
+        fits
+    }
+}
 // ---------------------------------------------------------------- sites and NPCs
 
 struct MissionSite {
@@ -43,40 +78,27 @@ pub(super) async fn ensure_site(c: &mut Client, m: &Mission) -> Result<(), CallE
     if sites().lock().unwrap().contains_key(&(me, m.agent_id)) {
         return Ok(());
     }
-    // The dungeon faction's mission/deadspace rats, else the generic mission rats.
-    let rows = c
-        .db
-        .query(
-            "SELECT t.type_id, g.name, COALESCE(t.radius, 50)::float8 AS radius, COALESCE(t.mass, 1000000)::float8 AS mass,
-                    (SELECT value FROM sde.type_attributes WHERE type_id = t.type_id AND attribute_id = 37) AS velocity,
-                    (SELECT value FROM sde.type_attributes WHERE type_id = t.type_id AND attribute_id = 70) AS agility,
-                    g.name ILIKE 'Mission Generic%' AS generic
-             FROM sde.inv_types t JOIN sde.inv_groups g ON g.group_id = t.group_id
-             LEFT JOIN sde.chr_factions f ON f.faction_id::bigint = $1
-             WHERE g.category_id = 11
-               AND (g.name ILIKE 'Mission ' || COALESCE(f.name, '~') || ' %'
-                    OR g.name ILIKE 'Deadspace ' || split_part(COALESCE(f.name, '~'), ' ', 1) || '%'
-                    OR g.name ILIKE 'Mission Generic%')",
-            &[&m.faction_id],
-        )
-        .await
-        .map_err(db_err)?.iter().map(sde_rows::Npc::from_row).collect::<Vec<_>>();
+    let faction = c.sde.factions.get(m.faction_id);
+    let faction_name = faction.and_then(|f| f.lower_name.as_deref()).unwrap_or("~");
+    let rows: Vec<_> = c.sde.types.iter().filter_map(|t| {
+        let group = c.sde.types.group(t.group_id?)?;
+        if group.category_id != Some(CATEGORY_ENTITY) { return None; }
+        let name = group.name.as_deref()?;
+        let generic = candidate_group(group.lower_name.as_deref()?, faction_name)?;
+        Some(Npc {
+            type_id: t.type_id, name, radius: t.radius.unwrap_or(50.0),
+            mass: t.mass.unwrap_or(1_000_000.0),
+            velocity: t.attribute(ATTR_MAX_VELOCITY), agility: t.attribute(ATTR_AGILITY), generic,
+        })
+    }).collect();
     // NPCs belong to the faction's NPC corporation: the client looks owners and corpIDs up
     // as corporations (tickers, standings), and a faction ID there breaks target locking.
-    let corp: i64 = c
-        .db
-        .query_opt("SELECT corporation_id::bigint AS corporation_id FROM sde.chr_factions WHERE faction_id::bigint = $1", &[&m.faction_id])
-        .await
-        .map_err(db_err)?
-        .and_then(|r| sde_rows::Corporation::from_row(&r).id)
-        .unwrap_or(GENERIC_NPC_CORP);
+    let corp = faction.and_then(|f| f.corporation_id).unwrap_or(GENERIC_NPC_CORP);
     let level = agent(m.agent_id).map(|a| a.level).unwrap_or(1);
     let tick = now_ms();
     let mut spawned = Vec::new();
     for class in spawn_classes(level) {
-        let fits: Vec<&sde_rows::Npc> = rows.iter().filter(|r| group_has_class(&r.name, class)).collect();
-        let faction: Vec<&&sde_rows::Npc> = fits.iter().filter(|r| !r.generic).collect();
-        let pool: Vec<&sde_rows::Npc> = if faction.is_empty() { fits.clone() } else { faction.into_iter().copied().collect() };
+        let pool = preferred(&rows, class);
         if pool.is_empty() {
             continue;
         }
@@ -145,3 +167,6 @@ pub(super) async fn objective_done(c: &Client, m: &Mission) -> bool {
     c.world.with(system, move |s| s.group_remaining(group) == 0).await.unwrap_or(false)
 }
 
+
+#[cfg(test)]
+mod tests;

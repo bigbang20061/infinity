@@ -4,10 +4,11 @@
 
 use crate::{dao, db::Db};
 
-#[expect(dead_code, reason = "read by Phase 1 of #5")]
 pub(crate) struct Faction {
     pub faction_id: i64,
+    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub name: Option<String>,
+    pub lower_name: Option<String>,
     pub corporation_id: Option<i64>,
 }
 
@@ -20,7 +21,6 @@ impl Factions {
         Ok(Self { rows: dao::sde::factions::load(db).await? })
     }
 
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) fn get(&self, id: i64) -> Option<&Faction> {
         self.rows.binary_search_by_key(&id, |row| row.faction_id).ok().map(|index| &self.rows[index])
     }

@@ -51,6 +51,8 @@ pub const GROUP_ASTEROID_BELT: i32 = 9;
 pub const CATEGORY_SHIP: i32 = 6;
 /// SDE invCategories: Charge.
 pub const CATEGORY_CHARGE: i32 = 8;
+/// SDE invCategories: Entity.
+pub const CATEGORY_ENTITY: i32 = 11;
 /// SDE invTypes: Hacking skill.
 pub const SKILL_HACKING: i32 = 21718;
 /// SDE invTypes: Archaeology skill.

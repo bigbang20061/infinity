@@ -2,13 +2,8 @@
 //! Shared exploration state and data sources are documented in the parent module.
 
 use super::*;
+use crate::consts::{ATTR_AGILITY, ATTR_MAX_VELOCITY, CATEGORY_ENTITY};
 
-struct FactionCorp { corporation_id: Option<i64> }
-impl FactionCorp { fn from_row(r: &tokio_postgres::Row) -> Self { Self { corporation_id: r.get("corporation_id") } } }
-struct RatType { type_id: i32, radius: f64, mass: f64, max_vel: Option<f64>, agility: Option<f64> }
-impl RatType { fn from_row(r: &tokio_postgres::Row) -> Self { Self { type_id: r.get("type_id"), radius: r.get("radius"), mass: r.get("mass"), max_vel: r.get("max_vel"), agility: r.get("agility") } } }
-struct ContainerType { type_id: i32, radius: f64 }
-impl ContainerType { fn from_row(r: &tokio_postgres::Row) -> Self { Self { type_id: r.get("type_id"), radius: r.get("radius") } } }
 
 // ---------------------------------------------------------------- site content
 
@@ -53,7 +48,7 @@ pub(super) fn sleeper_groups(difficulty: i64) -> [&'static str; 3] {
 pub(super) async fn spawn_site_npcs(c: &mut Client, site: &Site) -> Result<(), CallError> {
     let faction = site.faction.unwrap_or(FACTION_GURISTAS);
     let sleepers = faction == 500021 && site.name_id.is_some() && site.archetype == Some(24) && site.strength_attr == STRENGTH_ALL && {
-        let class = system_info(&c.db, site.system).await?.class;
+        let class = system_info(c.world.sde(), site.system)?.class;
         (1..=6).contains(&class)
     };
     let groups: Vec<String> = if sleepers {
@@ -97,32 +92,15 @@ pub(super) fn track_site_clearance(db: Db, world: Arc<World>, site_id: i64, syst
 /// Put one hostile NPC of each of `groups` (a random type of the group) in space for
 /// `faction`, between `spread.0` and `spread.1` metres from `center`.
 pub(super) async fn spawn_rats(c: &mut Client, system: i64, center: V3, faction: i64, groups: &[String], spread: (f64, f64)) -> Result<Vec<i64>, CallError> {
-    let corp: i64 = c
-        .db
-        .query_opt("SELECT corporation_id::bigint AS corporation_id FROM sde.chr_factions WHERE faction_id::bigint = $1", &[&faction])
-        .await
-        .map_err(db_err)?
-        .and_then(|r| FactionCorp::from_row(&r).corporation_id)
-        .unwrap_or(1000127);
+    let corp = c.world.sde().factions.get(faction).and_then(|f| f.corporation_id).unwrap_or(1000127);
     let ms = now_ms();
     let mut spawned = vec![];
     for group in groups {
-        let Some(r) = c
-            .db
-            .query_opt(
-                "SELECT t.type_id, COALESCE(t.radius, 50)::float8 AS radius, COALESCE(t.mass, 1000000)::float8 AS mass,
-                        (SELECT value FROM sde.type_attributes WHERE type_id = t.type_id AND attribute_id = 37) AS max_vel,
-                        (SELECT value FROM sde.type_attributes WHERE type_id = t.type_id AND attribute_id = 70) AS agility
-                 FROM sde.inv_types t JOIN sde.inv_groups g ON g.group_id = t.group_id
-                 WHERE g.category_id = 11 AND g.name = $1 ORDER BY random() LIMIT 1",
-                &[group],
-            )
-            .await
-            .map_err(db_err)?
-        else {
-            continue;
-        };
-        let r = RatType::from_row(&r);
+        let candidates: Vec<_> = c.world.sde().types.iter().filter(|t| {
+            t.group_id.and_then(|id| c.world.sde().types.group(id))
+                .is_some_and(|g| g.category_id == Some(CATEGORY_ENTITY) && g.name.as_deref() == Some(group.as_str()))
+        }).collect();
+        let Some(r) = pick(&candidates) else { continue };
         let d = spread.0 + rand01() * (spread.1 - spread.0);
         let v = rand_dir();
         let ball = Ball {
@@ -134,10 +112,10 @@ pub(super) async fn spawn_rats(c: &mut Client, system: i64, center: V3, faction:
             char_id: None,
             signature_radius: None,
             mode: MODE_STOP,
-            radius: r.radius as f32,
-            mass: r.mass,
-            max_vel: r.max_vel.unwrap_or(300.0) as f32,
-            agility: r.agility.unwrap_or(3.0) as f32,
+            radius: r.radius.unwrap_or(50.0) as f32,
+            mass: r.mass.unwrap_or(1_000_000.0),
+            max_vel: r.attribute(ATTR_MAX_VELOCITY).unwrap_or(300.0) as f32,
+            agility: r.attribute(ATTR_AGILITY).unwrap_or(3.0) as f32,
             speed_fraction: 0.0,
             pos: [center[0] + v[0] * d, center[1] + v[1] * d * 0.3, center[2] + v[2] * d],
             vel: [0.0; 3],
@@ -181,14 +159,14 @@ pub(super) fn belt_classes(security: f64) -> &'static [&'static str] {
 pub(super) async fn replace_site(db: &Db, world: &World, site_id: i64) -> Result<(), CallError> {
     let Some(old) = state().sites.get(&site_id).cloned() else { return Ok(()) };
     let system = old.system;
-    let info = system_info(db, system).await?;
+    let info = system_info(world.sde(), system)?;
     let mut taken: HashSet<String> = system_sites(system).into_iter().filter(|s| s.id != site_id).map(|s| s.target).collect();
     let new = if let Some(field) = old.mining_field() {
-        mining_site(db, world.sde(), system, &info, field, &mut taken).await?
+        mining_site(world.sde(), system, &info, field, &mut taken)?
     } else if old.is_hack_site() {
-        hack_site(db, world.sde(), system, &info, old.strength_attr == STRENGTH_MAGNETOMETRIC, &mut taken).await?
+        hack_site(world.sde(), system, &info, old.strength_attr == STRENGTH_MAGNETOMETRIC, &mut taken)?
     } else {
-        combat_site(db, world.sde(), system, &info, old.kind, &mut taken).await?
+        combat_site(world.sde(), system, &info, old.kind, &mut taken)?
     };
     enum Replacement { Apply(Site, Option<Site>) }
     db.transaction(
@@ -500,6 +478,22 @@ pub(super) fn container_ball(id: i64, type_id: i32, pos: V3, radius: f32, securi
     }
 }
 
+// PostgreSQL casts float8 to integer using round-to-nearest, ties-to-even.
+fn required_skill_matches(value: Option<f64>, skill: i32) -> bool {
+    value.is_some_and(|v| v.round_ties_even() == f64::from(skill))
+}
+
+fn select_loot<T>(mut rows: Vec<T>, limit: usize, eligible: impl Fn(&T) -> bool, mut random: impl FnMut() -> f64) -> Vec<T> {
+    rows.retain(eligible);
+    let count = limit.min(rows.len());
+    for i in 0..count {
+        let j = i + (random() * (rows.len() - i) as f64) as usize;
+        rows.swap(i, j);
+    }
+    rows.truncate(count);
+    rows
+}
+
 /// Spawn a data or relic site's containers with their loot (once).
 pub(super) async fn spawn_containers(c: &mut Client, site: &Site) -> Result<(), CallError> {
     let relic = site.strength_attr == STRENGTH_MAGNETOMETRIC;
@@ -507,22 +501,24 @@ pub(super) async fn spawn_containers(c: &mut Client, site: &Site) -> Result<(), 
     let prefix = container_prefix(faction);
     let sleeper = prefix == "Sleeper";
     let skill = if relic { SKILL_ARCHAEOLOGY } else { SKILL_HACKING };
-    let types = c
-        .db
-        .query(
-            "SELECT t.type_id, COALESCE(t.radius, 300)::float8 AS radius FROM sde.inv_types t
-             JOIN sde.type_attributes h ON h.type_id = t.type_id
-             JOIN sde.dogma_attributes hd ON hd.attribute_id = h.attribute_id AND hd.name = 'hackable'
-             JOIN sde.type_attributes sk ON sk.type_id = t.type_id AND sk.attribute_id = $6 AND sk.value::int = $2
-             LEFT JOIN sde.type_attributes tier ON tier.type_id = t.type_id
-                  AND tier.attribute_id = (SELECT attribute_id FROM sde.dogma_attributes WHERE name = 'tierDifficulty')
-             WHERE t.group_id = $1 AND (t.name LIKE $3 || ' %' OR ($4 AND t.name LIKE '%Sleeper%'))
-               AND COALESCE(tier.value, 1) <= $5",
-            &[&GROUP_SCATTER_CONTAINER, &skill, &prefix, &sleeper, &((site.difficulty + 1) as f64), &ATTR_REQUIRED_SKILL_1],
-        )
-        .await
-        .map_err(db_err)?;
-    let types: Vec<(i32, f64)> = types.iter().map(|r| { let r = ContainerType::from_row(r); (r.type_id, r.radius) }).collect();
+    let sde = c.world.sde();
+    let mut tiers = sde.dogma.attributes_by_name("tierDifficulty");
+    let tier = tiers.next().map(|a| a.attribute_id);
+    let duplicate_tier = tiers.next().is_some();
+    let hackable: Vec<_> = sde.dogma.attributes_by_name("hackable").map(|a| a.attribute_id).collect();
+    let mut types = Vec::new();
+    for t in sde.types.iter().filter(|t| t.group_id == Some(GROUP_SCATTER_CONTAINER)) {
+        let Some(name) = t.name.as_deref() else { continue };
+        if !(name.starts_with(&format!("{prefix} ")) || (sleeper && name.contains("Sleeper"))) { continue; }
+        if !required_skill_matches(t.attribute(ATTR_REQUIRED_SKILL_1), skill) { continue; }
+        let matches = hackable.iter().filter(|&&id| t.attribute(id).is_some()).count();
+        if matches == 0 { continue; }
+        if duplicate_tier {
+            return Err(CallError::Internal(anyhow::anyhow!("multiple tierDifficulty attributes")));
+        }
+        if !(tier.and_then(|id| t.attribute(id)).unwrap_or(1.0) <= (site.difficulty + 1) as f64) { continue; }
+        for _ in 0..matches { types.push((t.type_id, t.radius.unwrap_or(300.0))); }
+    }
     let count = 3 + (rand01() * 3.0) as usize;
     let value = CONTAINER_LOOT_VALUE[(site.difficulty.clamp(1, 4) - 1) as usize];
     let groups = loot_groups(relic, sleeper);
@@ -534,7 +530,9 @@ pub(super) async fn spawn_containers(c: &mut Client, site: &Site) -> Result<(), 
         let pos = [site.pos[0] + v[0] * d, site.pos[1] + v[1] * d * 0.3, site.pos[2] + v[2] * d];
         let id = crate::dao::exploration::insert_container(&c.db, type_id, site.system, pos).await.map_err(db_err)?;
         let stacks = 2 + (rand01() * 2.0) as i64;
-        let loot = crate::dao::exploration::loot(&c.db, &groups, value, stacks).await.map_err(db_err)?;
+        let rows = crate::dao::exploration::loot(&c.db, value).await.map_err(db_err)?;
+        let loot = select_loot(rows, stacks as usize, |r| c.world.sde().types.get(r.type_id)
+            .is_some_and(|t| t.published == Some(true) && t.group_id.is_some_and(|g| groups.contains(&g))), rand01);
         for r in &loot {
             let (loot_type, price) = (r.type_id, r.average);
             let quantity = ((value / stacks as f64 / price.max(1.0)) * (0.5 + rand01())).round().clamp(1.0, 500.0) as i32;
@@ -554,10 +552,14 @@ pub(super) async fn spawn_containers(c: &mut Client, site: &Site) -> Result<(), 
 pub(super) async fn restore_containers(db: &Db, world: &World, site: &Site, ids: &[i64]) -> Result<(), CallError> {
     let rows = crate::dao::exploration::containers(db, ids).await.map_err(db_err)?;
     for r in rows {
+        let Some(t) = world.sde().types.get(r.type_id) else { continue };
         let id = r.item_id;
         let security = if site.hacked.contains(&id) { 2 } else { 0 };
-        let ball = container_ball(id, r.type_id, r.pos, r.radius as f32, security);
+        let ball = container_ball(id, r.type_id, r.pos, t.radius.unwrap_or(300.0) as f32, security);
         world.add_ship(site.system, ball).await.map_err(CallError::Internal)?;
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

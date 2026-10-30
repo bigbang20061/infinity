@@ -43,6 +43,7 @@ mod ship;
 mod skills;
 mod standings;
 mod slash;
+mod sql_pattern;
 mod station;
 mod store;
 mod universe;

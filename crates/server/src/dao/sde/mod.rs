@@ -7,10 +7,12 @@
 //! Other SDE tables remain with their existing consumers until migrated.
 pub(crate) mod corporations;
 pub(crate) mod dogma;
+pub(crate) mod dungeons;
 pub(crate) mod factions;
 pub(crate) mod industry;
 pub(crate) mod localization;
 pub(crate) mod map;
+pub(crate) mod missions;
 pub(crate) mod store;
 pub(crate) mod types;
 pub(crate) mod wrecks;

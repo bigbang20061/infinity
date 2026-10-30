@@ -12,6 +12,7 @@ pub(crate) struct TypeData {
     pub(crate) type_id: i32,
     pub(crate) group_id: Option<i32>, pub(crate) category_id: Option<i32>,
     pub(crate) name: Option<String>,
+    pub(crate) lower_name: Option<String>,
     pub(crate) mass: Option<f64>, pub(crate) capacity: Option<f64>,
     pub(crate) volume: Option<f64>, pub(crate) radius: Option<f64>,
     pub(crate) portion_size: Option<i32>,
@@ -34,7 +35,8 @@ pub(crate) struct Group {
     #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) group_id: i32,
     pub(crate) category_id: Option<i32>,
-    pub(crate) name: Option<String>
+    pub(crate) name: Option<String>,
+    pub(crate) lower_name: Option<String>,
 }
 #[expect(dead_code, reason = "read by Phase 1 of #5")]
 pub(crate) struct Category { pub(crate) category_id: i32, pub(crate) name: Option<String> }
@@ -67,13 +69,13 @@ impl Types {
         for r in attrs { children.entry(r.type_id).or_default().attributes.push((r.attribute_id, r.value)); }
         for r in effects { children.entry(r.type_id).or_default().effects.push(TypeEffect { effect_id: r.effect_id, is_default: r.is_default }); }
         for r in materials { children.entry(r.type_id).or_default().materials.push(TypeMaterial { material_type_id: r.material_type_id, quantity: r.quantity }); }
-        let mut result = Self { types: Vec::with_capacity(types.len()), by_id: HashMap::with_capacity(types.len()), groups: groups.into_iter().map(|r| (r.group_id, Group { group_id: r.group_id, category_id: r.category_id, name: r.name })).collect(), categories: categories.into_iter().map(|r| (r.category_id, Category { category_id: r.category_id, name: r.name })).collect(), group_types: HashMap::new(), category_types: HashMap::new(), orphans: HashMap::new(), modified_attributes: HashSet::new() };
+        let mut result = Self { types: Vec::with_capacity(types.len()), by_id: HashMap::with_capacity(types.len()), groups: groups.into_iter().map(|r| (r.group_id, Group { group_id: r.group_id, category_id: r.category_id, name: r.name, lower_name: r.lower_name })).collect(), categories: categories.into_iter().map(|r| (r.category_id, Category { category_id: r.category_id, name: r.name })).collect(), group_types: HashMap::new(), category_types: HashMap::new(), orphans: HashMap::new(), modified_attributes: HashSet::new() };
         for r in types {
             result.by_id.insert(r.type_id, result.types.len());
             if let Some(id) = r.group_id { result.group_types.entry(id).or_default().push(r.type_id); }
             if let Some(id) = r.category_id { result.category_types.entry(id).or_default().push(r.type_id); }
             let c = children.remove(&r.type_id).unwrap_or_default();
-            result.types.push(TypeData { type_id: r.type_id, group_id: r.group_id, category_id: r.category_id, name: r.name, mass: r.mass, capacity: r.capacity, volume: r.volume, radius: r.radius, portion_size: r.portion_size, base_price: r.base_price, published: r.published, market_group_id: r.market_group_id, race_id: r.race_id, icon_id: r.icon_id, attributes: c.attributes, effects: c.effects, modifiers: HashMap::new(), materials: c.materials });
+            result.types.push(TypeData { type_id: r.type_id, group_id: r.group_id, category_id: r.category_id, name: r.name, lower_name: r.lower_name, mass: r.mass, capacity: r.capacity, volume: r.volume, radius: r.radius, portion_size: r.portion_size, base_price: r.base_price, published: r.published, market_group_id: r.market_group_id, race_id: r.race_id, icon_id: r.icon_id, attributes: c.attributes, effects: c.effects, modifiers: HashMap::new(), materials: c.materials });
         }
         result.orphans = children;
         Ok(result)
@@ -98,7 +100,6 @@ impl Types {
     pub(crate) fn len(&self) -> usize { self.types.len() }
     pub(crate) fn group(&self, id: i32) -> Option<&Group> { self.groups.get(&id) }
     pub(crate) fn category(&self, id: i32) -> Option<&Category> { self.categories.get(&id) }
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) fn group_types(&self, id: i32) -> &[i32] { self.group_types.get(&id).map_or(&[], Vec::as_slice) }
     #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) fn category_types(&self, id: i32) -> &[i32] { self.category_types.get(&id).map_or(&[], Vec::as_slice) }

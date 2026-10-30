@@ -20,7 +20,6 @@ impl Localization {
         Ok(Self { english, chinese })
     }
 
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) fn english(&self, id: i64) -> Option<&str> {
         self.english.binary_search_by_key(&id, |row| row.id).ok().and_then(|index| self.english[index].text.as_deref())
     }

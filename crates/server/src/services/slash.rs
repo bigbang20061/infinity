@@ -8,10 +8,14 @@
 //! Wallet commands write exact values through the character and account DAOs to
 //! `game.characters` and `game.accounts`; client wallet displays are clamped to
 //! their protocol limits. Corporation wallets and target writes are unsupported.
+//!
+//! Type and celestial data come from the startup SDE snapshot; item positions and
+//! wallet balances come from game data. Unsupported commands return a slash error.
 
 use super::{db_err, Call, CallError, CallResult};
+use super::sql_pattern::matches_pattern;
 use crate::client::Client;
-use crate::consts::{CLIENT_MAX_ISK, CLIENT_MAX_PLEX, FLAG_CARGO, FLAG_HANGAR, GM_ROLES};
+use crate::consts::{CLIENT_MAX_ISK, CLIENT_MAX_PLEX, FLAG_CARGO, FLAG_HANGAR, GM_ROLES, GROUP_PLANET};
 use crate::messages;
 use marshal::Value;
 use tracing::info;
@@ -25,13 +29,6 @@ const ISK_INTEGER_DIGITS: usize = 34;
 const ISK_DECIMALS: usize = 2;
 /// `game_schema.sql`: account PLEX balance is numeric(36, 0).
 const PLEX_DIGITS: usize = 36;
-
-struct TypeRow { type_id: i32, name: String }
-impl TypeRow { fn from_row(r: &tokio_postgres::Row) -> Self { Self { type_id: r.get("type_id"), name: r.get("name") } } }
-struct Celestial { x: f64, y: f64, z: f64, radius: f64 }
-impl Celestial { fn from_row(r: &tokio_postgres::Row) -> Self { Self { x: r.get("x"), y: r.get("y"), z: r.get("z"), radius: r.get("radius") } } }
-struct SystemCelestial { solar_system_id: i64, celestial: Celestial }
-impl SystemCelestial { fn from_row(r: &tokio_postgres::Row) -> Self { Self { solar_system_id: r.get("solar_system_id"), celestial: Celestial::from_row(r) } } }
 
 const COMMANDS: [(&str, &str); 12] = [
     ("tr", messages::GM_HELP_TELEPORT),
@@ -56,22 +53,23 @@ fn help() -> String {
     COMMANDS.iter().map(|(_, usage)| *usage).collect::<Vec<_>>().join("\n")
 }
 
+
 /// A type by ID or (partial) name.
 async fn resolve_type(c: &Client, arg: &str) -> Result<(i32, String), CallError> {
     let row = match arg.parse::<i32>() {
-        Ok(id) => c.db.query_opt("SELECT type_id, name FROM sde.inv_types WHERE type_id = $1", &[&id]).await,
+        Ok(id) => c.sde.types.get(id),
         Err(_) => {
-            c.db
-                .query_opt(
-                    "SELECT type_id, name FROM sde.inv_types WHERE published AND name ILIKE '%' || $1 || '%'
-                     ORDER BY lower(name) = lower($1) DESC, length(name) LIMIT 1",
-                    &[&arg],
-                )
-                .await
+            let lower = crate::dao::slash::lower_pattern(&c.db, arg).await.map_err(db_err)?;
+            let pattern = format!("%{lower}%");
+            c.sde.types.iter().filter_map(|t| {
+                let name = t.name.as_ref()?;
+                if t.published != Some(true) { return None; }
+                let folded = t.lower_name.as_ref()?;
+                matches_pattern(folded, &pattern).then_some((t, *folded == lower, name.chars().count()))
+            }).min_by_key(|(t, exact, len)| (!exact, *len, t.type_id)).map(|(t, _, _)| t)
         }
-    }
-    .map_err(db_err)?;
-    row.map(|r| { let r = TypeRow::from_row(&r); (r.type_id, r.name) }).ok_or_else(|| slash_error(messages::gm_unknown_type(arg)))
+    };
+    row.map(|t| (t.type_id, t.name.as_ref().expect("type name").clone())).ok_or_else(|| slash_error(messages::gm_unknown_type(arg)))
 }
 
 /// /tr me <destination>
@@ -92,33 +90,26 @@ async fn tr(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
         super::ship::teleport(c, here, pos).await?;
         return Ok(messages::gm_teleported(id));
     }
-    // A solar system: off one of its planets (or its sun).
+    // SQL's descending boolean order puts NULL group IDs before planets.
     if (30_000_000..33_000_000).contains(&id) {
-        let p = c
-            .db
-            .query_opt(
-                "SELECT x, y, z, COALESCE(radius, 10000)::float8 AS radius FROM sde.map_celestials WHERE solar_system_id = $1
-                 ORDER BY group_id = 7 DESC, random() LIMIT 1",
-                &[&(id as i32)],
-            )
-            .await
-            .map_err(db_err)?
+        let priority = c.sde.map.celestials(id)
+            .map(|p| (p.group_id.is_none(), p.group_id == Some(i64::from(GROUP_PLANET))))
+            .max();
+        let candidates = || c.sde.map.celestials(id).filter(|p| {
+            Some((p.group_id.is_none(), p.group_id == Some(i64::from(GROUP_PLANET)))) == priority
+        });
+        let count = candidates().count();
+        let p = candidates().nth((super::rand01() * count as f64) as usize)
             .ok_or_else(|| slash_error(messages::gm_unknown_system(id)))?;
-        let p = Celestial::from_row(&p);
-        let pos = [p.x + p.radius + 100_000.0, p.y, p.z];
+        let p = (p.x.expect("celestial x"), p.y.expect("celestial y"), p.z.expect("celestial z"), p.radius.unwrap_or(10_000.0));
+        let pos = [p.0 + p.3 + 100_000.0, p.1, p.2];
         super::ship::teleport(c, id, pos).await?;
         return Ok(messages::gm_teleported_to_system(id));
     }
     // A station, planet, moon, gate...
-    if let Some(p) = c
-        .db
-        .query_opt("SELECT solar_system_id::bigint, x, y, z, COALESCE(radius, 5000)::float8 AS radius FROM sde.map_celestials WHERE item_id = $1", &[&id])
-        .await
-        .map_err(db_err)?
-    {
-        let p = SystemCelestial::from_row(&p);
-        let pos = [p.celestial.x + p.celestial.radius + TELEPORT_CLEARANCE, p.celestial.y, p.celestial.z];
-        super::ship::teleport(c, p.solar_system_id, pos).await?;
+    if let Some(p) = c.sde.map.celestial(id) {
+        let pos = [p.x.expect("celestial x") + p.radius.unwrap_or(5_000.0) + TELEPORT_CLEARANCE, p.y.expect("celestial y"), p.z.expect("celestial z")];
+        super::ship::teleport(c, p.solar_system_id.expect("celestial system"), pos).await?;
         return Ok(messages::gm_teleported(id));
     }
     // A character in space, or an item floating somewhere.

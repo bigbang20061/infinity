@@ -20,17 +20,8 @@ fn site_location(m: &Mission) -> Value {
 
 /// The agent's station: (stationID, typeID, solarSystemID, position).
 async fn agent_station(c: &Client, agent: &Agent) -> Result<(i64, i64, i64, V3), CallError> {
-    let r = c
-        .db
-        .query_opt(
-            "SELECT s.type_id::bigint AS type_id, s.solar_system_id::bigint AS system_id, COALESCE(s.x, 0) AS x, COALESCE(s.y, 0) AS y, COALESCE(s.z, 0) AS z
-             FROM sde.sta_stations s WHERE s.station_id = $1::int",
-            &[&(agent.station_id as i32)],
-        )
-        .await
-        .map_err(db_err)?;
-    Ok(match r {
-        Some(r) => { let r = sde_rows::Station::from_row(&r); (agent.station_id, r.type_id, r.system_id, [r.x, r.y, r.z]) },
+    Ok(match c.sde.map.station(agent.station_id) {
+        Some(r) => (agent.station_id, r.type_id.expect("station type_id is NULL"), r.solar_system_id.expect("station solar_system_id is NULL"), [r.x.unwrap_or(0.0), r.y.unwrap_or(0.0), r.z.unwrap_or(0.0)]),
         None => (agent.station_id, 0, agent.system_id, [0.0; 3]),
     })
 }
@@ -58,18 +49,7 @@ async fn objective_info(c: &Client, m: &Mission) -> Result<Value, CallError> {
     let cargo_value = |has: bool, (type_id, qty): (i32, i32), volume: f64| {
         Value::dict([("hasCargo", Value::Bool(has)), ("quantity", Value::Int(qty as i64)), ("typeID", Value::Int(type_id as i64)), ("volume", Value::Float(volume))])
     };
-    let volume = |c: &Client, type_id: i32| {
-        let db = c.db.clone();
-        async move {
-            db
-                .query_opt("SELECT COALESCE(volume, 0)::float8 AS volume FROM sde.inv_types WHERE type_id = $1", &[&type_id])
-                .await
-                .ok()
-                .flatten()
-                .map(|r| sde_rows::Volume::from_row(&r).value)
-                .unwrap_or(0.0)
-        }
-    };
+    let volume = |c: &Client, type_id: i32| c.sde.types.get(type_id).and_then(|t| t.volume).unwrap_or(0.0);
     match (m.kind, m.cargo) {
         (Kind::Talk, _) => objectives.push(Value::tuple([Value::str("agent"), Value::tuple([Value::Int(hand_in), agent_location(c, hand_in).await?])])),
         (Kind::Courier, Some(cargo)) => {
@@ -80,14 +60,14 @@ async fn objective_info(c: &Client, m: &Mission) -> Result<Value, CallError> {
                 agent_location(c, m.agent_id).await?,
                 Value::Int(hand_in),
                 agent_location(c, hand_in).await?,
-                cargo_value(has, cargo, volume(c, cargo.0).await * cargo.1 as f64),
+                cargo_value(has, cargo, volume(c, cargo.0) * cargo.1 as f64),
             ]);
             objectives.push(Value::tuple([Value::str("transport"), data]));
         }
         (Kind::Trade, Some(cargo)) => {
             let station = agent(hand_in).map(|a| a.station_id).unwrap_or(0);
             let has = has_goods(c, station, cargo).await?;
-            let data = Value::tuple([Value::Int(hand_in), agent_location(c, hand_in).await?, cargo_value(has, cargo, volume(c, cargo.0).await * cargo.1 as f64)]);
+            let data = Value::tuple([Value::Int(hand_in), agent_location(c, hand_in).await?, cargo_value(has, cargo, volume(c, cargo.0) * cargo.1 as f64)]);
             objectives.push(Value::tuple([Value::str("fetch"), data]));
         }
         _ => {}
@@ -391,7 +371,7 @@ async fn do_action(c: &mut Client, agent: &Agent, action: Option<i64>) -> CallRe
             // A quit arc step can be taken up again (its fail mission, usually itself).
             if let Some(arc) = m.arc_id {
                 set_arc_state(c, arc, m.mission_id, "quit").await?;
-                let retry = arcs(c).await?.get(&m.mission_id).and_then(|s| s.fail).unwrap_or(m.mission_id);
+                let retry = c.sde.missions.step(m.mission_id).and_then(|s| s.fail).unwrap_or(m.mission_id);
                 set_arc_state(c, arc, retry, "unlocked").await?;
             }
             c.notify("OnAgentMissionChange", vec![Value::str("quit"), Value::Int(agent.id)]);

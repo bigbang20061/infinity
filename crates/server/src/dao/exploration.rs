@@ -2,7 +2,7 @@
 //! The owning services support `eve/client/script/parklife`; this DAO has no wire contract.
 //! Uses `game.exploration_sites`, `game.exploration_scanned`, `game.exploration_systems`,
 //! `game.agent_missions`, `game.asteroids`, `game.items`, `game.module_charges`
-//! and SDE data. Simulation, policy, transactions and notifications remain with callers.
+//! and `game.retail_prices`. Simulation, policy, transactions and notifications remain with callers.
 use crate::db::{executor::Executor, Error};
 use tokio_postgres::Row;
 
@@ -92,14 +92,11 @@ pub(crate) async fn insert_container(ex: &(impl Executor + ?Sized), type_id: i32
                  VALUES ($1, 1, $2, 0, 1, true, $3, $4, $5) RETURNING item_id", &[&type_id, &system, &pos[0], &pos[1], &pos[2]]).await?).item_id) }
 pub(crate) struct Loot { pub(crate) type_id: i32, pub(crate) average: f64 }
 impl Loot { fn from_row(r: &Row) -> Self { Self { type_id: r.get("type_id"), average: r.get("average") } } }
-pub(crate) async fn loot(ex: &(impl Executor + ?Sized), groups: &[i32], value: f64, stacks: i64) -> Result<Vec<Loot>, Error> { Ok(ex.query("SELECT t.type_id, r.average FROM sde.inv_types t JOIN game.retail_prices r USING (type_id)
-                 WHERE t.published AND t.group_id = ANY($1) AND r.average BETWEEN 1000 AND $2
-                 ORDER BY random() LIMIT $3", &[&groups, &value, &stacks]).await?.iter().map(Loot::from_row).collect()) }
+pub(crate) async fn loot(ex: &(impl Executor + ?Sized), value: f64) -> Result<Vec<Loot>, Error> { Ok(ex.query("SELECT type_id, average FROM game.retail_prices WHERE average BETWEEN 1000 AND $1", &[&value]).await?.iter().map(Loot::from_row).collect()) }
 pub(crate) async fn insert_loot(ex: &(impl Executor + ?Sized), type_id: i32, id: i64, quantity: i32) -> Result<(), Error> { ex.execute("INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity) VALUES ($1, 1, $2, 0, $3)", &[&type_id, &id, &quantity]).await?; Ok(()) }
-pub(crate) struct Container { pub(crate) item_id: i64, pub(crate) type_id: i32, pub(crate) pos: [f64; 3], pub(crate) radius: f64 }
-impl Container { fn from_row(r: &Row) -> Self { Self { item_id: r.get("item_id"), type_id: r.get("type_id"), pos: [r.get("x"), r.get("y"), r.get("z")], radius: r.get("radius") } } }
-pub(crate) async fn containers(ex: &(impl Executor + ?Sized), ids: &[i64]) -> Result<Vec<Container>, Error> { Ok(ex.query("SELECT i.item_id, i.type_id, i.x, i.y, i.z, COALESCE(t.radius, 300)::float8 AS radius FROM game.items i JOIN sde.inv_types t USING (type_id)
-             WHERE i.item_id = ANY($1) AND i.x IS NOT NULL", &[&ids]).await?.iter().map(Container::from_row).collect()) }
+pub(crate) struct Container { pub(crate) item_id: i64, pub(crate) type_id: i32, pub(crate) pos: [f64; 3] }
+impl Container { fn from_row(r: &Row) -> Self { Self { item_id: r.get("item_id"), type_id: r.get("type_id"), pos: [r.get("x"), r.get("y"), r.get("z")] } } }
+pub(crate) async fn containers(ex: &(impl Executor + ?Sized), ids: &[i64]) -> Result<Vec<Container>, Error> { Ok(ex.query("SELECT item_id, type_id, x, y, z FROM game.items WHERE item_id = ANY($1) AND x IS NOT NULL", &[&ids]).await?.iter().map(Container::from_row).collect()) }
 pub(crate) async fn set_container_owner(ex: &(impl Executor + ?Sized), container: i64, char_id: i64) -> Result<(), Error> { ex.execute("UPDATE game.items SET owner_id = $2 WHERE location_id = $1", &[&container, &char_id]).await?; Ok(()) }
 pub(crate) struct WormholeLocation { pub(crate) site_id: i64, pub(crate) system_id: i64 }
 impl WormholeLocation { fn from_row(r: &Row) -> Self { Self { site_id: r.get("site_id"), system_id: r.get("system_id") } } }

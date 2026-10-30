@@ -13,7 +13,6 @@ pub(crate) struct SolarSystem {
     pub name: Option<String>,
     pub constellation_id: Option<i64>,
     pub region_id: Option<i64>,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub faction_id: Option<i64>,
     pub security: Option<f64>,
     #[expect(dead_code, reason = "read by Phase 1 of #5")]
@@ -25,14 +24,11 @@ pub(crate) struct SolarSystem {
 }
 pub(crate) struct Region {
     pub region_id: i64,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub wormhole_class_id: Option<i64>,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub nebula_id: Option<i64>,
 }
 pub(crate) struct Constellation {
     pub constellation_id: i64,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub wormhole_class_id: Option<i64>,
 }
 pub(crate) struct Stargate {
@@ -49,11 +45,8 @@ pub(crate) struct Station {
     pub constellation_id: Option<i64>,
     pub region_id: Option<i64>,
     pub operation_id: Option<i64>,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub x: Option<f64>,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub y: Option<f64>,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub z: Option<f64>,
     pub security: Option<f64>,
 }
@@ -70,17 +63,13 @@ pub(crate) struct Celestial {
 
 pub(crate) struct Map {
     systems: Vec<SolarSystem>,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     regions: Vec<Region>,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     constellations: Vec<Constellation>,
     stargates: Vec<Stargate>,
     stations: Vec<Station>,
     celestials: Vec<Celestial>,
     system_index: HashMap<i64, usize>,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     region_index: HashMap<i64, usize>,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     constellation_index: HashMap<i64, usize>,
     stargate_index: HashMap<i64, usize>,
     station_index: HashMap<i64, usize>,
@@ -121,9 +110,7 @@ impl Map {
         Ok(Self { systems, regions, constellations, stargates, stations, celestials, system_index, region_index, constellation_index, stargate_index, station_index, celestial_index, system_celestials, system_stations, owner_stations, jumps: adjacency })
     }
     pub(crate) fn system(&self, id: i64) -> Option<&SolarSystem> { self.system_index.get(&id).map(|&i| &self.systems[i]) }
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) fn region(&self, id: i64) -> Option<&Region> { self.region_index.get(&id).map(|&i| &self.regions[i]) }
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) fn constellation(&self, id: i64) -> Option<&Constellation> { self.constellation_index.get(&id).map(|&i| &self.constellations[i]) }
     pub(crate) fn stargate(&self, id: i64) -> Option<&Stargate> { self.stargate_index.get(&id).map(|&i| &self.stargates[i]) }
     pub(crate) fn station(&self, id: i64) -> Option<&Station> { self.station_index.get(&id).map(|&i| &self.stations[i]) }

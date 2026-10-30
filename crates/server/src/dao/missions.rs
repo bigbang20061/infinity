@@ -1,18 +1,17 @@
 //! Agent mission and epic arc progress persistence.
 //! This DAO has no direct client mirror or wire contract; owning services supply those.
-//! Uses `game.agent_missions`, `game.epic_arc_missions` and `sde_native.missions`.
-//! Static-data-only lookups, mission mechanics, payments, transactions and
-//! notifications remain with callers.
+//! Uses `game.agent_missions` and `game.epic_arc_missions`.
+//! Static mission data, mechanics, payments, transactions and notifications remain with callers.
 
 use crate::db::{self, executor::Executor};
 use tokio_postgres::Row;
 
-const MISSION_COLUMNS: &str = "am.agent_id, am.mission_id, (m.data->>'nameID')::bigint AS name_id, (m.data->'messages'->>'messages.mission.briefing')::bigint AS briefing_id,
+const MISSION_COLUMNS: &str = "am.agent_id, am.mission_id,
     am.dungeon_id, am.faction_id, am.state, am.system_id, am.x, am.y, am.z, am.reward_isk, am.reward_lp, am.accepted_at,
     am.kind, am.arc_id, am.dest_agent, am.cargo_type, am.cargo_qty";
 
 pub(crate) struct MissionRow {
-    pub agent_id: i64, pub mission_id: i32, pub name_id: Option<i64>, pub briefing_id: Option<i64>,
+    pub agent_id: i64, pub mission_id: i32,
     pub dungeon_id: i32, pub faction_id: i64, pub state: i32, pub system_id: i64,
     pub x: f64, pub y: f64, pub z: f64, pub reward_isk: i64, pub reward_lp: i64,
     pub accepted_at: Option<i64>, pub kind: String, pub arc_id: Option<i64>, pub dest_agent: Option<i64>,
@@ -20,8 +19,7 @@ pub(crate) struct MissionRow {
 }
 impl MissionRow {
     fn from_row(r: &Row) -> Self {
-        Self { agent_id: r.get("agent_id"), mission_id: r.get("mission_id"), name_id: r.get("name_id"),
-            briefing_id: r.get("briefing_id"), dungeon_id: r.get("dungeon_id"), faction_id: r.get("faction_id"),
+        Self { agent_id: r.get("agent_id"), mission_id: r.get("mission_id"), dungeon_id: r.get("dungeon_id"), faction_id: r.get("faction_id"),
             state: r.get("state"), system_id: r.get("system_id"), x: r.get("x"), y: r.get("y"), z: r.get("z"),
             reward_isk: r.get("reward_isk"), reward_lp: r.get("reward_lp"), accepted_at: r.get("accepted_at"),
             kind: r.get("kind"), arc_id: r.get("arc_id"), dest_agent: r.get("dest_agent"),
@@ -29,7 +27,7 @@ impl MissionRow {
     }
 }
 pub(crate) async fn missions_of(ex: &(impl Executor + ?Sized), character_id: i64, agent_id: Option<i64>) -> Result<Vec<MissionRow>, db::Error> {
-    let rows = ex.query(&format!("SELECT {MISSION_COLUMNS} FROM game.agent_missions am JOIN sde_native.missions m ON m.key = am.mission_id::text
+    let rows = ex.query(&format!("SELECT {MISSION_COLUMNS} FROM game.agent_missions am
                  WHERE am.character_id = $1 AND ($2::bigint IS NULL OR am.agent_id = $2) ORDER BY am.offered_at"), &[&character_id, &agent_id]).await?;
     Ok(rows.iter().map(MissionRow::from_row).collect())
 }
@@ -45,11 +43,11 @@ pub(crate) async fn set_arc_state(ex: &(impl Executor + ?Sized), character_id: i
                  ON CONFLICT (character_id, arc_id, mission_id) DO UPDATE SET state = EXCLUDED.state, {column} = COALESCE(EXCLUDED.{column}, game.epic_arc_missions.{column})"), &[&character_id, &arc, &mission, &state, &stamp]).await
 }
 
-pub(crate) struct ArcStatus { pub arc_id: i64, pub mission_id: i32, pub accepted_at: Option<i64>, pub completed_at: Option<i64>, pub quit_at: Option<i64>, pub name_id: Option<i64> }
-impl ArcStatus { fn from_row(r: &Row) -> Self { Self { arc_id: r.get("arc_id"), mission_id: r.get("mission_id"), accepted_at: r.get("accepted_at"), completed_at: r.get("completed_at"), quit_at: r.get("quit_at"), name_id: r.get("name_id") } } }
+pub(crate) struct ArcStatus { pub arc_id: i64, pub mission_id: i32, pub accepted_at: Option<i64>, pub completed_at: Option<i64>, pub quit_at: Option<i64> }
+impl ArcStatus { fn from_row(r: &Row) -> Self { Self { arc_id: r.get("arc_id"), mission_id: r.get("mission_id"), accepted_at: r.get("accepted_at"), completed_at: r.get("completed_at"), quit_at: r.get("quit_at") } } }
 pub(crate) async fn arc_status(ex: &(impl Executor + ?Sized), character_id: i64) -> Result<Vec<ArcStatus>, db::Error> {
-    Ok(ex.query("SELECT e.arc_id, e.mission_id, e.accepted_at, e.completed_at, e.quit_at, (m.data->>'nameID')::bigint AS name_id
-             FROM game.epic_arc_missions e JOIN sde_native.missions m ON m.key = e.mission_id::text
+    Ok(ex.query("SELECT e.arc_id, e.mission_id, e.accepted_at, e.completed_at, e.quit_at
+             FROM game.epic_arc_missions e
              WHERE e.character_id = $1 AND e.state <> 'unlocked' ORDER BY e.arc_id", &[&character_id]).await?.iter().map(ArcStatus::from_row).collect())
 }
 
