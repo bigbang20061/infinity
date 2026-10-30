@@ -14,6 +14,13 @@ impl ExactBalance {
     }
 }
 
+struct Coverage { covers: bool }
+impl Coverage {
+    fn from_row(row: &tokio_postgres::Row) -> Self {
+        Self { covers: row.get("covers") }
+    }
+}
+
 pub(crate) async fn set_exact(ex: &(impl Executor + ?Sized), char_id: i64, amount: &str) -> Result<(String, f64), Error> {
     let row = ex.query_one(
         "UPDATE game.characters SET balance = $2::text::numeric WHERE character_id = $1 RETURNING balance::text AS exact, balance::float8 AS balance",
@@ -34,6 +41,13 @@ pub(crate) async fn credit_exact(ex: &(impl Executor + ?Sized), char_id: i64, am
 
 pub(crate) async fn balance(ex: &(impl Executor + ?Sized), char_id: i64) -> Result<f64, Error> {
     Ok(Balance::from_row(&ex.query_one("SELECT balance::float8 FROM game.characters WHERE character_id = $1", &[&char_id]).await?).0)
+}
+
+pub(crate) async fn covers(ex: &(impl Executor + ?Sized), char_id: i64, amount: f64) -> Result<bool, Error> {
+    Ok(Coverage::from_row(&ex.query_one(
+        "SELECT balance >= $2::float8::numeric AS covers FROM game.characters WHERE character_id = $1",
+        &[&char_id, &amount],
+    ).await?).covers)
 }
 
 pub(crate) async fn credit(ex: &(impl Executor + ?Sized), char_id: i64, amount: f64) -> Result<f64, Error> {
