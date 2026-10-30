@@ -8,7 +8,7 @@ use crate::consts::FILETIME_MINUTE;
 use crate::db::executor::Executor;
 use crate::db::outbox::{dispatch_client, Outbox};
 use marshal::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use tracing::{info, warn};
 
 /// Internal bound-object name for skillMgr2.GetMySkillHandler.
@@ -116,8 +116,8 @@ pub async fn grant_starting_skills(c: &Client, char_id: i64, race_id: i32) -> Re
     Ok(())
 }
 
-/// Apply training progress up to now: finished entries become trained levels.
-async fn advance_training(db: &(impl Executor + ?Sized), char_id: i64, now: i64) -> Result<Vec<(i32, i32)>, CallError> {
+/// Collect finished entries and restore the remaining queue positions.
+async fn collect_finished(db: &(impl Executor + ?Sized), char_id: i64, now: i64) -> Result<Vec<(i32, i32, i64)>, CallError> {
     let done = db
         .query(
             "DELETE FROM game.skill_queue WHERE character_id = $1 AND end_time IS NOT NULL AND end_time <= $2
@@ -126,18 +126,6 @@ async fn advance_training(db: &(impl Executor + ?Sized), char_id: i64, now: i64)
         )
         .await
         .map_err(db_err)?;
-    for r in &done {
-        let (type_id, level, sp): (i32, i32, i64) = (r.get(0), r.get(1), r.get(2));
-        db
-            .execute(
-                "INSERT INTO game.skills (character_id, type_id, level, skill_points) VALUES ($1, $2, $3, $4)
-                 ON CONFLICT (character_id, type_id) DO UPDATE SET level = GREATEST(game.skills.level, EXCLUDED.level),
-                     skill_points = GREATEST(game.skills.skill_points, EXCLUDED.skill_points)",
-                &[&char_id, &type_id, &level, &sp],
-            )
-            .await
-            .map_err(db_err)?;
-    }
     if !done.is_empty() {
         db
             .execute(
@@ -149,7 +137,50 @@ async fn advance_training(db: &(impl Executor + ?Sized), char_id: i64, now: i64)
             .await
             .map_err(db_err)?;
     }
-    Ok(done.iter().map(|r| (r.get(0), r.get(1))).collect())
+    Ok(done.iter().map(|r| (r.get(0), r.get(1), r.get(2))).collect())
+}
+
+// None level means banking only: it must not create a missing skill row.
+fn plan_skills(done: &[(i32, i32, i64)], training: Option<(i32, i64)>) -> BTreeMap<i32, (Option<i32>, i64)> {
+    let mut plan = BTreeMap::new();
+    for &(type_id, level, sp) in done {
+        plan.entry(type_id)
+            .and_modify(|(old_level, old_sp): &mut (Option<i32>, i64)| {
+                *old_level = Some(old_level.unwrap_or(level).max(level));
+                *old_sp = (*old_sp).max(sp);
+            })
+            .or_insert((Some(level), sp));
+    }
+    if let Some((type_id, sp)) = training {
+        plan.entry(type_id).and_modify(|(_, old_sp)| *old_sp = (*old_sp).max(sp)).or_insert((None, sp));
+    }
+    plan
+}
+
+async fn write_skills(db: &(impl Executor + ?Sized), char_id: i64, plan: &BTreeMap<i32, (Option<i32>, i64)>) -> Result<(), CallError> {
+    for (&type_id, &(level, sp)) in plan {
+        if let Some(level) = level {
+            db.execute(
+                "INSERT INTO game.skills (character_id, type_id, level, skill_points) VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (character_id, type_id) DO UPDATE SET level = GREATEST(game.skills.level, EXCLUDED.level),
+                     skill_points = GREATEST(game.skills.skill_points, EXCLUDED.skill_points)",
+                &[&char_id, &type_id, &level, &sp],
+            ).await.map_err(db_err)?;
+        } else {
+            db.execute(
+                "UPDATE game.skills SET skill_points = GREATEST(skill_points, $3) WHERE character_id = $1 AND type_id = $2",
+                &[&char_id, &type_id, &sp],
+            ).await.map_err(db_err)?;
+        }
+    }
+    Ok(())
+}
+
+/// Apply training progress up to now: finished entries become trained levels.
+async fn advance_training(db: &(impl Executor + ?Sized), char_id: i64, now: i64) -> Result<Vec<(i32, i32)>, CallError> {
+    let done = collect_finished(db, char_id, now).await?;
+    write_skills(db, char_id, &plan_skills(&done, None)).await?;
+    Ok(done.into_iter().map(|(type_id, level, _)| (type_id, level)).collect())
 }
 
 /// SP accrued so far by the entry currently in training, if any.
@@ -269,21 +300,27 @@ async fn save_queue(c: &mut Client, char_id: i64, queue: &Value, activate: bool,
         |tx, outbox: &mut Outbox| {
             let entries = entries.clone();
             Box::pin(async move {
-    let mut finished = advance_training(tx, char_id, now).await?;
+    let mut done = collect_finished(tx, char_id, now).await?;
     let training = in_training_sp(tx, char_id, now).await?;
-    if let Some((t, sp)) = training {
-        Executor::execute(tx,
-                "UPDATE game.skills SET skill_points = GREATEST(skill_points, $3) WHERE character_id = $1 AND type_id = $2",
-                &[&char_id, &t, &sp],
-            ).await.map_err(db_err)?;
-    }
+    let plan = plan_skills(&done, training);
     let attrs = character_attributes_db(tx, char_id).await?;
-    let current: HashMap<i32, (i32, i64)> = Executor::query(tx, "SELECT type_id, level, skill_points FROM game.skills WHERE character_id = $1", &[&char_id])
+    let mut current: HashMap<i32, (i32, i64)> = Executor::query(tx, "SELECT type_id, level, skill_points FROM game.skills WHERE character_id = $1", &[&char_id])
         .await
         .map_err(db_err)?
         .iter()
         .map(|r| (r.get(0), (r.get(1), r.get(2))))
         .collect();
+    let training = training.filter(|(type_id, _)| current.contains_key(type_id) || plan.get(type_id).is_some_and(|(level, _)| level.is_some()));
+    for (&type_id, &(level, sp)) in &plan {
+        if let Some(level) = level {
+            current.entry(type_id).and_modify(|skill| {
+                skill.0 = skill.0.max(level);
+                skill.1 = skill.1.max(sp);
+            }).or_insert((level, sp));
+        } else if let Some(skill) = current.get_mut(&type_id) {
+            skill.1 = skill.1.max(sp);
+        }
+    }
     Executor::execute(tx, "DELETE FROM game.skill_queue WHERE character_id = $1", &[&char_id]).await.map_err(db_err)?;
     let mut t = now;
     for (pos, (_, type_id, to_level)) in entries.into_iter().enumerate() {
@@ -309,10 +346,13 @@ async fn save_queue(c: &mut Client, char_id: i64, queue: &Value, activate: bool,
             .map_err(db_err)?;
     }
     if notify {
-        finished.extend(advance_training(tx, char_id, now).await?);
+        done.extend(collect_finished(tx, char_id, now).await?);
+    }
+    write_skills(tx, char_id, &plan_skills(&done, training)).await?;
+    if notify {
         outbox.notify_client("OnNewSkillQueueSaved", vec![queue_list_db(tx, char_id).await?]);
     }
-    Ok(finished)
+    Ok(done.into_iter().map(|(type_id, level, _)| (type_id, level)).collect::<Vec<_>>())
             })
         },
         |finished, outbox| async move {
@@ -386,3 +426,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     };
     Some(r)
 }
+
+#[cfg(test)]
+mod tests;

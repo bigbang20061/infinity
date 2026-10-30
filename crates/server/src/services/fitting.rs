@@ -4,14 +4,16 @@
 //! character's blueprints (`blueprintManager`, eve/client/script/industry/blueprintSvc.py).
 //! Fitting modules themselves is inventory moves into slot flags (inventory.rs) plus
 //! the online state dogma.rs keeps.
+//! Assembly updates packaged source hulls atomically before creating assembled hulls.
 
-use super::dogma::{load_items, ship_state, wire_quantity};
+use super::dogma::{load_items, load_items_db, ship_state, wire_quantity};
 use super::inventory::notify_item_change;
 use super::{db_err, keyval, user_error, value_field, value_id_list, value_ids, Call, CallError, CallResult};
 use crate::client::Client;
 use crate::consts::{BLUEPRINT_INFINITE_RUNS, CATEGORY_SHIP, FLAG_HANGAR, INDUSTRY_JOB_STATUS_INSTALLED, IX_LOCATION_ID, IX_SINGLETON, IX_STACK_SIZE};
 use crate::db::outbox::{dispatch_client, Outbox};
 use marshal::Value;
+use std::collections::BTreeMap;
 use tracing::info;
 
 /// SDE invCategories: Blueprint.
@@ -40,47 +42,92 @@ async fn board(c: &mut Client, ship_id: i64) -> CallResult {
     ship_state(c, ship_id).await
 }
 
+/// Plan one request against a packaged stack; zero in `remaining` marks conversion.
+fn assembly_step(original: i32, remaining: Option<i32>) -> Option<(i32, bool, i32)> {
+    if remaining == Some(0) { return None; }
+    let quantity = remaining.unwrap_or(original);
+    if quantity > 1 {
+        Some((quantity - 1, true, quantity))
+    } else {
+        Some((0, false, quantity))
+    }
+}
+
+fn assembly_source_change(original: i32, remaining: i32) -> Vec<(i64, Value)> {
+    let mut change = vec![(IX_STACK_SIZE, Value::Int(original as i64))];
+    if remaining == 0 {
+        change.push((IX_SINGLETON, Value::Bool(false)));
+    }
+    change
+}
+
 /// AssembleShip(itemIDs, name=, subSystems=) -> the assembled ship's itemID (or IDs).
 async fn assemble(c: &mut Client, call: &Call<'_>) -> CallResult {
     let char_id = c.session.int("charid").unwrap_or(0);
     let ids = value_ids(call.args.first());
     let name = call.kwargs.get("name").and_then(|v| v.as_text()).map(|t| t.into_owned());
-    let mut assembled = vec![];
-    let mut outbox = Outbox::default();
-    for id in ids {
-        let Some(item) = load_items(c, "i.item_id = $1 AND i.owner_id = $2", &[&id, &char_id]).await?.into_iter().next() else { continue };
-        if item.category_id != CATEGORY_SHIP as i64 || item.singleton {
-            continue;
-        }
-        // One hull off a stack becomes the ship; the rest stays packaged.
-        let ship_id = if item.quantity > 1 {
-            c.db.execute("UPDATE game.items SET quantity = quantity - 1 WHERE item_id = $1", &[&id]).await.map_err(db_err)?;
-            notify_item_change(&c.db, &mut outbox, id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
-            dispatch_client((), std::mem::take(&mut outbox), c)?;
-            let new_id: i64 = c
-                .db
-                .query_one(
-                    "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton, name)
-                     VALUES ($1, $2, $3, $4, 1, true, $5) RETURNING item_id",
-                    &[&item.type_id, &char_id, &item.location_id, &item.flag_id, &name],
-                )
-                .await
-                .map_err(db_err)?
-                .get(0);
-            notify_item_change(&c.db, &mut outbox, new_id, vec![(IX_LOCATION_ID, Value::Int(0))]).await?;
-            dispatch_client((), std::mem::take(&mut outbox), c)?;
-            new_id
-        } else {
-            c.db
-                .execute("UPDATE game.items SET singleton = true, name = COALESCE($2, name) WHERE item_id = $1", &[&id, &name])
-                .await
-                .map_err(db_err)?;
-            notify_item_change(&c.db, &mut outbox, id, vec![(IX_SINGLETON, Value::Bool(false))]).await?;
-            dispatch_client((), std::mem::take(&mut outbox), c)?;
-            id
-        };
-        assembled.push(ship_id);
-    }
+    let db = c.db.clone();
+    let assembled = db.transaction(
+        move |tx, outbox: &mut Outbox| {
+            let (ids, name) = (ids.clone(), name.clone());
+            Box::pin(async move {
+                // Simulate requests in their original order, but write each source once
+                // in primary-key order before inserting any generated hulls.
+                let mut sources = BTreeMap::new();
+                let mut actions = Vec::new();
+                for id in ids {
+                    if !sources.contains_key(&id) {
+                        if let Some(item) = load_items_db(tx, "i.item_id = $1 AND i.owner_id = $2", &[&id, &char_id]).await?.into_iter().next() {
+                            sources.insert(id, (item, None::<i32>));
+                        }
+                    }
+                    let Some((item, remaining)) = sources.get_mut(&id) else { continue };
+                    if item.category_id != CATEGORY_SHIP as i64 || item.singleton {
+                        continue;
+                    }
+                    if let Some((next, split, _)) = assembly_step(item.quantity, *remaining) {
+                        *remaining = Some(next);
+                        actions.push((id, split));
+                    }
+                }
+                for (id, (item, remaining)) in &sources {
+                    let Some(remaining) = remaining else { continue };
+                    let changed = if *remaining == 0 {
+                        tx.execute("UPDATE game.items SET quantity = CASE WHEN quantity > 1 THEN 1 ELSE quantity END, singleton = true, name = COALESCE($7, name) WHERE item_id = $1 AND owner_id = $2 AND location_id = $3 AND flag_id = $4 AND type_id = $5 AND quantity = $6 AND NOT singleton",
+                            &[id, &char_id, &item.location_id, &item.flag_id, &item.type_id, &item.quantity, &name]).await.map_err(db_err)?
+                    } else {
+                        tx.execute("UPDATE game.items SET quantity = $7 WHERE item_id = $1 AND owner_id = $2 AND location_id = $3 AND flag_id = $4 AND type_id = $5 AND quantity = $6 AND quantity > 1 AND NOT singleton",
+                            &[id, &char_id, &item.location_id, &item.flag_id, &item.type_id, &item.quantity, remaining]).await.map_err(db_err)?
+                    };
+                    if changed == 0 {
+                        return Err(super::notify_error("该物品的数量不足。"));
+                    }
+                }
+                let mut assembled = Vec::new();
+                let mut notified = std::collections::BTreeSet::new();
+                for (id, split) in actions {
+                    let (item, remaining) = &sources[&id];
+                    if notified.insert(id) {
+                        notify_item_change(tx, outbox, id, assembly_source_change(item.quantity, remaining.unwrap())).await?;
+                    }
+                    let ship_id = if split {
+                        let new_id: i64 = tx.query_one(
+                            "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton, name)
+                             VALUES ($1, $2, $3, $4, 1, true, $5) RETURNING item_id",
+                            &[&item.type_id, &char_id, &item.location_id, &item.flag_id, &name],
+                        ).await.map_err(db_err)?.get(0);
+                        notify_item_change(tx, outbox, new_id, vec![(IX_LOCATION_ID, Value::Int(0))]).await?;
+                        new_id
+                    } else {
+                        id
+                    };
+                    assembled.push(ship_id);
+                }
+                Ok(assembled)
+            })
+        },
+        |assembled, outbox| async move { dispatch_client(assembled, outbox, c) },
+    ).await?;
     Ok(match assembled.as_slice() {
         [one] => Value::Int(*one),
         _ => Value::list(assembled.into_iter().map(Value::Int)),
@@ -90,7 +137,7 @@ async fn assemble(c: &mut Client, call: &Call<'_>) -> CallResult {
 /// RepackageItems({stationID: [(itemID, locationID)]}, destroyable=): unassemble ships and modules.
 async fn repackage(c: &mut Client, call: &Call<'_>) -> CallResult {
     let char_id = c.session.int("charid").unwrap_or(0);
-    let mut outbox = Outbox::default();
+    let active_ship = c.session.int("shipid");
     let mut ids = vec![];
     if let Some(Value::Dict(by_station)) = call.args.first() {
         for (_, items) in by_station {
@@ -101,31 +148,33 @@ async fn repackage(c: &mut Client, call: &Call<'_>) -> CallResult {
             }
         }
     }
+    let mut planned = std::collections::BTreeSet::new();
     for id in ids {
-        if Some(id) == c.session.int("shipid") {
+        if Some(id) == active_ship {
             return Err(user_error("CantRepackageActiveShip", vec![]));
+        }
+        if planned.contains(&id) {
+            continue;
         }
         let Some(item) = load_items(c, "i.item_id = $1 AND i.owner_id = $2", &[&id, &char_id]).await?.into_iter().next() else { continue };
         if !item.singleton {
             continue;
         }
         if item.category_id == CATEGORY_SHIP as i64 {
-            let fitted: i64 = c
-                .db
-                .query_one("SELECT count(*) FROM game.items WHERE location_id = $1", &[&id])
-                .await
-                .map_err(db_err)?
-                .get(0);
+            let fitted: i64 = c.db.query_one("SELECT count(*) FROM game.items WHERE location_id = $1", &[&id])
+                .await.map_err(db_err)?.get(0);
             if fitted > 0 {
                 return Err(CallError::User { msg: "ConfirmRepackageSomethingWithUpgrades".into(), dict: vec![] });
             }
         }
-        c.db
-            .execute("UPDATE game.items SET singleton = false, online = false, name = NULL WHERE item_id = $1", &[&id])
-            .await
-            .map_err(db_err)?;
+        planned.insert(id);
+    }
+    for id in planned {
+        c.db.execute("UPDATE game.items SET singleton = false, online = false, name = NULL WHERE item_id = $1", &[&id])
+            .await.map_err(db_err)?;
+        let mut outbox = Outbox::default();
         notify_item_change(&c.db, &mut outbox, id, vec![(IX_SINGLETON, Value::Bool(true))]).await?;
-        dispatch_client((), std::mem::take(&mut outbox), c)?;
+        dispatch_client((), outbox, c)?;
     }
     Ok(Value::None)
 }
@@ -307,3 +356,5 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         _ => return None,
     })
 }
+
+#[cfg(test)] mod tests;

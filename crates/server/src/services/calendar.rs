@@ -100,9 +100,17 @@ async fn create(c: &Client, call: &Call<'_>, owner: i64) -> CallResult {
                     &[&owner, &me, &when, &duration, &title, &description, &important, &now],
                 ).await.map_err(db_err)?.get(0);
                 if owner == me {
-                    Executor::execute(tx, "INSERT INTO game.calendar_responses (event_id, char_id, status) VALUES ($1, $2, $3)", &[&id, &me, &RESPONSE_ACCEPTED]).await.map_err(db_err)?;
+                    let mut responses: Vec<_> = guests.iter().map(|&g| (g, RESPONSE_UNDECIDED)).collect();
+                    responses.push((me, RESPONSE_ACCEPTED));
+                    responses.sort_unstable_by_key(|&(char_id, _)| char_id);
+                    for (char_id, status) in responses {
+                        if char_id == me {
+                            Executor::execute(tx, "INSERT INTO game.calendar_responses (event_id, char_id, status) VALUES ($1, $2, $3)", &[&id, &char_id, &status]).await.map_err(db_err)?;
+                        } else {
+                            Executor::execute(tx, "INSERT INTO game.calendar_responses (event_id, char_id, status) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING", &[&id, &char_id, &status]).await.map_err(db_err)?;
+                        }
+                    }
                     for g in guests {
-                        Executor::execute(tx, "INSERT INTO game.calendar_responses (event_id, char_id, status) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING", &[&id, &g, &RESPONSE_UNDECIDED]).await.map_err(db_err)?;
                         outbox.notify_pilot(g, "OnNewCalendarEvent", vec![Value::Int(id), Value::Int(owner), Value::Int(when), Value::Int(duration as i64), Value::unicode(title.as_str()), Value::Int(important as i64)]);
                     }
                 }

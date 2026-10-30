@@ -322,8 +322,11 @@ async fn update_application(c: &Client, call: &Call<'_>) -> CallResult {
         |tx, outbox| {
             let message = message.clone();
             Box::pin(async move {
-                tx.execute("UPDATE game.corp_applications SET status = $2, custom_message = $3 WHERE application_id = $1", &[&app_id, &status, &message])
+                let affected = tx.execute("UPDATE game.corp_applications SET status = $2, custom_message = $3 WHERE application_id = $1 AND status = $4", &[&app_id, &status, &message, &current])
                     .await.map_err(db_err)?;
+                if affected == 0 {
+                    return Err(notify_error("该申请已处理完毕。"));
+                }
                 if joins {
                     let (old, _) = membership(tx, applicant).await?;
                     if is_player_corp(old) && ceo_of(tx, old).await? == Some(applicant) {
@@ -676,8 +679,11 @@ async fn resign_ceo(db: &Db, world: &World, me: i64, successor: Option<i64>) -> 
             db.transaction(
                 |tx, outbox: &mut Outbox| Box::pin(async move {
                     tx.execute("UPDATE game.corporations SET ceo_id = $2 WHERE corporation_id = $1", &[&corp, &next]).await.map_err(db_err)?;
-                    tx.execute("UPDATE game.characters SET corp_roles = $2 WHERE character_id = $1", &[&next, &CEO_ROLES]).await.map_err(db_err)?;
-                    tx.execute("UPDATE game.characters SET corp_roles = $2 WHERE character_id = $1", &[&me, &ROLE_DIRECTOR]).await.map_err(db_err)?;
+                    let mut role_writes = [(next, CEO_ROLES), (me, ROLE_DIRECTOR)];
+                    role_writes.sort_by_key(|(char_id, _)| *char_id);
+                    for (char_id, roles) in role_writes {
+                        tx.execute("UPDATE game.characters SET corp_roles = $2 WHERE character_id = $1", &[&char_id, &roles]).await.map_err(db_err)?;
+                    }
                     for char_id in [next, me] {
                         let (_, roles) = membership(tx, char_id).await?;
                         let pair = |k: &str| Value::tuple([Value::str(k), Value::Int(roles)]);

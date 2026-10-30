@@ -17,15 +17,16 @@
 //! Reprocessing (the station's bound reprocessingSvc) turns items into their
 //! sde.inv_type_materials per portion: a station yield of 50%, raised by Reprocessing,
 //! Reprocessing Efficiency and the item's own processing skill, less a 5% tax in ISK.
+//! Output that exceeds a single stack's capacity is refused without consuming inputs.
 
 use super::fit::{Fit, Key};
 use super::{db_err, keyval, notify_error, rand01, rand_dir, value_id_list, Call, CallError, CallResult};
 use crate::client::{filetime_now, unix_ms_from_filetime_ceil, Client};
-use crate::consts::{ATTR_CAPACITY, ATTR_MAX_RANGE, FILETIME_SECOND, FLAG_CARGO, FLAG_HANGAR, GROUP_ASTEROID_BELT, IX_LOCATION_ID, IX_STACK_SIZE};
+use crate::consts::{ATTR_CAPACITY, ATTR_MAX_RANGE, FILETIME_SECOND, FLAG_CARGO, FLAG_HANGAR, GROUP_ASTEROID_BELT, IX_FLAG, IX_LOCATION_ID, IX_STACK_SIZE};
 use crate::db::Db;
 use crate::space::{dist, now_ms, Ball, NotifyTx, World, MODE_RIGID, V3};
 use marshal::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use tracing::{info, warn};
 
@@ -505,6 +506,19 @@ struct Quote {
     materials: Vec<(i32, i64, i64, f64)>,
 }
 
+fn output_overflow() -> CallError {
+    notify_error("精炼产物数量超过物品堆叠容量。")
+}
+
+fn add_output(total: i64, amount: i64) -> Result<i64, CallError> {
+    total.checked_add(amount).ok_or_else(output_overflow)
+}
+
+fn output_stack_quantity(current: Option<i32>, amount: i64) -> Result<i32, CallError> {
+    let amount = i32::try_from(amount).map_err(|_| output_overflow())?;
+    current.unwrap_or(0).checked_add(amount).ok_or_else(output_overflow)
+}
+
 async fn quote(c: &Client, char_id: i64, item: &super::dogma::Item) -> Result<Option<Quote>, CallError> {
     let portion: i32 = c
         .db
@@ -530,15 +544,15 @@ async fn quote(c: &Client, char_id: i64, item: &super::dogma::Item) -> Result<Op
         return Ok(None);
     }
     let efficiency = (STATION_EFFICIENCY * skill_multiplier(c, char_id, item.type_id).await?).min(1.0);
-    let materials = materials
-        .iter()
-        .map(|r| {
-            let total = r.get::<_, Option<i64>>(1).unwrap_or(0) * batches as i64;
-            let received = (total as f64 * efficiency).floor() as i64;
-            (r.get::<_, i32>(0), received, total - received, received as f64 * r.get::<_, f64>(2) * STATION_TAX)
-        })
-        .filter(|m| m.1 + m.2 > 0)
-        .collect();
+    let mut result = Vec::new();
+    for r in &materials {
+        let total = r.get::<_, Option<i64>>(1).unwrap_or(0).checked_mul(batches as i64).ok_or_else(output_overflow)?;
+        let received = (total as f64 * efficiency).floor() as i64;
+        if total > 0 {
+            result.push((r.get::<_, i32>(0), received, total - received, received as f64 * r.get::<_, f64>(2) * STATION_TAX));
+        }
+    }
+    let materials = result;
     Ok(Some(Quote { type_id: item.type_id, leftover: quantity % portion, materials }))
 }
 
@@ -592,43 +606,77 @@ async fn reprocessing(c: &mut Client, call: &Call<'_>) -> CallResult {
             let out_location = call.args.get(3).and_then(|v| v.as_int()).unwrap_or(station);
             let out_flag = call.args.get(4).and_then(|v| v.as_int()).map(|f| f as i32).unwrap_or(FLAG_HANGAR);
             let items = reprocessable(c, &value_id_list(call.args.first())).await?;
-            let mut done = vec![];
-            let mut output: HashMap<i32, i64> = HashMap::new();
+            let mut sources = Vec::new();
+            let mut output = BTreeMap::<i32, i64>::new();
             let mut tax = 0.0;
-            let mut outbox = crate::db::outbox::Outbox::default();
             for item in items {
                 let Some(q) = quote(c, char_id, &item).await? else { continue };
-                let (id, quantity) = (item.item_id, item.quantity);
-                if q.leftover > 0 {
-                    c.db.execute("UPDATE game.items SET quantity = $2 WHERE item_id = $1", &[&id, &q.leftover]).await.map_err(db_err)?;
-                    super::inventory::notify_item_change(&c.db, &mut outbox, id, vec![(IX_STACK_SIZE, Value::Int(quantity as i64))]).await?;
-                } else {
-                    super::combat::remove_stack(&c.db, &mut outbox, item).await?;
-                }
-                crate::db::outbox::dispatch_client((), std::mem::take(&mut outbox), c)?;
-                for (t, received, _, isk) in &q.materials {
-                    *output.entry(*t).or_default() += received;
+                for (type_id, received, _, isk) in &q.materials {
+                    let total = output.entry(*type_id).or_default();
+                    *total = add_output(*total, *received)?;
                     tax += isk;
                 }
-                done.push(Value::Int(id));
+                sources.push((item, q.leftover));
             }
-            for (t, qty) in &output {
-                if *qty > 0 {
-                    super::combat::deposit(&c.db, &mut outbox, char_id, out_location, out_flag, *t, (*qty).min(i32::MAX as i64) as i32, 0).await?;
-                    crate::db::outbox::dispatch_client((), std::mem::take(&mut outbox), c)?;
-                }
-            }
-            if tax > 0.0 {
-                let balance: f64 = c
-                    .db
-                    .query_one("UPDATE game.characters SET balance = balance - $2::float8::numeric WHERE character_id = $1 RETURNING balance::float8", &[&char_id, &tax])
-                    .await
-                    .map_err(db_err)?
-                    .get(0);
-                c.notify("OnAccountChange", vec![Value::str("cash"), Value::Int(char_id), Value::Float(balance)]);
-            }
-            info!(user = c.login.user_id, "reprocessed {} items into {} material types ({tax:.0} ISK tax)", done.len(), output.len());
-            Ok(Value::tuple([Value::List(done), Value::Dict(output.into_iter().map(|(t, q)| (Value::Int(t as i64), Value::Int(q))).collect())]))
+            let plan = Arc::new((sources, output));
+            let db = c.db.clone();
+            let plan = db.transaction(
+                |tx, outbox| {
+                    let plan = Arc::clone(&plan);
+                    Box::pin(async move {
+                    use super::item_quantities::{apply, QuantityChange};
+                    let mut changes = BTreeMap::new();
+                    for (item, leftover) in &plan.0 {
+                        changes.insert(item.item_id, QuantityChange::new(item, (*leftover > 0).then_some(*leftover)));
+                    }
+                    let mut inserts = BTreeMap::new();
+                    for (&type_id, &amount) in &plan.1 {
+                        if amount <= 0 { continue; }
+                        let quantity = output_stack_quantity(None, amount)?;
+                        let candidates = super::dogma::load_items_db(tx,
+                            "i.location_id = $1 AND i.flag_id = $2 AND i.type_id = $3 AND i.owner_id = $4 AND NOT i.singleton",
+                            &[&out_location, &out_flag, &type_id, &char_id]).await?;
+                        let stack = candidates.into_iter().next();
+                        if let Some(item) = stack {
+                            let current = changes.get(&item.item_id).map_or(Some(item.quantity), |change| change.quantity);
+                            let final_quantity = output_stack_quantity(current, amount)?;
+                            changes.entry(item.item_id).and_modify(|change| change.quantity = Some(final_quantity))
+                                .or_insert_with(|| QuantityChange::new(&item, Some(final_quantity)));
+                        } else {
+                            inserts.insert(type_id, quantity);
+                        }
+                    }
+                    apply(tx, &changes, "该物品的数量不足。").await?;
+                    for (&id, change) in &changes {
+                        if change.quantity.is_some() {
+                            super::inventory::notify_item_change(tx, outbox, id, vec![(IX_STACK_SIZE, Value::Int(change.expected_quantity as i64))]).await?;
+                        } else {
+                            let item = plan.0.iter().find(|(item, _)| item.item_id == id).expect("removed item is a source");
+                            super::inventory::notify_item_removed(outbox, item.0.clone());
+                        }
+                    }
+                    for (type_id, quantity) in inserts {
+                        let id: i64 = tx.query_one(
+                            "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity) VALUES ($1, $2, $3, $4, $5) RETURNING item_id",
+                            &[&type_id, &char_id, &out_location, &out_flag, &quantity],
+                        ).await.map_err(db_err)?.get(0);
+                        super::inventory::notify_item_change(tx, outbox, id, vec![(IX_LOCATION_ID, Value::Int(0)), (IX_FLAG, Value::Int(out_flag as i64))]).await?;
+                    }
+                    if tax > 0.0 {
+                        let row = tx.query_opt(
+                            "UPDATE game.characters SET balance = balance - $2::float8::numeric WHERE character_id = $1 AND balance >= $2::float8::numeric RETURNING balance::float8",
+                            &[&char_id, &tax],
+                        ).await.map_err(db_err)?.ok_or_else(|| notify_error("你的 ISK 余额不足以支付精炼税。"))?;
+                        outbox.notify_client("OnAccountChange", vec![Value::str("cash"), Value::Int(char_id), Value::Float(row.get(0))]);
+                    }
+                    Ok::<_, CallError>(Arc::clone(&plan))
+                })
+                },
+                |value, outbox| async { crate::db::outbox::dispatch_client(value, outbox, c) },
+            ).await?;
+            let done: Vec<_> = plan.0.iter().map(|(item, _)| Value::Int(item.item_id)).collect();
+            info!(user = c.login.user_id, "reprocessed {} items into {} material types ({tax:.0} ISK tax)", done.len(), plan.1.len());
+            Ok(Value::tuple([Value::List(done), Value::Dict(plan.1.iter().map(|(&t, &q)| (Value::Int(t as i64), Value::Int(q))).collect())]))
         }
         _ => Ok(Value::None),
     }

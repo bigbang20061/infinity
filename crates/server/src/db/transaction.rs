@@ -1,5 +1,7 @@
 //! Atomic game and SDE database operations with bounded conflict retries.
 //! This server-side facility has no client counterpart; it does not retry individual statements.
+//! If rollback fails, the original operation error is returned without retrying
+//! because the transaction's outcome is uncertain; the rollback failure is logged.
 
 use std::{future::Future, pin::Pin};
 use tokio_postgres::error::SqlState;
@@ -50,7 +52,10 @@ impl Db {
             let value = match operation(&tx, &mut outbox).await {
                 Ok(value) => value,
                 Err(error) => {
-                    tx.rollback().await.map_err(Error::from).map_err(E::from)?;
+                    if let Err(rollback_error) = tx.rollback().await {
+                        tracing::warn!("transaction rollback failed: {rollback_error}");
+                        return Err(error);
+                    }
                     if retries < MAX_TRANSACTION_RETRIES && error.is_retryable_transaction() {
                         retries += 1;
                         continue;

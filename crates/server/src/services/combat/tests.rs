@@ -1,4 +1,24 @@
 use super::*;
+
+#[test]
+fn reload_reservations_share_stacks_in_order_without_overdraw() {
+    let item = |id, type_id, quantity| super::super::dogma::Item {
+        item_id: id, type_id, owner_id: 1, location_id: 2, flag_id: FLAG_CARGO,
+        quantity, singleton: false, group_id: 0, category_id: 0, custom_info: None,
+    };
+    let mut items = BTreeMap::from([
+        (1, (item(1, 10, 3), 3)),
+        (2, (item(2, 10, 4), 4)),
+        (3, (item(3, 11, 5), 5)),
+    ]);
+    let selected = [1, 2, 3];
+    assert_eq!(reserve_quantities(&mut items, &selected, 10, 5), 0);
+    assert_eq!((items[&1].1, items[&2].1, items[&3].1), (0, 2, 5));
+    assert_eq!(reserve_quantities(&mut items, &selected, 10, 4), 2);
+    assert_eq!((items[&1].1, items[&2].1, items[&3].1), (0, 0, 5));
+    assert_eq!(reserve_quantities(&mut items, &selected, 11, 3), 0);
+    assert_eq!(items[&3].1, 2);
+}
 #[test]
 fn module_ids_preserve_scalar_and_list_shapes() {
     assert_eq!(module_ids(None), Vec::<i64>::new());

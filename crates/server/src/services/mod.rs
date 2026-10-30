@@ -27,6 +27,7 @@ mod hacking;
 mod industry;
 mod insurance;
 mod inventory;
+pub(super) mod item_quantities;
 mod mail;
 mod market;
 mod npe;

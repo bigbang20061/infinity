@@ -4,7 +4,7 @@
 
 use std::convert::Infallible;
 use marshal::Value;
-use crate::{client::Client, services::CallError, space::World};
+use crate::{client::Client, services::CallError, space::{NotifyTx, World}};
 
 pub struct Outbox<E = Infallible> {
     entries: Vec<Effect<E>>,
@@ -22,6 +22,7 @@ pub enum Effect<E> {
 pub enum Notification {
     DirectClient { event: String, args: Vec<Value> },
     Pilot { char_id: i64, event: String, args: Vec<Value> },
+    Sender { sender: NotifyTx, event: String, args: Vec<Value> },
 }
 
 impl<E> Outbox<E> {
@@ -30,6 +31,9 @@ impl<E> Outbox<E> {
     }
     pub fn notify_pilot(&mut self, char_id: i64, event: &str, args: Vec<Value>) {
         self.entries.push(Effect::Notification(Notification::Pilot { char_id, event: event.into(), args }));
+    }
+    pub fn notify_sender(&mut self, sender: NotifyTx, event: &str, args: Vec<Value>) {
+        self.entries.push(Effect::Notification(Notification::Sender { sender, event: event.into(), args }));
     }
     pub fn operation(&mut self, operation: E) { self.entries.push(Effect::Operation(operation)); }
     pub fn into_entries(self) -> Vec<Effect<E>> { self.entries }
@@ -43,6 +47,7 @@ impl Notification {
                 client.notify(&event, args);
             }
             Self::Pilot { char_id, event, args } => world.notify_pilot(char_id, &event, args),
+            Self::Sender { sender, event, args } => { let _ = sender.send((event, args)); }
         }
         Ok(())
     }

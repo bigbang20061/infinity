@@ -76,7 +76,13 @@ async fn install(c: &Client, me: i64) -> CallResult {
     if rows.len() as i64 >= max {
         return Err(notify_error(&format!("你的意识形态心理学技能允许 {max} 个远距克隆。")));
     }
-    c.db.execute("INSERT INTO game.jump_clones (owner_id, location_id) VALUES ($1, $2)", &[&me, &station]).await.map_err(db_err)?;
+    let inserted = c.db.execute(
+        "INSERT INTO game.jump_clones (owner_id, location_id) SELECT $1, $2 WHERE NOT EXISTS (SELECT 1 FROM game.jump_clones WHERE owner_id = $1 AND location_id = $2)",
+        &[&me, &station],
+    ).await.map_err(db_err)?;
+    if inserted == 0 {
+        return Err(notify_error("你在这个空间站已经有一个远距克隆。"));
+    }
     info!("clones: {me} installed a jump clone at {station}");
     c.world.notify_pilot(me, "OnJumpCloneCacheInvalidated", vec![]);
     Ok(Value::None)

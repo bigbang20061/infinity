@@ -15,6 +15,7 @@
 //! mission sites out of planets, along with exploration overlays and asteroids.
 //! Scan completion, probe recovery and site respawns use transient system actor timers;
 //! pending timers do not survive a restart.
+//! Probe charges are consumed atomically before transient probes are created.
 //!
 //! Protocol (client: scanSvc, sensorSuiteService, probescanning, explorationscanner):
 //! - scanMgr.SignalTrackerRegister() -> OnSignalTrackerFullState(systemID, (anomalies,
@@ -1059,15 +1060,6 @@ pub async fn launch_probes(c: &mut Client, call: &Call<'_>) -> CallResult {
     if take <= 0 {
         return Ok(Value::None);
     }
-    if take == have {
-        c.db.execute("DELETE FROM game.module_charges WHERE ship_id = $1 AND flag_id = $2", &[&ship, &flag]).await.map_err(db_err)?;
-    } else {
-        c.db
-            .execute("UPDATE game.module_charges SET quantity = quantity - $3 WHERE ship_id = $1 AND flag_id = $2", &[&ship, &flag, &take])
-            .await
-            .map_err(db_err)?;
-    }
-    c.notify("OnModuleAttributeChanges", vec![super::combat::quantity_change(char_id, ship, flag, type_id, (have - take) as i64, have as i64)]);
     let attrs = c
         .db
         .query_one(
@@ -1081,13 +1073,37 @@ pub async fn launch_probes(c: &mut Client, call: &Call<'_>) -> CallResult {
     let (skill, _) = probe_skills(&c.db, char_id).await?;
     let pos = c.world.ball(system, ship).await.map(|b| b.pos).unwrap_or([0.0; 3]);
     let expiry = filetime_now() + (lifetime_ms * 10_000.0) as i64;
-    for _ in 0..take {
-        let id = NEXT_PROBE_ID.fetch_add(1, Ordering::Relaxed);
-        let probe = Probe { char_id, system, type_id, pos, expiry, strength: base * skill };
-        c.notify("OnNewProbe", vec![probe_value(id, &probe)]);
-        state().probes.insert(id, probe);
-    }
-    info!(user = c.login.user_id, "launched {take} probes of {type_id} from {module}");
+    enum Launch { Probes }
+    let user_id = c.login.user_id;
+    let db = c.db.clone();
+    db.transaction(
+        move |tx, outbox: &mut Outbox<Launch>| Box::pin(async move {
+            let remaining = if take == have {
+                tx.query_opt("DELETE FROM game.module_charges WHERE ship_id = $1 AND flag_id = $2 AND type_id = $3 AND quantity = $4 RETURNING quantity", &[&ship, &flag, &type_id, &have]).await.map_err(db_err)?.map(|_| 0)
+            } else {
+                tx.query_opt("UPDATE game.module_charges SET quantity = quantity - $4 WHERE ship_id = $1 AND flag_id = $2 AND type_id = $3 AND quantity >= $4 RETURNING quantity", &[&ship, &flag, &type_id, &take]).await.map_err(db_err)?.map(|r| r.get::<_, i32>(0))
+            }.ok_or_else(|| super::notify_error("探针发射器中的探针数量不足。"))?;
+            outbox.notify_client("OnModuleAttributeChanges", vec![super::combat::quantity_change(char_id, ship, flag, type_id, remaining as i64, (remaining + take) as i64)]);
+            outbox.operation(Launch::Probes);
+            Ok::<(), CallError>(())
+        }),
+        |(), outbox: Outbox<Launch>| async move {
+            let world = c.world.clone();
+            for effect in outbox.into_entries() {
+                match effect {
+                    Effect::Notification(notification) => notification.dispatch(&world, Some(&mut *c))?,
+                    Effect::Operation(Launch::Probes) => for _ in 0..take {
+                        let id = NEXT_PROBE_ID.fetch_add(1, Ordering::Relaxed);
+                        let probe = Probe { char_id, system, type_id, pos, expiry, strength: base * skill };
+                        c.notify("OnNewProbe", vec![probe_value(id, &probe)]);
+                        state().probes.insert(id, probe);
+                    },
+                }
+            }
+            Ok(())
+        },
+    ).await?;
+    info!(user = user_id, "launched {take} probes of {type_id} from {module}");
     Ok(Value::None)
 }
 
@@ -1804,7 +1820,9 @@ async fn collapse(db: &Db, world: &World, site_id: i64) -> Result<(), CallError>
     let (ids, sites) = {
         let st = state();
         let other = st.sites.get(&site_id).and_then(|s| s.wormhole.as_ref().map(|w| w.other));
-        let ids: Vec<_> = std::iter::once(site_id).chain(other).collect();
+        let mut ids: Vec<_> = std::iter::once(site_id).chain(other).collect();
+        ids.sort_unstable();
+        ids.dedup();
         let sites: Vec<_> = ids.iter().filter_map(|id| st.sites.get(id).cloned()).collect();
         (ids, sites)
     };
@@ -2206,5 +2224,4 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     }
 }
 
-#[cfg(test)]
-mod tests;
+#[cfg(test)] mod tests;

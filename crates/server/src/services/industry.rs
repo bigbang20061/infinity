@@ -880,13 +880,16 @@ async fn deliver_job<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox
     j.successful_runs = Some(successful);
     j.completed = Some(completed);
     j.completed_by = Some(by);
-    db
+    let affected = db
         .execute(
-            "UPDATE game.industry_jobs SET status = $2, successful_runs = $3, completed_date = $4, completed_by = $5 WHERE job_id = $1",
-            &[&j.id, &j.status, &j.successful_runs, &j.completed, &j.completed_by],
+            "UPDATE game.industry_jobs SET status = $2, successful_runs = $3, completed_date = $4, completed_by = $5 WHERE job_id = $1 AND status = $6",
+            &[&j.id, &j.status, &j.successful_runs, &j.completed, &j.completed_by, &INDUSTRY_JOB_STATUS_INSTALLED],
         )
         .await
         .map_err(db_err)?;
+    if affected == 0 {
+        return Err(notify_error("该项目已经交付。"));
+    }
     tell_job(outbox, j);
     Ok(())
 }

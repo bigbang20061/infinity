@@ -1,14 +1,17 @@
 //! invbroker: inventory managers (bound per station / solar system) hand out
 //! bound inventories, which list and describe the items in a container
 //! (eve/client/script/environment/invCache.py, invCacheContainer).
+//! Item quantities are stored in `game.items`; merge plans are guarded against
+//! stale snapshots. Other inventory operations retain their existing semantics.
 
 use super::dogma::{load_items, load_items_db, Item};
-use super::{db_err, keyval, value_id_list, Call, CallError, CallResult};
+use super::{db_err, keyval, notify_error, value_id_list, Call, CallError, CallResult};
 use crate::client::{short, Client};
 use crate::consts::{ATTR_CAPACITY, CATEGORY_SHIP, FLAG_CARGO, FLAG_CORP_SAG1, FLAG_FITTING_FIRST, FLAG_FITTING_LAST, FLAG_HANGAR, FLAG_PILOT, FLAG_RIG_FIRST, FLAG_RIG_LAST, FLAG_SUBSYSTEM_FIRST, FLAG_SUBSYSTEM_LAST, IX_FLAG, IX_LOCATION_ID, IX_SINGLETON, IX_STACK_SIZE, LOCATION_JUNKYARD, ROLE_DIRECTOR, TYPE_CHARACTER};
 use crate::db::executor::Executor;
 use crate::db::outbox::{dispatch_client, Outbox};
 use marshal::Value;
+use std::collections::BTreeMap;
 use tracing::warn;
 
 /// const.containerHangar: "my hangar in the current station".
@@ -153,8 +156,20 @@ pub async fn notify_item_change<X: Send>(db: &(impl Executor + ?Sized), outbox: 
     Ok(())
 }
 
+/// Queue the standard junkyard notification for a removed item.
+pub(super) fn notify_item_removed<X: Send>(outbox: &mut Outbox<X>, item: Item) {
+    let old_location = item.location_id;
+    let gone = Item { location_id: LOCATION_JUNKYARD, ..item };
+    let change = Value::Dict(vec![(Value::Int(IX_LOCATION_ID), Value::Int(old_location))]);
+    outbox.notify_client("OnItemChange", vec![gone.row(), change, Value::None]);
+}
+
 pub(super) async fn split_stack(db: &(impl Executor + ?Sized), item: &Item, quantity: i32, owner: i64, location: i64, flag: i32, singleton: bool) -> Result<i64, CallError> {
-    db.execute("UPDATE game.items SET quantity = quantity - $2 WHERE item_id = $1", &[&item.item_id, &quantity]).await.map_err(db_err)?;
+    let affected = db.execute(
+        "UPDATE game.items SET quantity = quantity - $2 WHERE item_id = $1 AND quantity = $3 AND owner_id = $4 AND location_id = $5 AND flag_id = $6 AND singleton = $7 AND NOT singleton AND quantity > $2 AND $2 > 0",
+        &[&item.item_id, &quantity, &item.quantity, &item.owner_id, &item.location_id, &item.flag_id, &item.singleton],
+    ).await.map_err(db_err)?;
+    if affected == 0 { return Err(notify_error("无法这样拆分该堆叠。")); }
     let new_id: i64 = db.query_one(
         "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton) VALUES ($1, $2, $3, $4, $5, $6) RETURNING item_id",
         &[&item.type_id, &owner, &location, &flag, &quantity, &singleton],
@@ -281,25 +296,34 @@ async fn move_item(c: &mut Client, container: &Container, item_id: i64, flag: Op
     ).await
 }
 
-/// Merge within the caller's transaction.
-async fn merge<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, source_id: i64, dest_id: i64, qty: i64) -> Result<(), CallError> {
-    let items = load_items_db(db, "i.item_id = ANY($1)", &[&vec![source_id, dest_id]]).await?;
-    let (Some(src), Some(dst)) = (items.iter().find(|i| i.item_id == source_id), items.iter().find(|i| i.item_id == dest_id)) else { return Ok(()) };
-    if src.type_id != dst.type_id || src.singleton || dst.singleton || source_id == dest_id {
-        return Ok(());
+/// Simulate transfers in request order, retaining the original snapshots for guarded writes.
+fn plan_merges(items: &[Item], ops: &[(i64, i64, i64)]) -> Result<BTreeMap<i64, super::item_quantities::QuantityChange>, CallError> {
+    let mut states: BTreeMap<i64, (&Item, Option<i32>)> = items.iter().map(|item| (item.item_id, (item, Some(item.quantity)))).collect();
+    for &(source, dest, requested) in ops {
+        if source == dest { continue; }
+        let (Some(&(src, Some(src_qty))), Some(&(dst, Some(dst_qty)))) = (states.get(&source), states.get(&dest)) else { continue };
+        if src.type_id != dst.type_id || src.singleton || dst.singleton || src_qty <= 0 { continue; }
+        let take = requested.clamp(1, i64::from(src_qty)) as i32;
+        let total = dst_qty.checked_add(take).ok_or_else(|| notify_error("该物品的数量不足。"))?;
+        states.get_mut(&source).unwrap().1 = if take == src_qty { None } else { Some(src_qty - take) };
+        states.get_mut(&dest).unwrap().1 = Some(total);
     }
-    let qty = qty.clamp(1, src.quantity as i64) as i32;
-    let (dst_old, src_old) = (dst.quantity, src.quantity);
-    db.execute("UPDATE game.items SET quantity = quantity + $2 WHERE item_id = $1", &[&dest_id, &qty]).await.map_err(db_err)?;
-    notify_item_change(db, outbox, dest_id, vec![(IX_STACK_SIZE, Value::Int(dst_old as i64))]).await?;
-    if qty >= src_old {
-        db.execute("DELETE FROM game.items WHERE item_id = $1", &[&source_id]).await.map_err(db_err)?;
-        let gone = Item { location_id: LOCATION_JUNKYARD, ..src.clone() };
-        let change = Value::Dict(vec![(Value::Int(IX_LOCATION_ID), Value::Int(src.location_id))]);
-        outbox.notify_client("OnItemChange", vec![gone.row(), change, Value::None]);
-    } else {
-        db.execute("UPDATE game.items SET quantity = quantity - $2 WHERE item_id = $1", &[&source_id, &qty]).await.map_err(db_err)?;
-        notify_item_change(db, outbox, source_id, vec![(IX_STACK_SIZE, Value::Int(src_old as i64))]).await?;
+    Ok(states.into_iter().filter_map(|(id, (item, quantity))| {
+        (quantity != Some(item.quantity)).then(|| (id, super::item_quantities::QuantityChange::new(item, quantity)))
+    }).collect())
+}
+
+async fn apply_merges<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, items: Vec<Item>, ops: &[(i64, i64, i64)]) -> Result<(), CallError> {
+    let changes = plan_merges(&items, ops)?;
+    super::item_quantities::apply(db, &changes, "该物品的数量不足。").await?;
+    for item in items {
+        if let Some(change) = changes.get(&item.item_id) {
+            if change.quantity.is_none() {
+                notify_item_removed(outbox, item);
+            } else {
+                notify_item_change(db, outbox, item.item_id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
+            }
+        }
     }
     Ok(())
 }
@@ -310,10 +334,9 @@ async fn merge_operations(c: &mut Client, ops: Vec<(i64, i64, i64)>) -> Result<(
         move |tx, outbox: &mut Outbox| {
             let ops = ops.clone();
             Box::pin(async move {
-                for (source, dest, qty) in ops {
-                    merge(tx, outbox, source, dest, qty).await?;
-                }
-                Ok(())
+                let ids: Vec<i64> = ops.iter().flat_map(|&(source, dest, _)| [source, dest]).collect();
+                let items = load_items_db(tx, "i.item_id = ANY($1)", &[&ids]).await?;
+                apply_merges(tx, outbox, items, &ops).await
             })
         },
         |value, outbox| async move { dispatch_client(value, outbox, c) },
@@ -345,13 +368,14 @@ async fn stack_all(c: &mut Client, container: &Container, flag: Option<i64>) -> 
                     },
                 };
                 let mut first: std::collections::HashMap<(i32, i32), i64> = Default::default();
+                let mut ops = Vec::new();
                 for item in items.iter().filter(|i| !i.singleton) {
                     match first.get(&(item.type_id, item.flag_id)) {
-                        Some(&dest) => merge(tx, outbox, item.item_id, dest, item.quantity as i64).await?,
+                        Some(&dest) => ops.push((item.item_id, dest, item.quantity as i64)),
                         None => { first.insert((item.type_id, item.flag_id), item.item_id); }
                     }
                 }
-                Ok(())
+                apply_merges(tx, outbox, items, &ops).await
             })
         },
         |value, outbox| async move { dispatch_client(value, outbox, c) },
@@ -508,3 +532,5 @@ pub async fn inventory(c: &mut Client, call: &Call<'_>) -> CallResult {
         }
     }
 }
+
+#[cfg(test)] mod tests;

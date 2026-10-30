@@ -326,10 +326,10 @@ pub async fn ship_lost(db: &Db, world: &World, system: i64, victim: i64, victim_
     let items = items.clone();
     db.transaction(
         |tx, outbox: &mut Outbox| {
-            let attackers = attackers.clone();
+            let mut attackers = attackers.clone();
             let items = items.clone();
             Box::pin(async move {
-                write_killmail(tx, outbox, system, victim, victim_corp, ship_type, &items, &attackers, now).await
+                write_killmail(tx, outbox, system, victim, victim_corp, ship_type, &items, &mut attackers, now).await
             })
         },
         |(kill_id, isk_lost), outbox| async move {
@@ -351,11 +351,11 @@ pub async fn ship_lost(db: &Db, world: &World, system: i64, victim: i64, victim_
 #[allow(clippy::too_many_arguments)]
 async fn write_killmail<X: Send>(
     db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, system: i64, victim: i64,
-    victim_corp: i64, ship_type: i32, items: &Lost, attackers: &[(i64, Contribution)], now: i64,
+    victim_corp: i64, ship_type: i32, items: &Lost, attackers: &mut [(i64, Contribution)], now: i64,
 ) -> Result<(i64, f64), CallError> {
     let final_blow = attackers.iter().max_by_key(|(_, c)| c.last).cloned();
     let mut blob = String::from("<doc><attackers>");
-    for (char_id, c) in attackers {
+    for (char_id, c) in attackers.iter() {
         let corp: i64 = db
             .query_opt("SELECT corporation_id FROM game.characters WHERE character_id = $1", &[char_id])
             .await
@@ -424,6 +424,7 @@ async fn write_killmail<X: Send>(
         let data = format!("{{killMailHash: '', killMailID: {kill_id}, victimID: {victim}, victimShipTypeID: {ship_type}}}");
         super::mail::notify(db, outbox, killer, NOTIFICATION_KILL_REPORT_FINAL_BLOW, NOTIFICATION_GROUP_WAR, victim, &data).await?;
     }
+    attackers.sort_unstable_by_key(|(char_id, _)| *char_id);
     for (char_id, c) in attackers {
         if c.illegal {
             shift_security(db, outbox, *char_id, KILL_PENALTY, -10.0).await?;
