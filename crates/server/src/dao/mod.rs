@@ -11,10 +11,13 @@
 
 pub(crate) mod accounts;
 pub(crate) mod bills;
+pub(crate) mod bookmarks;
+pub(crate) mod calendar;
 pub(crate) mod characters;
 pub(crate) mod contracts;
 pub(crate) mod insurance;
 pub(crate) mod items;
+pub(crate) mod mail;
 pub(crate) mod market;
 pub(crate) mod offices;
 pub(crate) mod skills;

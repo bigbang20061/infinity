@@ -21,6 +21,7 @@ mod crimewatch;
 mod dogma;
 mod exploration;
 mod fit;
+mod fixed;
 mod fleets;
 mod fitting;
 mod hacking;
@@ -356,6 +357,9 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
             if let Some(r) = bookmarks::dispatch(c, call).await {
                 return r;
             }
+            if matches!(call.service, "calendarMgr" | "accessGroupBookmarkMgr") {
+                if let Some(r) = fixed::social_early(call) { return r; }
+            }
             if let Some(r) = clones::dispatch(c, call).await {
                 return r;
             }
@@ -434,6 +438,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
             if let Some(r) = mail::dispatch(c, call).await {
                 return r;
             }
+            if let Some(r) = fixed::social_early(call) { return r; }
             if let Some(r) = universe::dispatch(c, call).await {
                 return r;
             }
