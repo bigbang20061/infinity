@@ -6,6 +6,7 @@
 //! Service validation, wire conversion, transactions and notifications are not handled here;
 //! corporation shares are not supported.
 
+pub(crate) mod enlistment;
 pub(crate) mod registry;
 pub(crate) mod dispatch;
 pub(crate) mod roles;
