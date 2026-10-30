@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  RUSTFLAGS: -D warnings
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.detect.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: detect
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.event.after }}
+        run: |
+          code=true
+          range=
+          if [[ "$EVENT_NAME" == pull_request ]]; then
+            range="${PR_BASE}...${PR_HEAD}"
+          elif [[ "$EVENT_NAME" == push && -n "$PUSH_BEFORE" && ! "$PUSH_BEFORE" =~ ^0+$ ]]; then
+            range="${PUSH_BEFORE}..${PUSH_AFTER}"
+          fi
+          if [[ -n "$range" ]] && git diff --name-only --no-renames -z "$range" > "$RUNNER_TEMP/changed-paths"; then
+            code=false
+            while IFS= read -r -d '' path; do
+              case "$path" in
+                crates/*.md) ;;
+                crates/*|Cargo.toml|Cargo.lock|rust-toolchain.toml|.github/workflows/*)
+                  code=true
+                  break
+                  ;;
+              esac
+            done < "$RUNNER_TEMP/changed-paths"
+          fi
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+
+  test-linux:
+    name: test-linux
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+      - run: cargo build --release --locked --workspace --all-targets
+      - run: cargo test --release --locked --workspace
+
+  build-windows:
+    name: build-windows
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+      - run: cargo build --release --locked --workspace
