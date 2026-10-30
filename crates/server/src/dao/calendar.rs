@@ -1,5 +1,6 @@
 //! Calendar event and response persistence for `eve/client/script/ui/services/eveCalendarsvc.py`.
 //! Uses `game.calendar_events` and `game.calendar_responses`; alliance events are not modelled.
+//! Client responses, policy, transactions and notifications remain with callers.
 
 use crate::db::{executor::Executor, Error};
 use tokio_postgres::Row;

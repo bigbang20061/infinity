@@ -1,6 +1,8 @@
 //! Industry persistence for blueprints, jobs and materials.
-//! The owning industry services implement the client contract, transaction boundaries and notifications.
-//! This module uses game items, blueprints, industry jobs and prices, plus SDE stations.
+//! The owning services support `eve/client/script/industry`; this DAO has no wire contract.
+//! Uses `game.items`, `game.blueprints`, `game.industry_jobs`, `game.retail_prices`
+//! and `sde.sta_stations`. Corporation jobs are unsupported by the services;
+//! policy, transactions and notifications remain with callers.
 
 use std::collections::HashMap;
 use crate::consts::{BLUEPRINT_COPY_QUANTITY, BLUEPRINT_INFINITE_RUNS};

@@ -1,7 +1,8 @@
-//! Persistent agent missions and epic arc progress.
-//!
-//! Services own mission mechanics, client responses and notifications. Static-data-only
-//! lookups remain with the services; mixed game/SDE reads are here.
+//! Agent mission and epic arc progress persistence, including mission payments.
+//! This DAO has no direct client mirror or wire contract; owning services supply those.
+//! Uses `game.agent_missions`, `game.epic_arc_missions`, `game.characters` and
+//! `sde_native.missions`. Static-data-only lookups, mission mechanics, transactions
+//! and notifications remain with callers.
 
 use crate::db::{self, executor::Executor};
 use tokio_postgres::Row;

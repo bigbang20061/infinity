@@ -1,6 +1,9 @@
-//! Alliance persistence for allianceRegistry and corpRegistry client operations.
-//! Reads and writes game.alliances and associated membership and application tables;
-//! gameplay authorization, notifications and transactions stay in services.
+//! Alliance registry, membership, application and history persistence.
+//! Owning services support `eve/client/script/ui/services/alliances` and
+//! `eve/client/script/ui/services/corporation`; this DAO has no wire contract.
+//! Uses `game.alliances`, `game.corporations`, `game.characters`,
+//! `game.alliance_applications` and `game.alliance_history`.
+//! Authorization, transactions and notifications remain with callers.
 use crate::db::{executor::Executor, Error};
 use tokio_postgres::Row;
 

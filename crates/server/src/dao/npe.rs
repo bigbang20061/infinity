@@ -1,5 +1,6 @@
 //! Persistence for AIR NPE character state in `game.air_npe_state`.
-//! The client-facing protocol, defaults and notifications are owned by the service.
+//! This DAO has no direct client mirror or wire contract; defaults, policy,
+//! transactions and notifications are owned by the service.
 
 use crate::db::{executor::Executor, Error};
 use tokio_postgres::Row;

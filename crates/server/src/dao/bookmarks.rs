@@ -1,6 +1,6 @@
 //! Bookmark persistence for `eve/client/script/ui/shared/bookmarks/bookmarkSvc.py`.
 //! Uses `game.bookmarks`, `game.bookmark_folders`, and `game.bookmark_subfolders`.
-//! Shared access-group folders are not modelled.
+//! Shared access-group folders are not modelled; policy, transactions and effects remain with callers.
 use crate::db::{executor::Executor, Error};
 use tokio_postgres::Row;
 

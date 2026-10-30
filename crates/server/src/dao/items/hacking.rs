@@ -1,4 +1,4 @@
-//! Analyzer item attributes and character skill levels used by hacking.
+//! Analyzer item attributes used by hacking; skill levels come from `skills::levels`.
 //! Client game state and notifications remain in the hacking service.
 use crate::db::{self, executor::Executor};
 use tokio_postgres::Row;

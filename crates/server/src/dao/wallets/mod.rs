@@ -1,6 +1,8 @@
-//! Character and corporation wallet persistence in `game.characters` and `game.corp_wallets`.
+//! Character and corporation wallet balances, credits and debits, and loyalty points.
+//! Uses `game.characters`, `game.corp_wallets` and `game.lp_balances`.
 //! This DAO has no direct client mirror or wire contract; owning services supply those.
-//! Economy policy, transactions, refusals, notifications and World are caller concerns.
+//! Corporation loyalty point wallets are unsupported by these queries; economy policy,
+//! transactions, refusals, notifications and World are caller concerns.
 
 pub(crate) mod characters;
 pub(crate) mod corporations;

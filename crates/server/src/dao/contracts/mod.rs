@@ -1,5 +1,7 @@
-//! Contract persistence for contractProxy (eve/client/script/ui/shared/neocom/contracts).
-//! Reads game contracts and station data; policy and transactions remain in services.
+//! Contract lifecycle, list, report, item, bid and status persistence for contractProxy.
+//! The owning service supports `eve/client/script/ui/shared/neocom/contracts`.
+//! Sources include game contracts, contract items, bids and items, plus SDE station and type data.
+//! Corporation contracts are unsupported; policy, transactions and notifications remain with callers.
 
 pub(crate) mod lifecycle;
 pub(crate) mod query;

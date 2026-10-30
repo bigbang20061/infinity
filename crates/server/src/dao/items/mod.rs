@@ -1,8 +1,10 @@
-//! Item loading, inventory, charges, positions, quantities and transfer persistence.
-//! Uses `game.items`, `game.characters`, `game.module_charges`, `game.weapon_banks`,
-//! `sde.inv_types` and `sde.type_attributes`.
+//! Item loading, inventory, creation, transfers, quantities, positions, charges,
+//! ship, clone, combat, dogma, fitting, hacking, mining and social persistence.
+//! Sources include `game.items`, `game.characters`, `game.module_charges`,
+//! `game.weapon_banks`, `game.fittings`, `game.blueprints`, `game.industry_jobs`,
+//! `game.market_orders` and SDE type, attribute and station data.
 //! This DAO has no direct client mirror or wire contract; owning services supply those.
-//! Transactions, refusals, notifications and World are caller concerns.
+//! Policy, transactions, refusals, notifications and World are caller concerns.
 
 pub(crate) mod charges;
 pub(crate) mod clones;

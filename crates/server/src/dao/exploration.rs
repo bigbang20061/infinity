@@ -1,5 +1,8 @@
-//! Exploration persistence for scan, site and wormhole services (eve/client/script/parklife).
-//! Uses game exploration, item and skill tables and the SDE; simulation and client behavior remain in services.
+//! Exploration site, wormhole, scan and probe persistence, including site position repair.
+//! The owning services support `eve/client/script/parklife`; this DAO has no wire contract.
+//! Uses `game.exploration_sites`, `game.exploration_scanned`, `game.exploration_systems`,
+//! `game.agent_missions`, `game.asteroids`, `game.items`, `game.module_charges`
+//! and SDE data. Simulation, policy, transactions and notifications remain with callers.
 use crate::db::{executor::Executor, Error};
 use tokio_postgres::Row;
 

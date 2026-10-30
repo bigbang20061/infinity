@@ -1,4 +1,4 @@
-//! Active fit data from game items, skills and module charges.
+//! Active fit data from game items and module charges; skill levels come from `skills::levels`.
 //! This DAO has no direct client service; dogma evaluation remains in the caller.
 //! Shared item type lookup lives in `items::inventory`.
 use crate::db::{executor::Executor, Error};

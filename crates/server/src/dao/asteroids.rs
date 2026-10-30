@@ -1,4 +1,6 @@
-//! Persistence of asteroid fields and their rocks; space state is managed by mining.
+//! Asteroid field growth, depletion and rock persistence in `game.asteroid_fields`
+//! and `game.asteroids`. This DAO has no direct client mirror or wire contract.
+//! Mining and space simulation, transactions and notifications remain with callers.
 use crate::db::{self, executor::Executor};
 use tokio_postgres::Row;
 

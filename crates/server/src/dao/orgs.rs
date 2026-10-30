@@ -1,6 +1,7 @@
 //! Persistence for corporation and alliance bulletins, contacts and labels.
-//! Mirrors corpRegistry and allianceRegistry client organization calls using
-//! game.org_bulletins, game.org_contacts and game.org_labels. Authorization,
+//! Owning services support `eve/client/script/ui/services/corporation` and
+//! `eve/client/script/ui/services/alliances`. Uses `game.org_bulletins`,
+//! `game.org_contacts` and `game.org_labels`. Authorization, transactions,
 //! notifications and other organization features are outside this module.
 use crate::db::{executor::Executor, Error};
 use tokio_postgres::Row;
