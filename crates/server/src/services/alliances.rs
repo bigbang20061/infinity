@@ -19,6 +19,7 @@ use crate::consts::{ACCOUNT_CASH, ORG_NAME_MAX_LENGTH, ORG_NAME_MIN_LENGTH, ORG_
 use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::{dispatch_world, Outbox};
+use crate::messages;
 use crate::space::World;
 use marshal::{DbRowDescriptor, DbType, Value};
 use tracing::info;
@@ -287,11 +288,11 @@ async fn set_alliance<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbo
 async fn unallied_ceo_corp(db: &Db, me: i64) -> Result<i64, CallError> {
     let (corp, _) = membership(db, me).await?;
     if !is_player_corp(corp) || ceo_of(db, corp).await? != Some(me) {
-        return Err(notify_error("只有玩家军团的 CEO 才能这样做。"));
+        return Err(notify_error(messages::PLAYER_CORP_CEO_REQUIRED));
     }
     let allied: Option<i64> = db.query_one("SELECT alliance_id FROM game.corporations WHERE corporation_id = $1", &[&corp]).await.map_err(db_err)?.get(0);
     if allied.is_some() {
-        return Err(notify_error("你的军团已经在一个联盟中。"));
+        return Err(notify_error(messages::CORP_ALREADY_IN_ALLIANCE));
     }
     Ok(corp)
 }
@@ -303,10 +304,10 @@ async fn create(c: &Client, call: &Call<'_>) -> CallResult {
     let (name, short_name, description, url) = (trimmed_arg_text(call, 0), trimmed_arg_text(call, 1).to_uppercase(), trimmed_arg_text(call, 2), trimmed_arg_text(call, 3));
     let corp = unallied_ceo_corp(db, me).await?;
     if !(ORG_NAME_MIN_LENGTH..=ORG_NAME_MAX_LENGTH).contains(&name.chars().count()) {
-        return Err(notify_error("联盟名称长度必须为 4 到 50 个字符。"));
+        return Err(notify_error(messages::ALLIANCE_NAME_LENGTH_INVALID));
     }
     if !(ORG_SHORT_NAME_MIN_LENGTH..=ORG_SHORT_NAME_MAX_LENGTH).contains(&short_name.chars().count()) || !short_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
-        return Err(notify_error("联盟简称必须为 2 到 5 个字母、数字、点或短横线。"));
+        return Err(notify_error(messages::ALLIANCE_SHORT_NAME_INVALID));
     }
     let taken: bool = db
         .query_one(
@@ -317,7 +318,7 @@ async fn create(c: &Client, call: &Call<'_>) -> CallResult {
         .map_err(db_err)?
         .get(0);
     if taken {
-        return Err(notify_error("该联盟名称或简称已被占用。"));
+        return Err(notify_error(messages::ALLIANCE_NAME_OR_SHORT_NAME_TAKEN));
     }
     let _trading = super::market::lock().await;
     let now = filetime_now();
@@ -405,10 +406,10 @@ async fn admit(db: &Db, world: &World, alliance: i64, corp: i64) -> Result<(), C
         .query_opt("SELECT alliance_id FROM game.corporations WHERE corporation_id = $1 AND NOT deleted", &[&corp])
         .await
         .map_err(db_err)?
-        .ok_or_else(|| notify_error("该军团已不存在。"))?
+        .ok_or_else(|| notify_error(messages::CORP_NOT_FOUND))?
         .get(0);
     if allied.is_some() {
-        return Err(notify_error("该军团已经在一个联盟中。"));
+        return Err(notify_error(messages::TARGET_CORP_ALREADY_IN_ALLIANCE));
     }
     let old_alliance = alliance_line_of(db, alliance).await?;
     let mut outbox = Outbox::default();
@@ -450,11 +451,11 @@ async fn executor_director(db: &Db, me: i64, alliance: i64) -> Result<bool, Call
 async fn support_executor(db: &Db, world: &World, me: i64, alliance: i64, candidate: i64) -> Result<(), CallError> {
     let (corp, _) = membership(db, me).await?;
     if ceo_of(db, corp).await? != Some(me) {
-        return Err(notify_error("只有军团 CEO 才能选择支持的执行军团。"));
+        return Err(notify_error(messages::CORP_CEO_REQUIRED_TO_CHOOSE_EXECUTOR));
     }
     let members = member_lines(db, alliance).await?;
     if !members.iter().any(|(c, _)| *c == candidate) || !members.iter().any(|(c, _)| *c == corp) {
-        return Err(notify_error("该军团不是联盟成员。"));
+        return Err(notify_error(messages::CORP_NOT_ALLIANCE_MEMBER));
     }
     let old = members.iter().find(|(c, _)| *c == corp).map(|(_, l)| l.clone());
     db.execute("UPDATE game.corporations SET chosen_executor_id = $2 WHERE corporation_id = $1", &[&corp, &candidate]).await.map_err(db_err)?;
@@ -521,7 +522,7 @@ async fn corp_registry(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             };
             match db.query_opt("SELECT 1 FROM game.alliances WHERE alliance_id = $1 AND NOT deleted", &[&alliance]).await {
                 Ok(Some(_)) => {}
-                Ok(None) => return Some(Err(notify_error("该联盟已不存在。"))),
+                Ok(None) => return Some(Err(notify_error(messages::ALLIANCE_NOT_FOUND))),
                 Err(e) => return Some(Err(db_err(e))),
             }
             let old = match application_line_of(db, alliance, corp).await {
@@ -529,7 +530,7 @@ async fn corp_registry(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                 Err(e) => return Some(Err(e)),
             };
             if old.as_ref().is_some_and(|l| l[4].as_int() == Some(APP_NEW as i64)) {
-                return Some(Err(CallError::User { msg: "CantApplyTwiceToAlliance".into(), dict: vec![] }));
+                return Some(Err(CallError::User { msg: messages::MSG_CANT_APPLY_TWICE_TO_ALLIANCE.into(), dict: vec![] }));
             }
             let stored = db
                 .execute(
@@ -560,7 +561,7 @@ async fn corp_registry(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             let alliance = int(0);
             let corp = c.session.int("corpid").unwrap_or(0);
             if ceo_of(db, corp).await.ok().flatten() != Some(me) {
-                return Some(Err(notify_error("只有军团 CEO 才能撤回联盟申请。")));
+                return Some(Err(notify_error(messages::CORP_CEO_REQUIRED_TO_WITHDRAW_ALLIANCE_APPLICATION)));
             }
             let old = match application_line_of(db, alliance, corp).await {
                 Ok(old) => old,
@@ -641,7 +642,7 @@ async fn alliance_registry(c: &mut Client, call: &Call<'_>) -> Option<CallResult
         // UpdateAlliance(description, url)
         "UpdateAlliance" => {
             if !executor_director(db, me, alliance).await.unwrap_or(false) {
-                return Some(Err(notify_error("只有执行军团的董事才能修改联盟信息。")));
+                return Some(Err(notify_error(messages::EXECUTOR_CORP_DIRECTOR_REQUIRED_TO_EDIT_ALLIANCE)));
             }
             let old = alliance_line_of(db, alliance).await.ok().flatten();
             match db
@@ -670,15 +671,15 @@ async fn alliance_registry(c: &mut Client, call: &Call<'_>) -> Option<CallResult
             let corp = int(0);
             let state = if call.method == "GMForceAcceptApplication" { APP_ACCEPTED } else { int(2) as i32 };
             if !executor_director(db, me, alliance).await.unwrap_or(false) {
-                return Some(Err(notify_error("只有执行军团的董事才能处理联盟申请。")));
+                return Some(Err(notify_error(messages::EXECUTOR_CORP_DIRECTOR_REQUIRED_TO_HANDLE_APPLICATION)));
             }
             let old = match application_line_of(db, alliance, corp).await {
                 Ok(Some(old)) => old,
-                Ok(None) => return Some(Err(notify_error("该申请已不存在。"))),
+                Ok(None) => return Some(Err(notify_error(messages::ALLIANCE_APPLICATION_NOT_FOUND))),
                 Err(e) => return Some(Err(e)),
             };
             if !matches!(state, APP_ACCEPTED | APP_REJECTED) {
-                return Some(Err(notify_error("无效的申请状态。")));
+                return Some(Err(notify_error(messages::ALLIANCE_APPLICATION_STATUS_INVALID)));
             }
             if state == APP_ACCEPTED {
                 if let Err(e) = admit(db, world, alliance, corp).await {
@@ -708,7 +709,7 @@ async fn alliance_registry(c: &mut Client, call: &Call<'_>) -> Option<CallResult
                 executor_director(db, me, alliance).await.unwrap_or(false)
             };
             if !allowed {
-                return Some(Err(notify_error("你无法将该军团移出联盟。")));
+                return Some(Err(notify_error(messages::NOT_AUTHORIZED_TO_REMOVE_CORP_FROM_ALLIANCE)));
             }
             match member_lines(db, alliance).await {
                 Ok(lines) if lines.iter().any(|(c, _)| *c == corp) => {
@@ -718,7 +719,7 @@ async fn alliance_registry(c: &mut Client, call: &Call<'_>) -> Option<CallResult
                         |value, outbox| async move { dispatch_world(value, outbox, world) },
                     ).await.map(|_| Value::None)
                 },
-                Ok(_) => Err(notify_error("该军团不是联盟成员。")),
+                Ok(_) => Err(notify_error(messages::CORP_NOT_ALLIANCE_MEMBER)),
                 Err(e) => Err(e),
             }
         }
@@ -734,7 +735,7 @@ async fn alliance_registry(c: &mut Client, call: &Call<'_>) -> Option<CallResult
         // SetRelationship(relationship, toID) / DeleteRelationship(toID)
         "SetRelationship" | "DeleteRelationship" => {
             if !executor_director(db, me, alliance).await.unwrap_or(false) {
-                return Some(Err(notify_error("只有执行军团的董事才能设置联盟关系。")));
+                return Some(Err(notify_error(messages::EXECUTOR_CORP_DIRECTOR_REQUIRED_TO_SET_RELATIONSHIP)));
             }
             let (relationship, to) = if call.method == "SetRelationship" { (Some(int(0) as i32), int(1)) } else { (None, int(0)) };
             let old: Option<i32> = match db.query_opt("SELECT relationship FROM game.alliance_relationships WHERE alliance_id = $1 AND to_id = $2", &[&alliance, &to]).await {
@@ -760,7 +761,7 @@ async fn alliance_registry(c: &mut Client, call: &Call<'_>) -> Option<CallResult
             let ch = change(RELATIONSHIP_COLUMNS, line(old).as_deref(), line(relationship).as_deref());
             tell(db, world, alliance, None, "OnAllianceRelationshipChanged", vec![Value::Int(alliance), Value::Int(to), ch]).await.map(|_| Value::None)
         }
-        "DeclareWarAgainst" => Err(notify_error("战争尚未开放。")),
+        "DeclareWarAgainst" => Err(notify_error(messages::WAR_DECLARATION_NOT_AVAILABLE)),
         // The alliance's bills (services/bills), paid by the executor's accountants.
         "GetBills" => super::bills::bills(db, alliance, false).await,
         "GetBillsReceivable" => super::bills::bills(db, alliance, true).await,
@@ -780,7 +781,7 @@ async fn alliance_registry(c: &mut Client, call: &Call<'_>) -> Option<CallResult
                 || (super::bills::is_accountant(db, me, corp).await.unwrap_or(false)
                     && db.query_opt("SELECT 1 FROM game.alliances WHERE alliance_id = $1 AND executor_corp_id = $2", &[&alliance, &corp]).await.ok().flatten().is_some());
             if !owed || !allowed || !super::corpwallet::may_take(db, me, corp, key).await.unwrap_or(false) {
-                return Some(Err(notify_error("你无法支付该账单。")));
+                return Some(Err(notify_error(messages::BILL_PAYMENT_NOT_AUTHORIZED)));
             }
             super::bills::pay(db, world, bill, Some(corp), key).await.map(|_| Value::None)
         }

@@ -16,6 +16,7 @@ use crate::consts::{ACCOUNT_CASH, CORPORATION_TYPE_PLAYER, CORPORATION_UNLIMITED
 use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::{dispatch_world, Outbox};
+use crate::messages;
 use crate::space::World;
 use marshal::{DbRowDescriptor, DbType, Value};
 use tracing::info;
@@ -168,13 +169,13 @@ async fn found(c: &Client, call: &Call<'_>) -> CallResult {
     let (name, ticker, description, url) = (trimmed_arg_text(call, 0), trimmed_arg_text(call, 1).to_uppercase(), trimmed_arg_text(call, 2), trimmed_arg_text(call, 3));
     let tax = call.args.get(4).and_then(|v| v.as_float()).unwrap_or(0.0).clamp(0.0, 1.0);
     let Some(station) = c.session.int("stationid") else {
-        return Err(notify_error("你必须停靠在空间站内才能创建军团。"));
+        return Err(notify_error(messages::STATION_DOCK_REQUIRED_TO_CREATE_CORP));
     };
     if !(ORG_NAME_MIN_LENGTH..=ORG_NAME_MAX_LENGTH).contains(&name.chars().count()) {
-        return Err(notify_error("军团名称长度必须为 4 到 50 个字符。"));
+        return Err(notify_error(messages::CORP_NAME_LENGTH_INVALID));
     }
     if !(ORG_SHORT_NAME_MIN_LENGTH..=ORG_SHORT_NAME_MAX_LENGTH).contains(&ticker.chars().count()) || !ticker.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
-        return Err(notify_error("军团代号必须为 2 到 5 个字母、数字、点或短横线。"));
+        return Err(notify_error(messages::CORP_SHORT_NAME_INVALID));
     }
     let skill: i32 = db
         .query_opt("SELECT level FROM game.skills WHERE character_id = $1 AND type_id = $2", &[&me, &SKILL_CORPORATION_MANAGEMENT])
@@ -183,11 +184,11 @@ async fn found(c: &Client, call: &Call<'_>) -> CallResult {
         .map(|r| r.get(0))
         .unwrap_or(0);
     if skill < MIN_CORPORATION_MANAGEMENT_LEVEL {
-        return Err(notify_error("创建军团需要军团管理技能。"));
+        return Err(notify_error(messages::CORPORATION_MANAGEMENT_SKILL_REQUIRED));
     }
     let (current, _) = membership(db, me).await?;
     if is_player_corp(current) && ceo_of(db, current).await? == Some(me) {
-        return Err(notify_error("你已是 CEO，请先辞职或关闭你的军团。"));
+        return Err(notify_error(messages::ALREADY_CORP_CEO_MUST_RESIGN_OR_CLOSE));
     }
     let taken: bool = db
         .query_one(
@@ -199,7 +200,7 @@ async fn found(c: &Client, call: &Call<'_>) -> CallResult {
         .map_err(db_err)?
         .get(0);
     if taken {
-        return Err(notify_error("该军团名称或代号已被占用。"));
+        return Err(notify_error(messages::CORP_NAME_OR_SHORT_NAME_TAKEN));
     }
     let _trading = super::market::lock().await;
     let now = filetime_now();
@@ -233,7 +234,7 @@ async fn found(c: &Client, call: &Call<'_>) -> CallResult {
 async fn leave_inner<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, char_id: i64, now: i64) -> Result<(), CallError> {
     let (corp, _) = membership(db, char_id).await?;
     if !is_player_corp(corp) {
-        return Err(notify_error("不能用这种方式退出 NPC 军团。"));
+        return Err(notify_error(messages::CANNOT_LEAVE_NPC_CORP));
     }
     if ceo_of(db, corp).await? == Some(char_id) {
         let others: i64 = db
@@ -242,7 +243,7 @@ async fn leave_inner<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox
             .map_err(db_err)?
             .get(0);
         if others > 0 {
-            return Err(notify_error("军团还有其他成员时，CEO 不能退出。"));
+            return Err(notify_error(messages::CORP_CEO_CANNOT_LEAVE_WITH_MEMBERS));
         }
         super::alliances::leave_alliance(db, outbox, corp, now).await?;
         db.execute("UPDATE game.corporations SET deleted = true, ceo_id = NULL WHERE corporation_id = $1", &[&corp]).await.map_err(db_err)?;
@@ -299,20 +300,20 @@ async fn update_application(c: &Client, call: &Call<'_>) -> CallResult {
     let (app_id, status) = (int(0), int(4) as i32);
     let message = call.args.get(5).and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
     let Some(r) = db.query_opt(&format!("{APPLICATION_SELECT} WHERE application_id = $1"), &[&app_id]).await.map_err(db_err)? else {
-        return Err(notify_error("该申请已不存在。"));
+        return Err(notify_error(messages::ALLIANCE_APPLICATION_NOT_FOUND));
     };
     let (corp, applicant, current): (i64, i64, i32) = (r.get(1), r.get(2), r.get(4));
     if !OPEN_APPLICATION.contains(&current) {
-        return Err(notify_error("该申请已处理完毕。"));
+        return Err(notify_error(messages::CORP_APPLICATION_ALREADY_PROCESSED));
     }
     let by_character = matches!(status, APP_ACCEPTED_BY_CHARACTER | APP_REJECTED_BY_CHARACTER | APP_WITHDRAWN_BY_CHARACTER | APP_RENEGOTIATED_BY_CHARACTER);
     if by_character && applicant != me {
-        return Err(notify_error("这不是你的申请。"));
+        return Err(notify_error(messages::CORP_APPLICATION_NOT_OWNED));
     }
     if !by_character {
         let (my_corp, roles) = membership(db, me).await?;
         if my_corp != corp || roles & (ROLE_PERSONNEL_MANAGER | ROLE_DIRECTOR) == 0 {
-            return Err(notify_error("只有军团的人事经理才能处理申请。"));
+            return Err(notify_error(messages::PERSONNEL_MANAGER_REQUIRED_FOR_APPLICATION));
         }
     }
     let joins = (status == APP_ACCEPTED_BY_CORPORATION && current != APP_INVITED_BY_CORPORATION)
@@ -325,12 +326,12 @@ async fn update_application(c: &Client, call: &Call<'_>) -> CallResult {
                 let affected = tx.execute("UPDATE game.corp_applications SET status = $2, custom_message = $3 WHERE application_id = $1 AND status = $4", &[&app_id, &status, &message, &current])
                     .await.map_err(db_err)?;
                 if affected == 0 {
-                    return Err(notify_error("该申请已处理完毕。"));
+                    return Err(notify_error(messages::CORP_APPLICATION_ALREADY_PROCESSED));
                 }
                 if joins {
                     let (old, _) = membership(tx, applicant).await?;
                     if is_player_corp(old) && ceo_of(tx, old).await? == Some(applicant) {
-                        return Err(notify_error("CEO 必须先离开自己的军团才能加入其他军团。"));
+                        return Err(notify_error(messages::CEO_MUST_LEAVE_CORP_BEFORE_JOINING));
                     }
                     set_corp(tx, outbox, applicant, corp, 0, now).await?;
                     tx.execute("UPDATE game.corp_applications SET status = $3 WHERE character_id = $1 AND application_id <> $2 AND status = ANY($4)", &[&applicant, &app_id, &APP_WITHDRAWN_BY_CHARACTER, &OPEN_APPLICATION.to_vec()])
@@ -491,7 +492,7 @@ async fn update_member(db: &Db, world: &World, me: i64, args: &[Value]) -> Resul
     let ceo = ceo_of(db, my_corp).await?;
     let is_ceo = ceo == Some(me);
     if my_corp != their_corp || (my_roles & ROLE_DIRECTOR == 0 && !is_ceo) || (ceo == Some(target) && !is_ceo) {
-        return Err(notify_error("你无法修改该成员的职权。"));
+        return Err(notify_error(messages::CANNOT_MODIFY_MEMBER_ROLES));
     }
     // A CEO keeps every role.
     let roles = if ceo == Some(target) { Some(CEO_ROLES) } else { roles };
@@ -515,7 +516,7 @@ async fn execute_actions(db: &Db, world: &World, me: i64, call: &Call<'_>) -> Re
     let (my_corp, my_roles) = membership(db, me).await?;
     let ceo = ceo_of(db, my_corp).await?;
     if my_roles & ROLE_DIRECTOR == 0 && ceo != Some(me) {
-        return Err(notify_error("只有董事才能批量修改成员。"));
+        return Err(notify_error(messages::DIRECTOR_REQUIRED_FOR_BULK_MEMBER_EDIT));
     }
     for target in targets {
         let (their_corp, _) = membership(db, target).await?;
@@ -605,7 +606,7 @@ async fn refresh_title_holders(db: &Db, world: &World, corp: i64, title_mask: i6
 async fn update_titles(db: &Db, world: &World, me: i64, corp: i64, lines: Vec<Vec<Value>>) -> Result<(), CallError> {
     let (my_corp, roles) = membership(db, me).await?;
     if my_corp != corp || roles & ROLE_DIRECTOR == 0 {
-        return Err(notify_error("只有董事才能修改头衔。"));
+        return Err(notify_error(messages::DIRECTOR_REQUIRED_TO_EDIT_TITLES));
     }
     let mut changed = 0i64;
     for line in lines {
@@ -633,7 +634,7 @@ async fn update_titles(db: &Db, world: &World, me: i64, corp: i64, lines: Vec<Ve
 async fn delete_title(db: &Db, world: &World, me: i64, corp: i64, title: i64) -> Result<(), CallError> {
     let (my_corp, roles) = membership(db, me).await?;
     if my_corp != corp || roles & ROLE_DIRECTOR == 0 {
-        return Err(notify_error("只有董事才能删除头衔。"));
+        return Err(notify_error(messages::DIRECTOR_REQUIRED_TO_DELETE_TITLES));
     }
     let holders = db
         .query("SELECT character_id FROM game.characters WHERE corporation_id = $1 AND corp_title_mask & $2 <> 0", &[&corp, &title])
@@ -669,12 +670,12 @@ async fn potential_ceos(db: &Db, corp: i64, ceo: i64) -> Result<Vec<i64>, CallEr
 async fn resign_ceo(db: &Db, world: &World, me: i64, successor: Option<i64>) -> CallResult {
     let (corp, _) = membership(db, me).await?;
     if !is_player_corp(corp) || ceo_of(db, corp).await? != Some(me) {
-        return Err(CallError::User { msg: "OnlyCEOCanResign".into(), dict: vec![] });
+        return Err(CallError::User { msg: messages::MSG_ONLY_CEO_CAN_RESIGN.into(), dict: vec![] });
     }
     match successor {
         Some(next) => {
             if !potential_ceos(db, corp, me).await?.contains(&next) {
-                return Err(notify_error("该成员无法成为 CEO。"));
+                return Err(notify_error(messages::MEMBER_CANNOT_BECOME_CEO));
             }
             db.transaction(
                 |tx, outbox: &mut Outbox| Box::pin(async move {
@@ -812,7 +813,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                         Err(e) => return Some(Err(e)),
                     };
                     if their_corp != my_corp || roles & ROLE_DIRECTOR == 0 || ceo_of(db, my_corp).await.ok().flatten() == Some(*target) {
-                        return Some(Err(notify_error("你无法移除该成员。")));
+                        return Some(Err(notify_error(messages::CANNOT_REMOVE_MEMBER)));
                     }
                 }
                 if let Err(e) = leave(db, world, *target).await {
@@ -826,14 +827,14 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             let target = int(0).unwrap_or(0);
             let text = call.args.get(1).and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
             if !is_player_corp(target) {
-                return Some(Err(notify_error("NPC 军团不接受申请。")));
+                return Some(Err(notify_error(messages::NPC_CORP_DOES_NOT_ACCEPT_APPLICATIONS)));
             }
             let recruiting: Option<bool> = match db.query_opt("SELECT is_recruiting FROM game.corporations WHERE corporation_id = $1 AND NOT deleted", &[&target]).await {
                 Ok(r) => r.map(|r| r.get(0)),
                 Err(e) => return Some(Err(db_err(e))),
             };
             if recruiting != Some(true) {
-                return Some(Err(notify_error("该军团目前不接受申请。")));
+                return Some(Err(notify_error(messages::CORP_NOT_RECRUITING)));
             }
             db
                 .query_one(
@@ -856,7 +857,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                     .await
                     .map(|_| Value::None)
                     .map_err(db_err),
-                Ok(_) => Err(notify_error("只有人事经理才能发出邀请。")),
+                Ok(_) => Err(notify_error(messages::PERSONNEL_MANAGER_REQUIRED_TO_INVITE)),
                 Err(e) => Err(e),
             }
         }
@@ -948,7 +949,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                     .await
                     .map(|_| Value::None)
                     .map_err(db_err),
-                Ok(_) => Err(notify_error("只有董事才能修改部门名称。")),
+                Ok(_) => Err(notify_error(messages::DIRECTOR_REQUIRED_TO_EDIT_DIVISION_NAMES)),
                 Err(e) => Err(e),
             }
         }
@@ -958,7 +959,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "GetInfoWindowDataForChar" => info_window_data(db, int(0).unwrap_or(me)).await,
         // Shares aren't modelled.
         "GetMemberIDsWithMoreThanAvgShares" => Ok(Value::list([])),
-        "PayoutDividend" | "MoveCompanyShares" | "MovePrivateShares" => Err(notify_error("军团股份尚未开放。")),
+        "PayoutDividend" | "MoveCompanyShares" | "MovePrivateShares" => Err(notify_error(messages::CORP_SHARES_UNAVAILABLE)),
         // UpdateCorporation(description, url, taxRate, isRecruiting, lpTaxRate)
         "UpdateCorporation" => {
             let text = |i: usize| call.args.get(i).and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
@@ -974,7 +975,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                     .await
                     .map(|_| Value::None)
                     .map_err(db_err),
-                Ok(_) => Err(notify_error("只有董事才能修改军团信息。")),
+                Ok(_) => Err(notify_error(messages::DIRECTOR_REQUIRED_TO_EDIT_CORP_INFO)),
                 Err(e) => Err(e),
             }
         }

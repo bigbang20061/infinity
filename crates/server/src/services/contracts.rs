@@ -26,6 +26,7 @@ use crate::consts::{ACCOUNT_CASH, FILETIME_DAY, FILETIME_MINUTE, FLAG_HANGAR, IX
 use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::{dispatch_world, Outbox};
+use crate::messages;
 use crate::space::World;
 use marshal::{DbRowDescriptor, DbType, Value};
 use std::collections::HashMap;
@@ -224,7 +225,7 @@ async fn contracts(db: &(impl Executor + ?Sized), where_sql: &str, params: &[&(d
 }
 
 async fn contract(db: &(impl Executor + ?Sized), id: i64) -> Result<Contract, CallError> {
-    contracts(db, "c.contract_id = $1", &[&id]).await?.pop().ok_or_else(|| user_error("ConContractNotFound", vec![]))
+    contracts(db, "c.contract_id = $1", &[&id]).await?.pop().ok_or_else(|| user_error(messages::MSG_CON_CONTRACT_NOT_FOUND, vec![]))
 }
 
 async fn set_status(db: &(impl Executor + ?Sized), k: &mut Contract, status: i32, completed: i64) -> Result<(), CallError> {
@@ -432,21 +433,21 @@ async fn create(c: &Client, info: &Value) -> CallResult {
     let money = |k: &str| round2(field(info, k).and_then(|v| v.as_float()).unwrap_or(0.0));
     let text = |k: &str, max: usize| value_text(field(info, k), max);
     if truthy(field(info, "forCorp")) {
-        return Err(notify_error("暂不支持军团合同。"));
+        return Err(notify_error(messages::CORPORATION_CONTRACTS_UNSUPPORTED));
     }
     let kind = int("contractType") as i32;
     if ![TYPE_ITEM_EXCHANGE, TYPE_AUCTION, TYPE_COURIER].contains(&kind) {
-        return Err(notify_error("请选择合同类型。"));
+        return Err(notify_error(messages::CONTRACT_TYPE_REQUIRED));
     }
     let (price, reward, collateral) = (money("price"), money("reward"), money("collateral"));
     if price < 0.0 || reward < 0.0 || collateral < 0.0 {
-        return Err(notify_error("金额不能为负数。"));
+        return Err(notify_error(messages::CONTRACT_AMOUNT_NEGATIVE));
     }
     let start = station(db, int("startStationID")).await?;
     let end = if kind == TYPE_COURIER { Some(station(db, int("destinationID")).await?) } else { None };
     let assignee = int("assignedToID");
     if assignee == me {
-        return Err(notify_error("你不能将合同指定给自己。"));
+        return Err(notify_error(messages::CONTRACT_SELF_ASSIGNMENT_FORBIDDEN));
     }
     let minutes = int("minutesExpire").clamp(60, 90 * 1440);
     let num_days = if kind == TYPE_COURIER { int("numDays").clamp(1, 365) as i32 } else { 0 };
@@ -474,14 +475,14 @@ async fn create(c: &Client, info: &Value) -> CallResult {
         vec![]
     };
     match kind {
-        TYPE_AUCTION if items.is_empty() => return Err(notify_error("拍卖需要有待售物品。")),
-        TYPE_AUCTION if collateral > 0.0 && collateral < price => return Err(notify_error("一口价不能低于起拍价。")),
-        TYPE_COURIER if items.is_empty() => return Err(notify_error("运输合同需要有待运送的物品。")),
-        TYPE_ITEM_EXCHANGE if items.is_empty() && requested.is_empty() => return Err(notify_error("物品交换需要提供或索取物品。")),
+        TYPE_AUCTION if items.is_empty() => return Err(notify_error(messages::AUCTION_REQUIRES_ITEMS)),
+        TYPE_AUCTION if collateral > 0.0 && collateral < price => return Err(notify_error(messages::BUYOUT_BELOW_START_PRICE)),
+        TYPE_COURIER if items.is_empty() => return Err(notify_error(messages::COURIER_REQUIRES_ITEMS)),
+        TYPE_ITEM_EXCHANGE if items.is_empty() && requested.is_empty() => return Err(notify_error(messages::ITEM_EXCHANGE_REQUIRES_OFFER_OR_REQUEST)),
         _ => {}
     }
     if items.len() > MAX_ITEMS || requested.len() > MAX_ITEMS {
-        return Err(notify_error("一份合同中的物品过多。"));
+        return Err(notify_error(messages::CONTRACT_ITEM_LIMIT_EXCEEDED));
     }
     let multi = truthy(field(info, "multiContract")) && items.len() > 1;
     let groups: Vec<Vec<(i64, i64)>> = if multi { items.iter().map(|i| vec![*i]).collect() } else { vec![items] };
@@ -499,20 +500,20 @@ async fn create(c: &Client, info: &Value) -> CallResult {
     let open = num_outstanding(db, me).await?;
     let cap = max_outstanding(db, me).await?;
     if open + groups.len() as i64 > cap {
-        return Err(notify_error(&format!("你有 {open} 份未完成的合同，你的合同技能最多允许 {cap} 份。")));
+        return Err(notify_error(&messages::contract_limit(open, cap)));
     }
     // Every item must be in the issuer's hangar at the start station.
     let mut loaded = HashMap::new();
     for (id, qty) in groups.iter().flatten() {
-        let item = load_items_db(db, "i.item_id = $1", &[id]).await?.pop().ok_or_else(|| notify_error("其中一件物品已不在原处。"))?;
+        let item = load_items_db(db, "i.item_id = $1", &[id]).await?.pop().ok_or_else(|| notify_error(messages::CONTRACT_ITEM_MISSING))?;
         if item.owner_id != me || item.location_id != start_id || item.flag_id != FLAG_HANGAR {
-            return Err(notify_error("只有起始空间站物品机库中的物品才能放入合同。"));
+            return Err(notify_error(messages::CONTRACT_ITEM_MUST_BE_IN_START_HANGAR));
         }
         if item.type_id == TYPE_PLASTIC_WRAP && kind != TYPE_COURIER {
-            return Err(notify_error("运输包裹不能交易。"));
+            return Err(notify_error(messages::COURIER_PACKAGE_NOT_TRADEABLE));
         }
         if *qty < 1 || (!item.singleton && *qty > item.quantity as i64) {
-            return Err(notify_error("其中一件物品的数量不足。"));
+            return Err(notify_error(messages::CONTRACT_ITEM_QUANTITY_INSUFFICIENT));
         }
         loaded.insert(*id, item);
     }
@@ -595,13 +596,13 @@ async fn accept(c: &Client, id: i64) -> CallResult {
         |db, outbox: &mut Outbox| Box::pin(async move {
             let mut k = contract(db, id).await?;
             if k.status != STATUS_OUTSTANDING || k.expired(now) {
-                return Err(user_error("ConContractNotOutstanding", vec![]));
+                return Err(user_error(messages::MSG_CON_CONTRACT_NOT_OUTSTANDING, vec![]));
             }
             if k.issuer == me {
-                return Err(notify_error("你不能接受自己的合同。"));
+                return Err(notify_error(messages::CONTRACT_SELF_ACCEPTANCE_FORBIDDEN));
             }
             if !k.available_to(me, corp) {
-                return Err(notify_error("该合同已指定给其他人。"));
+                return Err(notify_error(messages::CONTRACT_ASSIGNED_TO_OTHER));
             }
             match k.kind {
                 TYPE_ITEM_EXCHANGE => {
@@ -621,7 +622,7 @@ async fn accept(c: &Client, id: i64) -> CallResult {
                         .await?;
                         let have: i64 = stacks.iter().map(|s| if s.singleton { 1 } else { s.quantity as i64 }).sum();
                         if have < qty as i64 {
-                            return Err(notify_error("你在合同所在空间站的物品机库中没有全部所需物品。"));
+                            return Err(notify_error(messages::CONTRACT_REQUIRED_ITEMS_MISSING));
                         }
                         takes.push((type_id, qty, stacks));
                     }
@@ -653,7 +654,7 @@ async fn accept(c: &Client, id: i64) -> CallResult {
                         .query_one(
                             "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton, custom_info)
                              VALUES ($1, $2, $3, $4, 1, true, $5) RETURNING item_id",
-                            &[&TYPE_PLASTIC_WRAP, &me, &k.start, &FLAG_HANGAR, &format!("contract {id}")],
+                            &[&TYPE_PLASTIC_WRAP, &me, &k.start, &FLAG_HANGAR, &messages::contract_package_name(id)],
                         )
                         .await
                         .map_err(db_err)?
@@ -672,7 +673,7 @@ async fn accept(c: &Client, id: i64) -> CallResult {
                         .map_err(db_err)?;
                     tell(outbox, k.issuer, "OnContractAccepted", id);
                 }
-                _ => return Err(notify_error("拍卖只能出价竞拍。")),
+                _ => return Err(notify_error(messages::AUCTION_ONLY_BIDDABLE)),
             }
             Ok(k.keyval())
         }),
@@ -697,14 +698,14 @@ async fn complete(c: &Client, id: i64, status: i32) -> CallResult {
             match status {
                 STATUS_FINISHED => {
                     if k.kind != TYPE_COURIER || k.status != STATUS_IN_PROGRESS || k.acceptor != me {
-                        return Err(notify_error("只有承运人才能交付这份合同。"));
+                        return Err(notify_error(messages::COURIER_DELIVERY_REQUIRES_ACCEPTOR));
                     }
                     let wrap = match k.package {
                         Some(w) => load_items_db(db, "i.item_id = $1", &[&w]).await?.pop(),
                         None => None,
                     };
                     let Some(wrap) = wrap.filter(|w| w.owner_id == me && w.location_id == k.end) else {
-                        return Err(notify_error("包裹必须位于目的地空间站的机库中。"));
+                        return Err(notify_error(messages::COURIER_PACKAGE_MUST_BE_AT_DESTINATION));
                     };
                     take_items(db, outbox, wrap, 1).await?;
                     hand_over(db, outbox, id, k.issuer, k.end, FLAG_HANGAR).await?;
@@ -714,7 +715,7 @@ async fn complete(c: &Client, id: i64, status: i32) -> CallResult {
                 }
                 STATUS_FAILED => {
                     if k.kind != TYPE_COURIER || k.status != STATUS_IN_PROGRESS || !(k.acceptor == me || (k.issuer == me && k.overdue(now))) {
-                        return Err(notify_error("现在无法将这份合同判定为失败。"));
+                        return Err(notify_error(messages::COURIER_CANNOT_BE_FAILED_NOW));
                     }
                     credit(db, outbox, k.issuer, round2(k.collateral + k.reward)).await?;
                     let wrap = match k.package {
@@ -734,12 +735,12 @@ async fn complete(c: &Client, id: i64, status: i32) -> CallResult {
                 }
                 STATUS_REJECTED => {
                     if k.status != STATUS_OUTSTANDING || k.assignee == 0 || !(k.assignee == me || k.assignee == corp) {
-                        return Err(notify_error("只有合同的指定对象才能拒绝合同。"));
+                        return Err(notify_error(messages::CONTRACT_ASSIGNEE_REQUIRED_TO_REJECT));
                     }
                     set_status(db, &mut k, STATUS_REJECTED, now).await?;
                     tell(outbox, k.issuer, "OnContractRejected", id);
                 }
-                _ => return Err(notify_error("合同不能被设置为该状态。")),
+                _ => return Err(notify_error(messages::CONTRACT_STATUS_TRANSITION_INVALID)),
             }
             Ok(Value::Bool(true))
         }),
@@ -757,10 +758,10 @@ async fn delete_one(db: &Db, world: &World, me: i64, id: i64) -> Result<(), Call
         |db, outbox: &mut Outbox| Box::pin(async move {
             let mut k = contract(db, id).await?;
             if k.issuer != me || !(k.status == STATUS_OUTSTANDING || k.status == STATUS_REJECTED) {
-                return Err(notify_error("只有发布者才能删除未完成的合同。"));
+                return Err(notify_error(messages::CONTRACT_ISSUER_REQUIRED_TO_DELETE));
             }
             if k.kind == TYPE_AUCTION && top_bid(db, id).await?.is_some() {
-                return Err(notify_error("已有出价的拍卖不能删除。"));
+                return Err(notify_error(messages::BIDDED_AUCTION_CANNOT_BE_DELETED));
             }
             hand_over(db, outbox, id, me, k.start, FLAG_HANGAR).await?;
             if k.kind != TYPE_AUCTION {
@@ -787,18 +788,18 @@ async fn place_bid(c: &Client, id: i64, amount: f64) -> CallResult {
         |db, outbox: &mut Outbox| Box::pin(async move {
     let mut k = contract(db, id).await?;
     if k.kind != TYPE_AUCTION || k.status != STATUS_OUTSTANDING || k.expired(now) {
-        return Err(user_error("ConContractNotOutstanding", vec![]));
+        return Err(user_error(messages::MSG_CON_CONTRACT_NOT_OUTSTANDING, vec![]));
     }
     if k.issuer == me {
-        return Err(notify_error("你不能对自己的拍卖出价。"));
+        return Err(notify_error(messages::AUCTION_SELF_BID_FORBIDDEN));
     }
     if !k.available_to(me, corp) {
-        return Err(notify_error("该拍卖已指定给其他人。"));
+        return Err(notify_error(messages::AUCTION_ASSIGNED_TO_OTHER));
     }
     let mut amount = amount;
     let top = top_bid(db, id).await?;
     if !amount.is_finite() || amount < k.price || top.is_some_and(|(_, best)| amount <= best) {
-        return Err(notify_error("你的出价必须高于当前出价和起拍价。"));
+        return Err(notify_error(messages::BID_MUST_EXCEED_CURRENT_AND_START));
     }
     let buyout = k.collateral > 0.0 && amount >= k.collateral;
     if buyout {
@@ -1122,9 +1123,9 @@ async fn split_stack(c: &Client, station_id: i64, item_id: i64, quantity: i64) -
     let _trading = lock().await;
     db.transaction(
         |db, outbox: &mut Outbox| Box::pin(async move {
-            let item = load_items_db(db, "i.item_id = $1", &[&item_id]).await?.pop().ok_or_else(|| notify_error("该物品已不在原处。"))?;
+            let item = load_items_db(db, "i.item_id = $1", &[&item_id]).await?.pop().ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
             if item.owner_id != me || item.location_id != station_id || item.singleton || quantity < 1 || quantity >= item.quantity as i64 {
-                return Err(notify_error("无法这样拆分该堆叠。"));
+                return Err(notify_error(messages::STACK_CANNOT_BE_SPLIT));
             }
             let quantity = quantity as i32;
             let id = super::inventory::split_stack(db, &item, quantity, me, station_id, item.flag_id, false).await?;
@@ -1148,13 +1149,13 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     Some(match call.method {
         "CreateContract" => match call.args.first() {
             Some(info) => create(c, info).await,
-            None => Err(notify_error("没有要创建的合同。")),
+            None => Err(notify_error(messages::CONTRACT_CREATION_REQUEST_MISSING)),
         },
         "GetContract" => match contract(&c.db, int(0)).await {
             Ok(k) => bundles(&c.db, &[k]).await.map(|mut b| b.pop().unwrap_or(Value::None)),
             Err(e) => Err(e),
         },
-        "AcceptContract" if for_corp(1) => Err(notify_error("暂不支持军团合同。")),
+        "AcceptContract" if for_corp(1) => Err(notify_error(messages::CORPORATION_CONTRACTS_UNSUPPORTED)),
         "AcceptContract" => accept(c, int(0)).await,
         "CompleteContract" => complete(c, int(0), int(1) as i32).await,
         "DeleteContract" => {
@@ -1175,7 +1176,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             }
             Ok(Value::tuple([Value::List(deleted), Value::List(failed)]))
         }
-        "PlaceBid" if for_corp(2) => Err(notify_error("暂不支持军团合同。")),
+        "PlaceBid" if for_corp(2) => Err(notify_error(messages::CORPORATION_CONTRACTS_UNSUPPORTED)),
         "PlaceBid" => place_bid(c, int(0), call.args.get(1).and_then(|v| v.as_float()).unwrap_or(0.0)).await,
         // FinishAuction(contractID, isIssuer): expired auctions settle on their own; settle now if due.
         "FinishAuction" => {

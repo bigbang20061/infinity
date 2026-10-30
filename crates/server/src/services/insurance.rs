@@ -13,6 +13,7 @@ use crate::client::{filetime_now, Client};
 use crate::consts::{CATEGORY_SHIP, FILETIME_DAY};
 use crate::db::Db;
 use crate::db::{executor::Executor, outbox::{dispatch_world, Outbox}};
+use crate::messages;
 use crate::space::World;
 use marshal::Value;
 use tracing::info;
@@ -70,18 +71,18 @@ async fn insure(c: &Client, call: &Call<'_>) -> CallResult {
     let amount = call.args.get(1).and_then(|v| v.as_float()).unwrap_or(0.0);
     let void_old = call.kwargs.get("voidOld").or(call.args.get(3)).is_some_and(|v| matches!(v, Value::Bool(true)) || v.as_int() == Some(1));
     let Some(item) = super::dogma::load_items_db(db, "i.item_id = $1", &[&ship]).await?.pop() else {
-        return Err(CallError::User { msg: "InsCouldNotFindItem".into(), dict: vec![] });
+        return Err(CallError::User { msg: messages::MSG_INS_COULD_NOT_FIND_ITEM.into(), dict: vec![] });
     };
     if item.owner_id != me || !item.singleton || item.category_id != CATEGORY_SHIP as i64 {
-        return Err(notify_error("只能为你自己已组装的舰船投保。"));
+        return Err(notify_error(messages::INSURANCE_REQUIRES_OWN_ASSEMBLED_SHIP));
     }
     let full = value(db, item.type_id).await?;
     let Some(fraction) = FRACTIONS.iter().copied().find(|f| (full * (f - BASE_FRACTION) * FRACTION_INCREMENT - amount).abs() < QUOTE_TOLERANCE_ISK) else {
-        return Err(notify_error("保险报价已过期，请重新打开窗口。"));
+        return Err(notify_error(messages::INSURANCE_QUOTE_EXPIRED));
     };
     let existing = db.query_opt(&format!("{CONTRACT_SELECT} WHERE ship_id = $1"), &[&ship]).await.map_err(db_err)?;
     if existing.is_some() && !void_old {
-        return Err(CallError::User { msg: "InsureShipFailedSingleContract".into(), dict: vec![("ownerID".into(), Value::Int(me))] });
+        return Err(CallError::User { msg: messages::MSG_INSURE_SHIP_FAILED_SINGLE_CONTRACT.into(), dict: vec![("ownerID".into(), Value::Int(me))] });
     }
     let now = filetime_now();
     let type_id = item.type_id;

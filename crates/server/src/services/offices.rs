@@ -12,6 +12,7 @@ use crate::consts::{ACCOUNT_CASH, FILETIME_DAY, RENTAL_DAYS, ROLE_DIRECTOR};
 use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::dispatch_world;
+use crate::messages;
 use crate::space::World;
 use marshal::Value;
 use tracing::info;
@@ -164,16 +165,16 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         // RentOffice(cost): the quote the player agreed to.
         "RentOffice" => {
             if !is_player_corp(corp) {
-                return Some(Err(notify_error("NPC 军团不能租用办公室。")));
+                return Some(Err(notify_error(messages::NPC_CORPORATION_CANNOT_RENT_OFFICE)));
             }
             match may_rent(db, me, corp).await {
                 Ok(true) => {}
-                Ok(false) => return Some(Err(notify_error("你没有租用办公室的职权。"))),
+                Ok(false) => return Some(Err(notify_error(messages::NO_OFFICE_RENTAL_ROLE))),
                 Err(e) => return Some(Err(e)),
             }
             let quoted = call.args.first().and_then(|v| v.as_float().or_else(|| v.as_int().map(|i| i as f64)));
             match rent_price(db, station).await {
-                Ok(price) if quoted.is_some_and(|q| q + QUOTE_TOLERANCE < price) => return Some(Err(notify_error("办公室租金已变动，请重新查询。"))),
+                Ok(price) if quoted.is_some_and(|q| q + QUOTE_TOLERANCE < price) => return Some(Err(notify_error(messages::OFFICE_RENT_CHANGED))),
                 Err(e) => return Some(Err(e)),
                 _ => {}
             }
@@ -183,7 +184,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "UnrentOffice" => {
             match may_rent(db, me, corp).await {
                 Ok(true) => {}
-                Ok(false) => return Some(Err(notify_error("你没有退租办公室的职权。"))),
+                Ok(false) => return Some(Err(notify_error(messages::NO_OFFICE_RELEASE_ROLE))),
                 Err(e) => return Some(Err(e)),
             }
             let office = match office_at(db, corp, station).await {
@@ -192,7 +193,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                 Err(e) => return Some(Err(e)),
             };
             match db.query_opt("SELECT 1 FROM game.items WHERE location_id = $1 LIMIT 1", &[&office]).await {
-                Ok(Some(_)) => return Some(Err(notify_error("请先清空军团机库再退租办公室。"))),
+                Ok(Some(_)) => return Some(Err(notify_error(messages::EMPTY_CORPORATION_HANGAR_BEFORE_RELEASE))),
                 Err(e) => return Some(Err(db_err(e))),
                 Ok(None) => {}
             }

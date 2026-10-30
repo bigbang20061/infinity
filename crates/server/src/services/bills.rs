@@ -12,6 +12,7 @@ use crate::client::{filetime_now, Client};
 use crate::consts::{ACCOUNT_CASH, FILETIME_DAY, RENTAL_DAYS, ROLE_ACCOUNTANT, ROLE_DIRECTOR};
 use crate::db::Db;
 use crate::db::outbox::dispatch_world;
+use crate::messages;
 use crate::space::World;
 use marshal::Value;
 use std::sync::Arc;
@@ -71,7 +72,7 @@ pub(super) async fn pay(db: &Db, world: &World, bill: i64, corp: Option<i64>, ke
     db.transaction(
         |tx, outbox| Box::pin(async move {
             let Some(r) = tx.query_opt(&format!("{BILL_SELECT} WHERE bill_id = $1 AND status = $2"), &[&bill, &UNPAID]).await.map_err(db_err)? else {
-                return Err(notify_error("该账单已支付或不存在。"));
+                return Err(notify_error(messages::BILL_ALREADY_PAID_OR_MISSING));
             };
             let (kind, debtor, creditor, amount, external): (i32, i64, i64, f64, Option<i64>) = (r.get(1), r.get(2), r.get(3), r.get(4), r.get(7));
             match corp {
@@ -186,14 +187,14 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             match (is_accountant(db, me, corp).await, super::corpwallet::may_take(db, me, corp, key).await) {
                 (Ok(true), Ok(true)) => pay(db, world, int(0).unwrap_or(0), Some(corp), key).await.map(|_| Value::None),
                 (Err(e), _) | (_, Err(e)) => Err(e),
-                _ => Err(notify_error("你没有支付该账单的职权。")),
+                _ => Err(notify_error(messages::BILL_PAYMENT_PERMISSION_REQUIRED)),
             }
         }
         "CharPayBill" => {
             let bill = int(0).unwrap_or(0);
             match db.query_opt("SELECT 1 FROM game.bills WHERE bill_id = $1 AND debtor_id = $2", &[&bill, &me]).await {
                 Ok(Some(_)) => pay(db, world, bill, None, 0).await.map(|_| Value::None),
-                Ok(None) => Err(notify_error("这不是你的账单。")),
+                Ok(None) => Err(notify_error(messages::BILL_NOT_OWNED_BY_CHARACTER)),
                 Err(e) => Err(db_err(e)),
             }
         }
@@ -215,7 +216,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "SendAutomaticPaySettings" => {
             match is_accountant(db, me, corp).await {
                 Ok(true) => {}
-                Ok(false) => return Some(Err(notify_error("只有会计才能修改自动付款设置。"))),
+                Ok(false) => return Some(Err(notify_error(messages::ACCOUNTANT_REQUIRED_FOR_AUTOPAY_SETTINGS))),
                 Err(e) => return Some(Err(e)),
             }
             let Some(Value::Dict(owners)) = call.args.first() else { return Some(Ok(Value::None)) };

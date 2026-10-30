@@ -11,6 +11,7 @@
 
 use super::{keyval, notify_error, value_text, Call, CallError, CallResult};
 use crate::client::Client;
+use crate::messages;
 use crate::space::World;
 use marshal::Value;
 use std::collections::HashMap;
@@ -193,7 +194,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         ("fleetProxy", "GetAvailableFleetAds") => return Some(Ok(Value::Dict(vec![]))),
         ("fleetObjectHandler", "CreateFleet") if !call.bound => {
             if c.session.int("fleetid").is_some() {
-                return Some(Err(CallError::User { msg: "FleetError".into(), dict: vec![] }));
+                return Some(Err(CallError::User { msg: messages::MSG_FLEET_ERROR.into(), dict: vec![] }));
             }
             let id = next_id();
             let (wing, squad) = (next_id(), next_id());
@@ -201,7 +202,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                 id,
                 Fleet {
                     members: HashMap::new(),
-                    wings: vec![Wing { id: wing, name: "联队 1".into(), squads: vec![Squad { id: squad, name: "中队 1".into() }] }],
+                    wings: vec![Wing { id: wing, name: messages::FLEET_INITIAL_WING_NAME.into(), squads: vec![Squad { id: squad, name: messages::FLEET_INITIAL_SQUAD_NAME.into() }] }],
                     motd: String::new(),
                     invites: HashMap::new(),
                 },
@@ -222,7 +223,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "Init" => {
             let member = {
                 let mut st = state();
-                let Some(f) = st.fleets.get_mut(&fleet_id) else { return Some(Err(notify_error("该舰队已不存在。"))) };
+                let Some(f) = st.fleets.get_mut(&fleet_id) else { return Some(Err(notify_error(messages::FLEET_NOT_FOUND))) };
                 let squad = f.wings.first().and_then(|w| w.squads.first().map(|s| (w.id, s.id))).unwrap_or((NONE_ID, NONE_ID));
                 let m = Member { wing: squad.0, squad: squad.1, role: ROLE_LEADER, job: JOB_CREATOR, ship_type: int(0).unwrap_or(0) };
                 f.members.insert(me, m.clone());
@@ -237,7 +238,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "GetFleetID" => Ok(Value::Int(fleet_id)),
         "GetInitState" => {
             let st = state();
-            let Some(f) = st.fleets.get(&fleet_id) else { return Some(Err(notify_error("该舰队已不存在。"))) };
+            let Some(f) = st.fleets.get(&fleet_id) else { return Some(Err(notify_error(messages::FLEET_NOT_FOUND))) };
             Ok(keyval([
                 ("fleetID", Value::Int(fleet_id)),
                 ("members", Value::Dict(f.members.iter().map(|(ch, m)| (Value::Int(*ch), member_value(*ch, m))).collect())),
@@ -263,7 +264,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                     broadcast(&world, f, None, "OnFleetMotdChanged", vec![Value::unicode(motd), Value::Bool(true)]);
                     Ok(Value::None)
                 }
-                _ => Err(notify_error("只有舰队指挥官才能设置每日消息。")),
+                _ => Err(notify_error(messages::FLEET_LEADER_REQUIRED_FOR_MOTD)),
             }
         }
         "GetFleetMaxSize" => Ok(Value::Int(MAX_MEMBERS as i64)),
@@ -292,14 +293,14 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             {
                 let mut st = state();
                 if st.of.contains_key(&target) {
-                    return Some(Err(notify_error("该飞行员已在舰队中。")));
+                    return Some(Err(notify_error(messages::PILOT_ALREADY_IN_FLEET)));
                 }
-                let Some(f) = st.fleets.get_mut(&fleet_id) else { return Some(Err(notify_error("该舰队已不存在。"))) };
+                let Some(f) = st.fleets.get_mut(&fleet_id) else { return Some(Err(notify_error(messages::FLEET_NOT_FOUND))) };
                 if !f.members.contains_key(&me) {
-                    return Some(Err(notify_error("你不在该舰队中。")));
+                    return Some(Err(notify_error(messages::PILOT_NOT_IN_FLEET)));
                 }
                 if f.members.len() >= MAX_MEMBERS {
-                    return Some(Err(notify_error("舰队已满。")));
+                    return Some(Err(notify_error(messages::FLEET_FULL)));
                 }
                 f.invites.insert(target, (wing, squad, role));
             }
@@ -311,11 +312,11 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                 .flatten()
                 .map(|r| r.get(0))
                 .unwrap_or_default();
-            let question = format!("{name}邀请你加入舰队。是否接受？");
+            let question = messages::fleet_invitation(&name);
             world.notify_pilot(
                 target,
                 "OnFleetInvite",
-                vec![Value::Int(fleet_id), Value::Int(me), Value::str("CustomQuestion"), Value::dict([("header", Value::unicode("舰队邀请")), ("question", Value::unicode(question))])],
+                vec![Value::Int(fleet_id), Value::Int(me), Value::str(messages::MSG_CUSTOM_QUESTION), Value::dict([("header", Value::unicode(messages::FLEET_INVITATION_HEADER)), ("question", Value::unicode(question))])],
             );
             Ok(Value::None)
         }
@@ -324,10 +325,10 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             let joined = {
                 let mut st = state();
                 if st.of.contains_key(&me) {
-                    return Some(Err(notify_error("你已在舰队中。")));
+                    return Some(Err(notify_error(messages::PILOT_ALREADY_IN_FLEET_SELF)));
                 }
-                let Some(f) = st.fleets.get_mut(&fleet_id) else { return Some(Err(notify_error("该舰队已不存在。"))) };
-                let Some((wing, squad, role)) = f.invites.remove(&me) else { return Some(Err(notify_error("该邀请已过期。"))) };
+                let Some(f) = st.fleets.get_mut(&fleet_id) else { return Some(Err(notify_error(messages::FLEET_NOT_FOUND))) };
+                let Some((wing, squad, role)) = f.invites.remove(&me) else { return Some(Err(notify_error(messages::FLEET_INVITATION_EXPIRED))) };
                 let fallback = f.wings.first().and_then(|w| w.squads.first().map(|s| (w.id, s.id))).unwrap_or((NONE_ID, NONE_ID));
                 let valid = f.wings.iter().any(|w| w.id == wing && (squad == NONE_ID || w.squads.iter().any(|s| s.id == squad)));
                 let (wing, squad) = if valid { (wing, squad) } else { fallback };
@@ -361,7 +362,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             let target = int(0).unwrap_or(0);
             let allowed = state().fleets.get(&fleet_id).is_some_and(|f| is_leader(f, me) && f.members.contains_key(&target));
             if !allowed {
-                return Some(Err(notify_error("只有舰队指挥官才能移除成员。")));
+                return Some(Err(notify_error(messages::FLEET_LEADER_REQUIRED_TO_REMOVE_MEMBER)));
             }
             remove_member(&world, fleet_id, target);
             Ok(Value::None)
@@ -369,7 +370,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "DisbandFleet" => {
             let members: Vec<i64> = match state().fleets.get(&fleet_id) {
                 Some(f) if is_leader(f, me) => f.members.keys().copied().collect(),
-                _ => return Some(Err(notify_error("只有舰队指挥官才能解散舰队。"))),
+                _ => return Some(Err(notify_error(messages::FLEET_LEADER_REQUIRED_TO_DISBAND))),
             };
             for ch in members {
                 remove_member(&world, fleet_id, ch);
@@ -380,12 +381,12 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "MakeLeader" | "MoveMember" => {
             let target = int(0).unwrap_or(0);
             let mut st = state();
-            let Some(f) = st.fleets.get_mut(&fleet_id) else { return Some(Err(notify_error("该舰队已不存在。"))) };
+            let Some(f) = st.fleets.get_mut(&fleet_id) else { return Some(Err(notify_error(messages::FLEET_NOT_FOUND))) };
             let free_move = target == me && call.method == "MoveMember";
             if !is_leader(f, me) && !free_move {
-                return Some(Err(notify_error("只有舰队指挥官才能调动成员。")));
+                return Some(Err(notify_error(messages::FLEET_LEADER_REQUIRED_TO_MOVE_MEMBER)));
             }
-            let Some(before) = f.members.get(&target).cloned() else { return Some(Err(notify_error("该飞行员不在舰队中。"))) };
+            let Some(before) = f.members.get(&target).cloned() else { return Some(Err(notify_error(messages::PILOT_NOT_IN_FLEET_TARGET))) };
             let mut after = before.clone();
             if call.method == "MakeLeader" {
                 after.role = ROLE_LEADER;
@@ -419,11 +420,11 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                 Some(f) if is_leader(f, me) => {
                     let id = next_id();
                     let n = f.wings.len() + 1;
-                    f.wings.push(Wing { id, name: format!("联队 {n}"), squads: vec![] });
+                    f.wings.push(Wing { id, name: messages::fleet_wing_name(n), squads: vec![] });
                     broadcast(&world, f, None, "OnFleetWingAdded", vec![Value::Int(id)]);
                     Ok(Value::Int(id))
                 }
-                _ => Err(notify_error("只有舰队指挥官才能添加联队。")),
+                _ => Err(notify_error(messages::FLEET_LEADER_REQUIRED_TO_ADD_WING)),
             }
         }
         // CreateSquad(wingID)
@@ -433,13 +434,13 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             match st.fleets.get_mut(&fleet_id) {
                 Some(f) if is_leader(f, me) => {
                     let id = next_id();
-                    let Some(w) = f.wings.iter_mut().find(|w| w.id == wing) else { return Some(Err(notify_error("该联队已不存在。"))) };
+                    let Some(w) = f.wings.iter_mut().find(|w| w.id == wing) else { return Some(Err(notify_error(messages::FLEET_WING_NOT_FOUND))) };
                     let n = w.squads.len() + 1;
-                    w.squads.push(Squad { id, name: format!("中队 {n}") });
+                    w.squads.push(Squad { id, name: messages::fleet_squad_name(n) });
                     broadcast(&world, f, None, "OnFleetSquadAdded", vec![Value::Int(wing), Value::Int(id)]);
                     Ok(Value::Int(id))
                 }
-                _ => Err(notify_error("只有舰队指挥官才能添加中队。")),
+                _ => Err(notify_error(messages::FLEET_LEADER_REQUIRED_TO_ADD_SQUAD)),
             }
         }
         "DeleteWing" | "DeleteSquad" => {
@@ -449,7 +450,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                 Some(f) if is_leader(f, me) => {
                     let occupied = f.members.values().any(|m| m.wing == id || m.squad == id);
                     if occupied {
-                        return Some(Err(notify_error("请先将其中的成员移出。")));
+                        return Some(Err(notify_error(messages::FLEET_STRUCTURE_MUST_BE_EMPTY)));
                     }
                     if call.method == "DeleteWing" {
                         f.wings.retain(|w| w.id != id);
@@ -462,7 +463,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                     }
                     Ok(Value::None)
                 }
-                _ => Err(notify_error("只有舰队指挥官才能调整舰队结构。")),
+                _ => Err(notify_error(messages::FLEET_LEADER_REQUIRED_TO_CHANGE_STRUCTURE)),
             }
         }
         // ChangeWingName(wingID, name) / ChangeSquadName(squadID, name)
@@ -486,7 +487,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                     broadcast(&world, f, None, event, vec![Value::Int(id), Value::unicode(name)]);
                     Ok(Value::None)
                 }
-                _ => Err(notify_error("只有舰队指挥官才能重命名联队和中队。")),
+                _ => Err(notify_error(messages::FLEET_LEADER_REQUIRED_TO_RENAME_WING_OR_SQUAD)),
             }
         }
         // SendBroadcast(name, scope, itemID, typeID)

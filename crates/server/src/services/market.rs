@@ -19,6 +19,7 @@ use crate::consts::{ACCOUNT_CASH, FILETIME_DAY, FLAG_HANGAR, IX_LOCATION_ID, IX_
 use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::{Effect, Outbox};
+use crate::messages;
 use crate::space::World;
 use marshal::{DbRowDescriptor, DbType, Value};
 use std::collections::{HashMap, HashSet};
@@ -101,7 +102,7 @@ fn valid_price(price: f64) -> Result<f64, CallError> {
     if price.is_finite() && (0.01..=MAX_ORDER_PRICE).contains(&price) {
         Ok(round2(price))
     } else {
-        Err(notify_error("价格无效。"))
+        Err(notify_error(messages::INVALID_PRICE))
     }
 }
 
@@ -214,7 +215,7 @@ pub(super) async fn station(db: &(impl Executor + ?Sized), id: i64) -> Result<St
         )
         .await
         .map_err(db_err)?
-        .ok_or_else(|| notify_error("该地点没有市场。"))?;
+        .ok_or_else(|| notify_error(messages::NO_MARKET_AT_LOCATION))?;
     Ok(Station { id: r.get(0), system: r.get(1), constellation: r.get(2), region: r.get(3), owner: r.get(4) })
 }
 
@@ -300,7 +301,7 @@ fn broker_fee(rate: f64, amount: f64) -> f64 {
 async fn check_order_slots(db: &(impl Executor + ?Sized), char_id: i64, skills: &Skills) -> Result<(), CallError> {
     let open: i64 = db.query_one("SELECT count(*) FROM game.market_orders WHERE char_id = $1", &[&char_id]).await.map_err(db_err)?.get(0);
     if open >= skills.order_cap {
-        return Err(notify_error(&format!("你已有 {open} 个未完成的市场订单，达到了交易技能允许的上限。")));
+        return Err(notify_error(&messages::market_order_limit_message(open)));
     }
     Ok(())
 }
@@ -310,7 +311,7 @@ async fn balance(db: &(impl Executor + ?Sized), char_id: i64) -> Result<f64, Cal
 }
 
 fn not_enough_money(have: f64, amount: f64) -> CallError {
-    user_error("NotEnoughMoney", vec![("balance".into(), Value::Float(have)), ("amount".into(), Value::Float(amount))])
+    user_error(messages::MSG_NOT_ENOUGH_MONEY, vec![("balance".into(), Value::Float(have)), ("amount".into(), Value::Float(amount))])
 }
 
 async fn require_balance(db: &(impl Executor + ?Sized), char_id: i64, amount: f64) -> Result<(), CallError> {
@@ -473,7 +474,7 @@ async fn my_order(db: &(impl Executor + ?Sized), char_id: i64, order_id: i64, no
         .await
         .map_err(db_err)?
         .map(|r| order_from_row(&r))
-        .ok_or_else(|| notify_error("该订单已关闭。"))
+        .ok_or_else(|| notify_error(messages::MARKET_ORDER_CLOSED))
 }
 
 async fn insert_order(db: &(impl Executor + ?Sized), o: &mut Order) -> Result<(), CallError> {
@@ -680,7 +681,7 @@ async fn place_buy(c: &Client, station_id: i64, type_id: i64, price: f64, quanti
     let me = c.session.int("charid").unwrap_or(0);
     let price = valid_price(price)?;
     if quantity <= 0 || quantity > i32::MAX as i64 || !(0..=MAX_DURATION).contains(&duration) {
-        return Err(user_error("MktOrderDidNotMatch", vec![]));
+        return Err(user_error(messages::MSG_MKT_ORDER_DID_NOT_MATCH, vec![]));
     }
     let (type_id, quantity) = (type_id as i32, quantity as i32);
     let min_volume = (min_volume.clamp(1, quantity as i64)) as i32;
@@ -713,7 +714,7 @@ async fn place_buy(c: &Client, station_id: i64, type_id: i64, price: f64, quanti
     };
     if duration == 0 || order.vol_remaining == 0 {
         if bought == 0 {
-            return Err(user_error("MktOrderDidNotMatch", vec![]));
+            return Err(user_error(messages::MSG_MKT_ORDER_DID_NOT_MATCH, vec![]));
         }
         order.duration = 0;
         order.vol_remaining = 0;
@@ -736,18 +737,18 @@ async fn place_sell(c: &Client, item_id: i64, station_id: i64, type_id: i64, pri
     let me = c.session.int("charid").unwrap_or(0);
     let price = valid_price(price)?;
     if quantity <= 0 || !(0..=MAX_DURATION).contains(&duration) {
-        return Err(user_error("MktOrderDidNotMatch", vec![]));
+        return Err(user_error(messages::MSG_MKT_ORDER_DID_NOT_MATCH, vec![]));
     }
     let _trading = lock().await;
     let g = graph(db).await?;
     let now = filetime_now();
     db.transaction(|db, outbox: &mut Outbox<MarketEffect>| Box::pin(async move {
-    let item = load_items_db(db, "i.item_id = $1", &[&item_id]).await?.pop().ok_or_else(|| notify_error("该物品已不在原处。"))?;
+    let item = load_items_db(db, "i.item_id = $1", &[&item_id]).await?.pop().ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
     if item.owner_id != me || item.location_id != station_id || item.flag_id != FLAG_HANGAR || item.type_id as i64 != type_id {
-        return Err(notify_error("只能在物品所在空间站出售你物品机库中的物品。"));
+        return Err(notify_error(messages::MARKET_SELL_ITEM_MUST_BE_IN_STATION_HANGAR));
     }
     if item.singleton {
-        return Err(user_error("RepackageBeforeSelling", vec![("item".into(), Value::Int(type_id))]));
+        return Err(user_error(messages::MSG_REPACKAGE_BEFORE_SELLING, vec![("item".into(), Value::Int(type_id))]));
     }
     let (type_id, quantity) = (item.type_id, quantity.min(item.quantity as i64) as i32);
     let at = station(db, station_id).await?;
@@ -755,7 +756,7 @@ async fn place_sell(c: &Client, item_id: i64, station_id: i64, type_id: i64, pri
     if duration == 0 {
         let sold = hit_bids(db, outbox, g, me, &at, type_id, price, quantity, now).await?;
         if sold == 0 {
-            return Err(user_error("MktOrderDidNotMatch", vec![]));
+            return Err(user_error(messages::MSG_MKT_ORDER_DID_NOT_MATCH, vec![]));
         }
         take_items(db, outbox, item, sold).await?;
         let done = Order {

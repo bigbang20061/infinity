@@ -44,6 +44,7 @@ use crate::consts::{ACCOUNT_CASH, ATTR_ARMOR_DAMAGE, ATTR_CAPACITOR_CAPACITY, AT
 use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::{Outbox, dispatch_client, dispatch_world};
+use crate::messages;
 use crate::space::{dist, event, lock_time_ms, metres_to_km, ms_to_seconds, seconds_to_ms, now_ms, now_tick, Ball, NotifyTx, NpcAction, NpcBrain, NpcConfig, NpcEffects, NpcFuture, System, World, MODE_MISSILE, MODE_WARP};
 use marshal::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -251,25 +252,25 @@ fn targets_of(char_id: i64) -> Vec<i64> {
 /// time from the ship's scan resolution and the target's signature radius, with
 /// `OnTarget('add', targetID)`.
 async fn add_target(c: &mut Client, target: i64) -> CallResult {
-    let Some(cx) = ctx(c) else { return Err(user_error("TargetingAttemptCancelled", vec![])) };
+    let Some(cx) = ctx(c) else { return Err(user_error(messages::MSG_TARGETING_ATTEMPT_CANCELLED, vec![])) };
     let ship_id = cx.ship_id;
     let Some((ship, t)) = cx.world.with(cx.system_id, move |s| Some((s.ball(ship_id)?.clone(), s.ball(target)?.clone()))).await.flatten() else {
-        return Err(user_error("TargetingAttemptCancelled", vec![]));
+        return Err(user_error(messages::MSG_TARGETING_ATTEMPT_CANCELLED, vec![]));
     };
     let fit = Fit::load(&cx.db, cx.char_id, cx.ship_id).await?;
     let target_attrs = attributes(&cx.db, t.type_id).await?;
     let range = fit.value(Key::Ship, ATTR_MAX_TARGET_RANGE);
     let gap = dist(ship.pos, t.pos) - t.radius as f64;
     if gap > range {
-        let text = format!("目标距离 {:.1} 公里，超出了你的锁定距离（{:.1} 公里）。", metres_to_km(gap), metres_to_km(range));
-        return Err(user_error("CustomNotify", vec![("notify".into(), Value::unicode(text))]));
+        let text = messages::target_lock_range(metres_to_km(gap), metres_to_km(range));
+        return Err(user_error(messages::MSG_CUSTOM_NOTIFY, vec![("notify".into(), Value::unicode(text))]));
     }
     // The ship's limit, capped by the pilot's (Targeting skills).
     let pilot_limit = fit.value(Key::Char, ATTR_MAX_LOCKED_TARGETS);
     let ship_limit = fit.value(Key::Ship, ATTR_MAX_LOCKED_TARGETS);
     let max_targets = if pilot_limit > 0.0 { ship_limit.min(pilot_limit) } else { ship_limit } as usize;
     if targets_of(cx.char_id).len() >= max_targets.max(1) {
-        return Err(user_error("CustomNotify", vec![("notify".into(), Value::unicode(format!("你最多只能同时锁定 {} 个目标。", max_targets.max(1))))]));
+        return Err(user_error(messages::MSG_CUSTOM_NOTIFY, vec![("notify".into(), Value::unicode(messages::target_limit(max_targets.max(1))))]));
     }
     let delay = lock_time_ms(fit.value(Key::Ship, ATTR_SCAN_RESOLUTION), attr(&target_attrs, ATTR_SIGNATURE_RADIUS, t.radius as f64));
     let attempt = NEXT_LOCK.fetch_add(1, Ordering::Relaxed);
@@ -457,7 +458,7 @@ async fn load_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
             let modules = modules.clone();
             let charge_ids = charge_ids.clone();
             Box::pin(async move {
-                let refuse = || notify_error("弹药数量不足。");
+                let refuse = || notify_error(messages::INSUFFICIENT_AMMUNITION);
                 let owner = session_owner.ok_or_else(refuse)?;
                 let hull = super::dogma::load_items_db(tx, "i.item_id = $1", &[&ship]).await?
                     .into_iter().next().ok_or_else(refuse)?;
@@ -523,10 +524,10 @@ async fn load_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
                             let destination = super::dogma::load_items_db(tx, "i.location_id = $1 AND i.flag_id = $2 AND i.type_id = $3 AND i.owner_id = $4 AND NOT i.singleton", &[&ship, &FLAG_CARGO, &t, &unload_owner]).await?.into_iter().next();
                             if let Some(item) = destination {
                                 let entry = items.entry(item.item_id).or_insert_with(|| { let quantity = item.quantity; (item, quantity) });
-                                entry.1 = entry.1.checked_add(q).ok_or_else(|| notify_error("弹药数量不足。"))?;
+                                entry.1 = entry.1.checked_add(q).ok_or_else(|| notify_error(messages::INSUFFICIENT_AMMUNITION))?;
                             } else {
                                 let entry = inserts.entry((unload_owner, t)).or_default();
-                                *entry = entry.checked_add(q).ok_or_else(|| notify_error("弹药数量不足。"))?;
+                                *entry = entry.checked_add(q).ok_or_else(|| notify_error(messages::INSUFFICIENT_AMMUNITION))?;
                             }
                             0
                         }
@@ -539,10 +540,10 @@ async fn load_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
                 let changes = items.iter().filter_map(|(&id, (item, quantity))| {
                     (*quantity != item.quantity).then(|| (id, QuantityChange::new(item, (*quantity > 0).then_some(*quantity))))
                 }).collect();
-                item_quantities::apply(tx, &changes, "弹药数量不足。").await?;
+                item_quantities::apply(tx, &changes, messages::INSUFFICIENT_AMMUNITION).await?;
                 for (&flag, &(type_id, quantity, unload_owner)) in &unloads {
                     let affected = tx.execute("DELETE FROM game.module_charges WHERE ship_id = $1 AND flag_id = $2 AND type_id = $3 AND quantity = $4", &[&ship, &flag, &type_id, &quantity]).await.map_err(db_err)?;
-                    if affected == 0 { return Err(notify_error("弹药数量不足。")); }
+                    if affected == 0 { return Err(notify_error(messages::INSUFFICIENT_AMMUNITION)); }
                     outbox.notify_client("OnModuleAttributeChanges", vec![quantity_change(unload_owner, ship, flag, type_id, 0, quantity as i64)]);
                 }
                 for (id, (item, quantity)) in items {
@@ -598,7 +599,7 @@ async fn load_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
                     let returns = returns.clone();
                     Box::pin(async move {
                         for (type_id, quantity) in returns {
-                            let quantity = i32::try_from(quantity).map_err(|_| notify_error("弹药数量不足。"))?;
+                            let quantity = i32::try_from(quantity).map_err(|_| notify_error(messages::INSUFFICIENT_AMMUNITION))?;
                             tx.execute("INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity) VALUES ($1, $2, $3, $4, $5)", &[&type_id, &owner, &ship, &FLAG_CARGO, &quantity]).await.map_err(db_err)?;
                         }
                         Ok(())
@@ -1742,11 +1743,11 @@ async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
         },
     };
     if state().reloading.get(&item_id).is_some_and(|until| *until > filetime_now()) {
-        return Err(user_error("CantActivateReloadingModule", vec![("moduleTypeID".into(), Value::tuple([Value::Int(UE_TYPEID), Value::Int(module.type_id as i64)]))]));
+        return Err(user_error(messages::MSG_CANT_ACTIVATE_RELOADING_MODULE, vec![("moduleTypeID".into(), Value::tuple([Value::Int(UE_TYPEID), Value::Int(module.type_id as i64)]))]));
     }
     if effect.weapon.is_some() {
         let Some(t) = target.filter(|t| targets_of(cx.char_id).contains(t)) else {
-            return Err(user_error("DeniedActivateTargetNotPresent", vec![]));
+            return Err(user_error(messages::MSG_DENIED_ACTIVATE_TARGET_NOT_PRESENT, vec![]));
         };
         let ship_id = cx.ship_id;
         let (in_warp, own_type, present, victim) = cx.world.with(cx.system_id, move |s| {
@@ -1755,13 +1756,13 @@ async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
             (ship.is_some_and(|b| b.mode == MODE_WARP), ship.map(|b| b.type_id).unwrap_or(0), target.is_some(), target.and_then(|b| b.char_id))
         }).await.unwrap_or((false, 0, false, None));
         if in_warp {
-            return Err(user_error("DeniedActivateInWarp", vec![]));
+            return Err(user_error(messages::MSG_DENIED_ACTIVATE_IN_WARP, vec![]));
         }
         if !present {
-            return Err(user_error("DeniedActivateTargetNotPresent", vec![]));
+            return Err(user_error(messages::MSG_DENIED_ACTIVATE_TARGET_NOT_PRESENT, vec![]));
         }
         if loaded(&cx.db, cx.ship_id, module.flag_id).await?.is_none_or(|(_, q)| q <= 0) {
-            return Err(user_error("NoCharges", vec![("launcher".into(), Value::tuple([Value::Int(UE_TYPEID), Value::Int(module.type_id as i64)]))]));
+            return Err(user_error(messages::MSG_NO_CHARGES, vec![("launcher".into(), Value::tuple([Value::Int(UE_TYPEID), Value::Int(module.type_id as i64)]))]));
         }
         // Shooting another pilot is a matter for crimewatch.
         if let Some(victim) = victim {
@@ -1770,10 +1771,10 @@ async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
     }
     if effect.mining.is_some() {
         let Some(t) = target.filter(|t| targets_of(cx.char_id).contains(t)) else {
-            return Err(user_error("DeniedActivateTargetNotPresent", vec![]));
+            return Err(user_error(messages::MSG_DENIED_ACTIVATE_TARGET_NOT_PRESENT, vec![]));
         };
         if !super::mining::is_rock(t) {
-            return Err(user_error("CustomNotify", vec![("notify".into(), Value::unicode("只能对小行星、冰矿或气云使用采矿设备。"))]));
+            return Err(user_error(messages::MSG_CUSTOM_NOTIFY, vec![("notify".into(), Value::unicode(messages::MINING_MODULE_TARGET_INVALID))]));
         }
         let ship_id = cx.ship_id;
         let gap = cx.world.with(cx.system_id, move |s| {
@@ -1782,7 +1783,7 @@ async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
         let fit = Fit::load(&cx.db, cx.char_id, cx.ship_id).await?;
         let range = fit.value(Key::Module(item_id), ATTR_MAX_RANGE);
         if gap.is_none_or(|g| g > range) {
-            return Err(user_error("CustomNotify", vec![("notify".into(), Value::unicode(format!("目标超出了采矿设备的范围（{:.1} 公里）。", metres_to_km(range))))]));
+            return Err(user_error(messages::MSG_CUSTOM_NOTIFY, vec![("notify".into(), Value::unicode(messages::mining_range(metres_to_km(range))))]));
         }
     }
     if state().active.contains_key(&item_id) {

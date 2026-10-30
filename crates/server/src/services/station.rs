@@ -7,6 +7,7 @@
 
 use super::{db_err, rowset, Call, CallError, CallResult};
 use crate::client::Client;
+use crate::messages;
 use marshal::Value;
 
 /// CPython 2.7 code flags: CO_OPTIMIZED | CO_NEWLOCALS | CO_NOFREE.
@@ -128,8 +129,8 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         // client report a deposit that never happened.
         ("amplificationMatrixSolarsystemMgr", "TransferCash") => {
             return Some(Err(CallError::User {
-                msg: "CustomNotify".into(),
-                dict: vec![("notify".into(), Value::unicode("增幅矩阵暂不可用。"))],
+                msg: messages::MSG_CUSTOM_NOTIFY.into(),
+                dict: vec![("notify".into(), Value::unicode(messages::AMPLIFICATION_MATRIX_UNAVAILABLE))],
             }))
         }
         ("milestoneMgr", "ProcessCharacterLogon") => Value::None,

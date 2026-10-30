@@ -11,6 +11,7 @@ use crate::client::{filetime_now, Client};
 use crate::consts::{FILETIME_SECOND, FILETIME_UNIX_EPOCH, ROLE_DIRECTOR};
 use crate::db::executor::Executor;
 use crate::db::outbox::{dispatch_world, Outbox};
+use crate::messages;
 use marshal::{DbRowDescriptor, DbType, Value};
 
 /// Client appConst.eventResponseDeleted.
@@ -131,10 +132,10 @@ fn may_manage(c: &Client, owner: i64) -> bool {
 async fn edit(c: &Client, call: &Call<'_>) -> CallResult {
     let event = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
     let Some(owner) = c.db.query_opt("SELECT owner_id FROM game.calendar_events WHERE event_id = $1", &[&event]).await.map_err(db_err)?.map(|r| r.get::<_, i64>(0)) else {
-        return Err(notify_error("该活动已不存在。"));
+        return Err(notify_error(messages::CALENDAR_EVENT_NOT_FOUND));
     };
     if !may_manage(c, owner) {
-        return Err(notify_error("你无法修改该活动。"));
+        return Err(notify_error(messages::CALENDAR_EVENT_EDIT_NOT_AUTHORIZED));
     }
     let old = call.args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
     let when = call.args.get(2).and_then(|v| v.as_int()).unwrap_or(old);
@@ -182,11 +183,11 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         ("calendarMgr", "CreateCorporationEvent") => {
             let corp = c.session.int("corpid").unwrap_or(0);
             if !super::corps::is_player_corp(corp) || !may_manage(c, corp) {
-                return Some(Err(notify_error("只有玩家军团的董事才能创建军团活动。")));
+                return Some(Err(notify_error(messages::PLAYER_CORP_DIRECTOR_REQUIRED_FOR_CORP_EVENT)));
             }
             create(c, call, corp).await
         }
-        ("calendarMgr", "CreateAllianceEvent") | ("calendarMgr", "EditAllianceEvent") => Err(notify_error("暂不支持联盟活动。")),
+        ("calendarMgr", "CreateAllianceEvent") | ("calendarMgr", "EditAllianceEvent") => Err(notify_error(messages::ALLIANCE_EVENTS_UNSUPPORTED)),
         ("calendarMgr", "EditPersonalEvent") | ("calendarMgr", "EditCorporationEvent") => edit(c, call).await,
         // DeleteEvent(eventID, ownerID): the owner cancels it; an invitee drops it.
         ("calendarMgr", "DeleteEvent") => {
@@ -244,7 +245,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                 Err(e) => return Some(Err(db_err(e))),
             };
             if owner != Some(me) {
-                return Some(Err(notify_error("你无法修改该活动。")));
+                return Some(Err(notify_error(messages::CALENDAR_EVENT_EDIT_NOT_AUTHORIZED)));
             }
             for g in value_id_list(call.args.get(1)) {
                 if let Err(e) = c.db.execute("INSERT INTO game.calendar_responses (event_id, char_id, status) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING", &[&event, &g, &RESPONSE_UNDECIDED]).await {

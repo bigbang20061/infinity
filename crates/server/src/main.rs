@@ -15,6 +15,7 @@ mod gateway;
 mod handshake;
 mod images;
 mod macho;
+mod messages;
 mod services;
 mod session;
 mod space;

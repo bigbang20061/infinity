@@ -17,6 +17,7 @@ use super::dogma::load_items;
 use super::{db_err, keyval, Call, CallError, CallResult};
 use crate::client::{filetime_now, unix_seconds_from_filetime, Client};
 use crate::consts::FLAG_HANGAR;
+use crate::messages;
 use marshal::Value;
 use std::sync::OnceLock;
 use tracing::info;
@@ -91,18 +92,18 @@ async fn build_catalogue(c: &Client) -> Result<Catalogue, CallError> {
     let to_plex = |isk: f64| ((isk / plex_isk).round() as i64).max(1);
     let mut cat = Catalogue::default();
     let mut root = |id: i64, name: &str, home: bool| cat.categories.push(Category { id, name: name.into(), parent: None, home });
-    root(62, "每日礼包", true);
-    root(1, "舰船涂装", false);
-    root(2, "技能与服务", false);
-    root(21, "服饰", false);
-    root(49, "补给箱", false);
+    root(62, messages::DAILY_GIFT_CATEGORY_NAME, true);
+    root(1, messages::SHIP_SKIN_CATEGORY_NAME, false);
+    root(2, messages::SKILLS_AND_SERVICES_CATEGORY_NAME, false);
+    root(21, messages::APPAREL_CATEGORY_NAME, false);
+    root(49, messages::SUPPLY_CRATE_CATEGORY_NAME, false);
     let sub = |cat: &mut Catalogue, id: i64, name: &str, parent: i64| {
         cat.categories.push(Category { id, name: name.into(), parent: Some(parent), home: false })
     };
-    sub(&mut cat, 6201, "每日免费", 62);
-    sub(&mut cat, 201, "技能注入", 2);
-    sub(&mut cat, 4901, "补给箱", 49);
-    for (id, name) in [(101, "艾玛"), (102, "加达里"), (103, "盖伦特"), (104, "米玛塔尔"), (105, "其他")] {
+    sub(&mut cat, 6201, messages::DAILY_FREE_CATEGORY_NAME, 62);
+    sub(&mut cat, 201, messages::SKILL_INJECTOR_CATEGORY_NAME, 2);
+    sub(&mut cat, 4901, messages::SUPPLY_CRATE_CATEGORY_NAME, 49);
+    for (id, name) in [(101, messages::AMARR_CATEGORY_NAME), (102, messages::CALDARI_CATEGORY_NAME), (103, messages::GALLENTE_CATEGORY_NAME), (104, messages::MINMATAR_CATEGORY_NAME), (105, messages::OTHER_FACTION_CATEGORY_NAME)] {
         sub(&mut cat, id, name, 1);
     }
 
@@ -170,7 +171,7 @@ async fn build_catalogue(c: &Client) -> Result<Catalogue, CallError> {
     let rows = db
         .query(
             &format!(
-                "SELECT {TYPE_INFO_COLUMNS}, r.average, sub.key::bigint, COALESCE(sn.data->>'text', '服饰')
+                "SELECT {TYPE_INFO_COLUMNS}, r.average, sub.key::bigint, COALESCE(sn.data->>'text', $1::text)
                  FROM sde.inv_types t
                  JOIN sde.inv_categories c ON c.category_id = t.category_id AND c.name = 'Apparel'
                  JOIN game.retail_prices r ON r.type_id = t.type_id AND r.average > 0
@@ -181,7 +182,7 @@ async fn build_catalogue(c: &Client) -> Result<Catalogue, CallError> {
                  WHERE t.published
                  ORDER BY t.type_id"
             ),
-            &[],
+            &[&messages::APPAREL_CATEGORY_NAME],
         )
         .await
         .map_err(db_err)?;
@@ -377,7 +378,7 @@ async fn claim_tokens(c: &mut Client, call: &Call<'_>) -> CallResult {
         .query_opt("SELECT home_station_id, station_id FROM game.characters WHERE character_id = $1 AND user_id = $2", &[&char_id, &c.login.user_id])
         .await
         .map_err(db_err)?
-        .ok_or_else(|| CallError::User { msg: "CharacterNotFound".into(), dict: vec![] })?;
+        .ok_or_else(|| CallError::User { msg: messages::MSG_CHARACTER_NOT_FOUND.into(), dict: vec![] })?;
     let docked = if c.session.int("charid") == Some(char_id) { c.session.int("stationid") } else { row.get(1) };
     let station: Option<i64> = if home { row.get(0) } else { docked.or(row.get(0)) };
     let tokens = c

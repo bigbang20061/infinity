@@ -24,6 +24,7 @@ use crate::consts::{FILETIME_MINUTE, FILETIME_SECOND};
 use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::{dispatch_world, Outbox};
+use crate::messages;
 use crate::space::{seconds_to_ms, World};
 use marshal::Value;
 use std::collections::{HashMap, HashSet};
@@ -291,7 +292,7 @@ fn concord_response(pending: PendingConcord, system: i64, weak_world: Weak<World
             s.notify_pilot(
                 criminal,
                 "OnRemoteMessage",
-                vec![Value::str("CustomNotify"), Value::dict([("notify", Value::unicode("统合部因你的犯罪行为摧毁了你的舰船。"))])],
+                vec![Value::str(messages::MSG_CUSTOM_NOTIFY), Value::dict([("notify", Value::unicode(messages::CONCORD_DESTROYED_SHIP_FOR_CRIME))])],
             );
             s.defer(async move {
                 if let Some(world) = weak_world.upgrade() {

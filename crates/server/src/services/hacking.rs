@@ -15,6 +15,7 @@
 use super::{db_err, notify_error, rand01, Call, CallError, CallResult};
 use crate::client::Client;
 use crate::consts::{ATTR_MAX_RANGE, ATTR_REQUIRED_SKILL_1, SKILL_ARCHAEOLOGY, SKILL_HACKING};
+use crate::messages;
 use crate::space::{dist, metres_to_km};
 use marshal::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -431,12 +432,12 @@ pub async fn start(c: &mut Client, module: i64, target: Option<i64>) -> CallResu
     let (Some(system), Some(ship), Some(char_id)) = (c.session.int("solarsystemid"), c.session.int("shipid"), c.session.int("charid")) else {
         return Ok(Value::None);
     };
-    let Some(container) = target else { return Err(CallError::User { msg: "DeniedActivateTargetNotPresent".into(), dict: vec![] }) };
+    let Some(container) = target else { return Err(CallError::User { msg: messages::MSG_DENIED_ACTIVATE_TARGET_NOT_PRESENT.into(), dict: vec![] }) };
     let Some(site) = super::exploration::hack_target(container) else {
-        return Err(notify_error("分析仪只能用于数据和遗迹地点的容器。"));
+        return Err(notify_error(messages::ANALYZER_TARGET_MUST_BE_DATA_OR_RELIC));
     };
     if site.hacked {
-        return Err(notify_error("这个容器已经被破解了。"));
+        return Err(notify_error(messages::HACK_CONTAINER_ALREADY_HACKED));
     }
     let r = c
         .db
@@ -457,16 +458,16 @@ pub async fn start(c: &mut Client, module: i64, target: Option<i64>) -> CallResu
     let (module_type, skill, range, duration): (i32, i32, f64, f64) = (r.get(0), r.get(1), r.get(2), r.get(3));
     let needed = if site.relic { SKILL_ARCHAEOLOGY } else { SKILL_HACKING };
     if skill != needed {
-        return Err(notify_error(if site.relic { "这是遗迹容器，需要使用遗迹分析仪。" } else { "这是数据容器，需要使用数据分析仪。" }));
+        return Err(notify_error(if site.relic { messages::RELIC_CONTAINER_REQUIRES_RELIC_ANALYZER } else { messages::DATA_CONTAINER_REQUIRES_DATA_ANALYZER }));
     }
     let Some(gap) = c.world.with(system, move |s| {
         let (me, can) = (s.ball(ship)?, s.ball(container)?);
         Some(dist(me.pos, can.pos) - me.radius as f64 - can.radius as f64)
     }).await.flatten() else {
-        return Err(CallError::User { msg: "DeniedActivateTargetNotPresent".into(), dict: vec![] });
+        return Err(CallError::User { msg: messages::MSG_DENIED_ACTIVATE_TARGET_NOT_PRESENT.into(), dict: vec![] });
     };
     if gap > range {
-        return Err(notify_error(&format!("目标太远了（{:.1} 公里），分析仪的范围是 {:.1} 公里。", metres_to_km(gap), metres_to_km(range))));
+        return Err(notify_error(&messages::analyzer_range(metres_to_km(gap), metres_to_km(range))));
     }
     let level: f64 = c
         .db

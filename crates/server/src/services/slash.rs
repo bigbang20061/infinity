@@ -9,6 +9,7 @@
 use super::{db_err, Call, CallError, CallResult};
 use crate::client::Client;
 use crate::consts::{FLAG_CARGO, FLAG_HANGAR, GM_ROLES};
+use crate::messages;
 use marshal::Value;
 use tracing::info;
 
@@ -16,19 +17,19 @@ use tracing::info;
 const TELEPORT_CLEARANCE: f64 = 5000.0;
 
 const COMMANDS: [(&str, &str); 9] = [
-    ("tr", "/tr me <itemID|characterID|solarSystemID|stationID|celestialID> — teleport"),
-    ("wh", "/wh — teleport next to a wormhole (scanned down for you)"),
-    ("scanall", "/scanall — scan every signature in this system to 100%"),
-    ("sites", "/sites — list this system's anomalies and signatures"),
-    ("create", "/create <typeID|name> [qty] — into your hangar (docked) or cargo"),
-    ("createitem", "/createitem <typeID|name> [qty] — same as /create"),
-    ("isk", "/isk <amount> — add ISK to your wallet"),
-    ("heal", "/heal — repair your ship in space"),
-    ("help", "/help — this list"),
+    ("tr", messages::GM_HELP_TELEPORT),
+    ("wh", messages::GM_HELP_WORMHOLE),
+    ("scanall", messages::GM_HELP_SCAN_ALL),
+    ("sites", messages::GM_HELP_SITES),
+    ("create", messages::GM_HELP_CREATE),
+    ("createitem", messages::GM_HELP_CREATE_ITEM),
+    ("isk", messages::GM_HELP_ISK),
+    ("heal", messages::GM_HELP_HEAL),
+    ("help", messages::GM_HELP_HELP),
 ];
 
 fn slash_error(text: String) -> CallError {
-    CallError::User { msg: "SlashError".into(), dict: vec![("reason".into(), Value::unicode(text))] }
+    CallError::User { msg: messages::MSG_SLASH_ERROR.into(), dict: vec![("reason".into(), Value::unicode(text))] }
 }
 
 fn help() -> String {
@@ -50,7 +51,7 @@ async fn resolve_type(c: &Client, arg: &str) -> Result<(i32, String), CallError>
         }
     }
     .map_err(db_err)?;
-    row.map(|r| (r.get(0), r.get(1))).ok_or_else(|| slash_error(format!("no such type: {arg}")))
+    row.map(|r| (r.get(0), r.get(1))).ok_or_else(|| slash_error(messages::gm_unknown_type(arg)))
 }
 
 /// /tr me <destination>
@@ -58,18 +59,18 @@ async fn tr(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
     let dest = match args {
         ["me", dest, ..] => *dest,
         [dest] if *dest != "me" => *dest,
-        _ => return Err(slash_error("usage: /tr me <itemID|characterID|solarSystemID>".into())),
+        _ => return Err(slash_error(messages::GM_TELEPORT_USAGE.into())),
     };
-    let Ok(id) = dest.parse::<i64>() else { return Err(slash_error(format!("not an ID: {dest}"))) };
+    let Ok(id) = dest.parse::<i64>() else { return Err(slash_error(messages::gm_invalid_id(dest))) };
     if c.session.int("stationid").is_some() {
-        return Err(slash_error("undock first".into()));
+        return Err(slash_error(messages::GM_UNDOCK_FIRST.into()));
     }
     let here = c.session.int("solarsystemid").unwrap_or(0);
     // Something in this system's ballpark.
     if let Some((ball_pos, radius)) = c.world.with(here, move |s| s.ball(id).map(|b| (b.pos, b.radius))).await.flatten() {
         let pos = [ball_pos[0] + radius as f64 + TELEPORT_CLEARANCE, ball_pos[1], ball_pos[2]];
         super::ship::teleport(c, here, pos).await?;
-        return Ok(format!("teleported to {id}"));
+        return Ok(messages::gm_teleported(id));
     }
     // A solar system: off one of its planets (or its sun).
     if (30_000_000..33_000_000).contains(&id) {
@@ -82,10 +83,10 @@ async fn tr(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
             )
             .await
             .map_err(db_err)?
-            .ok_or_else(|| slash_error(format!("unknown solar system {id}")))?;
+            .ok_or_else(|| slash_error(messages::gm_unknown_system(id)))?;
         let pos = [p.get::<_, f64>(0) + p.get::<_, f64>(3) + 100_000.0, p.get(1), p.get(2)];
         super::ship::teleport(c, id, pos).await?;
-        return Ok(format!("teleported to system {id}"));
+        return Ok(messages::gm_teleported_to_system(id));
     }
     // A station, planet, moon, gate...
     if let Some(p) = c
@@ -96,7 +97,7 @@ async fn tr(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
     {
         let pos = [p.get::<_, f64>(1) + p.get::<_, f64>(4) + TELEPORT_CLEARANCE, p.get(2), p.get(3)];
         super::ship::teleport(c, p.get(0), pos).await?;
-        return Ok(format!("teleported to {id}"));
+        return Ok(messages::gm_teleported(id));
     }
     // A character in space, or an item floating somewhere.
     let at = c
@@ -115,29 +116,29 @@ async fn tr(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
         let live = c.world.with(system, move |s| s.pilot_ball(id).or_else(|| s.ball(id)).map(|b| b.pos)).await.flatten();
         let pos = live.map(|p| [p[0] + TELEPORT_CLEARANCE, p[1], p[2]]).unwrap_or(pos);
         super::ship::teleport(c, system, pos).await?;
-        return Ok(format!("teleported to {id} in {system}"));
+        return Ok(messages::gm_teleported_in_system(id, system));
     }
-    Err(slash_error(format!("can't find {id}")))
+    Err(slash_error(messages::gm_target_not_found(id)))
 }
 
 async fn create(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
-    let Some(what) = args.first() else { return Err(slash_error("usage: /create <typeID|name> [qty]".into())) };
+    let Some(what) = args.first() else { return Err(slash_error(messages::GM_CREATE_USAGE.into())) };
     let qty: i32 = args.get(1).and_then(|q| q.parse().ok()).unwrap_or(1).clamp(1, 1_000_000_000);
     let (type_id, name) = resolve_type(c, what).await?;
     let char_id = c.session.int("charid").unwrap_or(0);
     let (location, flag) = match (c.session.int("stationid"), c.session.int("shipid")) {
         (Some(station), _) => (station, FLAG_HANGAR),
         (None, Some(ship)) => (ship, FLAG_CARGO),
-        _ => return Err(slash_error("nowhere to put it".into())),
+        _ => return Err(slash_error(messages::GM_NOWHERE_TO_PUT_ITEM.into())),
     };
     let mut outbox = crate::db::outbox::Outbox::default();
     super::combat::deposit(&c.db, &mut outbox, char_id, location, flag, type_id, qty, 0).await?;
     crate::db::outbox::dispatch_client((), outbox, c)?;
-    Ok(format!("created {qty} x {name} ({type_id})"))
+    Ok(messages::gm_created_item(qty, &name, type_id))
 }
 
 async fn isk(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
-    let amount: f64 = args.first().and_then(|a| a.replace(',', "").parse().ok()).ok_or_else(|| slash_error("usage: /isk <amount>".into()))?;
+    let amount: f64 = args.first().and_then(|a| a.replace(',', "").parse().ok()).ok_or_else(|| slash_error(messages::GM_ISK_USAGE.into()))?;
     let char_id = c.session.int("charid").unwrap_or(0);
     let balance: f64 = c
         .db
@@ -146,15 +147,15 @@ async fn isk(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
         .map_err(db_err)?
         .get(0);
     c.notify("OnAccountChange", vec![Value::str("cash"), Value::Int(char_id), Value::Float(balance)]);
-    Ok(format!("balance {balance:.2} ISK"))
+    Ok(messages::gm_balance(balance))
 }
 
 async fn heal(c: &mut Client) -> Result<String, CallError> {
-    let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) else { return Ok("docked ships repair themselves".into()) };
+    let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) else { return Ok(messages::GM_DOCKED_SHIP_REPAIRS.into()) };
     super::combat::repair(ship);
     c.world.set_health(system, ship, [1.0; 3]);
     super::ship::send_state(c).await?;
-    Ok("repaired".into())
+    Ok(messages::GM_REPAIRED.into())
 }
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
@@ -162,7 +163,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         return None;
     }
     if c.login.role & GM_ROLES == 0 {
-        return Some(Err(slash_error("you are not a GM".into())));
+        return Some(Err(slash_error(messages::GM_ROLE_REQUIRED.into())));
     }
     let line = call.args.first().and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
     let line = line.trim().trim_start_matches('/');
@@ -170,8 +171,8 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     let command = words.next().unwrap_or("").to_lowercase();
     let args: Vec<&str> = words.collect();
     if command.is_empty() {
-        let names: Vec<String> = COMMANDS.iter().map(|(n, _)| format!("'{n}'")).collect();
-        return Some(Err(slash_error(format!("commands: [{}]", names.join(", ")))));
+        let names: Vec<String> = COMMANDS.iter().map(|(n, _)| messages::gm_command_name(n)).collect();
+        return Some(Err(slash_error(messages::gm_command_list(&names.join(", ")))));
     }
     info!(user = c.login.user_id, "slash: /{line}");
     let result = match command.as_str() {
@@ -183,7 +184,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "isk" => isk(c, &args).await,
         "heal" => heal(c).await,
         "help" => Ok(help()),
-        other => Err(slash_error(format!("unknown command /{other}\n{}", help()))),
+        other => Err(slash_error(messages::gm_unknown_command(other, &help()))),
     };
     Some(result.map(Value::unicode))
 }
