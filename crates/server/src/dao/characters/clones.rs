@@ -26,7 +26,7 @@ pub(crate) async fn target(ex: &(impl Executor + ?Sized), clone_id: i64, me: i64
                  WHERE j.clone_id = $1 AND j.owner_id = $2 AND j.location_id = $3", &[&clone_id, &me, &dest]).await?.as_ref().map(Station::from_row))
 }
 pub(crate) async fn install(ex: &(impl Executor + ?Sized), me: i64, station: i64) -> Result<u64, db::Error> {
-    ex.execute("INSERT INTO game.jump_clones (owner_id, location_id) SELECT $1, $2 WHERE NOT EXISTS (SELECT 1 FROM game.jump_clones WHERE owner_id = $1 AND location_id = $2)", &[&me, &station]).await
+    ex.execute("INSERT INTO game.jump_clones (owner_id, location_id) VALUES ($1, $2) ON CONFLICT (owner_id, location_id) DO NOTHING", &[&me, &station]).await
 }
 pub(crate) async fn delete(ex: &(impl Executor + ?Sized), clone_id: i64) -> Result<u64, db::Error> {
     ex.execute("DELETE FROM game.jump_clones WHERE clone_id = $1", &[&clone_id]).await

@@ -1,4 +1,7 @@
-//! One logged-in client: the machoNet packet loop after the handshake.
+//! One logged-in client's machoNet packet loop and ordered cleanup.
+//! `carbon/common/script/net/machoNet.py` defines transport usurp behavior.
+//! Session state uses the game database and in-memory world; account ownership
+//! is process-local and does not coordinate separate server processes.
 
 use crate::conn::{Conn, Writer};
 use crate::consts::{FILETIME_SECOND, FILETIME_UNIX_EPOCH};
@@ -139,57 +142,80 @@ impl Client {
         self.flush().await
     }
 
-    pub async fn run(mut self) -> Result<()> {
-        let l = &self.login;
-        let (uid, role, lang, addr) = (l.user_id, l.role, l.language_id.clone(), self.conn.peer.ip().to_string());
-        self.change_session(vec![
-            ("userid", Value::Int(uid)),
-            ("role", Value::Int(role)),
-            ("languageID", Value::str(lang)),
-            ("address", Value::str(addr)),
-            ("userType", Value::Int(20)),
-        ]);
-        self.flush().await?;
+    pub async fn run(mut self, registration: &mut crate::live_sessions::Registration) -> Result<()> {
+        let result: Result<()> = async {
+            if registration.is_cancelled() {
+                return Ok(());
+            }
+            let l = &self.login;
+            let (uid, role, lang, addr) = (l.user_id, l.role, l.language_id.clone(), self.conn.peer.ip().to_string());
+            self.change_session(vec![
+                ("userid", Value::Int(uid)),
+                ("role", Value::Int(role)),
+                ("languageID", Value::str(lang)),
+                ("address", Value::str(addr)),
+                ("userType", Value::Int(20)),
+            ]);
+            self.flush().await?;
 
-        loop {
-            tokio::select! {
-                incoming = self.inbox.recv() => {
-                    let Some(v) = incoming.transpose()?.flatten() else { break };
-                    let packet = match Packet::from_value(&v) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            warn!("unparseable packet ({e}): {}", short(&v));
-                            continue;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = registration.cancelled() => break,
+                    incoming = self.inbox.recv() => {
+                        let Some(v) = incoming.transpose()?.flatten() else { break };
+                        let packet = match Packet::from_value(&v) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                warn!("unparseable packet ({e}): {}", short(&v));
+                                continue;
+                            }
+                        };
+                        self.handle(packet).await?;
+                    }
+                    Some(events) = self.destiny_rx.recv() => {
+                        self.notify("DoDestinyUpdate", vec![Value::List(events), Value::Bool(false)]);
+                    }
+                    Some((event, args)) = self.notify_rx.recv() => {
+                        if event == "__ship_destroyed" {
+                            services::ship_destroyed(&mut self, &args).await;
+                        } else if event == "__session" {
+                            // Another task changed this pilot's session (corporation membership): [(key, value)].
+                            let pairs: Vec<(String, Value)> = args
+                                .iter()
+                                .filter_map(|p| match p.items()? {
+                                    [k, v] => Some((k.as_text()?.into_owned(), v.clone())),
+                                    _ => None,
+                                })
+                                .collect();
+                            self.change_session(pairs.iter().map(|(k, v)| (k.as_str(), v.clone())).collect());
+                        } else {
+                            self.notify(&event, args);
                         }
-                    };
-                    self.handle(packet).await?;
-                }
-                Some(events) = self.destiny_rx.recv() => {
-                    self.notify("DoDestinyUpdate", vec![Value::List(events), Value::Bool(false)]);
-                }
-                Some((event, args)) = self.notify_rx.recv() => {
-                    if event == "__ship_destroyed" {
-                        services::ship_destroyed(&mut self, &args).await;
-                    } else if event == "__session" {
-                        // Another task changed this pilot's session (corporation membership): [(key, value)].
-                        let pairs: Vec<(String, Value)> = args
-                            .iter()
-                            .filter_map(|p| match p.items()? {
-                                [k, v] => Some((k.as_text()?.into_owned(), v.clone())),
-                                _ => None,
-                            })
-                            .collect();
-                        self.change_session(pairs.iter().map(|(k, v)| (k.as_str(), v.clone())).collect());
-                    } else {
-                        self.notify(&event, args);
                     }
                 }
+                if registration.is_cancelled() {
+                    break;
+                }
+                self.flush().await?;
             }
-            self.flush().await?;
+            Ok(())
+        }.await;
+        if registration.is_cancelled() {
+            if let Err(e) = self.conn.send(&crate::conn::usurped_close()).await {
+                warn!(user = self.login.user_id, "usurp close failed: {e:#}");
+            }
         }
-        self.leave_world().await?;
+        let cleanup = self.leave_world().await;
+        if let Err(e) = &cleanup {
+            warn!(user = self.login.user_id, "leave world failed: {e:#}");
+        }
+        let close = self.conn.close().await;
+        if let Err(e) = &close {
+            warn!(user = self.login.user_id, "connection close failed: {e:#}");
+        }
         info!(user = self.login.user_id, "client disconnected");
-        Ok(())
+        result.and(cleanup).and(close)
     }
 
     /// The character leaves the game (disconnect, or logging off to character selection):
