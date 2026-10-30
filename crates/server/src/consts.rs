@@ -3,7 +3,8 @@
 //! IDs follow the SDE and the client's inventorycommon, dogma and corporation
 //! constants. FILETIME durations use Windows 100 ns ticks; AU is in metres.
 //! Runtime configuration, formulas and module-owned wire protocol constants do
-//! not belong here. This module provides no data lookup or runtime state.
+//! not belong here. Shared gateway protocol units are included. This module
+//! provides no data lookup or runtime state.
 
 // FILETIME durations and timestamps.
 /// Windows FILETIME epoch offset: 100 ns ticks from 1601-01-01 to 1970-01-01.
@@ -188,6 +189,8 @@ pub const ROLE_PLAYER_LOGIN: i64 = 2305843009213693952 | 4611686018427387904;
 pub const GM_ROLES: i64 = 18014398509481984 | 9007199254740992 | 262144 | 4096;
 
 // Client wallet and office constants; server market policy.
+/// Gateway PLEX vault protocol: one PLEX is 100 hundredths.
+pub(crate) const PLEX_HUNDREDTHS: i64 = 100;
 /// Client appConst.accountingKeyCash: personal cash and the master corporation wallet.
 pub const ACCOUNT_CASH: i32 = 1000;
 /// Client appConst.rentalPeriodOffice, in days.

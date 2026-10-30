@@ -1,8 +1,8 @@
-//! Agent mission and epic arc progress persistence, including mission payments.
+//! Agent mission and epic arc progress persistence.
 //! This DAO has no direct client mirror or wire contract; owning services supply those.
-//! Uses `game.agent_missions`, `game.epic_arc_missions`, `game.characters` and
-//! `sde_native.missions`. Static-data-only lookups, mission mechanics, transactions
-//! and notifications remain with callers.
+//! Uses `game.agent_missions`, `game.epic_arc_missions` and `sde_native.missions`.
+//! Static-data-only lookups, mission mechanics, payments, transactions and
+//! notifications remain with callers.
 
 use crate::db::{self, executor::Executor};
 use tokio_postgres::Row;
@@ -80,9 +80,4 @@ pub(crate) async fn remove(ex: &(impl Executor + ?Sized), character_id: i64, age
 }
 pub(crate) async fn remove_accepted(ex: &(impl Executor + ?Sized), character_id: i64, agent_id: i64, mission_id: i32, state: i32) -> Result<u64, db::Error> {
     ex.execute("DELETE FROM game.agent_missions WHERE character_id = $1 AND agent_id = $2 AND mission_id = $3 AND state = $4", &[&character_id, &agent_id, &mission_id, &state]).await
-}
-pub(crate) struct Balance { pub balance: f64 }
-impl Balance { fn from_row(r: &Row) -> Self { Self { balance: r.get("balance") } } }
-pub(crate) async fn pay(ex: &(impl Executor + ?Sized), character_id: i64, amount: i64) -> Result<Balance, db::Error> {
-    Ok(Balance::from_row(&ex.query_one("UPDATE game.characters SET balance = balance + $2::bigint WHERE character_id = $1 RETURNING balance::float8 AS balance", &[&character_id, &amount]).await?))
 }

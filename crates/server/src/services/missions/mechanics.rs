@@ -323,7 +323,7 @@ pub(super) async fn finish(c: &mut Client, m: &Mission, agent: &Agent, choice: O
                 }
                 outbox.operation(());
                 if reward_isk > 0 {
-                    let balance = crate::dao::missions::pay(tx, me, reward_isk).await.map_err(db_err)?.balance;
+                    let balance = crate::dao::wallets::characters::credit(tx, me, reward_isk as f64).await.map_err(db_err)?;
                     outbox.notify_client("OnAccountChange", vec![Value::str("cash"), Value::Int(me), Value::Float(balance)]);
                 }
                 super::standings::add_lp(tx, outbox, me, corp, reward_lp).await?;
