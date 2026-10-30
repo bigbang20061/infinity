@@ -4,10 +4,13 @@
 #  2. start.ini: cryptoPack = Placebo (the original is kept as start.ini.orig).
 # The launcher's updates restore both files; run this again after one. -Check only reports.
 param(
-    [string]$Root = "D:\EVE\SharedCache\infinity",
+    # Client folder; see client-root.ps1 for how it is found when omitted.
+    [string]$Root,
     [switch]$Check
 )
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "client-root.ps1")
+$Root = Resolve-ClientRoot $Root
 Set-Location (Join-Path $PSScriptRoot "..")
 
 $dll = Join-Path $Root "bin64\blue.dll"

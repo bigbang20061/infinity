@@ -3,7 +3,8 @@
 param(
     [string]$User = "tester",
     [string]$Password = "tester",
-    [string]$Root = "D:\EVE\SharedCache\infinity",
+    # Client folder; see client-root.ps1 for how it is found when omitted.
+    [string]$Root,
     [string]$ServerHost = "127.0.0.1",
     [int]$Port = 26000,
     [int]$ImagePort = 26001,
@@ -11,7 +12,9 @@ param(
     # Character slot index (0-2) or characterID to enter the game with automatically.
     [string]$AutoSelect = ""
 )
-$settingsRoot = Join-Path $env:LOCALAPPDATA "CCP\EVE\d_eve_sharedcache_infinity_$ServerHost"
+. (Join-Path $PSScriptRoot "client-root.ps1")
+$Root = Resolve-ClientRoot $Root
+$settingsRoot = Get-ClientSettingsRoot $Root $ServerHost
 
 # Chat runs as plain XMPP on the emulator; tell the client not to wrap it in TLS.
 $prefs = Join-Path $settingsRoot "settings\prefs.ini"

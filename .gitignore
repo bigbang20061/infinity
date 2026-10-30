@@ -7,3 +7,6 @@
 /sde/
 /client/
 /carbonengine/
+
+# Local client folder remembered by scripts/client-root.ps1
+/.client-root

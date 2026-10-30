@@ -65,20 +65,19 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
 - PowerShell, to run the helper scripts in `scripts/`.
 - `crates/server/proto/eve_protos.desc`: the protobuf descriptor set extracted from the client.
   - The public gateway decodes the client's messages with it, and the server does not compile without it.
-  - It is derived from the client, so it is ignored by git and not shipped here. The extraction tool is not included either.
+  - It is included in the repository. The extraction tool is not.
 - Optional: a Rust toolchain, for local builds and tests. A local toolchain also lets `patch-client.ps1` build `blue-patch` itself instead of running it from the Docker image.
 
 ## Quick start
 
-1. Place the descriptor at `crates/server/proto/eve_protos.desc`.
-2. Start the database and the server:
+1. Start the database and the server:
 
    ```sh
    docker compose up -d --build
    ```
 
    On the first start with an empty database volume, `scripts/db-init.sh` loads every dump under `db/`. This takes a few minutes, and the server waits until the database is healthy.
-3. Prepare the client. Close the client first, and run this again after every launcher update:
+2. Prepare the client. Close the client first, and run this again after every launcher update:
 
    ```powershell
    scripts/patch-client.ps1 -Root <client folder>
@@ -89,10 +88,12 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
    - It sets `cryptoPack = Placebo` in `start.ini`. The original is kept as `start.ini.orig`.
 
    Pass `-Check` to only report what is needed.
-4. Launch the client against the server:
+
+   `-Root` is remembered in `.client-root` (ignored by git), so later runs of both scripts can omit it. Without it, the scripts use `$env:INFINITY_CLIENT`, then the remembered folder, then `<drive>:\EVE\SharedCache\infinity` on any drive.
+3. Launch the client against the server:
 
    ```powershell
-   scripts/run-client.ps1 -Root <client folder> -User <name> -Password <password>
+   scripts/run-client.ps1 -User <name> -Password <password>
    ```
 
    The script does the following:
