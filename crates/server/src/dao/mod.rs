@@ -10,6 +10,7 @@
 //! Transactions, refusals, notifications and World are caller concerns.
 
 pub(crate) mod accounts;
+pub(crate) mod alliances;
 pub(crate) mod bills;
 pub(crate) mod bookmarks;
 pub(crate) mod calendar;
