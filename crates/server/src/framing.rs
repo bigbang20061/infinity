@@ -5,6 +5,8 @@
 //! bits are the body length; the high bits are flags (carbonengine io
 //! `protocol.h`). Little-endian was confirmed by disassembling the client's
 //! parser, which loads the header with a plain `mov` and masks `0x0FFFFFFF`.
+//! As server policy, zlib packets may inflate to at most the transport's
+//! maximum packet size; larger decompressed packets are rejected.
 
 use std::io::{self, Read};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -19,14 +21,25 @@ const FLAG_ZLIB: u32 = 1 << 29;
 const FLAG_SNAPPY: u32 = 1 << 30;
 /// Client SocketTransportFactory.MaxPacketSize, in bytes.
 pub const MAX_PACKET: usize = 10 * 1024 * 1024;
+/// Server policy: decompressed packets cannot exceed the transport packet limit.
+const MAX_INFLATED_PACKET: usize = MAX_PACKET;
 /// Carbonengine packet framing: a little-endian u32 occupies four bytes.
 const HEADER_BYTES: usize = std::mem::size_of::<u32>();
 /// Server allocation estimate for either form of zlib-compressed packet.
 const INFLATE_CAPACITY_FACTOR: usize = 4;
 
 pub(crate) fn inflate(payload: &[u8]) -> io::Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(payload.len() * INFLATE_CAPACITY_FACTOR);
-    flate2::read::ZlibDecoder::new(payload).read_to_end(&mut out)?;
+    let capacity = payload.len().saturating_mul(INFLATE_CAPACITY_FACTOR).min(MAX_INFLATED_PACKET);
+    let mut out = Vec::with_capacity(capacity);
+    flate2::read::ZlibDecoder::new(payload)
+        .take((MAX_INFLATED_PACKET + 1) as u64)
+        .read_to_end(&mut out)?;
+    if out.len() > MAX_INFLATED_PACKET {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("inflated packet exceeds limit of {MAX_INFLATED_PACKET} bytes"),
+        ));
+    }
     Ok(out)
 }
 
