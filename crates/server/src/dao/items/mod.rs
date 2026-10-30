@@ -9,6 +9,7 @@ pub(crate) mod clones;
 pub(crate) mod combat;
 pub(crate) mod creation;
 pub(crate) mod dogma;
+pub(crate) mod fitting;
 pub(crate) mod inventory;
 pub(crate) mod loading;
 pub(crate) mod positions;

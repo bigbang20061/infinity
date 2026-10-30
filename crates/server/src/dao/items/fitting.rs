@@ -1,0 +1,65 @@
+//! Persistence for ship assembly, repackaging, saved fittings and blueprints.
+//! Client services own policy, transactions and notification ordering.
+use crate::db::{executor::Executor, Error};
+use crate::dao::items::loading::Item;
+use crate::consts::{BLUEPRINT_INFINITE_RUNS, INDUSTRY_JOB_STATUS_INSTALLED, FLAG_HANGAR};
+use std::collections::BTreeMap;
+use tokio_postgres::Row;
+
+use super::inventory::ItemId;
+struct Count { count: i64 }
+impl Count { fn from_row(r: &Row) -> Self { Self { count: r.get("count") } } }
+struct FittingId { fitting_id: i64 }
+impl FittingId { fn from_row(r: &Row) -> Self { Self { fitting_id: r.get("fitting_id") } } }
+pub(crate) struct Fitting { pub fitting_id: i64, pub owner_id: i64, pub name: String, pub description: String, pub ship_type_id: i32, pub fit_types: Vec<i32>, pub fit_flags: Vec<i32>, pub fit_qty: Vec<i32> }
+impl Fitting { fn from_row(r: &Row) -> Self { Self { fitting_id: r.get("fitting_id"), owner_id: r.get("owner_id"), name: r.get("name"), description: r.get("description"), ship_type_id: r.get("ship_type_id"), fit_types: r.get("fit_types"), fit_flags: r.get("fit_flags"), fit_qty: r.get("fit_qty") } } }
+pub(crate) struct Blueprint { pub item_id: i64, pub type_id: i32, pub owner_id: i64, pub location_id: i64, pub flag_id: i32, pub quantity: i32, pub singleton: bool, pub location_type_id: Option<i32>, pub solar_system_id: Option<i64>, pub station_id: Option<i64>, pub material_efficiency: i64, pub time_efficiency: i64, pub runs: i64, pub job_id: Option<i64> }
+impl Blueprint { fn from_row(r: &Row) -> Self { Self { item_id: r.get("item_id"), type_id: r.get("type_id"), owner_id: r.get("owner_id"), location_id: r.get("location_id"), flag_id: r.get("flag_id"), quantity: r.get("quantity"), singleton: r.get("singleton"), location_type_id: r.get("location_type_id"), solar_system_id: r.get("solar_system_id"), station_id: r.get("station_id"), material_efficiency: r.get("material_efficiency"), time_efficiency: r.get("time_efficiency"), runs: r.get("runs"), job_id: r.get("job_id") } } }
+
+pub(crate) async fn assemble_sources(ex: &(impl Executor + ?Sized), sources: &BTreeMap<i64, (Item, Option<i32>)>, owner: i64, name: &Option<String>) -> Result<bool, Error> {
+    for (id, (item, remaining)) in sources {
+        let Some(remaining) = remaining else { continue };
+        let changed = if *remaining == 0 {
+            ex.execute("UPDATE game.items SET quantity = CASE WHEN quantity > 1 THEN 1 ELSE quantity END, singleton = true, name = COALESCE($7, name) WHERE item_id = $1 AND owner_id = $2 AND location_id = $3 AND flag_id = $4 AND type_id = $5 AND quantity = $6 AND NOT singleton", &[id, &owner, &item.location_id, &item.flag_id, &item.type_id, &item.quantity, name]).await?
+        } else {
+            ex.execute("UPDATE game.items SET quantity = $7 WHERE item_id = $1 AND owner_id = $2 AND location_id = $3 AND flag_id = $4 AND type_id = $5 AND quantity = $6 AND quantity > 1 AND NOT singleton", &[id, &owner, &item.location_id, &item.flag_id, &item.type_id, &item.quantity, remaining]).await?
+        };
+        if changed == 0 { return Ok(false); }
+    }
+    Ok(true)
+}
+pub(crate) async fn insert_assembled(ex: &(impl Executor + ?Sized), item: &Item, owner: i64, name: &Option<String>) -> Result<i64, Error> {
+    Ok(ItemId::from_row(&ex.query_one("INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton, name)
+                             VALUES ($1, $2, $3, $4, 1, true, $5) RETURNING item_id", &[&item.type_id, &owner, &item.location_id, &item.flag_id, name]).await?).item_id)
+}
+pub(crate) async fn fitted_count(ex: &(impl Executor + ?Sized), id: i64) -> Result<i64, Error> {
+    Ok(Count::from_row(&ex.query_one("SELECT count(*) AS count FROM game.items WHERE location_id = $1", &[&id]).await?).count)
+}
+pub(crate) async fn repackage(ex: &(impl Executor + ?Sized), id: i64, owner: i64, station: i64) -> Result<u64, Error> {
+    ex.execute("UPDATE game.items SET singleton = false, online = false, name = NULL WHERE item_id = $1 AND owner_id = $2 AND location_id = $3 AND flag_id = $4 AND singleton", &[&id, &owner, &station, &FLAG_HANGAR]).await
+}
+const COLS: &str = "fitting_id, owner_id, name, description, ship_type_id, fit_types, fit_flags, fit_qty";
+pub(crate) async fn fittings(ex: &(impl Executor + ?Sized), owner: i64) -> Result<Vec<Fitting>, Error> {
+    Ok(ex.query(&format!("SELECT {COLS} FROM game.fittings WHERE owner_id = $1 ORDER BY fitting_id"), &[&owner]).await?.iter().map(Fitting::from_row).collect())
+}
+pub(crate) async fn save(ex: &(impl Executor + ?Sized), owner: i64, name: &str, description: &str, ship_type: i32, types: &[i32], flags: &[i32], qty: &[i32]) -> Result<i64, Error> {
+    Ok(FittingId::from_row(&ex.query_one("INSERT INTO game.fittings (owner_id, name, description, ship_type_id, fit_types, fit_flags, fit_qty)
+                             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING fitting_id", &[&owner, &name, &description, &ship_type, &types, &flags, &qty]).await?).fitting_id)
+}
+pub(crate) async fn delete(ex: &(impl Executor + ?Sized), owner: i64, id: i64) -> Result<u64, Error> { ex.execute("DELETE FROM game.fittings WHERE owner_id = $1 AND fitting_id = $2", &[&owner, &id]).await }
+pub(crate) async fn delete_many(ex: &(impl Executor + ?Sized), owner: i64, ids: &[i64]) -> Result<u64, Error> { ex.execute("DELETE FROM game.fittings WHERE owner_id = $1 AND fitting_id = ANY($2)", &[&owner, &ids]).await }
+pub(crate) async fn rename(ex: &(impl Executor + ?Sized), id: i64, owner: i64, name: &str, description: &str) -> Result<u64, Error> { ex.execute("UPDATE game.fittings SET name = $3, description = $4 WHERE fitting_id = $1 AND owner_id = $2", &[&id, &owner, &name, &description]).await }
+pub(crate) async fn blueprints(ex: &(impl Executor + ?Sized), owner: i64, category: i32, item: Option<i64>) -> Result<Vec<Blueprint>, Error> {
+    Ok(ex.query("SELECT i.item_id, i.type_id, i.owner_id, i.location_id, i.flag_id, i.quantity, i.singleton,
+                    COALESCE(loc.type_id, st.type_id) AS location_type_id, COALESCE(st.solar_system_id::bigint, loc.location_id, ch.solar_system_id) AS solar_system_id,
+                    st.station_id::bigint, COALESCE(b.material_efficiency, 0)::bigint AS material_efficiency, COALESCE(b.time_efficiency, 0)::bigint AS time_efficiency,
+                    COALESCE(b.runs, $4::int)::bigint AS runs,
+                    (SELECT j.job_id FROM game.industry_jobs j WHERE j.blueprint_id = i.item_id AND j.status = $5::int LIMIT 1) AS job_id
+             FROM game.items i
+             JOIN sde.inv_types t USING (type_id)
+             LEFT JOIN game.items loc ON loc.item_id = i.location_id
+             LEFT JOIN sde.sta_stations st ON st.station_id::bigint = COALESCE(loc.location_id, i.location_id)
+             LEFT JOIN game.characters ch ON ch.character_id = i.owner_id
+             LEFT JOIN game.blueprints b ON b.item_id = i.item_id
+             WHERE i.owner_id = $1 AND t.category_id = $2 AND ($3::bigint IS NULL OR i.item_id = $3) AND i.location_id > 0", &[&owner, &category, &item, &BLUEPRINT_INFINITE_RUNS, &INDUSTRY_JOB_STATUS_INSTALLED]).await?.iter().map(Blueprint::from_row).collect())
+}
