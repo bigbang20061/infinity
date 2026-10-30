@@ -24,6 +24,15 @@
 //! Dropped cycle owners release their own in-memory activation markers without notifications.
 //! Reset clears a pilot's targets and pending locks and stops only that pilot's modules.
 //! Missiles in flight use a temporary, nonpersistent ID namespace.
+//! LoadAmmo accepts an owned active or assembled docked fitting ship and owned charge
+//! stacks in its holds, the current hangar, or a directly held singleton container.
+//! eve/client/script/dogma/clientDogmaLocation.py:980-1001,1072 forwards the actual
+//! source location; eve/client/script/ui/shared/fittingScreen/tryFit.py:187-223 and
+//! eve/client/script/ui/shared/fitting/fittingUtil.py:226-237 accept inventory sources.
+//! eve/client/script/dogma/clientDogmaLocation.py:91-120 offers singleton charges
+//! through `LoadChargesToModule` as well as stacked charges.
+//! eve/common/script/util/inventoryFlagsCommon.py:9-15,53-60,217-226 describes cargo,
+//! fleet and ammo holds. Remote, foreign and recursively nested containers are unsupported.
 
 use super::dogma::load_items;
 use super::inventory::{notify_item_change, notify_item_removed};
@@ -43,6 +52,10 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use tracing::{debug, info, warn};
 
 const HI_SLOTS: std::ops::RangeInclusive<i32> = 27..=34;
+/// inventorycommon/const.py:177, flagSpecializedAmmoHold.
+const FLAG_AMMO_HOLD: i32 = 143;
+/// inventorycommon/const.py:189, flagFleetHangar.
+const FLAG_FLEET_HANGAR: i32 = 155;
 const ATTR_DAMAGE_MULTIPLIER: i32 = 64;
 const ATTR_FALLOFF: i32 = 158;
 const ATTR_DAMAGE: [i32; 4] = [114, 118, 117, 116]; // em, thermal, kinetic, explosive
@@ -432,6 +445,9 @@ async fn load_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
     let ship = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
     let modules = module_ids(call.args.get(1));
     let charge_ids = value_id_list(call.args.get(2));
+    let charge_location = call.args.get(3).and_then(|v| v.as_int());
+    let active_ship = c.session.int("shipid");
+    let station = c.session.int("stationid");
     let session_owner = c.session.int("charid");
     let owner = session_owner.unwrap_or(0);
     let db = c.db.clone();
@@ -441,13 +457,47 @@ async fn load_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
             let modules = modules.clone();
             let charge_ids = charge_ids.clone();
             Box::pin(async move {
+                let refuse = || notify_error("弹药数量不足。");
+                let owner = session_owner.ok_or_else(refuse)?;
+                let hull = super::dogma::load_items_db(tx, "i.item_id = $1", &[&ship]).await?
+                    .into_iter().next().ok_or_else(refuse)?;
+                if hull.owner_id != owner || hull.category_id != crate::consts::CATEGORY_SHIP as i64
+                    || (active_ship != Some(ship) && !(hull.singleton && station == Some(hull.location_id) && hull.flag_id == FLAG_HANGAR)) {
+                    return Err(refuse());
+                }
+                let source = charge_location.ok_or_else(refuse)?;
+                let source_flags: &[i32] = if station == Some(source) {
+                    &[FLAG_HANGAR]
+                } else {
+                    let container = super::dogma::load_items_db(tx, "i.item_id = $1", &[&source]).await?
+                        .into_iter().next().ok_or_else(refuse)?;
+                    if container.owner_id != owner || !container.singleton {
+                        return Err(refuse());
+                    }
+                    let is_ship = container.category_id == crate::consts::CATEGORY_SHIP as i64;
+                    let in_hangar = station == Some(container.location_id) && container.flag_id == FLAG_HANGAR;
+                    let is_active_ship = is_ship && source == ship && active_ship == Some(ship);
+                    if !in_hangar && !is_active_ship
+                        && (is_ship || container.location_id != ship
+                            || !matches!(container.flag_id, FLAG_CARGO | FLAG_FLEET_HANGAR)) {
+                        return Err(refuse());
+                    }
+                    if is_ship { &[FLAG_CARGO, FLAG_AMMO_HOLD, FLAG_FLEET_HANGAR] } else { &[FLAG_HANGAR] }
+                };
                 let mut all = Vec::new();
                 for m in modules {
                     for id in bank(tx, ship, m).await? {
                         if !all.contains(&id) { all.push(id); }
                     }
                 }
-                let stacks = super::dogma::load_items_db(tx, "i.item_id = ANY($1) AND i.quantity > 0", &[&charge_ids]).await?;
+                let fitted = super::dogma::load_items_db(tx, "i.item_id = ANY($1)", &[&all]).await?;
+                if all.iter().any(|id| !fitted.iter().any(|item| item.item_id == *id && item.owner_id == owner && item.location_id == ship && super::inventory::is_fitting_flag(item.flag_id))) {
+                    return Err(refuse());
+                }
+                let stacks = super::dogma::load_items_db(tx, "i.item_id = ANY($1)", &[&charge_ids]).await?;
+                if charge_ids.iter().any(|id| !stacks.iter().any(|item| item.item_id == *id && item.owner_id == owner && item.location_id == source && source_flags.contains(&item.flag_id) && item.quantity > 0)) {
+                    return Err(refuse());
+                }
                 let selected: Vec<i64> = stacks.iter().map(|item| item.item_id).collect();
                 let mut items: BTreeMap<i64, (super::dogma::Item, i32)> = stacks.into_iter().map(|item| (item.item_id, { let quantity = item.quantity; (item, quantity) })).collect();
                 let mut inserts: BTreeMap<(i64, i32), i32> = BTreeMap::new();
@@ -455,7 +505,7 @@ async fn load_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
                 let mut loads = Vec::new();
                 let mut flags = HashSet::new();
                 for module_id in all {
-                    let Some(module) = super::dogma::load_items_db(tx, "i.item_id = $1 AND i.location_id = $2", &[&module_id, &ship]).await?.into_iter().next() else { continue };
+                    let module = fitted.iter().find(|item| item.item_id == module_id).ok_or_else(refuse)?;
                     if !flags.insert(module.flag_id) { continue; }
                     let Some(type_id) = selected.iter().find_map(|id| items.get(id).filter(|(_, q)| *q > 0).map(|(item, _)| item.type_id)) else { break };
                     let capacity: f64 = tx.query_one(
