@@ -191,6 +191,13 @@ pub const GM_ROLES: i64 = 18014398509481984 | 9007199254740992 | 262144 | 4096;
 // Client wallet and office constants; server market policy.
 /// Gateway PLEX vault protocol: one PLEX is 100 hundredths.
 pub(crate) const PLEX_HUNDREDTHS: i64 = 100;
+/// Client `eve/common/lib/appConst.py` maxLong and
+/// `carbon/common/script/util/format.py` FmtAmt: largest f64 not above maxLong;
+/// `i64::MAX as f64` rounds up above it.
+pub(crate) const CLIENT_MAX_ISK: f64 = 9_223_372_036_854_774_784.0;
+/// Gateway `eve_public/plex` Currency.total_in_cents uses signed protobuf
+/// hundredths; the largest whole PLEX is `i64::MAX / PLEX_HUNDREDTHS`.
+pub(crate) const CLIENT_MAX_PLEX: i64 = i64::MAX / PLEX_HUNDREDTHS;
 /// Client appConst.accountingKeyCash: personal cash and the master corporation wallet.
 pub const ACCOUNT_CASH: i32 = 1000;
 /// Client appConst.rentalPeriodOffice, in days.

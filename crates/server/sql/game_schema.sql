@@ -40,6 +40,16 @@ CREATE TABLE IF NOT EXISTS game.characters (
     logoff_at        timestamptz NOT NULL DEFAULT now(),
     deleted          boolean NOT NULL DEFAULT false
 );
+
+-- services/slash.rs / dao/wallets: exact 36-digit character ISK storage.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_schema = 'game' AND table_name = 'characters' AND column_name = 'balance'
+                 AND (data_type <> 'numeric' OR numeric_precision IS DISTINCT FROM 36 OR numeric_scale IS DISTINCT FROM 2)) THEN
+        ALTER TABLE game.characters ALTER COLUMN balance TYPE numeric(36, 2);
+    END IF;
+END $$;
 CREATE UNIQUE INDEX IF NOT EXISTS characters_name_idx ON game.characters (lower(name)) WHERE NOT deleted;
 CREATE INDEX IF NOT EXISTS characters_user_idx ON game.characters (user_id);
 CREATE TABLE IF NOT EXISTS game.items (
@@ -481,6 +491,16 @@ CREATE TABLE IF NOT EXISTS game.corp_wallets (
     PRIMARY KEY (corporation_id, account_key)
 );
 
+-- services/slash.rs / dao/wallets: exact 36-digit corporation ISK storage.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_schema = 'game' AND table_name = 'corp_wallets' AND column_name = 'balance'
+                 AND (data_type <> 'numeric' OR numeric_precision IS DISTINCT FROM 36 OR numeric_scale IS DISTINCT FROM 2)) THEN
+        ALTER TABLE game.corp_wallets ALTER COLUMN balance TYPE numeric(36, 2);
+    END IF;
+END $$;
+
 -- Corporation and alliance bulletins, contacts and contact labels (services/orgs.rs);
 -- owner_id is the corporation or alliance.
 CREATE TABLE IF NOT EXISTS game.org_bulletins (
@@ -628,6 +648,16 @@ CREATE TABLE IF NOT EXISTS game.retail_prices (
 
 -- New Eden Store: the account's PLEX vault (whole PLEX).
 ALTER TABLE game.accounts ADD COLUMN IF NOT EXISTS plex_balance bigint NOT NULL DEFAULT 1000;
+
+-- services/slash.rs / dao/accounts: exact 36-digit PLEX storage.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_schema = 'game' AND table_name = 'accounts' AND column_name = 'plex_balance'
+                 AND (data_type <> 'numeric' OR numeric_precision IS DISTINCT FROM 36 OR numeric_scale IS DISTINCT FROM 0)) THEN
+        ALTER TABLE game.accounts ALTER COLUMN plex_balance TYPE numeric(36, 0);
+    END IF;
+END $$;
 
 -- Redeeming queue: items owed to an account (store purchases, login rewards),
 -- turned into items when claimed onto a character.

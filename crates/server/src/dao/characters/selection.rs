@@ -2,6 +2,7 @@
 //! `game.items`, `game.corporations` and, through the shared role expression, `game.corp_titles`.
 //! This DAO has no direct client mirror or wire contract; owning services supply those.
 //! Session policy, transactions, refusals, notifications and World are caller concerns.
+//! Stored ISK is exact numeric; the selection balance is a lossy clamped client projection.
 
 use crate::db::{self, executor::Executor};
 use tokio_postgres::Row;
@@ -16,7 +17,7 @@ pub(crate) struct CharacterRow {
 impl CharacterRow {
     fn from_row(r: &Row) -> Self { Self {
         character_id: r.get("character_id"), name: r.get("name"), corporation_id: r.get("corporation_id"), station_id: r.get("station_id"),
-        solar_system_id: r.get("solar_system_id"), balance: r.get("balance"), skill_points: r.get("skill_points"), logoff_date: r.get("logoff_date"),
+        solar_system_id: r.get("solar_system_id"), balance: crate::dao::wallets::client_isk(r.get("balance")), skill_points: r.get("skill_points"), logoff_date: r.get("logoff_date"),
         gender_id: r.get("gender_id"), bloodline_id: r.get("bloodline_id"), race_id: r.get("race_id"), ship_type_id: r.get("ship_type_id"), delete_prepare_at: r.get("delete_prepare_at"),
     } }
 }
