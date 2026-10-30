@@ -45,8 +45,8 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
 - Some runtime state lives only in memory and is lost when the server restarts:
   - fleets, combat and Crimewatch timers, ship damage, and in-progress hacking;
   - everything spawned into space (NPCs, wrecks, scheduled effects);
-  - a ship's velocity, warp and cloak, so a restarted ship starts at rest;
-  - charges being reloaded into a module in space, which have already left the cargo hold.
+  - a ship's velocity, warp and cloak, so a restarted ship starts at rest.
+- A reload still running when the server stops is not resumed. At the next start its charges go back to the ship's cargo hold.
 - A ship's position in space is saved when its pilot leaves the game, and every 30 seconds while it moves. A crash therefore loses at most the last 30 seconds of movement.
 - Stopping the server with Ctrl-C or SIGTERM (`docker compose stop`) saves the position of every ship in space before it exits. The server waits at most 10 seconds for these writes.
 

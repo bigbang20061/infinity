@@ -223,21 +223,17 @@ fn reload_reservation_survives_departure_and_preserves_new_marker() {
     let captured = result.clone();
     s.schedule_at(100, move |s| {
         assert!(!s.contains(42));
-        let load = (7, 27, 8, 10, 2);
         let mut markers = HashMap::from([(7, 100)]);
-        let (accepted, rejected) = partition_reload(vec![load], &markers, 100);
         markers.insert(7, 200);
         clear_reload_markers(&mut markers, &[7], 100);
-        *captured.lock().unwrap() = Some((accepted, rejected, markers));
+        *captured.lock().unwrap() = Some(markers);
     });
     s.remove_ball(42).unwrap();
     s.tick(99);
     assert!(result.lock().unwrap().is_none());
     s.tick(100);
     let result = result.lock().unwrap();
-    let (accepted, rejected, markers) = result.as_ref().unwrap();
-    assert_eq!(accepted, &vec![(7, 27, 8, 10, 2)]);
-    assert!(rejected.is_empty());
+    let markers = result.as_ref().unwrap();
     assert_eq!(markers.get(&7), Some(&200));
 }
 

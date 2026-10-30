@@ -707,6 +707,17 @@ CREATE TABLE IF NOT EXISTS game.module_charges (
     PRIMARY KEY (ship_id, flag_id)
 );
 
+-- In-flight reload reservations (dao/items/pending_reloads).
+CREATE TABLE IF NOT EXISTS game.pending_reloads (
+    reload_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    owner_id  bigint NOT NULL,
+    ship_id   bigint NOT NULL,
+    module_id bigint NOT NULL,
+    flag_id   integer NOT NULL,
+    type_id   integer NOT NULL,
+    quantity  integer NOT NULL CHECK (quantity > 0)
+);
+
 -- Weapon groups: each slave module fires with its master.
 CREATE TABLE IF NOT EXISTS game.weapon_banks (
     ship_id   bigint NOT NULL,

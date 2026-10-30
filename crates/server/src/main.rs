@@ -1,7 +1,8 @@
 //! Infinity emulator server: proxy and sol node, gateway, chat, image server and CDN.
 //! The handshake mirrors the client's macho networking; state comes from the game
-//! database and SDE. On SIGINT or SIGTERM, listeners stop and changed pilot
-//! positions are flushed with a bounded wait; existing sessions are not drained.
+//! database and SDE. Interrupted reloads return to cargo before workers or listeners
+//! start. On SIGINT or SIGTERM, listeners stop and changed pilot positions are flushed
+//! with a bounded wait; existing sessions are not drained.
 //! Authenticated account ownership is process-local; replacements wait for
 //! prior cleanup. Cross-process session coordination is not supported.
 
@@ -124,6 +125,10 @@ async fn main() -> Result<()> {
         .init();
     let cfg = Arc::new(Config::from_env()?);
     let db = db::Db::connect(&cfg.database_url, cfg.database_pool_size).await?;
+    services::recover_pending_reloads(&db).await.map_err(|error| match error {
+        services::CallError::Internal(e) => e,
+        services::CallError::User { msg, .. } => anyhow::anyhow!(msg),
+    })?;
     if let Err(services::CallError::Internal(e)) = services::unbury_sites(&db).await {
         tracing::warn!("moving sites out of planets failed: {e:#}");
     }

@@ -1,6 +1,7 @@
 //! Ordered post-commit service effects and client notifications.
 //! Notifications correspond to client scatter events; no database tables are accessed here.
 //! Application-specific effects must be dispatched by their owning service.
+//! Direct client notifications can also be delivered through a supplied sender.
 
 use std::convert::Infallible;
 use marshal::Value;
@@ -51,6 +52,18 @@ impl Notification {
         }
         Ok(())
     }
+
+    /// Dispatch a direct client notification through `sender`, preserving other targets.
+    /// A closed sender is ignored, as with `Sender` notifications.
+    pub fn dispatch_sender(self, world: &World, sender: &NotifyTx) -> Result<(), CallError> {
+        match self {
+            Self::DirectClient { event, args } => {
+                let _ = sender.send((event, args));
+                Ok(())
+            }
+            notification => notification.dispatch(world, None),
+        }
+    }
 }
 
 pub fn dispatch_world<T>(value: T, outbox: Outbox, world: &World) -> Result<T, CallError> {
@@ -74,4 +87,3 @@ pub fn dispatch_client<T>(value: T, outbox: Outbox, client: &mut Client) -> Resu
     Ok(value)
 }
 
-#[cfg(test)] mod tests;

@@ -49,6 +49,7 @@ pub use contracts::settle_auctions;
 pub use fleets::logged_off as fleet_logged_off;
 pub use market::expire_orders as expire_market_orders;
 pub use bills::run_billing;
+pub(crate) use combat::recover_pending_reloads;
 pub use exploration::unbury_sites;
 
 use crate::client::{short, Client};

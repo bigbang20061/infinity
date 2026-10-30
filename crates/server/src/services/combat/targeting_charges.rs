@@ -1,4 +1,6 @@
-//! Combat mechanics; state and routing live in the parent module.
+//! Combat targeting and ammunition loading, mirroring eve/client/script/dogma/clientDogmaLocation.py.
+//! Uses game.items, game.module_charges and game.pending_reloads for inventory and reservations.
+//! Reload timer markers are memory-only; newer starts return older reservations, and startup recovery returns pending charges rather than resuming timers.
 use super::*;
 
 // ---------------------------------------------------------------- targeting
@@ -148,6 +150,7 @@ pub(super) async fn load_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
             let charge_ids = charge_ids.clone();
             Box::pin(async move {
                 let refuse = || notify_error(messages::INSUFFICIENT_AMMUNITION);
+                if !crate::dao::items::ship::lock_reload_ship(tx, ship).await.map_err(db_err)? { return Err(refuse()); }
                 let owner = session_owner.ok_or_else(refuse)?;
                 let hull = load_items(tx, ItemQuery::Id(ship)).await.map_err(db_err)?
                     .into_iter().next().ok_or_else(refuse)?;
@@ -184,6 +187,12 @@ pub(super) async fn load_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
                 if all.iter().any(|id| !fitted.iter().any(|item| item.item_id == *id && item.owner_id == owner && item.location_id == ship && super::super::inventory::is_fitting_flag(item.flag_id))) {
                     return Err(refuse());
                 }
+                let mut target_flags: Vec<i32> = fitted.iter().map(|item| item.flag_id).collect();
+                target_flags.sort_unstable();
+                target_flags.dedup();
+                let older = crate::dao::items::pending_reloads::for_flags(tx, ship, &target_flags).await.map_err(db_err)?;
+                let older_ids: Vec<i64> = older.into_iter().map(|row| row.reload_id).collect();
+                super::reload_recovery::return_pending(tx, outbox, &older_ids, true).await?;
                 let stacks = load_items(tx, ItemQuery::Ids(&charge_ids)).await.map_err(db_err)?;
                 if charge_ids.iter().any(|id| !stacks.iter().any(|item| item.item_id == *id && item.owner_id == owner && item.location_id == source && source_flags.contains(&item.flag_id) && item.quantity > 0)) {
                     return Err(refuse());
@@ -243,15 +252,21 @@ pub(super) async fn load_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
                 for id in ids {
                     notify_item_change(tx, outbox, id, vec![(IX_LOCATION_ID, Value::Int(ship)), (IX_FLAG, Value::Int(FLAG_CARGO as i64))]).await?;
                 }
-                Ok(loads)
+                let mut pending = Vec::with_capacity(loads.len());
+                for load in loads {
+                    let (module, flag, type_id, now, have) = load;
+                    let reload_id = crate::dao::items::pending_reloads::insert(tx, owner, ship, module, flag, type_id, now - have).await.map_err(db_err)?;
+                    pending.push(PendingLoad { reload_id, load });
+                }
+                Ok(pending)
             })
         },
         |value, outbox| async move { dispatch_client(value, outbox, client) },
     ).await?;
-    let Some(&(first, _, type_id, _, _)) = loads.first() else { return Ok(Value::None) };
+    let Some(&(first, _, type_id, _, _)) = loads.first().map(|pending| &pending.load) else { return Ok(Value::None) };
     let notify = c.notify_tx.clone();
     if c.session.int("solarsystemid").is_none() {
-        apply_loads(&db, &c.world, &notify, owner, ship, loads).await?;
+        apply_loads(&db, &c.world, &notify, ship, loads).await?;
         return Ok(Value::None);
     }
     let reload_ms = match Fit::load(&c.db, owner, ship).await?.value(Key::Module(first), ATTR_RELOAD_TIME) {
@@ -260,7 +275,7 @@ pub(super) async fn load_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
     };
     let start = filetime_now();
     let until = start + filetime_ticks_from_ms(reload_ms);
-    let ids: Vec<i64> = loads.iter().map(|l| l.0).collect();
+    let ids: Vec<i64> = loads.iter().map(|l| l.load.0).collect();
     {
         let mut st = state();
         for id in &ids {
@@ -275,33 +290,8 @@ pub(super) async fn load_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
     let system = c.session.int("solarsystemid").unwrap();
     let world = c.world.clone();
     c.world.schedule(system, seconds_to_ms(ms_to_seconds(reload_ms)), move |s| {
-        let (loads, rejected) = partition_reload(loads, &state().reloading, until);
         s.defer(async move {
-            let mut returns = BTreeMap::<i32, i64>::new();
-            for &(_, _, type_id, now, have) in &rejected {
-                *returns.entry(type_id).or_default() += i64::from(now) - i64::from(have);
-            }
-            let world_ref = &world;
-            let result: Result<(), CallError> = db.transaction(
-                |tx, _: &mut Outbox| {
-                    let returns = returns.clone();
-                    Box::pin(async move {
-                        let returns = returns.into_iter().map(|(type_id, quantity)| {
-                            i32::try_from(quantity).map(|quantity| (type_id, quantity)).map_err(|_| notify_error(messages::INSUFFICIENT_AMMUNITION))
-                        }).collect::<Result<Vec<_>, _>>()?;
-                        crate::dao::items::combat::insert_return(tx, owner, ship, FLAG_CARGO, &returns).await.map_err(db_err)?;
-                        Ok(())
-                    })
-                },
-                |value, outbox| async move { dispatch_world(value, outbox, world_ref) },
-            ).await;
-            if let Err(e) = result {
-                warn!("returning superseded reload to cargo failed: {}", match e {
-                    CallError::Internal(e) => format!("{e:#}"),
-                    CallError::User { msg, .. } => msg,
-                });
-            }
-            if let Err(e) = apply_loads(&db, &world, &notify, owner, ship, loads).await {
+            if let Err(e) = apply_loads(&db, &world, &notify, ship, loads).await {
                 warn!("reload of {ids:?} failed: {}", match e {
                     CallError::Internal(e) => format!("{e:#}"),
                     CallError::User { msg, .. } => msg,
@@ -326,34 +316,55 @@ pub(super) fn reserve_quantities(items: &mut BTreeMap<i64, (Item, i32)>, selecte
 }
 pub(super) type ReservedLoad = (i64, i32, i32, i32, i32);
 
-pub(super) fn partition_reload(loads: Vec<ReservedLoad>, reloading: &HashMap<i64, i64>, until: i64) -> (Vec<ReservedLoad>, Vec<ReservedLoad>) {
-    loads.into_iter().partition(|load| reloading.get(&load.0) == Some(&until))
+#[derive(Clone)]
+struct PendingLoad {
+    reload_id: i64,
+    load: ReservedLoad,
 }
+
 pub(super) fn clear_reload_markers(reloading: &mut HashMap<i64, i64>, ids: &[i64], until: i64) {
     for id in ids {
         if reloading.get(id) == Some(&until) { reloading.remove(id); }
     }
 }
 
-
-
 /// Put loaded charges in their modules and tell the client.
-pub(super) async fn apply_loads(db: &Db, world: &World, notify: &NotifyTx, owner: i64, ship: i64, mut loads: Vec<ReservedLoad>) -> Result<(), CallError> {
-    loads.sort_by_key(|load| load.1);
+async fn apply_loads(db: &Db, world: &World, notify: &NotifyTx, ship: i64, mut loads: Vec<PendingLoad>) -> Result<(), CallError> {
+    loads.sort_by_key(|load| load.reload_id);
     db.transaction(
         |tx, outbox: &mut Outbox| {
             let loads = loads.clone();
             let notify = notify.clone();
             Box::pin(async move {
-                crate::dao::items::combat::apply_loads(tx, ship, &loads).await.map_err(db_err)?;
-                for (module, flag, type_id, now, have) in loads {
-                    outbox.notify_sender(notify.clone(), "OnModuleAttributeChanges", vec![quantity_change(owner, ship, flag, type_id, now as i64, have as i64)]);
-                    debug!("loaded {now} x {type_id} into module {module}");
+                let exists = crate::dao::items::ship::lock_reload_ship(tx, ship).await.map_err(db_err)?;
+                let mut entries: Vec<(i64, ReservedLoad)> = Vec::new();
+                for pending in loads {
+                    let Some(row) = crate::dao::items::pending_reloads::take(tx, pending.reload_id).await.map_err(db_err)? else { continue };
+                    if !exists { continue; }
+                    let (_, _, _, now, have) = pending.load;
+                    entries.push((row.owner_id, (row.module_id, row.flag_id, row.type_id, now, have)));
+                }
+                if !entries.is_empty() {
+                    entries.sort_by_key(|(_, load)| load.1);
+                    let loads: Vec<ReservedLoad> = entries.iter().map(|(_, load)| *load).collect();
+                    crate::dao::items::combat::apply_loads(tx, ship, &loads).await.map_err(db_err)?;
+                    for (owner, (module, flag, type_id, now, have)) in entries {
+                        outbox.notify_sender(notify.clone(), "OnModuleAttributeChanges", vec![quantity_change(owner, ship, flag, type_id, now as i64, have as i64)]);
+                        debug!("loaded {now} x {type_id} into module {module}");
+                    }
                 }
                 Ok(())
             })
         },
-        |value, outbox| async move { dispatch_world(value, outbox, world) },
+        |value, outbox| async move {
+            for entry in outbox.into_entries() {
+                match entry {
+                    crate::db::outbox::Effect::Notification(n) => n.dispatch_sender(world, notify)?,
+                    crate::db::outbox::Effect::Operation(never) => match never {},
+                }
+            }
+            Ok(value)
+        },
     ).await
 }
 
