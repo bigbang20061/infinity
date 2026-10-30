@@ -49,7 +49,7 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
 - A reload still running when the server stops is not resumed. At the next start its charges go back to the ship's cargo hold.
 - A ship's position in space is saved when its pilot leaves the game, and every 30 seconds while it moves. A crash therefore loses at most the last 30 seconds of movement.
 - Stopping the server with Ctrl-C or SIGTERM (`docker compose stop`) saves the position of every ship in space before it exits. The server waits at most 10 seconds for these writes.
-- Balances are stored with up to 36 digits (ISK: 34 integer digits and 2 decimal places; PLEX: 36 integer digits). The client is sent at most 9,223,372,036,854,774,784 ISK or 92,233,720,368,547,758 PLEX. ISK reaches the client as a double, so above about 45 trillion ISK it can no longer show every cent.
+- Balances are stored with up to 36 digits (ISK: 34 integer digits and 2 decimal places; PLEX: 36 integer digits), and the server works with the full value. The client is sent at most the largest balance it displays without scientific notation: 1,000,000,000,000,000,000 ISK for a character wallet, 9,223,372,036,854,774,784 ISK for a corporation wallet, and 99,999,999,999,999 PLEX. ISK reaches the client as a double, so above about 45 trillion ISK it can no longer show every cent.
 
 ## Repository layout
 
