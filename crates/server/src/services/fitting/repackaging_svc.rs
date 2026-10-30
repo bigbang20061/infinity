@@ -1,5 +1,6 @@
 //! Item repackaging, mirroring the client repackagingSvc service.
-//! Uses game items and SDE stations; structure access is unsupported.
+//! Uses game items and SDE stations; each call writes atomically and notifies after commit.
+//! Structure access is unsupported.
 use crate::services::inventory::notify_item_change;
 use crate::services::{db_err, user_error, Call, CallError, CallResult};
 use crate::dao::items::loading::{load_items, ItemQuery};
@@ -51,15 +52,24 @@ async fn repackage(c: &mut Client, call: &Call<'_>) -> CallResult {
         }
         planned.insert(id, item.location_id);
     }
-    for (id, station) in planned {
-        let changed = fitting_dao::repackage(&c.db, id, char_id, station).await.map_err(db_err)?;
-        if changed == 0 {
-            return Err(crate::services::notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
-        }
-        let mut outbox = Outbox::default();
-        notify_item_change(&c.db, &mut outbox, id, vec![(IX_SINGLETON, Value::Bool(true))]).await?;
-        dispatch_client((), outbox, c)?;
-    }
+    let db = c.db.clone();
+    let planned = std::sync::Arc::new(planned);
+    db.transaction(
+        move |tx, outbox: &mut Outbox| {
+            let planned = std::sync::Arc::clone(&planned);
+            Box::pin(async move {
+                for (&id, &station) in planned.iter() {
+                    let changed = fitting_dao::repackage(tx, id, char_id, station).await.map_err(db_err)?;
+                    if changed == 0 {
+                        return Err(crate::services::notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
+                    }
+                    notify_item_change(tx, outbox, id, vec![(IX_SINGLETON, Value::Bool(true))]).await?;
+                }
+                Ok(())
+            })
+        },
+        |value, outbox| async move { dispatch_client(value, outbox, c) },
+    ).await?;
     Ok(Value::None)
 }
 
