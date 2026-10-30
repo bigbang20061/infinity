@@ -11,6 +11,8 @@ use super::{db_err, keyval, notify_error, value_id_list, value_text, Call, CallE
 use crate::client::{filetime_now, Client};
 use crate::consts::{FILETIME_MINUTE, TYPE_SOLAR_SYSTEM};
 use crate::db::Db;
+use crate::db::executor::Executor;
+use crate::db::outbox::Outbox;
 use marshal::Value;
 
 /// appConst.ACCESS_PERSONAL
@@ -73,7 +75,7 @@ fn bookmark_row(r: &tokio_postgres::Row) -> Value {
     ])
 }
 
-async fn own_folder(db: &Db, me: i64, folder: i64) -> Result<(), CallError> {
+async fn own_folder(db: &(impl Executor + ?Sized), me: i64, folder: i64) -> Result<(), CallError> {
     let mine: bool = db
         .query_one("SELECT EXISTS (SELECT 1 FROM game.bookmark_folders WHERE folder_id = $1 AND owner_id = $2)", &[&folder, &me])
         .await
@@ -241,15 +243,16 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             .map_err(db_err),
         "DeleteFolder" => {
             let folder = int(0);
-            if let Err(e) = own_folder(db, me, folder).await {
-                return Some(Err(e));
-            }
-            for sql in ["DELETE FROM game.bookmarks WHERE folder_id = $1", "DELETE FROM game.bookmark_subfolders WHERE folder_id = $1", "DELETE FROM game.bookmark_folders WHERE folder_id = $1"] {
-                if let Err(e) = db.execute(sql, &[&folder]).await {
-                    return Some(Err(db_err(e)));
-                }
-            }
-            Ok(Value::None)
+            db.transaction(
+                |tx, _: &mut Outbox| Box::pin(async move {
+                    own_folder(tx, me, folder).await?;
+                    for sql in ["DELETE FROM game.bookmarks WHERE folder_id = $1", "DELETE FROM game.bookmark_subfolders WHERE folder_id = $1", "DELETE FROM game.bookmark_folders WHERE folder_id = $1"] {
+                        Executor::execute(tx, sql, &[&folder]).await.map_err(db_err)?;
+                    }
+                    Ok(Value::None)
+                }),
+                |value, _| async move { Ok(value) },
+            ).await
         }
         "GetFolderInfo" => match db.query_opt("SELECT folder_id, name, description FROM game.bookmark_folders WHERE folder_id = $1 AND owner_id = $2", &[&int(0), &me]).await {
             Ok(r) => Ok(r.map(|r| folder_row(&r, me)).unwrap_or(Value::None)),
@@ -284,17 +287,17 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         }
         // DeleteSubfolder(folderID, subfolderID) -> the bookmark IDs deleted with it
         "DeleteSubfolder" => {
-            if let Err(e) = own_folder(db, me, int(0)).await {
-                return Some(Err(e));
-            }
-            let deleted = match db.query("DELETE FROM game.bookmarks WHERE folder_id = $1 AND subfolder_id = $2 RETURNING bookmark_id", &[&int(0), &int(1)]).await {
-                Ok(r) => r,
-                Err(e) => return Some(Err(db_err(e))),
-            };
-            if let Err(e) = db.execute("DELETE FROM game.bookmark_subfolders WHERE subfolder_id = $1", &[&int(1)]).await {
-                return Some(Err(db_err(e)));
-            }
-            Ok(Value::list(deleted.iter().map(|r| Value::Int(r.get(0)))))
+            let folder = int(0);
+            let subfolder = int(1);
+            db.transaction(
+                |tx, _: &mut Outbox| Box::pin(async move {
+                    own_folder(tx, me, folder).await?;
+                    let deleted = Executor::query(tx, "DELETE FROM game.bookmarks WHERE folder_id = $1 AND subfolder_id = $2 RETURNING bookmark_id", &[&folder, &subfolder]).await.map_err(db_err)?;
+                    Executor::execute(tx, "DELETE FROM game.bookmark_subfolders WHERE subfolder_id = $1", &[&subfolder]).await.map_err(db_err)?;
+                    Ok(Value::list(deleted.iter().map(|r| Value::Int(r.get(0)))))
+                }),
+                |value, _| async move { Ok(value) },
+            ).await
         }
         "BookmarkStaticLocation" => static_location(c, call).await,
         // UpdateBookmark(bookmarkID, folderID, name, note, subfolderID, newFolderID, expiryCancel)

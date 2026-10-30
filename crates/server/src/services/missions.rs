@@ -496,18 +496,20 @@ async fn has_goods(c: &Client, station: i64, (type_id, qty): (i32, i32)) -> Resu
 /// Take `qty` of the goods from the hangar and cargo at `station`.
 async fn take_goods(c: &mut Client, station: i64, (type_id, qty): (i32, i32)) -> Result<(), CallError> {
     let mut left = qty;
+    let mut outbox = crate::db::outbox::Outbox::default();
     for item in goods_at(c, station, type_id).await? {
         if left <= 0 {
             break;
         }
         if item.quantity <= left {
             left -= item.quantity;
-            super::combat::remove_stack(c, item).await?;
+            super::combat::remove_stack(&c.db, &mut outbox, item).await?;
         } else {
             c.db.execute("UPDATE game.items SET quantity = quantity - $2 WHERE item_id = $1", &[&item.item_id, &left]).await.map_err(db_err)?;
-            super::inventory::notify_item_change(c, item.item_id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
+            super::inventory::notify_item_change(&c.db, &mut outbox, item.item_id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
             left = 0;
         }
+        crate::db::outbox::dispatch_client((), std::mem::take(&mut outbox), c)?;
     }
     Ok(())
 }
@@ -549,7 +551,9 @@ async fn finish(c: &mut Client, m: &Mission, agent: &Agent, choice: Option<usize
         c.notify("OnAccountChange", vec![Value::str("cash"), Value::Int(me), Value::Float(balance)]);
     }
     // Loyalty points with the agent's corporation, and standings with agent, corporation and faction.
-    super::standings::add_lp(&c.db, &c.world, me, agent.corp_id, m.reward_lp).await?;
+    let mut outbox = crate::db::outbox::Outbox::default();
+    super::standings::add_lp(&c.db, &mut outbox, me, agent.corp_id, m.reward_lp).await?;
+    crate::db::outbox::dispatch_client((), outbox, c)?;
     super::standings::mission_completed(&c.db, &c.world, me, agent.id, agent.corp_id, agent.faction_id, agent.level).await?;
     if let Some(arc) = m.arc_id {
         let item = c
@@ -564,7 +568,9 @@ async fn finish(c: &mut Client, m: &Mission, agent: &Agent, choice: Option<usize
         if let Some(r) = item {
             let (type_id, qty): (Option<i32>, Option<i32>) = (r.get(0), r.get(1));
             if let (Some(type_id), Some(qty)) = (type_id, qty) {
-                super::combat::deposit(c, me, agent.station_id, FLAG_HANGAR, type_id, qty.max(1), 0).await?;
+                let mut outbox = crate::db::outbox::Outbox::default();
+                super::combat::deposit(&c.db, &mut outbox, me, agent.station_id, FLAG_HANGAR, type_id, qty.max(1), 0).await?;
+                crate::db::outbox::dispatch_client((), outbox, c)?;
             }
         }
         set_arc_state(c, arc, m.mission_id, "completed").await?;
@@ -1119,7 +1125,9 @@ async fn do_action(c: &mut Client, agent: &Agent, action: Option<i64>) -> CallRe
             // Courier cargo waits in the pilot's hangar at the agent's station.
             if let (Kind::Courier, Some((type_id, qty))) = (m.kind, m.cargo) {
                 let me = c.session.int("charid").unwrap_or(0);
-                super::combat::deposit(c, me, agent.station_id, FLAG_HANGAR, type_id, qty, 0).await?;
+                let mut outbox = crate::db::outbox::Outbox::default();
+                super::combat::deposit(&c.db, &mut outbox, me, agent.station_id, FLAG_HANGAR, type_id, qty, 0).await?;
+                crate::db::outbox::dispatch_client((), outbox, c)?;
             }
             info!(user = c.login.user_id, "agent {}: mission {} accepted", agent.id, m.mission_id);
             c.notify("OnAgentMissionChange", vec![Value::str("accepted"), Value::Int(agent.id)]);

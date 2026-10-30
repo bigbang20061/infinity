@@ -17,6 +17,8 @@ use super::{crowset, db_err, keyval, notify_error, trimmed_arg_text, Call, CallE
 use crate::client::{filetime_now, Client};
 use crate::consts::{ACCOUNT_CASH, ORG_NAME_MAX_LENGTH, ORG_NAME_MIN_LENGTH, ORG_SHORT_NAME_MAX_LENGTH, ORG_SHORT_NAME_MIN_LENGTH, ROLE_DIRECTOR};
 use crate::db::Db;
+use crate::db::executor::Executor;
+use crate::db::outbox::{dispatch_world, Outbox};
 use crate::space::World;
 use marshal::{DbRowDescriptor, DbType, Value};
 use tracing::info;
@@ -134,7 +136,7 @@ fn alliance_line(r: &tokio_postgres::Row) -> Vec<Value> {
     ]
 }
 
-async fn alliance_line_of(db: &Db, alliance: i64) -> Result<Option<Vec<Value>>, CallError> {
+async fn alliance_line_of(db: &(impl Executor + ?Sized), alliance: i64) -> Result<Option<Vec<Value>>, CallError> {
     Ok(db.query_opt(&format!("{ALLIANCE_SELECT} WHERE a.alliance_id = $1"), &[&alliance]).await.map_err(db_err)?.map(|r| alliance_line(&r)))
 }
 
@@ -155,7 +157,7 @@ fn member_header() -> DbRowDescriptor {
 }
 
 /// (corporationID, line) of each member corporation.
-async fn member_lines(db: &Db, alliance: i64) -> Result<Vec<(i64, Vec<Value>)>, CallError> {
+async fn member_lines(db: &(impl Executor + ?Sized), alliance: i64) -> Result<Vec<(i64, Vec<Value>)>, CallError> {
     let rows = db
         .query(
             "SELECT corporation_id, chosen_executor_id, COALESCE(alliance_joined, created) FROM game.corporations
@@ -221,7 +223,7 @@ fn relationship_header() -> DbRowDescriptor {
 // ---------------------------------------------------------------- notifications
 
 /// Every non-deleted character of the corporations in `alliance`, or of `corp` alone.
-async fn pilots(db: &Db, alliance: Option<i64>, corp: Option<i64>) -> Result<Vec<i64>, CallError> {
+async fn pilots(db: &(impl Executor + ?Sized), alliance: Option<i64>, corp: Option<i64>) -> Result<Vec<i64>, CallError> {
     let rows = db
         .query(
             "SELECT ch.character_id FROM game.characters ch JOIN game.corporations co ON co.corporation_id = ch.corporation_id
@@ -260,8 +262,7 @@ async fn member_changed(db: &Db, world: &World, alliance: i64, corp: i64, old: O
 }
 
 /// Put `corp` in `alliance` (or none): history, and every member's session.
-async fn set_alliance(db: &Db, world: &World, corp: i64, alliance: Option<i64>) -> Result<(), CallError> {
-    let now = filetime_now();
+async fn set_alliance<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, corp: i64, alliance: Option<i64>, now: i64) -> Result<(), CallError> {
     db
         .execute(
             "UPDATE game.corporations SET alliance_id = $2, alliance_joined = $3, chosen_executor_id = NULL WHERE corporation_id = $1",
@@ -275,9 +276,8 @@ async fn set_alliance(db: &Db, world: &World, corp: i64, alliance: Option<i64>) 
         .map_err(db_err)?;
     let value = alliance.map(Value::Int).unwrap_or(Value::None);
     for char_id in pilots(db, None, Some(corp)).await? {
-        world.notify_pilot(char_id, "__session", vec![Value::tuple([Value::str("allianceid"), value.clone()])]);
+        outbox.notify_pilot(char_id, "__session", vec![Value::tuple([Value::str("allianceid"), value.clone()])]);
     }
-    info!("alliances: corporation {corp} is now in {alliance:?}");
     Ok(())
 }
 
@@ -320,25 +320,31 @@ async fn create(c: &Client, call: &Call<'_>) -> CallResult {
         return Err(notify_error("该联盟名称或简称已被占用。"));
     }
     let _trading = super::market::lock().await;
-    super::corpwallet::corp_debit(db, world, corp, ACCOUNT_CASH, CREATION_COST).await?;
-    let id: i64 = db
-        .query_one(
-            "INSERT INTO game.alliances (name, short_name, description, url, executor_corp_id, creator_corp_id, creator_char_id, created)
-             VALUES ($1, $2, $3, $4, $5, $5, $6, $7) RETURNING alliance_id",
-            &[&name, &short_name, &description, &url, &corp, &me, &filetime_now()],
-        )
-        .await
-        .map_err(db_err)?
-        .get(0);
-    db.execute("DELETE FROM game.alliance_applications WHERE corporation_id = $1", &[&corp]).await.map_err(db_err)?;
-    set_alliance(db, world, corp, Some(id)).await?;
+    let now = filetime_now();
+    let id = db.transaction(
+        |tx, outbox| {
+            let (name, short_name, description, url) = (name.clone(), short_name.clone(), description.clone(), url.clone());
+            Box::pin(async move {
+                super::corpwallet::corp_debit(tx, outbox, corp, ACCOUNT_CASH, CREATION_COST).await?;
+                let id: i64 = tx.query_one(
+                    "INSERT INTO game.alliances (name, short_name, description, url, executor_corp_id, creator_corp_id, creator_char_id, created)
+                     VALUES ($1, $2, $3, $4, $5, $5, $6, $7) RETURNING alliance_id",
+                    &[&name, &short_name, &description, &url, &corp, &me, &now],
+                ).await.map_err(db_err)?.get(0);
+                tx.execute("DELETE FROM game.alliance_applications WHERE corporation_id = $1", &[&corp]).await.map_err(db_err)?;
+                set_alliance(tx, outbox, corp, Some(id), now).await?;
+                Ok(id)
+            })
+        },
+        |id, outbox| async move { dispatch_world(id, outbox, world) },
+    ).await?;
     info!("alliances: {me} of {corp} founded {id} <{short_name}> {name}");
     Ok(Value::Int(id))
 }
 
 /// Take `corp` out of its alliance: a new executor if it was one, or the alliance closes
 /// with its last member.
-pub(super) async fn leave_alliance(db: &Db, world: &World, corp: i64) -> Result<(), CallError> {
+pub(super) async fn leave_alliance<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, corp: i64, now: i64) -> Result<(), CallError> {
     let Some(r) = db
         .query_opt(
             "SELECT co.alliance_id, a.executor_corp_id FROM game.corporations co JOIN game.alliances a ON a.alliance_id = co.alliance_id
@@ -353,8 +359,11 @@ pub(super) async fn leave_alliance(db: &Db, world: &World, corp: i64) -> Result<
     let (alliance, executor): (i64, Option<i64>) = (r.get(0), r.get(1));
     let old_member = member_lines(db, alliance).await?.into_iter().find(|(c, _)| *c == corp).map(|(_, l)| l);
     let old_alliance = alliance_line_of(db, alliance).await?;
-    member_changed_before_leaving(db, world, alliance, corp, old_member).await?;
-    set_alliance(db, world, corp, None).await?;
+    let ch = change(MEMBER_COLUMNS, old_member.as_deref(), None);
+    for char_id in pilots(db, Some(alliance), Some(corp)).await? {
+        outbox.notify_pilot(char_id, "OnAllianceMemberChanged", vec![Value::Int(alliance), Value::Int(corp), ch.clone()]);
+    }
+    set_alliance(db, outbox, corp, None, now).await?;
     db
         .execute("UPDATE game.corporations SET chosen_executor_id = NULL WHERE alliance_id = $1 AND chosen_executor_id = $2", &[&alliance, &corp])
         .await
@@ -374,23 +383,21 @@ pub(super) async fn leave_alliance(db: &Db, world: &World, corp: i64) -> Result<
         match next {
             Some(next) => {
                 db.execute("UPDATE game.alliances SET executor_corp_id = $2 WHERE alliance_id = $1", &[&alliance, &next]).await.map_err(db_err)?;
-                info!("alliances: {next} is now executor of {alliance}");
             }
             None => {
                 db.execute("UPDATE game.alliances SET deleted = true, executor_corp_id = NULL WHERE alliance_id = $1", &[&alliance]).await.map_err(db_err)?;
                 db.execute("DELETE FROM game.alliance_applications WHERE alliance_id = $1", &[&alliance]).await.map_err(db_err)?;
-                info!("alliances: {alliance} closed");
             }
         }
     }
-    alliance_changed(db, world, alliance, old_alliance).await
+    let new = alliance_line_of(db, alliance).await?;
+    let ch = change(ALLIANCE_COLUMNS, old_alliance.as_deref(), new.as_deref());
+    for char_id in pilots(db, Some(alliance), None).await? {
+        outbox.notify_pilot(char_id, "OnAllianceChanged", vec![Value::Int(alliance), ch.clone()]);
+    }
+    Ok(())
 }
 
-/// OnAllianceMemberChanged for a corporation about to leave, sent while it can still hear it.
-async fn member_changed_before_leaving(db: &Db, world: &World, alliance: i64, corp: i64, old: Option<Vec<Value>>) -> Result<(), CallError> {
-    let ch = change(MEMBER_COLUMNS, old.as_deref(), None);
-    tell(db, world, alliance, Some(corp), "OnAllianceMemberChanged", vec![Value::Int(alliance), Value::Int(corp), ch]).await
-}
 
 /// Join an accepted corporation to the alliance.
 async fn admit(db: &Db, world: &World, alliance: i64, corp: i64) -> Result<(), CallError> {
@@ -404,7 +411,9 @@ async fn admit(db: &Db, world: &World, alliance: i64, corp: i64) -> Result<(), C
         return Err(notify_error("该军团已经在一个联盟中。"));
     }
     let old_alliance = alliance_line_of(db, alliance).await?;
-    set_alliance(db, world, corp, Some(alliance)).await?;
+    let mut outbox = Outbox::default();
+    set_alliance(db, &mut outbox, corp, Some(alliance), filetime_now()).await?;
+    dispatch_world((), outbox, world)?;
     // Other applications of a corporation that joined lapse.
     let others = db
         .query(&format!("{APPLICATION_SELECT} WHERE corporation_id = $1 AND alliance_id <> $2"), &[&corp, &alliance])
@@ -702,7 +711,13 @@ async fn alliance_registry(c: &mut Client, call: &Call<'_>) -> Option<CallResult
                 return Some(Err(notify_error("你无法将该军团移出联盟。")));
             }
             match member_lines(db, alliance).await {
-                Ok(lines) if lines.iter().any(|(c, _)| *c == corp) => leave_alliance(db, world, corp).await.map(|_| Value::None),
+                Ok(lines) if lines.iter().any(|(c, _)| *c == corp) => {
+                    let now = filetime_now();
+                    db.transaction(
+                        |tx, outbox| Box::pin(async move { leave_alliance(tx, outbox, corp, now).await }),
+                        |value, outbox| async move { dispatch_world(value, outbox, world) },
+                    ).await.map(|_| Value::None)
+                },
                 Ok(_) => Err(notify_error("该军团不是联盟成员。")),
                 Err(e) => Err(e),
             }

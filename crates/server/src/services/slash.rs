@@ -130,7 +130,9 @@ async fn create(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
         (None, Some(ship)) => (ship, FLAG_CARGO),
         _ => return Err(slash_error("nowhere to put it".into())),
     };
-    super::combat::deposit(c, char_id, location, flag, type_id, qty, 0).await?;
+    let mut outbox = crate::db::outbox::Outbox::default();
+    super::combat::deposit(&c.db, &mut outbox, char_id, location, flag, type_id, qty, 0).await?;
+    crate::db::outbox::dispatch_client((), outbox, c)?;
     Ok(format!("created {qty} x {name} ({type_id})"))
 }
 

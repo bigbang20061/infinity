@@ -17,6 +17,8 @@
 use super::{db_err, keyval, notify_error, rowset, Call, CallError, CallResult};
 use crate::client::Client;
 use crate::db::Db;
+use crate::db::executor::Executor;
+use crate::db::outbox::{dispatch_world, Outbox};
 use crate::space::World;
 use marshal::Value;
 use tracing::info;
@@ -117,7 +119,7 @@ pub async fn mission_declined(db: &Db, world: &World, char_id: i64, agent: i64, 
 
 // ---------------------------------------------------------------- loyalty points
 
-pub async fn lp_balance(db: &Db, char_id: i64, corp: i64) -> Result<i64, CallError> {
+pub async fn lp_balance(db: &(impl Executor + ?Sized), char_id: i64, corp: i64) -> Result<i64, CallError> {
     Ok(db
         .query_opt("SELECT amount FROM game.lp_balances WHERE char_id = $1 AND corp_id = $2", &[&char_id, &corp])
         .await
@@ -127,7 +129,7 @@ pub async fn lp_balance(db: &Db, char_id: i64, corp: i64) -> Result<i64, CallErr
 }
 
 /// Add (or, negative, take) loyalty points with `corp`; taking more than there is fails.
-pub async fn add_lp(db: &Db, world: &World, char_id: i64, corp: i64, amount: i64) -> Result<(), CallError> {
+pub async fn add_lp<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, char_id: i64, corp: i64, amount: i64) -> Result<(), CallError> {
     if amount == 0 || corp == 0 {
         return Ok(());
     }
@@ -143,7 +145,7 @@ pub async fn add_lp(db: &Db, world: &World, char_id: i64, corp: i64, amount: i64
         )
         .await
         .map_err(db_err)?;
-    world.notify_pilot(char_id, "OnLPChange", vec![Value::str("lp"), Value::Int(corp), Value::Int(before), Value::Int(before + amount)]);
+    outbox.notify_pilot(char_id, "OnLPChange", vec![Value::str("lp"), Value::Int(corp), Value::Int(before), Value::Int(before + amount)]);
     Ok(())
 }
 
@@ -185,12 +187,18 @@ async fn take_offer(c: &Client, corp: i64, offer: i64, count: i64) -> CallResult
         return Err(notify_error("该兑换项已不可用。"));
     };
     let _trading = super::market::lock().await;
-    if lp_balance(db, me, corp).await? < lp * count {
-        return Err(notify_error("你的忠诚点不足。"));
-    }
-    super::market::debit(db, world, me, (isk * count) as f64).await?;
-    add_lp(db, world, me, corp, -lp * count).await?;
-    super::market::deliver(db, world, me, station, type_id, count as i32).await?;
+    db.transaction(
+        |tx, outbox| Box::pin(async move {
+            if lp_balance(tx, me, corp).await? < lp * count {
+                return Err(notify_error("你的忠诚点不足。"));
+            }
+            super::market::debit(tx, outbox, me, (isk * count) as f64).await?;
+            add_lp(tx, outbox, me, corp, -lp * count).await?;
+            super::market::deliver(tx, outbox, me, station, type_id, count as i32).await?;
+            Ok(())
+        }),
+        |value, outbox| async move { dispatch_world(value, outbox, world) },
+    ).await?;
     info!("lp store: {me} bought {count} x {type_id} from {corp} for {} LP and {} ISK", lp * count, isk * count);
     Ok(Value::Bool(true))
 }

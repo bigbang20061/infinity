@@ -99,6 +99,25 @@ impl From<anyhow::Error> for CallError {
     }
 }
 
+impl From<crate::db::Error> for CallError {
+    fn from(error: crate::db::Error) -> Self {
+        Self::Internal(error.into())
+    }
+}
+
+impl crate::db::transaction::TransactionError for CallError {
+    fn is_retryable_transaction(&self) -> bool {
+        use crate::db::transaction::{retryable_postgres, TransactionError};
+        match self {
+            Self::User { .. } => false,
+            Self::Internal(error) => error.chain().any(|cause| {
+                cause.downcast_ref::<crate::db::Error>().is_some_and(TransactionError::is_retryable_transaction)
+                    || cause.downcast_ref::<tokio_postgres::Error>().is_some_and(retryable_postgres)
+            }),
+        }
+    }
+}
+
 pub type CallResult = Result<Value, CallError>;
 
 pub fn db_err(e: impl Into<anyhow::Error>) -> CallError {
@@ -166,7 +185,7 @@ pub(super) async fn has_role_or_is_ceo(db: &Db, char_id: i64, corp_id: i64, role
 }
 
 /// Iterate character IDs for all non-deleted members of `corp_id`; database errors propagate.
-pub(super) async fn active_corporation_member_ids(db: &Db, corp_id: i64) -> Result<impl Iterator<Item = i64>, CallError> {
+pub(super) async fn active_corporation_member_ids(db: &(impl crate::db::executor::Executor + ?Sized), corp_id: i64) -> Result<impl Iterator<Item = i64>, CallError> {
     let rows = db.query("SELECT character_id FROM game.characters WHERE corporation_id = $1 AND NOT deleted", &[&corp_id]).await.map_err(db_err)?;
     Ok(rows.into_iter().map(|r| r.get(0)))
 }

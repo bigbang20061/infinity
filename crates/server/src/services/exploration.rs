@@ -29,6 +29,8 @@ use super::{db_err, keyval, notify_error, off_surface, rand01, rand_dir, value_i
 use crate::client::{filetime_now, filetime_ticks_from_seconds, Client};
 use crate::consts::{ATTR_EXPLOSION_DELAY, ATTR_REQUIRED_SKILL_1, AU, FACTION_AMARR, FACTION_ANGEL_CARTEL, FACTION_CALDARI, FACTION_GALLENTE, FACTION_GURISTAS, FACTION_MINMATAR, FILETIME_SECOND, FLAG_CARGO, GROUP_ASTEROID_BELT, GROUP_PLANET, SKILL_ARCHAEOLOGY, SKILL_HACKING};
 use crate::db::Db;
+use crate::db::executor::Executor;
+use crate::db::outbox::{dispatch_client, Effect, Outbox};
 use crate::space::{dist, kg_to_tonnes, minutes_to_seconds, now_ms, Ball, World, MODE_RIGID, MODE_STOP, V3};
 use marshal::Value;
 use std::collections::{HashMap, HashSet};
@@ -585,7 +587,7 @@ fn site_from_row(r: &tokio_postgres::Row) -> Site {
     }
 }
 
-async fn save_site(db: &Db, s: &Site) -> Result<(), CallError> {
+async fn save_site(db: &(impl Executor + ?Sized), s: &Site) -> Result<(), CallError> {
     let w = s.wormhole.as_ref();
     let kind: i16 = if s.kind == Kind::Anomaly { 0 } else { 1 };
     db
@@ -645,7 +647,7 @@ async fn persist(db: &Db, site_id: i64) -> Result<(), CallError> {
     }
 }
 
-async fn delete_site(db: &Db, site_id: i64) -> Result<(), CallError> {
+async fn delete_site(db: &(impl Executor + ?Sized), site_id: i64) -> Result<(), CallError> {
     db.execute("DELETE FROM game.exploration_sites WHERE site_id = $1", &[&site_id]).await.map_err(db_err)?;
     db.execute("DELETE FROM game.exploration_scanned WHERE site_id = $1", &[&site_id]).await.map_err(db_err)?;
     Ok(())
@@ -1267,9 +1269,11 @@ async fn recover_probes(c: &mut Client, call: &Call<'_>, destroy: bool) -> CallR
         }
     }
     if !destroy {
+        let mut outbox = Outbox::default();
         for (type_id, n) in back {
-            super::combat::deposit(c, char_id, ship, FLAG_CARGO, type_id, n, ship).await?;
+            super::combat::deposit(&c.db, &mut outbox, char_id, ship, FLAG_CARGO, type_id, n, ship).await?;
         }
+        dispatch_client((), outbox, c)?;
     }
     for (system, gone) in recovered_by_system {
         if destroy {
@@ -1546,16 +1550,10 @@ pub(super) fn err_text(e: CallError) -> String {
 /// A finished site leaves (with any containers) and one of the same kind appears
 /// elsewhere in the system.
 async fn replace_site(db: &Db, world: &World, site_id: i64) -> Result<(), CallError> {
-    let Some(old) = state().sites.remove(&site_id) else { return Ok(()) };
+    let Some(old) = state().sites.get(&site_id).cloned() else { return Ok(()) };
     let system = old.system;
-    info!("site {} in {system} done", old.target);
-    delete_site(db, site_id).await?;
-    for id in old.containers.iter().flatten() {
-        world.remove_ball(system, *id).await;
-        db.execute("DELETE FROM game.items WHERE location_id = $1 OR item_id = $1", &[id]).await.map_err(db_err)?;
-    }
     let info = system_info(db, system).await?;
-    let mut taken: HashSet<String> = system_sites(system).into_iter().map(|s| s.target).collect();
+    let mut taken: HashSet<String> = system_sites(system).into_iter().filter(|s| s.id != site_id).map(|s| s.target).collect();
     let new = if let Some(field) = old.mining_field() {
         mining_site(db, system, &info, field, &mut taken).await?
     } else if old.is_hack_site() {
@@ -1563,12 +1561,42 @@ async fn replace_site(db: &Db, world: &World, site_id: i64) -> Result<(), CallEr
     } else {
         combat_site(db, system, &info, old.kind, &mut taken).await?
     };
-    if let Some(s) = &new {
-        save_site(db, s).await?;
-        state().sites.insert(s.id, s.clone());
-    }
-    broadcast_sites(world, system, new.as_slice(), std::slice::from_ref(&old)).await;
-    Ok(())
+    enum Replacement { Apply(Site, Option<Site>) }
+    db.transaction(
+        move |tx, outbox: &mut Outbox<Replacement>| {
+            let (old, new) = (old.clone(), new.clone());
+            Box::pin(async move {
+                delete_site(tx, old.id).await?;
+                for id in old.containers.iter().flatten() {
+                    Executor::execute(tx, "DELETE FROM game.items WHERE location_id = $1 OR item_id = $1", &[id]).await.map_err(db_err)?;
+                }
+                if let Some(site) = &new {
+                    save_site(tx, site).await?;
+                }
+                outbox.operation(Replacement::Apply(old, new));
+                Ok(())
+            })
+        },
+        |(), outbox: Outbox<Replacement>| async move {
+            for effect in outbox.into_entries() {
+                match effect {
+                    Effect::Notification(notification) => notification.dispatch(world, None)?,
+                    Effect::Operation(Replacement::Apply(old, new)) => {
+                        info!("site {} in {system} done", old.target);
+                        state().sites.remove(&old.id);
+                        for id in old.containers.iter().flatten() {
+                            world.remove_ball(system, *id).await;
+                        }
+                        if let Some(site) = &new {
+                            state().sites.insert(site.id, site.clone());
+                        }
+                        broadcast_sites(world, system, new.as_slice(), std::slice::from_ref(&old)).await;
+                    }
+                }
+            }
+            Ok(())
+        },
+    ).await
 }
 
 /// The wormhole age bucket (slimItem.wormholeAge: 0 new ... 3 about to close).
@@ -1773,17 +1801,42 @@ async fn wormhole_jump(c: &mut Client, wormhole_id: i64) -> CallResult {
 
 /// A wormhole connection closes: both ends leave space and the scanners.
 async fn collapse(db: &Db, world: &World, site_id: i64) -> Result<(), CallError> {
-    let other = state().sites.get(&site_id).and_then(|s| s.wormhole.as_ref().map(|w| w.other));
-    for id in std::iter::once(site_id).chain(other) {
-        delete_site(db, id).await?;
-        let Some(s) = state().sites.remove(&id) else { continue };
-        info!("wormhole {} in {} collapsed", s.target, s.system);
-        if s.in_space {
-            world.destroy_ball(s.system, s.id).await;
-        }
-        broadcast_sites(world, s.system, &[], &[s]).await;
-    }
-    Ok(())
+    let (ids, sites) = {
+        let st = state();
+        let other = st.sites.get(&site_id).and_then(|s| s.wormhole.as_ref().map(|w| w.other));
+        let ids: Vec<_> = std::iter::once(site_id).chain(other).collect();
+        let sites: Vec<_> = ids.iter().filter_map(|id| st.sites.get(id).cloned()).collect();
+        (ids, sites)
+    };
+    enum Collapse { Remove(Vec<Site>) }
+    db.transaction(
+        move |tx, outbox: &mut Outbox<Collapse>| {
+            let (ids, sites) = (ids.clone(), sites.clone());
+            Box::pin(async move {
+                for id in ids {
+                    delete_site(tx, id).await?;
+                }
+                outbox.operation(Collapse::Remove(sites));
+                Ok(())
+            })
+        },
+        |(), outbox: Outbox<Collapse>| async move {
+            for effect in outbox.into_entries() {
+                match effect {
+                    Effect::Notification(notification) => notification.dispatch(world, None)?,
+                    Effect::Operation(Collapse::Remove(sites)) => for s in sites {
+                        state().sites.remove(&s.id);
+                        info!("wormhole {} in {} collapsed", s.target, s.system);
+                        if s.in_space {
+                            world.destroy_ball(s.system, s.id).await;
+                        }
+                        broadcast_sites(world, s.system, &[], &[s]).await;
+                    },
+                }
+            }
+            Ok(())
+        },
+    ).await
 }
 
 /// Close wormholes past their lifetime (checked whenever a pilot registers).
@@ -1981,32 +2034,47 @@ pub(super) async fn set_container_state(world: &World, system: i64, container: i
 /// A won hack: the container opens to its hacker, and once every container of the site
 /// is open the site winds down.
 pub(super) async fn container_hacked(db: &Db, world: &Arc<World>, container: i64, char_id: i64) -> Result<(), CallError> {
-    let Some(site_id) = ({
-        let mut st = state();
-        st.sites.values_mut().find(|s| s.containers.as_ref().is_some_and(|c| c.contains(&container))).map(|s| {
-            if !s.hacked.contains(&container) {
-                s.hacked.push(container);
-            }
-            s.id
-        })
-    }) else {
+    let Some(mut site) = state().sites.values().find(|s| s.containers.as_ref().is_some_and(|c| c.contains(&container))).cloned() else {
         return Ok(());
     };
-    persist(db, site_id).await?;
-    db.execute("UPDATE game.items SET owner_id = $2 WHERE location_id = $1", &[&container, &char_id]).await.map_err(db_err)?;
-    let Some(site) = state().sites.get(&site_id).cloned() else { return Ok(()) };
-    set_container_state(world, site.system, container, 2).await;
-    if site.containers.as_ref().is_some_and(|c| c.iter().all(|id| site.hacked.contains(id))) {
-        let (db, completion_world) = (db.clone(), world.clone());
-        world.schedule(site.system, HACKED_SITE_LINGER_MS, move |s| {
-            s.defer(async move {
-                if let Err(e) = replace_site(&db, &completion_world, site_id).await {
-                    warn!("replacing site {site_id}: {}", err_text(e));
-                }
-            });
-        });
+    if !site.hacked.contains(&container) {
+        site.hacked.push(container);
     }
-    Ok(())
+    enum Completion { Open(Site) }
+    db.transaction(
+        move |tx, outbox: &mut Outbox<Completion>| {
+            let site = site.clone();
+            Box::pin(async move {
+                save_site(tx, &site).await?;
+                Executor::execute(tx, "UPDATE game.items SET owner_id = $2 WHERE location_id = $1", &[&container, &char_id]).await.map_err(db_err)?;
+                outbox.operation(Completion::Open(site));
+                Ok(())
+            })
+        },
+        |(), outbox: Outbox<Completion>| async move {
+            for effect in outbox.into_entries() {
+                match effect {
+                    Effect::Notification(notification) => notification.dispatch(world, None)?,
+                    Effect::Operation(Completion::Open(site)) => {
+                        let site_id = site.id;
+                        state().sites.insert(site_id, site.clone());
+                        set_container_state(world, site.system, container, 2).await;
+                        if site.containers.as_ref().is_some_and(|c| c.iter().all(|id| site.hacked.contains(id))) {
+                            let (db, completion_world) = (db.clone(), world.clone());
+                            world.schedule(site.system, HACKED_SITE_LINGER_MS, move |s| {
+                                s.defer(async move {
+                                    if let Err(e) = replace_site(&db, &completion_world, site_id).await {
+                                        warn!("replacing site {site_id}: {}", err_text(e));
+                                    }
+                                });
+                            });
+                        }
+                    }
+                }
+            }
+            Ok(())
+        },
+    ).await
 }
 
 // ---------------------------------------------------------------- GM commands (services/slash)

@@ -3,11 +3,13 @@
 //! Movement and jump waits run in per-system actors; arrival cloak expiry is handled by the actor tick.
 //! Local-chat invites use an outside-space delay for session settlement.
 //! Uses ship attributes and celestial data from the SDE and persists locations in game tables.
+//! Ship loss commits before its independently best-effort killmail and insurance operations.
 //! Mirrors the client ship service and remote ballpark; NPC workers are out of scope.
 
 use super::{db_err, Call, CallError, CallResult};
 use crate::client::{short, Client};
 use crate::consts::{ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_SIGNATURE_RADIUS, FILETIME_SECOND, FLAG_HANGAR, TYPE_CAPSULE};
+use crate::db::outbox::{Effect, Outbox};
 use crate::space::{self, event, now_ms, now_tick, seconds_to_ms_f64, warp_duration, Ball, Warp, V3, CLOAK_RESTORE, MODE_FOLLOW, MODE_GOTO, MODE_ORBIT, MODE_STOP, MODE_WARP};
 use marshal::Value;
 use tracing::{info, warn};
@@ -413,8 +415,6 @@ pub async fn lose_ship(c: &mut Client, ship: i64, pos: [f64; 3]) -> Result<(), C
     if c.session.int("shipid") != Some(ship) {
         return Ok(());
     }
-    super::combat::reset(c);
-    super::combat::forget_ship(ship);
     let lost_type: Option<i32> = c.db.query_opt("SELECT type_id FROM game.items WHERE item_id = $1", &[&ship]).await.map_err(db_err)?.map(|r| r.get(0));
     // The killmail lists what went down with it: fittings, cargo and loaded charges.
     let mut lost: super::crimewatch::Lost = c
@@ -431,85 +431,92 @@ pub async fn lose_ship(c: &mut Client, ship: i64, pos: [f64; 3]) -> Result<(), C
     for r in c.db.query("SELECT type_id, flag_id, quantity FROM game.module_charges WHERE ship_id = $1", &[&ship]).await.map_err(db_err)? {
         lost.push((r.get(0), r.get(1), false, r.get::<_, i32>(2) as i64));
     }
-    if let Some(ship_type) = lost_type {
-        let corp = c.session.int("corpid").unwrap_or(0);
-        if let Err(CallError::Internal(e)) = super::crimewatch::ship_lost(&c.db, &c.world, system, char_id, corp, ship, ship_type, &lost).await {
-            warn!(user = c.login.user_id, "killmail for {ship}: {e:#}");
-        }
-        if let Err(CallError::Internal(e)) = super::insurance::ship_destroyed(&c.db, &c.world, ship).await {
-            warn!(user = c.login.user_id, "insurance payout for {ship}: {e:#}");
-        }
-    }
-    if lost_type == Some(TYPE_CAPSULE) {
-        return wake_in_clone(c, char_id, ship).await;
-    }
-    for sql in [
-        "DELETE FROM game.items WHERE location_id = $1",
-        "DELETE FROM game.module_charges WHERE ship_id = $1",
-        "DELETE FROM game.weapon_banks WHERE ship_id = $1",
-        "DELETE FROM game.items WHERE item_id = $1",
-    ] {
-        c.db.execute(sql, &[&ship]).await.map_err(db_err)?;
-    }
-    let capsule: i64 = c
-        .db
-        .query_one(
-            "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton, x, y, z)
-             VALUES ($1, $2, $3, 0, 1, true, $4, $5, $6) RETURNING item_id",
-            &[&TYPE_CAPSULE, &char_id, &system, &pos[0], &pos[1], &pos[2]],
-        )
-        .await
-        .map_err(db_err)?
-        .get(0);
-    c.db.execute("UPDATE game.characters SET ship_id = $2 WHERE character_id = $1", &[&char_id, &capsule]).await.map_err(db_err)?;
-    let ball = ship_ball(c, capsule, pos).await?;
-    c.world.add_ship(system, ball).await.map_err(CallError::Internal)?;
-    info!(user = c.login.user_id, "ship {ship} lost; {char_id} ejected in capsule {capsule}");
-    c.change_session(vec![("shipid", Value::Int(capsule))]);
-    send_state(c).await
-}
-
-/// Podded: the pilot wakes up in a new clone at its home station, in a fresh capsule.
-async fn wake_in_clone(c: &mut Client, char_id: i64, pod: i64) -> Result<(), CallError> {
-    c.db.execute("DELETE FROM game.items WHERE item_id = $1", &[&pod]).await.map_err(db_err)?;
-    let home = c
-        .db
-        .query_one(
-            "SELECT s.station_id::bigint, s.solar_system_id::bigint, s.constellation_id::bigint, s.region_id::bigint
-             FROM game.characters ch JOIN sde.sta_stations s ON s.station_id = COALESCE(ch.home_station_id, ch.station_id)
-             WHERE ch.character_id = $1",
-            &[&char_id],
-        )
-        .await
-        .map_err(db_err)?;
-    let (station, system, constellation, region): (i64, i64, i64, i64) = (home.get(0), home.get(1), home.get(2), home.get(3));
-    let capsule: i64 = c
-        .db
-        .query_one(
-            "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton) VALUES ($1, $2, $3, $4, 1, true) RETURNING item_id",
-            &[&TYPE_CAPSULE, &char_id, &station, &FLAG_HANGAR],
-        )
-        .await
-        .map_err(db_err)?
-        .get(0);
-    c.db
-        .execute(
-            "UPDATE game.characters SET ship_id = $2, station_id = $3, solar_system_id = $4, constellation_id = $5, region_id = $6 WHERE character_id = $1",
-            &[&char_id, &capsule, &station, &system, &constellation, &region],
-        )
-        .await
-        .map_err(db_err)?;
-    c.world.unobserve(c.login.client_id);
-    info!(user = c.login.user_id, "{char_id} podded; new clone at {station}");
-    c.change_session(vec![
-        ("solarsystemid", Value::None),
-        ("stationid", Value::Int(station)),
-        ("solarsystemid2", Value::Int(system)),
-        ("constellationid", Value::Int(constellation)),
-        ("regionid", Value::Int(region)),
-        ("shipid", Value::Int(capsule)),
-    ]);
-    Ok(())
+    let corp = c.session.int("corpid").unwrap_or(0);
+    let db = c.db.clone();
+    db.transaction(
+        |tx, outbox: &mut Outbox<()>| Box::pin(async move {
+            let home = if lost_type == Some(TYPE_CAPSULE) {
+                let r = tx.query_one(
+                    "SELECT s.station_id::bigint, s.solar_system_id::bigint, s.constellation_id::bigint, s.region_id::bigint
+                     FROM game.characters ch JOIN sde.sta_stations s ON s.station_id = COALESCE(ch.home_station_id, ch.station_id)
+                     WHERE ch.character_id = $1", &[&char_id],
+                ).await.map_err(db_err)?;
+                Some((r.get::<_, i64>(0), r.get::<_, i64>(1), r.get::<_, i64>(2), r.get::<_, i64>(3)))
+            } else { None };
+            for sql in [
+                "DELETE FROM game.items WHERE location_id = $1",
+                "DELETE FROM game.module_charges WHERE ship_id = $1",
+                "DELETE FROM game.weapon_banks WHERE ship_id = $1",
+                "DELETE FROM game.items WHERE item_id = $1",
+            ] {
+                tx.execute(sql, &[&ship]).await.map_err(db_err)?;
+            }
+            let capsule: i64 = if let Some((station, _, _, _)) = home {
+                tx.query_one(
+                    "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton) VALUES ($1, $2, $3, $4, 1, true) RETURNING item_id",
+                    &[&TYPE_CAPSULE, &char_id, &station, &FLAG_HANGAR],
+                ).await.map_err(db_err)?.get(0)
+            } else {
+                tx.query_one(
+                    "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton, x, y, z)
+                     VALUES ($1, $2, $3, 0, 1, true, $4, $5, $6) RETURNING item_id",
+                    &[&TYPE_CAPSULE, &char_id, &system, &pos[0], &pos[1], &pos[2]],
+                ).await.map_err(db_err)?.get(0)
+            };
+            if let Some((station, system, constellation, region)) = home {
+                tx.execute(
+                    "UPDATE game.characters SET ship_id = $2, station_id = $3, solar_system_id = $4, constellation_id = $5, region_id = $6 WHERE character_id = $1",
+                    &[&char_id, &capsule, &station, &system, &constellation, &region],
+                ).await.map_err(db_err)?;
+            } else {
+                tx.execute("UPDATE game.characters SET ship_id = $2 WHERE character_id = $1", &[&char_id, &capsule]).await.map_err(db_err)?;
+            }
+            outbox.operation(());
+            Ok((capsule, home))
+        }),
+        |(capsule, home), outbox| async move {
+            for entry in outbox.into_entries() {
+                match entry {
+                    Effect::Notification(notification) => notification.dispatch(&c.world.clone(), Some(&mut *c))?,
+                    Effect::Operation(()) => {
+                        super::combat::reset(c);
+                        super::combat::forget_ship(ship);
+                        if let Some(ship_type) = lost_type {
+                            match super::crimewatch::ship_lost(&c.db, &c.world, system, char_id, corp, ship, ship_type, &lost).await {
+                                Err(CallError::Internal(e)) => warn!(user = c.login.user_id, "killmail for {ship}: {e:#}"),
+                                Err(CallError::User { msg, .. }) => warn!(user = c.login.user_id, "killmail for {ship}: {msg}"),
+                                Ok(()) => {}
+                            }
+                            match super::insurance::ship_destroyed(&c.db, &c.world, ship).await {
+                                Err(CallError::Internal(e)) => warn!(user = c.login.user_id, "insurance payout for {ship}: {e:#}"),
+                                Err(CallError::User { msg, .. }) => warn!(user = c.login.user_id, "insurance payout for {ship}: {msg}"),
+                                Ok(()) => {}
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some((station, system, constellation, region)) = home {
+                c.world.unobserve(c.login.client_id);
+                info!(user = c.login.user_id, "{char_id} podded; new clone at {station}");
+                c.change_session(vec![
+                    ("solarsystemid", Value::None),
+                    ("stationid", Value::Int(station)),
+                    ("solarsystemid2", Value::Int(system)),
+                    ("constellationid", Value::Int(constellation)),
+                    ("regionid", Value::Int(region)),
+                    ("shipid", Value::Int(capsule)),
+                ]);
+                Ok(())
+            } else {
+                let ball = ship_ball(c, capsule, pos).await?;
+                c.world.add_ship(system, ball).await.map_err(CallError::Internal)?;
+                info!(user = c.login.user_id, "ship {ship} lost; {char_id} ejected in capsule {capsule}");
+                c.change_session(vec![("shipid", Value::Int(capsule))]);
+                send_state(c).await
+            }
+        },
+    ).await
 }
 
 /// Push the full destiny state for the client's current system (on beyonce bind / UpdateStateRequest).
@@ -686,4 +693,5 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         _ => return None,
     })
 }
+
 

@@ -15,13 +15,17 @@
 //! contract waits for its issuer to delete it and take the escrow back; expired auctions
 //! with bids settle on their own. Contracts cost no fees, and corporation contracts aren't
 //! supported yet.
+//! Contract lifecycle mutations and stack splits commit their database changes atomically;
+//! their notifications are delivered only after commit.
 
 use super::dogma::{load_items_db, Item};
 use super::market::{credit, debit, deliver, lock, round2, station, take_items};
 use super::{db_err, keyval, notify_error, user_error, value_id_list, value_text, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
-use crate::consts::{ACCOUNT_CASH, FILETIME_DAY, FILETIME_MINUTE, FLAG_HANGAR, IX_LOCATION_ID, LOCATION_JUNKYARD};
+use crate::consts::{ACCOUNT_CASH, FILETIME_DAY, FILETIME_MINUTE, FLAG_HANGAR, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD};
 use crate::db::Db;
+use crate::db::executor::Executor;
+use crate::db::outbox::{dispatch_world, Outbox};
 use crate::space::World;
 use marshal::{DbRowDescriptor, DbType, Value};
 use std::collections::HashMap;
@@ -214,18 +218,18 @@ fn contract_from_row(r: &tokio_postgres::Row) -> Contract {
 }
 
 /// Contracts matching `where_sql` (parameters from $1), newest first.
-async fn contracts(db: &Db, where_sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<Contract>, CallError> {
+async fn contracts(db: &(impl Executor + ?Sized), where_sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<Contract>, CallError> {
     let rows = db.query(&format!("{CONTRACT_SELECT} WHERE {where_sql} ORDER BY c.contract_id DESC LIMIT 1000"), params).await.map_err(db_err)?;
     Ok(rows.iter().map(contract_from_row).collect())
 }
 
-async fn contract(db: &Db, id: i64) -> Result<Contract, CallError> {
+async fn contract(db: &(impl Executor + ?Sized), id: i64) -> Result<Contract, CallError> {
     contracts(db, "c.contract_id = $1", &[&id]).await?.pop().ok_or_else(|| user_error("ConContractNotFound", vec![]))
 }
 
-async fn set_status(db: &Db, k: &mut Contract, status: i32) -> Result<(), CallError> {
+async fn set_status(db: &(impl Executor + ?Sized), k: &mut Contract, status: i32, completed: i64) -> Result<(), CallError> {
     k.status = status;
-    k.completed = filetime_now();
+    k.completed = completed;
     db
         .execute("UPDATE game.contracts SET status = $2, date_completed = $3, acceptor_id = $4 WHERE contract_id = $1", &[&k.id, &status, &k.completed, &k.acceptor])
         .await
@@ -306,27 +310,27 @@ async fn listing(db: &Db, list: &[Contract]) -> CallResult {
     ]))
 }
 
-async fn docked_at(db: &Db, char_id: i64) -> Result<Option<i64>, CallError> {
+async fn docked_at(db: &(impl Executor + ?Sized), char_id: i64) -> Result<Option<i64>, CallError> {
     Ok(db.query_opt("SELECT station_id FROM game.characters WHERE character_id = $1", &[&char_id]).await.map_err(db_err)?.and_then(|r| r.get(0)))
 }
 
 /// Tell `owner` about items now in their hangar at `station`, if they have it open.
-pub(super) async fn show_items(db: &Db, world: &World, owner: i64, station: i64, ids: &[i64], from: i64) -> Result<(), CallError> {
+pub(super) async fn show_items<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, owner: i64, station: i64, ids: &[i64], from: i64) -> Result<(), CallError> {
     if docked_at(db, owner).await? != Some(station) {
         return Ok(());
     }
     for item in load_items_db(db, "i.item_id = ANY($1)", &[&ids.to_vec()]).await? {
-        world.notify_pilot(owner, "OnItemChange", vec![item.row(), Value::Dict(vec![(Value::Int(IX_LOCATION_ID), Value::Int(from))]), Value::None]);
+        outbox.notify_pilot(owner, "OnItemChange", vec![item.row(), Value::Dict(vec![(Value::Int(IX_LOCATION_ID), Value::Int(from))]), Value::None]);
     }
     Ok(())
 }
 
 /// Move `quantity` of an item from its owner's hangar into the contract's escrow.
-async fn escrow_item(db: &Db, world: &World, item: Item, quantity: i32, contract_id: i64) -> Result<(), CallError> {
+async fn escrow_item<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, item: Item, quantity: i32, contract_id: i64) -> Result<(), CallError> {
     let (type_id, owner) = (item.type_id, item.owner_id);
     let escrow = -contract_id;
     let (item_id, quantity) = if !item.singleton && quantity < item.quantity {
-        take_items(db, world, item, quantity).await?;
+        take_items(db, outbox, item, quantity).await?;
         let id: i64 = db
             .query_one(
                 "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity) VALUES ($1, $2, $3, $4, $5) RETURNING item_id",
@@ -342,7 +346,7 @@ async fn escrow_item(db: &Db, world: &World, item: Item, quantity: i32, contract
         let quantity = if item.singleton { 1 } else { item.quantity };
         let id = item.item_id;
         let gone = Item { location_id: escrow, ..item };
-        world.notify_pilot(owner, "OnItemChange", vec![gone.row(), Value::Dict(vec![(Value::Int(IX_LOCATION_ID), Value::Int(old))]), Value::None]);
+        outbox.notify_pilot(owner, "OnItemChange", vec![gone.row(), Value::Dict(vec![(Value::Int(IX_LOCATION_ID), Value::Int(old))]), Value::None]);
         (id, quantity)
     };
     db
@@ -355,7 +359,7 @@ async fn escrow_item(db: &Db, world: &World, item: Item, quantity: i32, contract
     Ok(())
 }
 
-async fn escrowed_ids(db: &Db, contract_id: i64) -> Result<Vec<i64>, CallError> {
+async fn escrowed_ids(db: &(impl Executor + ?Sized), contract_id: i64) -> Result<Vec<i64>, CallError> {
     let rows = db
         .query("SELECT item_id FROM game.contract_items WHERE contract_id = $1 AND in_crate AND item_id IS NOT NULL", &[&contract_id])
         .await
@@ -364,25 +368,25 @@ async fn escrowed_ids(db: &Db, contract_id: i64) -> Result<Vec<i64>, CallError> 
 }
 
 /// Give the escrowed items (and whatever they hold) to `owner` at `location`/`flag`.
-async fn hand_over(db: &Db, world: &World, contract_id: i64, owner: i64, location: i64, flag: i32) -> Result<(), CallError> {
+async fn hand_over<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, contract_id: i64, owner: i64, location: i64, flag: i32) -> Result<(), CallError> {
     let ids = escrowed_ids(db, contract_id).await?;
     db
         .execute("UPDATE game.items SET owner_id = $2, location_id = $3, flag_id = $4 WHERE item_id = ANY($1)", &[&ids, &owner, &location, &flag])
         .await
         .map_err(db_err)?;
     db.execute("UPDATE game.items SET owner_id = $2 WHERE location_id = ANY($1)", &[&ids, &owner]).await.map_err(db_err)?;
-    show_items(db, world, owner, location, &ids, -contract_id).await
+    show_items(db, outbox, owner, location, &ids, -contract_id).await
 }
 
 /// Lose the escrowed items (a courier package that no longer exists).
-async fn destroy_escrow(db: &Db, contract_id: i64) -> Result<(), CallError> {
+async fn destroy_escrow(db: &(impl Executor + ?Sized), contract_id: i64) -> Result<(), CallError> {
     let ids = escrowed_ids(db, contract_id).await?;
     db.execute("DELETE FROM game.items WHERE location_id = ANY($1)", &[&ids]).await.map_err(db_err)?;
     db.execute("DELETE FROM game.items WHERE item_id = ANY($1)", &[&ids]).await.map_err(db_err)?;
     Ok(())
 }
 
-async fn top_bid(db: &Db, contract_id: i64) -> Result<Option<(i64, f64)>, CallError> {
+async fn top_bid(db: &(impl Executor + ?Sized), contract_id: i64) -> Result<Option<(i64, f64)>, CallError> {
     Ok(db
         .query_opt("SELECT bidder_id, amount FROM game.contract_bids WHERE contract_id = $1 ORDER BY amount DESC, bid_id LIMIT 1", &[&contract_id])
         .await
@@ -390,13 +394,13 @@ async fn top_bid(db: &Db, contract_id: i64) -> Result<Option<(i64, f64)>, CallEr
         .map(|r| (r.get(0), r.get(1))))
 }
 
-fn tell(world: &World, char_id: i64, event: &str, contract_id: i64) {
+fn tell<X: Send>(outbox: &mut Outbox<X>, char_id: i64, event: &str, contract_id: i64) {
     if char_id != 0 {
-        world.notify_pilot(char_id, event, vec![Value::Int(contract_id)]);
+        outbox.notify_pilot(char_id, event, vec![Value::Int(contract_id)]);
     }
 }
 
-async fn max_outstanding(db: &Db, char_id: i64) -> Result<i64, CallError> {
+async fn max_outstanding(db: &(impl Executor + ?Sized), char_id: i64) -> Result<i64, CallError> {
     let rows = db
         .query(
             "SELECT type_id, level FROM game.skills WHERE character_id = $1 AND type_id = ANY($2)",
@@ -408,7 +412,7 @@ async fn max_outstanding(db: &Db, char_id: i64) -> Result<i64, CallError> {
     Ok(NUM_CONTRACTS_BY_SKILL[level(SKILL_CONTRACTING)] + NUM_CONTRACTS_BY_ADVSKILL[level(SKILL_ADVANCED_CONTRACTING)])
 }
 
-async fn num_outstanding(db: &Db, char_id: i64) -> Result<i64, CallError> {
+async fn num_outstanding(db: &(impl Executor + ?Sized), char_id: i64) -> Result<i64, CallError> {
     Ok(db
         .query_one("SELECT count(*) FROM game.contracts WHERE issuer_id = $1 AND status = $2", &[&char_id, &STATUS_OUTSTANDING])
         .await
@@ -483,6 +487,15 @@ async fn create(c: &Client, info: &Value) -> CallResult {
     let groups: Vec<Vec<(i64, i64)>> = if multi { items.iter().map(|i| vec![*i]).collect() } else { vec![items] };
 
     let _trading = lock().await;
+    let now = filetime_now();
+    let start_id = start.id;
+    let end_id = end.map(|s| s.id).unwrap_or(0);
+    let input = Arc::new((groups, requested, title, description));
+    let created = db.transaction(
+        |db, outbox: &mut Outbox| {
+            let input = Arc::clone(&input);
+            Box::pin(async move {
+    let (groups, requested, title, description) = &*input;
     let open = num_outstanding(db, me).await?;
     let cap = max_outstanding(db, me).await?;
     if open + groups.len() as i64 > cap {
@@ -492,7 +505,7 @@ async fn create(c: &Client, info: &Value) -> CallResult {
     let mut loaded = HashMap::new();
     for (id, qty) in groups.iter().flatten() {
         let item = load_items_db(db, "i.item_id = $1", &[id]).await?.pop().ok_or_else(|| notify_error("其中一件物品已不在原处。"))?;
-        if item.owner_id != me || item.location_id != start.id || item.flag_id != FLAG_HANGAR {
+        if item.owner_id != me || item.location_id != start_id || item.flag_id != FLAG_HANGAR {
             return Err(notify_error("只有起始空间站物品机库中的物品才能放入合同。"));
         }
         if item.type_id == TYPE_PLASTIC_WRAP && kind != TYPE_COURIER {
@@ -504,10 +517,9 @@ async fn create(c: &Client, info: &Value) -> CallResult {
         loaded.insert(*id, item);
     }
     let escrow_isk = if kind == TYPE_AUCTION { 0.0 } else { reward };
-    let now = filetime_now();
     let mut created = vec![];
-    for group in &groups {
-        debit(db, world, me, escrow_isk).await?;
+    for group in groups {
+        debit(db, outbox, me, escrow_isk).await?;
         let id: i64 = db
             .query_one(
                 "INSERT INTO game.contracts (type, issuer_id, issuer_corp_id, assignee_id, start_station_id, end_station_id, price, reward,
@@ -518,8 +530,8 @@ async fn create(c: &Client, info: &Value) -> CallResult {
                     &me,
                     &corp,
                     &assignee,
-                    &start.id,
-                    &end.map(|s| s.id).unwrap_or(0),
+                    &start_id,
+                    &end_id,
                     &price,
                     &reward,
                     &collateral,
@@ -536,10 +548,10 @@ async fn create(c: &Client, info: &Value) -> CallResult {
             .get(0);
         for (item_id, qty) in group {
             if let Some(item) = loaded.remove(item_id) {
-                escrow_item(db, world, item, *qty as i32, id).await?;
+                escrow_item(db, outbox, item, *qty as i32, id).await?;
             }
         }
-        for (type_id, qty) in &requested {
+        for (type_id, qty) in requested {
             db
                 .execute(
                     "INSERT INTO game.contract_items (contract_id, type_id, quantity, in_crate) VALUES ($1, $2, $3, false)",
@@ -557,11 +569,18 @@ async fn create(c: &Client, info: &Value) -> CallResult {
             )
             .await
             .map_err(db_err)?;
-        info!("contracts: {me} created contract {id} (type {kind}) at {}", start.id);
-        tell(world, if assignee == corp { 0 } else { assignee }, "OnContractAssigned", id);
+        tell(outbox, if assignee == corp { 0 } else { assignee }, "OnContractAssigned", id);
         created.push(Value::Int(id));
     }
-    world.notify_pilot(me, "OnContractCreated", vec![]);
+    outbox.notify_pilot(me, "OnContractCreated", vec![]);
+    Ok(created)
+            })
+        },
+        |value, outbox| async move { dispatch_world(value, outbox, world) },
+    ).await?;
+    for id in &created {
+        info!("contracts: {me} created contract {id:?} (type {kind}) at {start_id}");
+    }
     Ok(Value::List(created))
 }
 
@@ -571,90 +590,97 @@ async fn accept(c: &Client, id: i64) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
     let corp = c.session.int("corpid").unwrap_or(0);
     let _trading = lock().await;
-    let mut k = contract(db, id).await?;
     let now = filetime_now();
-    if k.status != STATUS_OUTSTANDING || k.expired(now) {
-        return Err(user_error("ConContractNotOutstanding", vec![]));
-    }
-    if k.issuer == me {
-        return Err(notify_error("你不能接受自己的合同。"));
-    }
-    if !k.available_to(me, corp) {
-        return Err(notify_error("该合同已指定给其他人。"));
-    }
-    match k.kind {
-        TYPE_ITEM_EXCHANGE => {
-            // The requested items must all be in the acceptor's hangar at the start station.
-            let wanted = db
-                .query("SELECT type_id, quantity FROM game.contract_items WHERE contract_id = $1 AND NOT in_crate", &[&id])
-                .await
-                .map_err(db_err)?;
-            let mut takes = vec![];
-            for w in &wanted {
-                let (type_id, qty): (i32, i32) = (w.get(0), w.get(1));
-                let stacks = load_items_db(
-                    db,
-                    "i.owner_id = $1 AND i.location_id = $2 AND i.flag_id = $3 AND i.type_id = $4 ORDER BY i.quantity DESC, i.item_id",
-                    &[&me, &k.start, &FLAG_HANGAR, &type_id],
-                )
-                .await?;
-                let have: i64 = stacks.iter().map(|s| if s.singleton { 1 } else { s.quantity as i64 }).sum();
-                if have < qty as i64 {
-                    return Err(notify_error("你在合同所在空间站的物品机库中没有全部所需物品。"));
-                }
-                takes.push((type_id, qty, stacks));
+    db.transaction(
+        |db, outbox: &mut Outbox| Box::pin(async move {
+            let mut k = contract(db, id).await?;
+            if k.status != STATUS_OUTSTANDING || k.expired(now) {
+                return Err(user_error("ConContractNotOutstanding", vec![]));
             }
-            debit(db, world, me, k.price).await?;
-            for (type_id, qty, stacks) in takes {
-                let mut left = qty;
-                for s in stacks {
-                    if left == 0 {
-                        break;
+            if k.issuer == me {
+                return Err(notify_error("你不能接受自己的合同。"));
+            }
+            if !k.available_to(me, corp) {
+                return Err(notify_error("该合同已指定给其他人。"));
+            }
+            match k.kind {
+                TYPE_ITEM_EXCHANGE => {
+                    // The requested items must all be in the acceptor's hangar at the start station.
+                    let wanted = db
+                        .query("SELECT type_id, quantity FROM game.contract_items WHERE contract_id = $1 AND NOT in_crate", &[&id])
+                        .await
+                        .map_err(db_err)?;
+                    let mut takes = vec![];
+                    for w in &wanted {
+                        let (type_id, qty): (i32, i32) = (w.get(0), w.get(1));
+                        let stacks = load_items_db(
+                            db,
+                            "i.owner_id = $1 AND i.location_id = $2 AND i.flag_id = $3 AND i.type_id = $4 ORDER BY i.quantity DESC, i.item_id",
+                            &[&me, &k.start, &FLAG_HANGAR, &type_id],
+                        )
+                        .await?;
+                        let have: i64 = stacks.iter().map(|s| if s.singleton { 1 } else { s.quantity as i64 }).sum();
+                        if have < qty as i64 {
+                            return Err(notify_error("你在合同所在空间站的物品机库中没有全部所需物品。"));
+                        }
+                        takes.push((type_id, qty, stacks));
                     }
-                    let n = if s.singleton { 1 } else { s.quantity.min(left) };
-                    take_items(db, world, s, n).await?;
-                    left -= n;
+                    debit(db, outbox, me, k.price).await?;
+                    for (type_id, qty, stacks) in takes {
+                        let mut left = qty;
+                        for s in stacks {
+                            if left == 0 {
+                                break;
+                            }
+                            let n = if s.singleton { 1 } else { s.quantity.min(left) };
+                            take_items(db, outbox, s, n).await?;
+                            left -= n;
+                        }
+                        deliver(db, outbox, k.issuer, k.start, type_id, qty).await?;
+                    }
+                    credit(db, outbox, k.issuer, k.price).await?;
+                    credit(db, outbox, me, k.reward).await?;
+                    hand_over(db, outbox, id, me, k.start, FLAG_HANGAR).await?;
+                    k.acceptor = me;
+                    k.accepted = now;
+                    db.execute("UPDATE game.contracts SET date_accepted = $2 WHERE contract_id = $1", &[&id, &now]).await.map_err(db_err)?;
+                    set_status(db, &mut k, STATUS_FINISHED, now).await?;
+                    tell(outbox, k.issuer, "OnContractCompleted", id);
                 }
-                deliver(db, world, k.issuer, k.start, type_id, qty).await?;
+                TYPE_COURIER => {
+                    debit(db, outbox, me, k.collateral).await?;
+                    let wrap: i64 = db
+                        .query_one(
+                            "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton, custom_info)
+                             VALUES ($1, $2, $3, $4, 1, true, $5) RETURNING item_id",
+                            &[&TYPE_PLASTIC_WRAP, &me, &k.start, &FLAG_HANGAR, &format!("contract {id}")],
+                        )
+                        .await
+                        .map_err(db_err)?
+                        .get(0);
+                    show_items(db, outbox, me, k.start, &[wrap], LOCATION_JUNKYARD).await?;
+                    k.acceptor = me;
+                    k.accepted = now;
+                    k.status = STATUS_IN_PROGRESS;
+                    k.package = Some(wrap);
+                    db
+                        .execute(
+                            "UPDATE game.contracts SET acceptor_id = $2, date_accepted = $3, status = $4, package_id = $5 WHERE contract_id = $1",
+                            &[&id, &me, &now, &STATUS_IN_PROGRESS, &wrap],
+                        )
+                        .await
+                        .map_err(db_err)?;
+                    tell(outbox, k.issuer, "OnContractAccepted", id);
+                }
+                _ => return Err(notify_error("拍卖只能出价竞拍。")),
             }
-            credit(db, world, k.issuer, k.price).await?;
-            credit(db, world, me, k.reward).await?;
-            hand_over(db, world, id, me, k.start, FLAG_HANGAR).await?;
-            k.acceptor = me;
-            k.accepted = now;
-            db.execute("UPDATE game.contracts SET date_accepted = $2 WHERE contract_id = $1", &[&id, &now]).await.map_err(db_err)?;
-            set_status(db, &mut k, STATUS_FINISHED).await?;
-            tell(world, k.issuer, "OnContractCompleted", id);
-        }
-        TYPE_COURIER => {
-            debit(db, world, me, k.collateral).await?;
-            let wrap: i64 = db
-                .query_one(
-                    "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton, custom_info)
-                     VALUES ($1, $2, $3, $4, 1, true, $5) RETURNING item_id",
-                    &[&TYPE_PLASTIC_WRAP, &me, &k.start, &FLAG_HANGAR, &format!("contract {id}")],
-                )
-                .await
-                .map_err(db_err)?
-                .get(0);
-            show_items(db, world, me, k.start, &[wrap], LOCATION_JUNKYARD).await?;
-            k.acceptor = me;
-            k.accepted = now;
-            k.status = STATUS_IN_PROGRESS;
-            k.package = Some(wrap);
-            db
-                .execute(
-                    "UPDATE game.contracts SET acceptor_id = $2, date_accepted = $3, status = $4, package_id = $5 WHERE contract_id = $1",
-                    &[&id, &me, &now, &STATUS_IN_PROGRESS, &wrap],
-                )
-                .await
-                .map_err(db_err)?;
-            tell(world, k.issuer, "OnContractAccepted", id);
-        }
-        _ => return Err(notify_error("拍卖只能出价竞拍。")),
-    }
-    info!("contracts: {me} accepted contract {id}");
-    Ok(k.keyval())
+            Ok(k.keyval())
+        }),
+        |value, outbox| async move { dispatch_world(value, outbox, world) },
+    ).await.map(|value| {
+        info!("contracts: {me} accepted contract {id}");
+        value
+    })
 }
 
 /// `CompleteContract(contractID, status)`: deliver a courier package (finished), give one up
@@ -664,73 +690,87 @@ async fn complete(c: &Client, id: i64, status: i32) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
     let corp = c.session.int("corpid").unwrap_or(0);
     let _trading = lock().await;
-    let mut k = contract(db, id).await?;
     let now = filetime_now();
-    match status {
-        STATUS_FINISHED => {
-            if k.kind != TYPE_COURIER || k.status != STATUS_IN_PROGRESS || k.acceptor != me {
-                return Err(notify_error("只有承运人才能交付这份合同。"));
-            }
-            let wrap = match k.package {
-                Some(w) => load_items_db(db, "i.item_id = $1", &[&w]).await?.pop(),
-                None => None,
-            };
-            let Some(wrap) = wrap.filter(|w| w.owner_id == me && w.location_id == k.end) else {
-                return Err(notify_error("包裹必须位于目的地空间站的机库中。"));
-            };
-            take_items(db, world, wrap, 1).await?;
-            hand_over(db, world, id, k.issuer, k.end, FLAG_HANGAR).await?;
-            credit(db, world, me, round2(k.reward + k.collateral)).await?;
-            set_status(db, &mut k, STATUS_FINISHED).await?;
-            tell(world, k.issuer, "OnContractCompleted", id);
-        }
-        STATUS_FAILED => {
-            if k.kind != TYPE_COURIER || k.status != STATUS_IN_PROGRESS || !(k.acceptor == me || (k.issuer == me && k.overdue(now))) {
-                return Err(notify_error("现在无法将这份合同判定为失败。"));
-            }
-            credit(db, world, k.issuer, round2(k.collateral + k.reward)).await?;
-            let wrap = match k.package {
-                Some(w) => load_items_db(db, "i.item_id = $1", &[&w]).await?.pop(),
-                None => None,
-            };
-            match wrap {
-                Some(w) => {
-                    let (location, flag) = (w.location_id, w.flag_id);
-                    take_items(db, world, w, 1).await?;
-                    hand_over(db, world, id, k.acceptor, location, flag).await?;
+    db.transaction(
+        |db, outbox: &mut Outbox| Box::pin(async move {
+            let mut k = contract(db, id).await?;
+            match status {
+                STATUS_FINISHED => {
+                    if k.kind != TYPE_COURIER || k.status != STATUS_IN_PROGRESS || k.acceptor != me {
+                        return Err(notify_error("只有承运人才能交付这份合同。"));
+                    }
+                    let wrap = match k.package {
+                        Some(w) => load_items_db(db, "i.item_id = $1", &[&w]).await?.pop(),
+                        None => None,
+                    };
+                    let Some(wrap) = wrap.filter(|w| w.owner_id == me && w.location_id == k.end) else {
+                        return Err(notify_error("包裹必须位于目的地空间站的机库中。"));
+                    };
+                    take_items(db, outbox, wrap, 1).await?;
+                    hand_over(db, outbox, id, k.issuer, k.end, FLAG_HANGAR).await?;
+                    credit(db, outbox, me, round2(k.reward + k.collateral)).await?;
+                    set_status(db, &mut k, STATUS_FINISHED, now).await?;
+                    tell(outbox, k.issuer, "OnContractCompleted", id);
                 }
-                None => destroy_escrow(db, id).await?,
+                STATUS_FAILED => {
+                    if k.kind != TYPE_COURIER || k.status != STATUS_IN_PROGRESS || !(k.acceptor == me || (k.issuer == me && k.overdue(now))) {
+                        return Err(notify_error("现在无法将这份合同判定为失败。"));
+                    }
+                    credit(db, outbox, k.issuer, round2(k.collateral + k.reward)).await?;
+                    let wrap = match k.package {
+                        Some(w) => load_items_db(db, "i.item_id = $1", &[&w]).await?.pop(),
+                        None => None,
+                    };
+                    match wrap {
+                        Some(w) => {
+                            let (location, flag) = (w.location_id, w.flag_id);
+                            take_items(db, outbox, w, 1).await?;
+                            hand_over(db, outbox, id, k.acceptor, location, flag).await?;
+                        }
+                        None => destroy_escrow(db, id).await?,
+                    }
+                    set_status(db, &mut k, STATUS_FAILED, now).await?;
+                    tell(outbox, if me == k.issuer { k.acceptor } else { k.issuer }, "OnContractFailed", id);
+                }
+                STATUS_REJECTED => {
+                    if k.status != STATUS_OUTSTANDING || k.assignee == 0 || !(k.assignee == me || k.assignee == corp) {
+                        return Err(notify_error("只有合同的指定对象才能拒绝合同。"));
+                    }
+                    set_status(db, &mut k, STATUS_REJECTED, now).await?;
+                    tell(outbox, k.issuer, "OnContractRejected", id);
+                }
+                _ => return Err(notify_error("合同不能被设置为该状态。")),
             }
-            set_status(db, &mut k, STATUS_FAILED).await?;
-            tell(world, if me == k.issuer { k.acceptor } else { k.issuer }, "OnContractFailed", id);
-        }
-        STATUS_REJECTED => {
-            if k.status != STATUS_OUTSTANDING || k.assignee == 0 || !(k.assignee == me || k.assignee == corp) {
-                return Err(notify_error("只有合同的指定对象才能拒绝合同。"));
-            }
-            set_status(db, &mut k, STATUS_REJECTED).await?;
-            tell(world, k.issuer, "OnContractRejected", id);
-        }
-        _ => return Err(notify_error("合同不能被设置为该状态。")),
-    }
-    info!("contracts: {me} set contract {id} to status {status}");
-    Ok(Value::Bool(true))
+            Ok(Value::Bool(true))
+        }),
+        |value, outbox| async move { dispatch_world(value, outbox, world) },
+    ).await.map(|value| {
+        info!("contracts: {me} set contract {id} to status {status}");
+        value
+    })
 }
 
 /// The issuer takes an outstanding (or expired, or rejected) contract back with its escrow.
 async fn delete_one(db: &Db, world: &World, me: i64, id: i64) -> Result<(), CallError> {
-    let mut k = contract(db, id).await?;
-    if k.issuer != me || !(k.status == STATUS_OUTSTANDING || k.status == STATUS_REJECTED) {
-        return Err(notify_error("只有发布者才能删除未完成的合同。"));
-    }
-    if k.kind == TYPE_AUCTION && top_bid(db, id).await?.is_some() {
-        return Err(notify_error("已有出价的拍卖不能删除。"));
-    }
-    hand_over(db, world, id, me, k.start, FLAG_HANGAR).await?;
-    if k.kind != TYPE_AUCTION {
-        credit(db, world, me, k.reward).await?;
-    }
-    set_status(db, &mut k, STATUS_DELETED).await?;
+    let now = filetime_now();
+    db.transaction(
+        |db, outbox: &mut Outbox| Box::pin(async move {
+            let mut k = contract(db, id).await?;
+            if k.issuer != me || !(k.status == STATUS_OUTSTANDING || k.status == STATUS_REJECTED) {
+                return Err(notify_error("只有发布者才能删除未完成的合同。"));
+            }
+            if k.kind == TYPE_AUCTION && top_bid(db, id).await?.is_some() {
+                return Err(notify_error("已有出价的拍卖不能删除。"));
+            }
+            hand_over(db, outbox, id, me, k.start, FLAG_HANGAR).await?;
+            if k.kind != TYPE_AUCTION {
+                credit(db, outbox, me, k.reward).await?;
+            }
+            set_status(db, &mut k, STATUS_DELETED, now).await?;
+            Ok(())
+        }),
+        |value, outbox| async move { dispatch_world(value, outbox, world) },
+    ).await?;
     info!("contracts: {me} deleted contract {id}");
     Ok(())
 }
@@ -738,11 +778,14 @@ async fn delete_one(db: &Db, world: &World, me: i64, id: i64) -> Result<(), Call
 /// `PlaceBid(contractID, amount, forCorp)`; a bid at the buyout wins at once.
 async fn place_bid(c: &Client, id: i64, amount: f64) -> CallResult {
     let (db, world) = (&c.db, &*c.world);
+    let amount = round2(amount);
     let me = c.session.int("charid").unwrap_or(0);
     let corp = c.session.int("corpid").unwrap_or(0);
     let _trading = lock().await;
-    let mut k = contract(db, id).await?;
     let now = filetime_now();
+    let (amount, buyout) = db.transaction(
+        |db, outbox: &mut Outbox| Box::pin(async move {
+    let mut k = contract(db, id).await?;
     if k.kind != TYPE_AUCTION || k.status != STATUS_OUTSTANDING || k.expired(now) {
         return Err(user_error("ConContractNotOutstanding", vec![]));
     }
@@ -752,7 +795,7 @@ async fn place_bid(c: &Client, id: i64, amount: f64) -> CallResult {
     if !k.available_to(me, corp) {
         return Err(notify_error("该拍卖已指定给其他人。"));
     }
-    let mut amount = round2(amount);
+    let mut amount = amount;
     let top = top_bid(db, id).await?;
     if !amount.is_finite() || amount < k.price || top.is_some_and(|(_, best)| amount <= best) {
         return Err(notify_error("你的出价必须高于当前出价和起拍价。"));
@@ -761,32 +804,38 @@ async fn place_bid(c: &Client, id: i64, amount: f64) -> CallResult {
     if buyout {
         amount = k.collateral;
     }
-    debit(db, world, me, amount).await?;
+    debit(db, outbox, me, amount).await?;
     if let Some((bidder, best)) = top {
-        credit(db, world, bidder, best).await?;
-        tell(world, bidder, "OnContractOutbid", id);
+        credit(db, outbox, bidder, best).await?;
+        tell(outbox, bidder, "OnContractOutbid", id);
     }
     db
         .execute("INSERT INTO game.contract_bids (contract_id, bidder_id, amount, date) VALUES ($1, $2, $3, $4)", &[&id, &me, &amount, &now])
         .await
         .map_err(db_err)?;
+    if buyout {
+        settle(db, outbox, &mut k, me, amount, now).await?;
+        tell(outbox, k.issuer, "OnContractBuyout", id);
+    }
+    Ok((amount, buyout))
+        }),
+        |value, outbox| async move { dispatch_world(value, outbox, world) },
+    ).await?;
     info!("contracts: {me} bid {amount} ISK on auction {id}");
     if buyout {
-        settle(db, world, &mut k, me, amount).await?;
-        tell(world, k.issuer, "OnContractBuyout", id);
+        info!("contracts: auction {id} went to {me} for {amount} ISK");
     }
     Ok(Value::Bool(true))
 }
 
 /// An auction won: the items go to the winner at the start station, the bid to the issuer.
-async fn settle(db: &Db, world: &World, k: &mut Contract, winner: i64, amount: f64) -> Result<(), CallError> {
-    hand_over(db, world, k.id, winner, k.start, FLAG_HANGAR).await?;
-    credit(db, world, k.issuer, amount).await?;
+async fn settle<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, k: &mut Contract, winner: i64, amount: f64, now: i64) -> Result<(), CallError> {
+    hand_over(db, outbox, k.id, winner, k.start, FLAG_HANGAR).await?;
+    credit(db, outbox, k.issuer, amount).await?;
     k.acceptor = winner;
-    set_status(db, k, STATUS_FINISHED).await?;
-    tell(world, k.issuer, "OnContractCompleted", k.id);
-    tell(world, winner, "OnContractCompleted", k.id);
-    info!("contracts: auction {} went to {winner} for {amount} ISK", k.id);
+    set_status(db, k, STATUS_FINISHED, now).await?;
+    tell(outbox, k.issuer, "OnContractCompleted", k.id);
+    tell(outbox, winner, "OnContractCompleted", k.id);
     Ok(())
 }
 
@@ -802,15 +851,29 @@ pub async fn settle_auctions(db: Db, world: Arc<World>) {
 
 async fn settle_expired(db: &Db, world: &World) -> Result<(), CallError> {
     let _trading = lock().await;
+    let now = filetime_now();
     let expired = contracts(
         db,
         "c.type = $1 AND c.status = $2 AND c.date_expired <= $3 AND EXISTS (SELECT 1 FROM game.contract_bids b WHERE b.contract_id = c.contract_id)",
-        &[&TYPE_AUCTION, &STATUS_OUTSTANDING, &filetime_now()],
+        &[&TYPE_AUCTION, &STATUS_OUTSTANDING, &now],
     )
     .await?;
-    for mut k in expired {
-        if let Some((winner, amount)) = top_bid(db, k.id).await? {
-            settle(db, world, &mut k, winner, amount).await?;
+    for k in expired {
+        let id = k.id;
+        let settled = db.transaction(
+            |db, outbox: &mut Outbox| Box::pin(async move {
+                let mut k = contract(db, id).await?;
+                if let Some((winner, amount)) = top_bid(db, id).await? {
+                    settle(db, outbox, &mut k, winner, amount, now).await?;
+                    Ok(Some((winner, amount)))
+                } else {
+                    Ok(None)
+                }
+            }),
+            |value, outbox| async move { dispatch_world(value, outbox, world) },
+        ).await?;
+        if let Some((winner, amount)) = settled {
+            info!("contracts: auction {id} went to {winner} for {amount} ISK");
         }
     }
     Ok(())
@@ -1057,22 +1120,22 @@ async fn split_stack(c: &Client, station_id: i64, item_id: i64, quantity: i64) -
     let (db, world) = (&c.db, &*c.world);
     let me = c.session.int("charid").unwrap_or(0);
     let _trading = lock().await;
-    let item = load_items_db(db, "i.item_id = $1", &[&item_id]).await?.pop().ok_or_else(|| notify_error("该物品已不在原处。"))?;
-    if item.owner_id != me || item.location_id != station_id || item.singleton || quantity < 1 || quantity >= item.quantity as i64 {
-        return Err(notify_error("无法这样拆分该堆叠。"));
-    }
-    let (type_id, flag, quantity) = (item.type_id, item.flag_id, quantity as i32);
-    take_items(db, world, item, quantity).await?;
-    let id: i64 = db
-        .query_one(
-            "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity) VALUES ($1, $2, $3, $4, $5) RETURNING item_id",
-            &[&type_id, &me, &station_id, &flag, &quantity],
-        )
-        .await
-        .map_err(db_err)?
-        .get(0);
-    show_items(db, world, me, station_id, &[id], LOCATION_JUNKYARD).await?;
-    Ok(Value::Int(id))
+    db.transaction(
+        |db, outbox: &mut Outbox| Box::pin(async move {
+            let item = load_items_db(db, "i.item_id = $1", &[&item_id]).await?.pop().ok_or_else(|| notify_error("该物品已不在原处。"))?;
+            if item.owner_id != me || item.location_id != station_id || item.singleton || quantity < 1 || quantity >= item.quantity as i64 {
+                return Err(notify_error("无法这样拆分该堆叠。"));
+            }
+            let quantity = quantity as i32;
+            let id = super::inventory::split_stack(db, &item, quantity, me, station_id, item.flag_id, false).await?;
+            let old_quantity = item.quantity;
+            let left = Item { quantity: old_quantity - quantity, ..item };
+            outbox.notify_pilot(me, "OnItemChange", vec![left.row(), Value::Dict(vec![(Value::Int(IX_STACK_SIZE), Value::Int(old_quantity as i64))]), Value::None]);
+            show_items(db, outbox, me, station_id, &[id], LOCATION_JUNKYARD).await?;
+            Ok(Value::Int(id))
+        }),
+        |value, outbox| async move { dispatch_world(value, outbox, world) },
+    ).await
 }
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {

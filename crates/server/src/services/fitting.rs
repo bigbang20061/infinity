@@ -10,6 +10,7 @@ use super::inventory::notify_item_change;
 use super::{db_err, keyval, user_error, value_field, value_id_list, value_ids, Call, CallError, CallResult};
 use crate::client::Client;
 use crate::consts::{BLUEPRINT_INFINITE_RUNS, CATEGORY_SHIP, FLAG_HANGAR, INDUSTRY_JOB_STATUS_INSTALLED, IX_LOCATION_ID, IX_SINGLETON, IX_STACK_SIZE};
+use crate::db::outbox::{dispatch_client, Outbox};
 use marshal::Value;
 use tracing::info;
 
@@ -45,6 +46,7 @@ async fn assemble(c: &mut Client, call: &Call<'_>) -> CallResult {
     let ids = value_ids(call.args.first());
     let name = call.kwargs.get("name").and_then(|v| v.as_text()).map(|t| t.into_owned());
     let mut assembled = vec![];
+    let mut outbox = Outbox::default();
     for id in ids {
         let Some(item) = load_items(c, "i.item_id = $1 AND i.owner_id = $2", &[&id, &char_id]).await?.into_iter().next() else { continue };
         if item.category_id != CATEGORY_SHIP as i64 || item.singleton {
@@ -53,7 +55,8 @@ async fn assemble(c: &mut Client, call: &Call<'_>) -> CallResult {
         // One hull off a stack becomes the ship; the rest stays packaged.
         let ship_id = if item.quantity > 1 {
             c.db.execute("UPDATE game.items SET quantity = quantity - 1 WHERE item_id = $1", &[&id]).await.map_err(db_err)?;
-            notify_item_change(c, id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
+            notify_item_change(&c.db, &mut outbox, id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
+            dispatch_client((), std::mem::take(&mut outbox), c)?;
             let new_id: i64 = c
                 .db
                 .query_one(
@@ -64,14 +67,16 @@ async fn assemble(c: &mut Client, call: &Call<'_>) -> CallResult {
                 .await
                 .map_err(db_err)?
                 .get(0);
-            notify_item_change(c, new_id, vec![(IX_LOCATION_ID, Value::Int(0))]).await?;
+            notify_item_change(&c.db, &mut outbox, new_id, vec![(IX_LOCATION_ID, Value::Int(0))]).await?;
+            dispatch_client((), std::mem::take(&mut outbox), c)?;
             new_id
         } else {
             c.db
                 .execute("UPDATE game.items SET singleton = true, name = COALESCE($2, name) WHERE item_id = $1", &[&id, &name])
                 .await
                 .map_err(db_err)?;
-            notify_item_change(c, id, vec![(IX_SINGLETON, Value::Bool(false))]).await?;
+            notify_item_change(&c.db, &mut outbox, id, vec![(IX_SINGLETON, Value::Bool(false))]).await?;
+            dispatch_client((), std::mem::take(&mut outbox), c)?;
             id
         };
         assembled.push(ship_id);
@@ -85,6 +90,7 @@ async fn assemble(c: &mut Client, call: &Call<'_>) -> CallResult {
 /// RepackageItems({stationID: [(itemID, locationID)]}, destroyable=): unassemble ships and modules.
 async fn repackage(c: &mut Client, call: &Call<'_>) -> CallResult {
     let char_id = c.session.int("charid").unwrap_or(0);
+    let mut outbox = Outbox::default();
     let mut ids = vec![];
     if let Some(Value::Dict(by_station)) = call.args.first() {
         for (_, items) in by_station {
@@ -118,7 +124,8 @@ async fn repackage(c: &mut Client, call: &Call<'_>) -> CallResult {
             .execute("UPDATE game.items SET singleton = false, online = false, name = NULL WHERE item_id = $1", &[&id])
             .await
             .map_err(db_err)?;
-        notify_item_change(c, id, vec![(IX_SINGLETON, Value::Bool(true))]).await?;
+        notify_item_change(&c.db, &mut outbox, id, vec![(IX_SINGLETON, Value::Bool(true))]).await?;
+        dispatch_client((), std::mem::take(&mut outbox), c)?;
     }
     Ok(Value::None)
 }

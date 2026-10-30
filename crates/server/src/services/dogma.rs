@@ -32,6 +32,7 @@ pub(super) fn wire_quantity(singleton: bool, quantity: i64) -> i64 {
 }
 
 /// An inventory item as the client's item DBRow expects it.
+#[derive(Clone)]
 pub struct Item {
     pub item_id: i64,
     pub type_id: i32,
@@ -68,7 +69,7 @@ pub async fn load_items(c: &Client, where_sql: &str, params: &[&(dyn tokio_postg
 }
 
 /// load_items for tasks without a client.
-pub async fn load_items_db(db: &crate::db::Db, where_sql: &str, params: &[&(dyn tokio_postgres::types::ToSql + Sync)]) -> Result<Vec<Item>, CallError> {
+pub async fn load_items_db(db: &(impl crate::db::executor::Executor + ?Sized), where_sql: &str, params: &[&(dyn tokio_postgres::types::ToSql + Sync)]) -> Result<Vec<Item>, CallError> {
     let rows = db
         .query(
             &format!(

@@ -30,6 +30,8 @@ use super::{db_err, rand01, user_error, value_id_list, Call, CallError, CallResu
 use crate::client::{filetime_now, filetime_ticks_from_ms, Client};
 use crate::consts::{ACCOUNT_CASH, ATTR_ARMOR_DAMAGE, ATTR_CAPACITOR_CAPACITY, ATTR_CAPACITY, ATTR_CHARGE, ATTR_EXPLOSION_DELAY, ATTR_HULL_DAMAGE, ATTR_IS_ONLINE, ATTR_MASS, ATTR_MAX_RANGE, ATTR_MAX_VELOCITY, ATTR_QUANTITY, ATTR_SHIELD_CAPACITY, ATTR_SHIELD_CHARGE, ATTR_SIGNATURE_RADIUS, ATTR_STRUCTURE_HP, CATEGORY_CHARGE, DAMAGE_TYPE_COUNT, EFFECT_AFTERBURNER, EFFECT_MICROWARPDRIVE, EFFECT_ONLINE, FILETIME_SECOND, FLAG_CARGO, FLAG_HANGAR, IX_FLAG, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD};
 use crate::db::Db;
+use crate::db::executor::Executor;
+use crate::db::outbox::{Outbox, dispatch_client, dispatch_world};
 use crate::space::{dist, event, lock_time_ms, metres_to_km, ms_to_seconds, seconds_to_ms, now_ms, now_tick, Ball, NotifyTx, NpcAction, NpcBrain, NpcConfig, NpcEffects, NpcFuture, System, World, MODE_MISSILE, MODE_WARP};
 use marshal::Value;
 use std::collections::{HashMap, HashSet};
@@ -352,7 +354,7 @@ pub async fn flag_quantities(c: &Client, ship: i64) -> Result<(Value, Vec<Value>
     Ok((cache, keys))
 }
 
-async fn loaded(db: &Db, ship: i64, flag: i32) -> Result<Option<(i32, i32)>, CallError> {
+async fn loaded(db: &(impl Executor + ?Sized), ship: i64, flag: i32) -> Result<Option<(i32, i32)>, CallError> {
     Ok(db
         .query_opt("SELECT type_id, quantity FROM game.module_charges WHERE ship_id = $1 AND flag_id = $2", &[&ship, &flag])
         .await
@@ -361,18 +363,17 @@ async fn loaded(db: &Db, ship: i64, flag: i32) -> Result<Option<(i32, i32)>, Cal
 }
 
 /// Tell the client a stack is gone, then delete it.
-pub(super) async fn remove_stack(c: &mut Client, item: super::dogma::Item) -> Result<(), CallError> {
-    c.db.execute("DELETE FROM game.items WHERE item_id = $1", &[&item.item_id]).await.map_err(db_err)?;
+pub(super) async fn remove_stack<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, item: super::dogma::Item) -> Result<(), CallError> {
+    db.execute("DELETE FROM game.items WHERE item_id = $1", &[&item.item_id]).await.map_err(db_err)?;
     let old = item.location_id;
     let gone = super::dogma::Item { location_id: LOCATION_JUNKYARD, ..item };
-    c.notify("OnItemChange", vec![gone.row(), Value::Dict(vec![(Value::Int(IX_LOCATION_ID), Value::Int(old))]), Value::None]);
+    outbox.notify_client("OnItemChange", vec![gone.row(), Value::Dict(vec![(Value::Int(IX_LOCATION_ID), Value::Int(old))]), Value::None]);
     Ok(())
 }
 
 /// Put `quantity` x `type_id` into `location`/`flag`, onto an existing stack if there is one.
-pub(super) async fn deposit(c: &mut Client, owner: i64, location: i64, flag: i32, type_id: i32, quantity: i32, from: i64) -> Result<(), CallError> {
-    let stack = c
-        .db
+pub(super) async fn deposit<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, owner: i64, location: i64, flag: i32, type_id: i32, quantity: i32, from: i64) -> Result<(), CallError> {
+    let stack = db
         .query_opt(
             "SELECT item_id, quantity FROM game.items WHERE location_id = $1 AND flag_id = $2 AND type_id = $3 AND owner_id = $4 AND NOT singleton LIMIT 1",
             &[&location, &flag, &type_id, &owner],
@@ -382,12 +383,11 @@ pub(super) async fn deposit(c: &mut Client, owner: i64, location: i64, flag: i32
     match stack {
         Some(r) => {
             let (id, old): (i64, i32) = (r.get(0), r.get(1));
-            c.db.execute("UPDATE game.items SET quantity = quantity + $2 WHERE item_id = $1", &[&id, &quantity]).await.map_err(db_err)?;
-            notify_item_change(c, id, vec![(IX_STACK_SIZE, Value::Int(old as i64))]).await
+            db.execute("UPDATE game.items SET quantity = quantity + $2 WHERE item_id = $1", &[&id, &quantity]).await.map_err(db_err)?;
+            notify_item_change(db, outbox, id, vec![(IX_STACK_SIZE, Value::Int(old as i64))]).await
         }
         None => {
-            let id: i64 = c
-                .db
+            let id: i64 = db
                 .query_one(
                     "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity) VALUES ($1, $2, $3, $4, $5) RETURNING item_id",
                     &[&type_id, &owner, &location, &flag, &quantity],
@@ -395,24 +395,23 @@ pub(super) async fn deposit(c: &mut Client, owner: i64, location: i64, flag: i32
                 .await
                 .map_err(db_err)?
                 .get(0);
-            notify_item_change(c, id, vec![(IX_LOCATION_ID, Value::Int(from)), (IX_FLAG, Value::Int(flag as i64))]).await
+            notify_item_change(db, outbox, id, vec![(IX_LOCATION_ID, Value::Int(from)), (IX_FLAG, Value::Int(flag as i64))]).await
         }
     }
 }
 
 /// Modules of a weapon group, master first.
-async fn bank(db: &Db, ship: i64, master: i64) -> Result<Vec<i64>, CallError> {
+async fn bank(db: &(impl Executor + ?Sized), ship: i64, master: i64) -> Result<Vec<i64>, CallError> {
     let rows = db.query("SELECT slave_id FROM game.weapon_banks WHERE ship_id = $1 AND master_id = $2", &[&ship, &master]).await.map_err(db_err)?;
     Ok(std::iter::once(master).chain(rows.iter().map(|r| r.get(0))).collect())
 }
 
 /// Empty a module's charges into `location`/`flag` (cargo by default).
-async fn unload(c: &mut Client, ship: i64, module: &super::dogma::Item, location: i64, flag: i32) -> Result<(), CallError> {
-    let Some((type_id, qty)) = loaded(&c.db, ship, module.flag_id).await? else { return Ok(()) };
-    c.db.execute("DELETE FROM game.module_charges WHERE ship_id = $1 AND flag_id = $2", &[&ship, &module.flag_id]).await.map_err(db_err)?;
-    let owner = c.session.int("charid").unwrap_or(module.owner_id);
-    c.notify("OnModuleAttributeChanges", vec![quantity_change(owner, ship, module.flag_id, type_id, 0, qty as i64)]);
-    deposit(c, owner, location, flag, type_id, qty, ship).await
+async fn unload<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, owner: i64, ship: i64, module: &super::dogma::Item, location: i64, flag: i32) -> Result<(), CallError> {
+    let Some((type_id, qty)) = loaded(db, ship, module.flag_id).await? else { return Ok(()) };
+    db.execute("DELETE FROM game.module_charges WHERE ship_id = $1 AND flag_id = $2", &[&ship, &module.flag_id]).await.map_err(db_err)?;
+    outbox.notify_client("OnModuleAttributeChanges", vec![quantity_change(owner, ship, module.flag_id, type_id, 0, qty as i64)]);
+    deposit(db, outbox, owner, location, flag, type_id, qty, ship).await
 }
 
 // Unlike value_ids, scalar module IDs accept Bool through as_int; lists take precedence.
@@ -473,7 +472,16 @@ async fn load_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
         let have = match current {
             Some((t, q)) if t == type_id => q,
             Some(_) => {
-                unload(c, ship, &module, ship, FLAG_CARGO).await?;
+                let db = c.db.clone();
+                let unload_owner = c.session.int("charid").unwrap_or(module.owner_id);
+                let client = &mut *c;
+                db.transaction(
+                    |tx, outbox: &mut Outbox| {
+                        let module = module.clone();
+                        Box::pin(async move { unload(tx, outbox, unload_owner, ship, &module, ship, FLAG_CARGO).await })
+                    },
+                    |value, outbox| async move { dispatch_client(value, outbox, client) },
+                ).await?;
                 0
             }
             None => 0,
@@ -486,10 +494,16 @@ async fn load_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
             let take = need.min(stack.quantity);
             need -= take;
             if take == stack.quantity {
-                remove_stack(c, stack).await?;
+                let db = c.db.clone();
+                let mut outbox = Outbox::default();
+                remove_stack(&db, &mut outbox, stack).await?;
+                dispatch_client((), outbox, c)?;
             } else {
                 c.db.execute("UPDATE game.items SET quantity = quantity - $2 WHERE item_id = $1", &[&stack.item_id, &take]).await.map_err(db_err)?;
-                notify_item_change(c, stack.item_id, vec![(IX_STACK_SIZE, Value::Int(stack.quantity as i64))]).await?;
+                let db = c.db.clone();
+                let mut outbox = Outbox::default();
+                notify_item_change(&db, &mut outbox, stack.item_id, vec![(IX_STACK_SIZE, Value::Int(stack.quantity as i64))]).await?;
+                dispatch_client((), outbox, c)?;
             }
         }
         let now = max - need;
@@ -589,20 +603,30 @@ async fn unload_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
         None => (ship, None),
     };
     let flag = flag.unwrap_or(if location == ship { FLAG_CARGO } else { FLAG_HANGAR });
-    for m in modules {
-        for id in bank(&c.db, ship, m).await? {
-            if let Some(module) = load_items(c, "i.item_id = $1 AND i.location_id = $2", &[&id, &ship]).await?.into_iter().next() {
-                unload(c, ship, &module, location, flag).await?;
-            }
-        }
-    }
-    Ok(Value::None)
+    let owner = c.session.int("charid");
+    let db = c.db.clone();
+    db.transaction(
+        |tx, outbox: &mut Outbox| {
+            let modules = modules.clone();
+            Box::pin(async move {
+                for m in modules {
+                    for id in bank(tx, ship, m).await? {
+                        if let Some(module) = super::dogma::load_items_db(tx, "i.item_id = $1 AND i.location_id = $2", &[&id, &ship]).await?.into_iter().next() {
+                            unload(tx, outbox, owner.unwrap_or(module.owner_id), ship, &module, location, flag).await?;
+                        }
+                    }
+                }
+                Ok(Value::None)
+            })
+        },
+        |value, outbox| async move { dispatch_client(value, outbox, c) },
+    ).await
 }
 
 // ---------------------------------------------------------------- weapon groups
 
 /// `{masterID: [slaveIDs]}` for a ship.
-pub async fn banks(db: &Db, ship: i64) -> Result<Value, CallError> {
+pub async fn banks(db: &(impl Executor + ?Sized), ship: i64) -> Result<Value, CallError> {
     let rows = db.query("SELECT master_id, slave_id FROM game.weapon_banks WHERE ship_id = $1 ORDER BY slave_id", &[&ship]).await.map_err(db_err)?;
     let mut by_master: Vec<(i64, Vec<Value>)> = Vec::new();
     for r in rows {
@@ -615,7 +639,7 @@ pub async fn banks(db: &Db, ship: i64) -> Result<Value, CallError> {
     Ok(Value::Dict(by_master.into_iter().map(|(m, s)| (Value::Int(m), Value::List(s))).collect()))
 }
 
-async fn link(db: &Db, ship: i64, master: i64, slave: i64) -> Result<(), CallError> {
+async fn link(db: &(impl Executor + ?Sized), ship: i64, master: i64, slave: i64) -> Result<(), CallError> {
     if master == slave {
         return Ok(());
     }
@@ -635,19 +659,31 @@ async fn weapon_groups(c: &mut Client, call: &Call<'_>) -> CallResult {
     let int = |i: usize| call.args.get(i).and_then(|v| v.as_int()).unwrap_or(0);
     let ship = int(0);
     let db = c.db.clone();
-    match call.method {
+    let method = match call.method {
+        "LinkWeapons" => "LinkWeapons",
+        "MergeModuleGroups" => "MergeModuleGroups",
+        "PeelAndLink" => "PeelAndLink",
+        "LinkAllWeapons" => "LinkAllWeapons",
+        "UnlinkModule" => "UnlinkModule",
+        "UnlinkAllModules" => "UnlinkAllModules",
+        _ => "",
+    };
+    let (master, other) = (int(1), int(2));
+    let fallback_ship = if ship != 0 { ship } else { c.session.int("shipid").unwrap_or(0) };
+    db.transaction(
+        |db, _outbox: &mut Outbox| Box::pin(async move {
+    match method {
         "LinkWeapons" | "MergeModuleGroups" | "PeelAndLink" => {
-            let (master, other) = (int(1), int(2));
-            if call.method == "PeelAndLink" {
+            if method == "PeelAndLink" {
                 db.execute("DELETE FROM game.weapon_banks WHERE ship_id = $1 AND slave_id = $2", &[&ship, &other]).await.map_err(db_err)?;
                 db
                     .execute("INSERT INTO game.weapon_banks (ship_id, master_id, slave_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING", &[&ship, &master, &other])
                     .await
                     .map_err(db_err)?;
             } else {
-                link(&db, ship, master, other).await?;
+                link(db, ship, master, other).await?;
             }
-            banks(&db, ship).await
+            banks(db, ship).await
         }
         // Group every online high-slot module with the others of its type.
         "LinkAllWeapons" => {
@@ -663,17 +699,16 @@ async fn weapon_groups(c: &mut Client, call: &Call<'_>) -> CallResult {
             for r in rows {
                 let (id, type_id): (i64, i32) = (r.get(0), r.get(1));
                 match masters.get(&type_id) {
-                    Some(&m) => link(&db, ship, m, id).await?,
+                    Some(&m) => link(db, ship, m, id).await?,
                     None => {
                         masters.insert(type_id, id);
                     }
                 }
             }
-            banks(&db, ship).await
+            banks(db, ship).await
         }
         // Takes the last module off a group; returns it.
         "UnlinkModule" => {
-            let master = int(1);
             let slave: Option<i64> = db
                 .query_opt(
                     "DELETE FROM game.weapon_banks WHERE slave_id = (SELECT max(slave_id) FROM game.weapon_banks WHERE ship_id = $1 AND master_id = $2) RETURNING slave_id",
@@ -688,8 +723,11 @@ async fn weapon_groups(c: &mut Client, call: &Call<'_>) -> CallResult {
             db.execute("DELETE FROM game.weapon_banks WHERE ship_id = $1", &[&ship]).await.map_err(db_err)?;
             Ok(Value::None)
         }
-        _ => banks(&db, if ship != 0 { ship } else { c.session.int("shipid").unwrap_or(0) }).await,
+        _ => banks(db, fallback_ship).await,
     }
+        }),
+        |value, outbox| async move { dispatch_client(value, outbox, c) },
+    ).await
 }
 
 // ---------------------------------------------------------------- capacitor and hit points
@@ -963,7 +1001,9 @@ async fn reward_kill(db: &Db, world: &World, system: i64, npc: &Ball, killer: Op
             .get(0);
         world.notify_pilot(pilot, "OnAccountChange", vec![Value::str("cash"), Value::Int(pilot), Value::Float(balance)]);
         if let Some((corp, _)) = corp_tax.filter(|_| tax > 0.0) {
-            super::corpwallet::corp_credit(db, world, corp, ACCOUNT_CASH, tax).await?;
+            let mut outbox = Outbox::default();
+            super::corpwallet::corp_credit(db, &mut outbox, corp, ACCOUNT_CASH, tax).await?;
+            dispatch_world((), outbox, world)?;
         }
         info!("{pilot} earned {bounty:.0} ISK bounty for {} ({tax:.0} corporation tax)", npc.type_id);
         super::crimewatch::npc_killed(db, world, pilot).await?;

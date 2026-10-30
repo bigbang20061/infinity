@@ -6,11 +6,13 @@
 //! (fraction - 0.4) / 2 of it up front, as insuranceConst prices its packages from Basic
 //! (0.5) to Platinum (1.0); it runs for 12 weeks. Destroyed ships pay their owner and post an
 //! insurance payout notification.
+//! Payout and policy issuance each commit their wallet, policy and notification writes atomically.
 
 use super::{db_err, keyval, notify_error, value_id_list, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
 use crate::consts::{CATEGORY_SHIP, FILETIME_DAY};
 use crate::db::Db;
+use crate::db::{executor::Executor, outbox::{dispatch_world, Outbox}};
 use crate::space::World;
 use marshal::Value;
 use tracing::info;
@@ -35,7 +37,7 @@ const INSURER: i64 = 1000132;
 const QUOTE_TOLERANCE_ISK: f64 = 1.0;
 
 /// What a ship type is insured for (the payout at fraction 1.0); 0 if it can't be insured.
-async fn value(db: &Db, type_id: i32) -> Result<f64, CallError> {
+async fn value(db: &(impl Executor + ?Sized), type_id: i32) -> Result<f64, CallError> {
     Ok(db
         .query_opt(
             "SELECT COALESCE(NULLIF(r.adjusted, 0), NULLIF(r.average, 0), t.base_price, 0)::float8
@@ -81,41 +83,51 @@ async fn insure(c: &Client, call: &Call<'_>) -> CallResult {
     if existing.is_some() && !void_old {
         return Err(CallError::User { msg: "InsureShipFailedSingleContract".into(), dict: vec![("ownerID".into(), Value::Int(me))] });
     }
-    super::market::debit(db, world, me, amount).await?;
     let now = filetime_now();
-    db
-        .execute(
-            "INSERT INTO game.insurance (ship_id, owner_id, type_id, fraction, start_date, end_date) VALUES ($1, $2, $3, $4, $5, $6)
-             ON CONFLICT (ship_id) DO UPDATE SET owner_id = $2, type_id = $3, fraction = $4, start_date = $5, end_date = $6",
-            &[&ship, &me, &item.type_id, &fraction, &now, &(now + CONTRACT_DAYS * FILETIME_DAY)],
-        )
-        .await
-        .map_err(db_err)?;
+    let type_id = item.type_id;
+    db.transaction(
+        |tx, outbox: &mut Outbox| Box::pin(async move {
+            super::market::debit(tx, outbox, me, amount).await?;
+            tx.execute(
+                "INSERT INTO game.insurance (ship_id, owner_id, type_id, fraction, start_date, end_date) VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT (ship_id) DO UPDATE SET owner_id = $2, type_id = $3, fraction = $4, start_date = $5, end_date = $6",
+                &[&ship, &me, &type_id, &fraction, &now, &(now + CONTRACT_DAYS * FILETIME_DAY)],
+            ).await.map_err(db_err)?;
+            super::mail::notify(tx, outbox, me, NOTIFICATION_ISSUED, NOTIFICATION_GROUP_INSURANCE, INSURER, &format!("{{itemID: {ship}, typeID: {type_id}}}")).await?;
+            outbox.notify_pilot(me, "OnShipInsured", vec![]);
+            Ok(())
+        }),
+        |(), outbox| async move { dispatch_world((), outbox, world) },
+    ).await?;
     info!("insurance: {me} insured ship {ship} at {fraction} for {amount:.0} ISK");
-    super::mail::notify(db, world, me, NOTIFICATION_ISSUED, NOTIFICATION_GROUP_INSURANCE, INSURER, &format!("{{itemID: {ship}, typeID: {}}}", item.type_id)).await?;
-    world.notify_pilot(me, "OnShipInsured", vec![]);
     Ok(Value::None)
 }
 
 /// A ship was destroyed: pay out its insurance, if it has any that is still running.
 pub async fn ship_destroyed(db: &Db, world: &World, ship: i64) -> Result<(), CallError> {
-    let Some(r) = db
-        .query_opt("DELETE FROM game.insurance WHERE ship_id = $1 RETURNING owner_id, type_id, fraction, end_date", &[&ship])
-        .await
-        .map_err(db_err)?
-    else {
-        return Ok(());
-    };
-    let (owner, type_id, fraction, end): (i64, i32, f64, i64) = (r.get(0), r.get(1), r.get(2), r.get(3));
-    if end < filetime_now() {
-        return Ok(());
-    }
-    let payout = super::market::round2(value(db, type_id).await? * fraction);
-    super::market::credit(db, world, owner, payout).await?;
-    let data = format!("{{amount: {payout}, itemID: {ship}, typeID: {type_id}, payout: 0}}");
-    super::mail::notify(db, world, owner, NOTIFICATION_PAYOUT, NOTIFICATION_GROUP_INSURANCE, INSURER, &data).await?;
-    info!("insurance: ship {ship} of {owner} paid out {payout:.0} ISK");
-    Ok(())
+    let now = filetime_now();
+    db.transaction(
+        |tx, outbox: &mut Outbox| Box::pin(async move {
+            let Some(r) = tx
+                .query_opt("DELETE FROM game.insurance WHERE ship_id = $1 RETURNING owner_id, type_id, fraction, end_date", &[&ship])
+                .await.map_err(db_err)?
+            else { return Ok(None); };
+            let (owner, type_id, fraction, end): (i64, i32, f64, i64) = (r.get(0), r.get(1), r.get(2), r.get(3));
+            if end < now { return Ok(None); }
+            let payout = super::market::round2(value(tx, type_id).await? * fraction);
+            super::market::credit(tx, outbox, owner, payout).await?;
+            let data = format!("{{amount: {payout}, itemID: {ship}, typeID: {type_id}, payout: 0}}");
+            super::mail::notify(tx, outbox, owner, NOTIFICATION_PAYOUT, NOTIFICATION_GROUP_INSURANCE, INSURER, &data).await?;
+            Ok(Some((owner, payout)))
+        }),
+        |paid, outbox| async move {
+            dispatch_world((), outbox, world)?;
+            if let Some((owner, payout)) = paid {
+                info!("insurance: ship {ship} of {owner} paid out {payout:.0} ISK");
+            }
+            Ok(())
+        },
+    ).await
 }
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {

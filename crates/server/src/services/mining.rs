@@ -595,15 +595,17 @@ async fn reprocessing(c: &mut Client, call: &Call<'_>) -> CallResult {
             let mut done = vec![];
             let mut output: HashMap<i32, i64> = HashMap::new();
             let mut tax = 0.0;
+            let mut outbox = crate::db::outbox::Outbox::default();
             for item in items {
                 let Some(q) = quote(c, char_id, &item).await? else { continue };
                 let (id, quantity) = (item.item_id, item.quantity);
                 if q.leftover > 0 {
                     c.db.execute("UPDATE game.items SET quantity = $2 WHERE item_id = $1", &[&id, &q.leftover]).await.map_err(db_err)?;
-                    super::inventory::notify_item_change(c, id, vec![(IX_STACK_SIZE, Value::Int(quantity as i64))]).await?;
+                    super::inventory::notify_item_change(&c.db, &mut outbox, id, vec![(IX_STACK_SIZE, Value::Int(quantity as i64))]).await?;
                 } else {
-                    super::combat::remove_stack(c, item).await?;
+                    super::combat::remove_stack(&c.db, &mut outbox, item).await?;
                 }
+                crate::db::outbox::dispatch_client((), std::mem::take(&mut outbox), c)?;
                 for (t, received, _, isk) in &q.materials {
                     *output.entry(*t).or_default() += received;
                     tax += isk;
@@ -612,7 +614,8 @@ async fn reprocessing(c: &mut Client, call: &Call<'_>) -> CallResult {
             }
             for (t, qty) in &output {
                 if *qty > 0 {
-                    super::combat::deposit(c, char_id, out_location, out_flag, *t, (*qty).min(i32::MAX as i64) as i32, 0).await?;
+                    super::combat::deposit(&c.db, &mut outbox, char_id, out_location, out_flag, *t, (*qty).min(i32::MAX as i64) as i32, 0).await?;
+                    crate::db::outbox::dispatch_client((), std::mem::take(&mut outbox), c)?;
                 }
             }
             if tax > 0.0 {

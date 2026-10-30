@@ -9,6 +9,8 @@
 use super::{db_err, keyval, notify_error, value_id_list, value_text, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
 use crate::consts::{FILETIME_SECOND, FILETIME_UNIX_EPOCH, ROLE_DIRECTOR};
+use crate::db::executor::Executor;
+use crate::db::outbox::{dispatch_world, Outbox};
 use marshal::{DbRowDescriptor, DbType, Value};
 
 /// Client appConst.eventResponseDeleted.
@@ -84,25 +86,31 @@ async fn create(c: &Client, call: &Call<'_>, owner: i64) -> CallResult {
     let (title, description) = (value_text(call.args.get(2), MAX_TITLE_LENGTH), value_text(call.args.get(3), MAX_DESCRIPTION_LENGTH));
     let important = call.args.get(4).and_then(|v| v.as_int()).unwrap_or(0) as i32;
     let now = filetime_now();
-    let id: i64 = c
-        .db
-        .query_one(
-            "INSERT INTO game.calendar_events (owner_id, creator_id, event_date, duration, title, description, importance, modified)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING event_id",
-            &[&owner, &me, &when, &duration, &title, &description, &important, &now],
-        )
-        .await
-        .map_err(db_err)?
-        .get(0);
-    if owner == me {
-        let guests: Vec<i64> = call.args.get(5).and_then(|v| v.items()).unwrap_or(&[]).iter().filter_map(|v| v.as_int()).filter(|g| *g != me).take(MAX_INVITEES).collect();
-        c.db.execute("INSERT INTO game.calendar_responses (event_id, char_id, status) VALUES ($1, $2, $3)", &[&id, &me, &RESPONSE_ACCEPTED]).await.map_err(db_err)?;
-        for g in &guests {
-            c.db.execute("INSERT INTO game.calendar_responses (event_id, char_id, status) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING", &[&id, g, &RESPONSE_UNDECIDED]).await.map_err(db_err)?;
-            c.world.notify_pilot(*g, "OnNewCalendarEvent", vec![Value::Int(id), Value::Int(owner), Value::Int(when), Value::Int(duration as i64), Value::unicode(title.as_str()), Value::Int(important as i64)]);
-        }
-    }
-    Ok(Value::Int(id))
+    let guests: Vec<i64> = call.args.get(5).and_then(|v| v.items()).unwrap_or(&[]).iter().filter_map(|v| v.as_int()).filter(|g| *g != me).take(MAX_INVITEES).collect();
+    let world = c.world.clone();
+    c.db.transaction(
+        |tx, outbox: &mut Outbox| {
+            let title = title.clone();
+            let description = description.clone();
+            let guests = guests.clone();
+            Box::pin(async move {
+                let id: i64 = Executor::query_one(tx,
+                    "INSERT INTO game.calendar_events (owner_id, creator_id, event_date, duration, title, description, importance, modified)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING event_id",
+                    &[&owner, &me, &when, &duration, &title, &description, &important, &now],
+                ).await.map_err(db_err)?.get(0);
+                if owner == me {
+                    Executor::execute(tx, "INSERT INTO game.calendar_responses (event_id, char_id, status) VALUES ($1, $2, $3)", &[&id, &me, &RESPONSE_ACCEPTED]).await.map_err(db_err)?;
+                    for g in guests {
+                        Executor::execute(tx, "INSERT INTO game.calendar_responses (event_id, char_id, status) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING", &[&id, &g, &RESPONSE_UNDECIDED]).await.map_err(db_err)?;
+                        outbox.notify_pilot(g, "OnNewCalendarEvent", vec![Value::Int(id), Value::Int(owner), Value::Int(when), Value::Int(duration as i64), Value::unicode(title.as_str()), Value::Int(important as i64)]);
+                    }
+                }
+                Ok(Value::Int(id))
+            })
+        },
+        |value, outbox| async move { dispatch_world(value, outbox, &world) },
+    ).await
 }
 
 /// The character may change `owner`'s events: their own, or their corporation's as a director.

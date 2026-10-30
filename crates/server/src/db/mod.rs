@@ -4,6 +4,10 @@
 //! Failed statements are not retried.
 //! The shared account PLEX query returns whole PLEX; wire-unit conversion is the caller's policy.
 
+pub mod executor;
+pub mod outbox;
+pub mod transaction;
+
 use crate::consts::{NPC_BID_RATIO, ROLE_PLAYER_LOGIN};
 use anyhow::{Context, Result};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -12,8 +16,8 @@ use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use tokio_postgres::{types::ToSql, Client, NoTls, Row, ToStatement};
 use tracing::info;
 
-const GAME_SCHEMA: &str = include_str!("../sql/game_schema.sql");
-const MARKET_SEED: &str = include_str!("../sql/market_seed.sql");
+const GAME_SCHEMA: &str = include_str!("../../sql/game_schema.sql");
+const MARKET_SEED: &str = include_str!("../../sql/market_seed.sql");
 
 /// Existing server policy for the first database reconnect delay.
 const RECONNECT_INITIAL_DELAY_SECONDS: u64 = 1;

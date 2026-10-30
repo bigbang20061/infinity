@@ -11,6 +11,7 @@ use super::{active_corporation_member_ids, db_err, has_role_or_is_ceo, keyval, n
 use crate::client::{filetime_now, Client};
 use crate::consts::{ACCOUNT_CASH, FILETIME_DAY, RENTAL_DAYS, ROLE_ACCOUNTANT, ROLE_DIRECTOR};
 use crate::db::Db;
+use crate::db::outbox::dispatch_world;
 use crate::space::World;
 use marshal::Value;
 use std::sync::Arc;
@@ -67,34 +68,41 @@ async fn announce(db: &Db, world: &World, corp: i64) -> Result<(), CallError> {
 /// wallet), credit the creditor, and carry out what it paid for.
 pub(super) async fn pay(db: &Db, world: &World, bill: i64, corp: Option<i64>, key: i32) -> Result<(), CallError> {
     let _trading = super::market::lock().await;
-    let Some(r) = db.query_opt(&format!("{BILL_SELECT} WHERE bill_id = $1 AND status = $2"), &[&bill, &UNPAID]).await.map_err(db_err)? else {
-        return Err(notify_error("该账单已支付或不存在。"));
-    };
-    let (kind, debtor, creditor, amount, external): (i32, i64, i64, f64, Option<i64>) = (r.get(1), r.get(2), r.get(3), r.get(4), r.get(7));
-    match corp {
-        Some(corp) => super::corpwallet::corp_debit(db, world, corp, key, amount).await?,
-        None => super::market::debit(db, world, debtor, amount).await?,
-    }
-    if super::corps::is_player_corp(creditor) {
-        super::corpwallet::corp_credit(db, world, creditor, ACCOUNT_CASH, amount).await?;
-    }
-    db.execute("UPDATE game.bills SET status = $2 WHERE bill_id = $1", &[&bill, &PAID]).await.map_err(db_err)?;
-    if kind == BILL_RENTAL {
-        if let Some(office) = external {
-            db
-                .execute(
-                    "UPDATE game.offices SET rented_until = rented_until + $2 WHERE office_id = $1",
-                    &[&office, &(RENTAL_DAYS * FILETIME_DAY)],
-                )
-                .await
-                .map_err(db_err)?;
-        }
-    }
-    info!("bills: {debtor} paid bill {bill} ({amount:.0} ISK to {creditor})");
-    if let Some(corp) = corp {
-        announce(db, world, corp).await?;
-    }
-    Ok(())
+    db.transaction(
+        |tx, outbox| Box::pin(async move {
+            let Some(r) = tx.query_opt(&format!("{BILL_SELECT} WHERE bill_id = $1 AND status = $2"), &[&bill, &UNPAID]).await.map_err(db_err)? else {
+                return Err(notify_error("该账单已支付或不存在。"));
+            };
+            let (kind, debtor, creditor, amount, external): (i32, i64, i64, f64, Option<i64>) = (r.get(1), r.get(2), r.get(3), r.get(4), r.get(7));
+            match corp {
+                Some(corp) => super::corpwallet::corp_debit(tx, outbox, corp, key, amount).await?,
+                None => super::market::debit(tx, outbox, debtor, amount).await?,
+            }
+            if super::corps::is_player_corp(creditor) {
+                super::corpwallet::corp_credit(tx, outbox, creditor, ACCOUNT_CASH, amount).await?;
+            }
+            tx.execute("UPDATE game.bills SET status = $2 WHERE bill_id = $1", &[&bill, &PAID]).await.map_err(db_err)?;
+            if kind == BILL_RENTAL {
+                if let Some(office) = external {
+                    tx.execute(
+                        "UPDATE game.offices SET rented_until = rented_until + $2 WHERE office_id = $1",
+                        &[&office, &(RENTAL_DAYS * FILETIME_DAY)],
+                    ).await.map_err(db_err)?;
+                }
+            }
+            if let Some(corp) = corp {
+                for id in active_corporation_member_ids(tx, corp).await? {
+                    outbox.notify_pilot(id, "OnBillReceived", vec![]);
+                }
+            }
+            Ok((debtor, creditor, amount))
+        }),
+        |(debtor, creditor, amount), outbox| async move {
+            dispatch_world((), outbox, world)?;
+            info!("bills: {debtor} paid bill {bill} ({amount:.0} ISK to {creditor})");
+            Ok(())
+        },
+    ).await
 }
 
 /// Issue rent bills that have come due and pay those set to be paid automatically.

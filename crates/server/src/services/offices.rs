@@ -10,6 +10,8 @@ use super::{active_corporation_member_ids, db_err, has_role_or_is_ceo, keyval, n
 use crate::client::{filetime_now, Client};
 use crate::consts::{ACCOUNT_CASH, FILETIME_DAY, RENTAL_DAYS, ROLE_DIRECTOR};
 use crate::db::Db;
+use crate::db::executor::Executor;
+use crate::db::outbox::dispatch_world;
 use crate::space::World;
 use marshal::Value;
 use tracing::info;
@@ -47,7 +49,7 @@ pub(super) async fn rent_price(db: &Db, station: i64) -> Result<f64, CallError> 
 }
 
 /// The corporation's office at `station`, if it rents one.
-pub(super) async fn office_at(db: &Db, corp: i64, station: i64) -> Result<Option<i64>, CallError> {
+pub(super) async fn office_at(db: &(impl Executor + ?Sized), corp: i64, station: i64) -> Result<Option<i64>, CallError> {
     Ok(db
         .query_opt("SELECT office_id FROM game.offices WHERE corporation_id = $1 AND station_id = $2", &[&corp, &station])
         .await
@@ -59,7 +61,6 @@ pub(super) async fn office_at(db: &Db, corp: i64, station: i64) -> Result<Option
 pub(super) async fn office_owner(db: &Db, item: i64) -> Result<Option<i64>, CallError> {
     Ok(db.query_opt("SELECT corporation_id FROM game.offices WHERE office_id = $1", &[&item]).await.map_err(db_err)?.map(|r| r.get(0)))
 }
-
 /// Tell the corporation's online members its offices changed.
 async fn announce(db: &Db, world: &World, corp: i64, office: i64) -> Result<(), CallError> {
     for id in active_corporation_member_ids(db, corp).await? {
@@ -68,37 +69,41 @@ async fn announce(db: &Db, world: &World, corp: i64, office: i64) -> Result<(), 
     Ok(())
 }
 
+
 /// Rent (or extend) `corp`'s office at `station` for a period, paid from its master wallet.
 pub(super) async fn rent(db: &Db, world: &World, corp: i64, station: i64) -> Result<i64, CallError> {
     let price = rent_price(db, station).await?;
     let _trading = super::market::lock().await;
-    super::corpwallet::corp_debit(db, world, corp, ACCOUNT_CASH, price).await?;
     let now = filetime_now();
-    if let Some(office) = office_at(db, corp, station).await? {
-        db
-            .execute("UPDATE game.offices SET rented_until = GREATEST(rented_until, $2) + $3 WHERE office_id = $1", &[&office, &now, &(RENTAL_DAYS * FILETIME_DAY)])
-            .await
-            .map_err(db_err)?;
-        return Ok(office);
-    }
-    let office: i64 = db
-        .query_one(
-            "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton) VALUES ($1, $2, $3, $4, 1, true) RETURNING item_id",
-            &[&TYPE_OFFICE, &corp, &station, &OFFICE_ITEM_FLAG],
-        )
-        .await
-        .map_err(db_err)?
-        .get(0);
-    db
-        .execute(
-            "INSERT INTO game.offices (office_id, corporation_id, station_id, rented_until) VALUES ($1, $2, $3, $4)",
-            &[&office, &corp, &station, &(now + RENTAL_DAYS * FILETIME_DAY)],
-        )
-        .await
-        .map_err(db_err)?;
-    announce(db, world, corp, office).await?;
-    info!("offices: {corp} rented office {office} at {station} for {price:.0} ISK");
-    Ok(office)
+    db.transaction(
+        |tx, outbox| Box::pin(async move {
+            super::corpwallet::corp_debit(tx, outbox, corp, ACCOUNT_CASH, price).await?;
+            if let Some(office) = office_at(tx, corp, station).await? {
+                tx.execute("UPDATE game.offices SET rented_until = GREATEST(rented_until, $2) + $3 WHERE office_id = $1", &[&office, &now, &(RENTAL_DAYS * FILETIME_DAY)])
+                    .await.map_err(db_err)?;
+                return Ok((office, false));
+            }
+            let office: i64 = tx.query_one(
+                "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton) VALUES ($1, $2, $3, $4, 1, true) RETURNING item_id",
+                &[&TYPE_OFFICE, &corp, &station, &OFFICE_ITEM_FLAG],
+            ).await.map_err(db_err)?.get(0);
+            tx.execute(
+                "INSERT INTO game.offices (office_id, corporation_id, station_id, rented_until) VALUES ($1, $2, $3, $4)",
+                &[&office, &corp, &station, &(now + RENTAL_DAYS * FILETIME_DAY)],
+            ).await.map_err(db_err)?;
+            for id in active_corporation_member_ids(tx, corp).await? {
+                outbox.notify_pilot(id, "OnOfficeRentalChange", vec![Value::Int(corp), Value::Int(office)]);
+            }
+            Ok((office, true))
+        }),
+        |(office, created), outbox| async move {
+            dispatch_world((), outbox, world)?;
+            if created {
+                info!("offices: {corp} rented office {office} at {station} for {price:.0} ISK");
+            }
+            Ok(office)
+        },
+    ).await
 }
 
 /// A director, the CEO, or a member allowed to rent offices.

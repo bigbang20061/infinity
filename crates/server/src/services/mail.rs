@@ -14,7 +14,7 @@ use super::{db_err, keyval, notify_error, value_id_list, value_text, Call, CallE
 use crate::client::{filetime_now, Client};
 use crate::consts::FILETIME_MINUTE;
 use crate::db::Db;
-use crate::space::World;
+use crate::db::{executor::Executor, outbox::Outbox};
 use marshal::Value;
 use std::io::Write;
 use tracing::info;
@@ -268,7 +268,7 @@ async fn create_label(c: &Client, name: &str, color: Option<i64>) -> CallResult 
 /// Post a notification to a character (and show it at once if they're online). `data` is
 /// the YAML mapping the client's formatter for `type_id` reads; `group` is its
 /// notificationconst group.
-pub async fn notify(db: &Db, world: &World, receiver: i64, type_id: i32, group: i32, sender: i64, data: &str) -> Result<(), CallError> {
+pub async fn notify<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, receiver: i64, type_id: i32, group: i32, sender: i64, data: &str) -> Result<(), CallError> {
     let created = filetime_now();
     let id: i64 = db
         .query_one(
@@ -278,7 +278,7 @@ pub async fn notify(db: &Db, world: &World, receiver: i64, type_id: i32, group: 
         .await
         .map_err(db_err)?
         .get(0);
-    world.notify_pilot(receiver, "OnNotificationReceived", vec![Value::Int(id), Value::Int(type_id as i64), Value::Int(sender), Value::Int(created), Value::str(data)]);
+    outbox.notify_pilot(receiver, "OnNotificationReceived", vec![Value::Int(id), Value::Int(type_id as i64), Value::Int(sender), Value::Int(created), Value::str(data)]);
     Ok(())
 }
 
