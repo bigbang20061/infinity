@@ -1,11 +1,13 @@
 //! `mailMgr`, mirroring `eve/client/script/ui/services/mail/mailSvc.py`.
 //! Uses the mail DAO's message, status and label tables and character membership.
+//! Sending commits message, status and reply/forward writes together before notifications.
 //! Mailing lists are not supported.
 use super::super::{db_err, keyval, notify_error, value_id_list, value_text, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
 use crate::consts::FILETIME_MINUTE;
 use crate::dao::mail::{self, LabelAction, Selector};
 use crate::db::Db;
+use crate::db::outbox::{dispatch_world, Outbox};
 use crate::messages;
 use marshal::Value;
 use std::io::Write;
@@ -101,7 +103,6 @@ async fn send(c: &Client, call: &Call<'_>) -> CallResult {
     }
     let sent = filetime_now() / FILETIME_MINUTE * FILETIME_MINUTE;
     let to_text = to_chars.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
-    let id = mail::insert_message(db, me, &to_text, to_corp, &title, &body, sent).await.map_err(db_err)?;
     // Everyone involved gets a status row; the sender's starts read.
     let mut boxes: Vec<(i64, i32, i32)> = vec![];
     for ch in &to_chars {
@@ -119,32 +120,49 @@ async fn send(c: &Client, call: &Call<'_>) -> CallResult {
         Some(b) => b.2 |= LABEL_SENT,
         None => boxes.push((me, STATUS_READ, LABEL_SENT)),
     }
-    for (ch, status, labels) in &boxes {
-        mail::insert_status(db, id, *ch, *status, *labels).await.map_err(db_err)?;
-    }
-    for (original, bit) in [(reply_to, STATUS_REPLIED), (forwarded_from, STATUS_FORWARDED)] {
-        if original > 0 {
-            mail::mark_original(db, original, me, bit).await.map_err(db_err)?;
-        }
-    }
+    // Stable sorting preserves which status wins for duplicate recipients.
+    let mut sorted_boxes = boxes.clone();
+    sorted_boxes.sort_by_key(|b| b.0);
+    let mut originals = [(reply_to, STATUS_REPLIED), (forwarded_from, STATUS_FORWARDED)];
+    originals.sort_by_key(|(id, _)| *id);
     let to_list_value = Value::list(to_chars.iter().map(|i| Value::Int(*i)));
-    for (ch, _, _) in boxes.iter().filter(|b| b.0 != me) {
-        world.notify_pilot(
-            *ch,
-            "OnMailSent",
-            vec![
-                Value::Int(id),
-                Value::Int(me),
-                Value::Int(sent),
-                to_list_value.clone(),
-                Value::None,
-                to_corp.map(Value::Int).unwrap_or(Value::None),
-                Value::unicode(title.as_str()),
-                Value::Int(0),
-            ],
-        );
-    }
-    info!("mail: {me} sent message {id} to {} recipients", boxes.len() - 1);
+    let inputs = std::sync::Arc::new((to_text, title, body, boxes, sorted_boxes, to_list_value));
+    let id = db.transaction(
+        |tx, outbox: &mut Outbox| {
+            let inputs = std::sync::Arc::clone(&inputs);
+            Box::pin(async move {
+                let (to_text, title, body, boxes, sorted_boxes, to_list_value) = &*inputs;
+                let id = mail::insert_message(tx, me, to_text, to_corp, title, body, sent).await.map_err(db_err)?;
+                for (ch, status, labels) in sorted_boxes {
+                    mail::insert_status(tx, id, *ch, *status, *labels).await.map_err(db_err)?;
+                }
+                for (original, bit) in originals {
+                    if original > 0 {
+                        mail::mark_original(tx, original, me, bit).await.map_err(db_err)?;
+                    }
+                }
+                for (ch, _, _) in boxes.iter().filter(|b| b.0 != me) {
+                    outbox.notify_pilot(
+                        *ch,
+                        "OnMailSent",
+                        vec![
+                            Value::Int(id),
+                            Value::Int(me),
+                            Value::Int(sent),
+                            to_list_value.clone(),
+                            Value::None,
+                            to_corp.map(Value::Int).unwrap_or(Value::None),
+                            Value::unicode(title.as_str()),
+                            Value::Int(0),
+                        ],
+                    );
+                }
+                Ok(id)
+            })
+        },
+        |id, outbox| async move { dispatch_world(id, outbox, world) },
+    ).await?;
+    info!("mail: {me} sent message {id} to {} recipients", inputs.3.len() - 1);
     Ok(Value::Int(id))
 }
 

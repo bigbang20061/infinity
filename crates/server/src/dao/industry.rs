@@ -2,7 +2,7 @@
 //! The owning services support `eve/client/script/industry`; this DAO has no wire contract.
 //! Uses `game.items`, `game.blueprints`, `game.industry_jobs`, `game.retail_prices`
 //! and `sde.sta_stations`. Corporation jobs are unsupported by the services;
-//! policy, transactions and notifications remain with callers.
+//! policy, transactions and notifications remain with callers. Cancellation is guarded by installed status.
 
 use std::collections::HashMap;
 use crate::consts::{BLUEPRINT_COPY_QUANTITY, BLUEPRINT_INFINITE_RUNS};
@@ -36,7 +36,7 @@ const INSERT_JOB_SQL: &str = "INSERT INTO game.industry_jobs (installer_id, owne
 const DELETE_BLUEPRINT_SQL: &str = "DELETE FROM game.blueprints WHERE item_id = $1";
 const INSERT_COPY_SQL: &str = "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton) VALUES ($1, $2, $3, $4, $5::bigint::integer, true) RETURNING item_id";
 const DELIVER_SQL: &str = "UPDATE game.industry_jobs SET status = $2, successful_runs = $3, completed_date = $4, completed_by = $5 WHERE job_id = $1 AND status = $6";
-const CANCEL_SQL: &str = "UPDATE game.industry_jobs SET status = $2, completed_date = $3, completed_by = $4 WHERE job_id = $1";
+const CANCEL_SQL: &str = "UPDATE game.industry_jobs SET status = $2, completed_date = $3, completed_by = $4 WHERE job_id = $1 AND status = $5";
 
 pub(crate) struct Blueprint {
     pub(crate) item_id: i64, pub(crate) type_id: i32, pub(crate) owner: i64, pub(crate) station: Option<i64>,
@@ -134,6 +134,6 @@ pub(crate) async fn insert_copy(ex: &(impl Executor + ?Sized), type_id: i32, own
 pub(crate) async fn deliver_job(ex: &(impl Executor + ?Sized), job: &Job, installed_status: i32) -> Result<u64, db::Error> {
     ex.execute(DELIVER_SQL, &[&job.id, &job.status, &job.successful_runs, &job.completed, &job.completed_by, &installed_status]).await
 }
-pub(crate) async fn cancel_job(ex: &(impl Executor + ?Sized), job: &Job, completed_by: i64) -> Result<u64, db::Error> {
-    ex.execute(CANCEL_SQL, &[&job.id, &job.status, &job.completed, &completed_by]).await
+pub(crate) async fn cancel_job(ex: &(impl Executor + ?Sized), job: &Job, completed_by: i64, installed_status: i32) -> Result<u64, db::Error> {
+    ex.execute(CANCEL_SQL, &[&job.id, &job.status, &job.completed, &completed_by, &installed_status]).await
 }

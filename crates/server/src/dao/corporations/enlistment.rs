@@ -1,6 +1,6 @@
 //! Corporation militia enlistment whitelist persistence in `game.corp_enlistment_factions`.
 //! This DAO has no direct client mirror or wire contract; the owning service handles those.
-//! Validation, transactions and notifications are not handled here.
+//! Validation and notifications are handled by the service, which calls writes in one transaction.
 
 use crate::db::{self, executor::Executor};
 use tokio_postgres::Row;

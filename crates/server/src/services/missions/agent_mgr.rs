@@ -345,9 +345,6 @@ async fn do_action(c: &mut Client, agent: &Agent, action: Option<i64>) -> CallRe
             conversation(s, a, none())
         }
         (Some(choice), Some(m)) if choice >= ACT_OPTION && m.state == STATE_OFFERED && m.kind == Kind::Interaction => {
-            if let Some(arc) = m.arc_id {
-                set_arc_state(c, arc, m.mission_id, "accepted").await?;
-            }
             finish(c, &m, agent, Some((choice - ACT_OPTION) as usize)).await?;
             let s = says(c, &m, "messages.mission.completed.agentsays", messages::MISSION_ACCEPTED_CONFIRMATION).await?;
             conversation(s, actions(&[(ACT_REQUEST, BTN_REQUEST)]), last_action(true, false, false))
@@ -372,7 +369,9 @@ async fn do_action(c: &mut Client, agent: &Agent, action: Option<i64>) -> CallRe
         (Some(ACT_DECLINE), Some(m)) if m.state == STATE_OFFERED => {
             remove(c, agent.id).await?;
             let me = c.session.int("charid").unwrap_or(0);
-            super::standings::mission_declined(&c.db, &c.world, me, agent.id, agent.corp_id).await?;
+            let mut outbox = crate::db::outbox::Outbox::default();
+            super::standings::mission_declined(&c.db, &mut outbox, me, agent.id, agent.corp_id).await?;
+            crate::db::outbox::dispatch_client((), outbox, c)?;
             c.notify("OnAgentMissionChange", vec![Value::str("offer_declined"), Value::Int(agent.id)]);
             let s = says(c, &m, "messages.mission.declined.agentsays", messages::MISSION_DECLINED).await?;
             conversation(s, Value::list([]), last_action(false, true, false))
@@ -386,7 +385,9 @@ async fn do_action(c: &mut Client, agent: &Agent, action: Option<i64>) -> CallRe
         (Some(ACT_QUIT), Some(m)) => {
             remove(c, agent.id).await?;
             let me = c.session.int("charid").unwrap_or(0);
-            super::standings::mission_declined(&c.db, &c.world, me, agent.id, agent.corp_id).await?;
+            let mut outbox = crate::db::outbox::Outbox::default();
+            super::standings::mission_declined(&c.db, &mut outbox, me, agent.id, agent.corp_id).await?;
+            crate::db::outbox::dispatch_client((), outbox, c)?;
             // A quit arc step can be taken up again (its fail mission, usually itself).
             if let Some(arc) = m.arc_id {
                 set_arc_state(c, arc, m.mission_id, "quit").await?;
