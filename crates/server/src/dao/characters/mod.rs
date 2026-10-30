@@ -9,3 +9,4 @@ pub(crate) mod members;
 pub(crate) mod persistence;
 pub(crate) mod roles;
 pub(crate) mod selection;
+pub(crate) mod standings;

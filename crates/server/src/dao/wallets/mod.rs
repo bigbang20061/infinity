@@ -4,6 +4,7 @@
 
 pub(crate) mod characters;
 pub(crate) mod corporations;
+pub(crate) mod loyalty;
 
 struct Balance(f64);
 
