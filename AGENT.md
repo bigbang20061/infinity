@@ -27,6 +27,7 @@ These rules apply to anyone changing this repository, coding agents and humans a
   - Unit conversions go through the shared helpers, never inline factors such as `* 10_000` or `/ 1000`.
   - Exempt: `0` and `1` as identities, array indices, and test fixtures.
 - **No duplicated helpers.** Before writing a helper, search for an existing one. A helper needed by more than one module lives in one shared place (see Shared helpers); never copy it into another module.
+- **Small files, one concern each.** A Rust source file covers one feature, answers at most one client service, and stays under 800 lines. Tests live in their own files, never in a code file. See File layout and Testing and verification.
 
 ## 2. Build, test, run
 
@@ -91,11 +92,34 @@ Any other tag starts nothing.
 - Comments state facts and reasons the code can't show: protocol details, client file and function references, formulas and their sources. Don't narrate what the code obviously does.
 - Code, comments, log messages and docs are written in English.
 
+### File layout
+
+- **One feature per module.**
+  - A module covers one feature or mechanism, such as fleets, industry jobs or the space tick.
+  - Two features never share a file.
+  - Code that two features need goes to a shared home (see Shared helpers), not into one of them.
+- **One client service per file.** All `(service, method)` arms of a client service, such as `fleetMgr` or `industryManager`, sit in one file, and that file serves no other service.
+  - A feature the client reaches through one service is one file, `services/<feature>.rs`.
+  - A feature with several services is a directory, `services/<feature>/`, holding:
+    - `mod.rs`: the module doc, the feature's shared types, state and queries, and a `dispatch` that only routes each service to its file.
+    - `<service>.rs`: that service's handlers, named after the service in snake case (`industry_manager.rs`).
+    - Mechanics that answer no service, such as timers, formulas or order matching: each in its own file, named after the mechanic.
+  - The one exception is the table of fixed answers for services the server does not model yet (Remote services, step 5). It holds constant answers only. Once a service needs logic, its arms move to a feature module.
+- **`mod.rs` files route and share; they do not implement.** `services/mod.rs` holds the module declarations, the dispatch chain and the shared helpers. It answers no service itself.
+- **Size.** Keep Rust source files under 500 lines where practical. No file passes 800 lines, and that includes test files.
+  - A change that would take a file past 800 lines first splits it, by service or by sub-feature. The split is a commit of its own that only moves code and does not change behaviour. The change then goes on top.
+  - Tests are never part of a code file (see Testing and verification).
+  - Exempt: captured retail data under `crates/server/retail/`, SQL files and generated code.
+- **The same rules apply outside `services/`.** A file in `space/`, `gateway/` or the crate root covers one concern. When it outgrows the limit or picks up a second concern, it becomes a directory module.
+- **A split leaves one path.**
+  - After a split, callers import from the new location. No re-export or alias keeps the old path alive (see One architecture per concern).
+  - Items are only as visible as their callers need: `pub(super)` before `pub`.
+
 ### Remote services
 
 1. Find the caller in the client: the service, the method, the arguments, and what the client does with the result.
 2. Handle the call in the matching module's `dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult>` as a `(service, method)` match arm. Return `None` for calls the module does not own, so dispatch falls through to the next module.
-3. If the feature needs a new module, add `mod <name>;` and a `dispatch` call to the fallthrough chain in `services/mod.rs`.
+3. If the feature needs a new module, add `mod <name>;` and a `dispatch` call to the fallthrough chain in `services/mod.rs`. A new client service gets its own file (see File layout).
 4. `retail::cached_call` answers first. Do not shadow a captured retail answer unless you replace it on purpose.
 5. If a feature isn't modelled but the client needs an answer, return an empty but well-formed value from `services/station.rs` or `services/universe.rs`, with a comment saying what the client reads from it.
 6. Unhandled calls log `UNHANDLED <service>::<method>` and return `None`. Make that line go away by handling the call. Never suppress the warning.
@@ -182,7 +206,14 @@ Stay inside the existing ranges, and pick a fresh, non-overlapping range for any
 
 ## 5. Testing and verification
 
-- Unit tests live in a `#[cfg(test)] mod tests` block at the bottom of the module; the marshal crate keeps them in `src/tests.rs`.
+- **Tests live in their own files, never in a code file.**
+  - A module's unit tests go in a `tests.rs` beside it:
+    - `foo.rs` → `foo/tests.rs`
+    - `foo/mod.rs` → `foo/tests.rs`
+    - a crate root (`lib.rs`, `main.rs`) → `src/tests.rs`, as the marshal crate already does
+  - The module declares them with one line at its end: `#[cfg(test)] mod tests;`.
+  - A code file holds no test code: no inline `mod tests { ... }` block, and no test-only helpers, fixtures or other `#[cfg(test)]` items. Test helpers belong in the test file.
+  - As a child module, `tests.rs` already sees the module's private items through `use super::*`. Never widen an item's visibility for a test.
 - Test behaviour a client or player would notice: wire encoding round-trips, formulas, boundaries, state transitions and error cases. Do not write tests that only restate constants or wiring.
 - Protocol and gameplay changes must be exercised with the real client. Run `scripts/iterate.ps1`, walk through the changed path, and confirm the run adds none of the following:
   - `UNHANDLED` calls
