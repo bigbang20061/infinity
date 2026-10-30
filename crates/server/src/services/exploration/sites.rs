@@ -184,11 +184,11 @@ pub(super) async fn replace_site(db: &Db, world: &World, site_id: i64) -> Result
     let info = system_info(db, system).await?;
     let mut taken: HashSet<String> = system_sites(system).into_iter().filter(|s| s.id != site_id).map(|s| s.target).collect();
     let new = if let Some(field) = old.mining_field() {
-        mining_site(db, system, &info, field, &mut taken).await?
+        mining_site(db, world.sde(), system, &info, field, &mut taken).await?
     } else if old.is_hack_site() {
-        hack_site(db, system, &info, old.strength_attr == STRENGTH_MAGNETOMETRIC, &mut taken).await?
+        hack_site(db, world.sde(), system, &info, old.strength_attr == STRENGTH_MAGNETOMETRIC, &mut taken).await?
     } else {
-        combat_site(db, system, &info, old.kind, &mut taken).await?
+        combat_site(db, world.sde(), system, &info, old.kind, &mut taken).await?
     };
     enum Replacement { Apply(Site, Option<Site>) }
     db.transaction(

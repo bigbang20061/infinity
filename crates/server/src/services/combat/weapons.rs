@@ -43,7 +43,7 @@ pub(super) fn repair_kind(effect: &str) -> Option<(usize, i32)> {
 
 /// The ship's speed and mass as fitted now (propulsion running or not), for everyone's destiny.
 pub(super) async fn apply_propulsion(cx: &Ctx, master: i64, generation: Arc<AtomicBool>, active: bool) {
-    let Ok(fit) = Fit::load(&cx.db, cx.char_id, cx.ship_id).await else { return };
+    let Ok(fit) = Fit::load(&cx.db, cx.world.sde().clone(), cx.char_id, cx.ship_id).await else { return };
     let (speed, mass, signature) = (fit.value(Key::Ship, ATTR_MAX_VELOCITY), fit.value(Key::Ship, ATTR_MASS), fit.value(Key::Ship, ATTR_SIGNATURE_RADIUS));
     let ship = cx.ship_id;
     cx.world.post(cx.system_id, move |s| {
@@ -272,7 +272,7 @@ pub(super) async fn launch_missile(db: Db, world: Arc<World>, system: i64, from:
     };
     let missile_id = missile.id;
     world.add_ship(system, missile).await.map_err(CallError::Internal)?;
-    let signature = attr(&attributes(&db, target.type_id).await?, ATTR_SIGNATURE_RADIUS, target.radius as f64);
+    let signature = attr(world.sde(), target.type_id, ATTR_SIGNATURE_RADIUS, target.radius as f64);
     let distance = dist(from.pos, target.pos);
     let delay_ms = seconds_to_ms((distance / m.velocity.max(1.0)).clamp(MIN_MISSILE_FLIGHT_SECONDS, MAX_MISSILE_FLIGHT_SECONDS));
     let (shooter_id, shooter_pilot) = (from.id, from.char_id);
@@ -399,7 +399,7 @@ pub(super) async fn cycle_begin_work(mut cycle: Cycle) {
     }
     let reason = 'work: {
         // Effective attributes as they are now (charges change, modules go offline...).
-        let fit = match Fit::load(&cx.db, cx.char_id, cx.ship_id).await {
+        let fit = match Fit::load(&cx.db, cx.world.sde().clone(), cx.char_id, cx.ship_id).await {
             Ok(f) => f,
             Err(_) => {
                 break 'work "fit unavailable";
@@ -603,7 +603,7 @@ pub(super) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
         let gap = cx.world.with(cx.system_id, move |s| {
             s.ball(ship_id).zip(s.ball(t)).map(|(a, b)| dist(a.pos, b.pos) - a.radius as f64 - b.radius as f64)
         }).await.flatten();
-        let fit = Fit::load(&cx.db, cx.char_id, cx.ship_id).await?;
+        let fit = Fit::load(&cx.db, cx.world.sde().clone(), cx.char_id, cx.ship_id).await?;
         let range = fit.value(Key::Module(item_id), ATTR_MAX_RANGE);
         if gap.is_none_or(|g| g > range) {
             return Err(user_error(messages::MSG_CUSTOM_NOTIFY, vec![("notify".into(), Value::unicode(messages::mining_range(metres_to_km(range))))]));
@@ -612,7 +612,7 @@ pub(super) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
     if state().active.contains_key(&item_id) {
         return Ok(Value::None);
     }
-    let fit = Fit::load(&cx.db, cx.char_id, cx.ship_id).await?;
+    let fit = Fit::load(&cx.db, cx.world.sde().clone(), cx.char_id, cx.ship_id).await?;
     let duration_ms = effect.duration_attribute.map(|a| fit.value(Key::Module(item_id), a)).unwrap_or(DEFAULT_MODULE_DURATION_MS).max(MIN_MODULE_DURATION_MS);
     // The group fires together.
     let mut modules = vec![Module { id: item_id, type_id: module.type_id, flag: module.flag_id }];

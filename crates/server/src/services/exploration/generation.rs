@@ -1,5 +1,9 @@
-//! Exploration generation mechanics.
-//! Shared exploration state and data sources are documented in the parent module.
+//! Generates exploration sites and wormhole pairs using server selection and placement
+//! policy. The shared SDE supplies placement; runtime database `sde` map/type tables and
+//! `sde_native.dungeons` and localization supply candidates, and generated sites are
+//! persisted as game state. `eve/client/script/parklife/scanSvc.py:253-260` consumes
+//! scan results, not a position generator. No usable general live-server dungeon-layout
+//! source was validated in the decoded client tree; full layouts are not reproduced.
 
 use super::*;
 
@@ -101,9 +105,9 @@ pub(super) fn site_distance() -> f64 {
 }
 
 /// A random point well off the surface of a random planet of the system.
-pub(super) async fn exploration_site_position(db: &Db, system: i64) -> Result<V3, CallError> {
-    let (base, radius) = crate::services::site_position(db, system).await?.unwrap_or(([AU, 0.0, 0.0], 0.0));
-    Ok(off_surface(base, radius, site_distance()))
+pub(super) fn exploration_site_position(sde: &Sde, system: i64) -> V3 {
+    let (base, radius) = crate::services::site_position(sde, system).unwrap_or(([AU, 0.0, 0.0], 0.0));
+    off_surface(base, radius, site_distance())
 }
 /// A combat dungeon of `faction` within the difficulty range: acceleration-gated
 /// complexes are scanned down as signatures, open sites show as anomalies.
@@ -155,7 +159,7 @@ pub(super) fn new_site(system: i64, pos: V3, kind: Kind, strength_attr: i64, eas
 }
 
 /// One combat site for the system: an anomaly or a (gated) signature.
-pub(super) async fn combat_site(db: &Db, system: i64, info: &SystemInfo, kind: Kind, taken: &mut HashSet<String>) -> Result<Option<Site>, CallError> {
+pub(super) async fn combat_site(db: &Db, sde: &Sde, system: i64, info: &SystemInfo, kind: Kind, taken: &mut HashSet<String>) -> Result<Option<Site>, CallError> {
     let jspace = (1..=6).contains(&info.class);
     let (faction, range) = if jspace {
         let lo = (info.class + 1) / 2 + 1; // C1-2: 2, C3-4: 3, C5-6: 4
@@ -170,7 +174,7 @@ pub(super) async fn combat_site(db: &Db, system: i64, info: &SystemInfo, kind: K
     };
     let gated = kind == Kind::Signature && !jspace;
     let Some(d) = pick_combat_dungeon(db, faction, range, gated, jspace).await? else { return Ok(None) };
-    let pos = exploration_site_position(db, system).await?;
+    let pos = exploration_site_position(sde, system);
     let ease = [1.0, 0.8, 0.6, 0.5, 0.4][(d.difficulty.clamp(1, 5) - 1) as usize];
     let mut site = new_site(system, pos, kind, STRENGTH_ALL, ease, taken);
     site.dungeon_id = Some(d.id);
@@ -185,6 +189,7 @@ pub(super) async fn combat_site(db: &Db, system: i64, info: &SystemInfo, kind: K
 /// in the destination. Returns (wormhole site, K162 site).
 pub(super) async fn wormhole_pair(
     db: &Db,
+    sde: &Sde,
     system: i64,
     class: i64,
     targets: &[i64],
@@ -232,10 +237,10 @@ pub(super) async fn wormhole_pair(
     let a = WormholeAttributesRow::from_row(&a);
     let (life, mass, jump) = (a.life, a.mass, a.jump);
     let born = filetime_now();
-    let mut here = new_site(system, exploration_site_position(db, system).await?, Kind::Signature, STRENGTH_WORMHOLE, WORMHOLE_SCAN_EASE, taken);
+    let mut here = new_site(system, exploration_site_position(sde, system), Kind::Signature, STRENGTH_WORMHOLE, WORMHOLE_SCAN_EASE, taken);
     // The far side's target IDs are drawn from its own system's set when it is generated;
     // a clash there is harmless (results are per system).
-    let mut there = new_site(dest_system, exploration_site_position(db, dest_system).await?, Kind::Signature, STRENGTH_WORMHOLE, WORMHOLE_SCAN_EASE, &mut HashSet::new());
+    let mut there = new_site(dest_system, exploration_site_position(sde, dest_system), Kind::Signature, STRENGTH_WORMHOLE, WORMHOLE_SCAN_EASE, &mut HashSet::new());
     let base = Wormhole {
         type_id,
         dest_system,
@@ -291,11 +296,11 @@ pub(super) async fn ensure_loaded(db: &Db, world: &Arc<World>, system: i64) -> R
         } else {
             let info = system_info(db, system).await?;
             let mut taken = stored.iter().map(|s| s.target.clone()).collect();
-            mining_sites(db, system, &info, &mut taken).await?
+            mining_sites(db, world.sde(), system, &info, &mut taken).await?
         }
     } else {
         let taken = stored.iter().map(|s| s.target.clone()).collect();
-        generate(db, system, taken).await?
+        generate(db, world.sde(), system, taken).await?
     };
     for s in &new {
         save_site(db, s).await?;
@@ -340,7 +345,7 @@ pub(super) async fn ensure_static_exit(db: &Db, world: &World, system: i64) -> R
         return Ok(());
     }
     let mut taken: HashSet<String> = system_sites(system).into_iter().map(|s| s.target).collect();
-    let Some((here, there)) = wormhole_pair(db, system, info.class, &[7, 8, 9], &mut taken).await? else { return Ok(()) };
+    let Some((here, there)) = wormhole_pair(db, world.sde(), system, info.class, &[7, 8, 9], &mut taken).await? else { return Ok(()) };
     save_site(db, &here).await?;
     save_site(db, &there).await?;
     info!("exploration: {system} gets a new exit {} -> {}", here.target, there.system);
@@ -355,7 +360,7 @@ pub(super) async fn ensure_static_exit(db: &Db, world: &World, system: i64) -> R
 
 /// A system's sites, generated the first time anyone looks. Wormholes also create their
 /// far end in the destination system.
-pub(super) async fn generate(db: &Db, system: i64, mut taken: HashSet<String>) -> Result<Vec<Site>, CallError> {
+pub(super) async fn generate(db: &Db, sde: &Sde, system: i64, mut taken: HashSet<String>) -> Result<Vec<Site>, CallError> {
     let info = system_info(db, system).await?;
     let mut new = vec![];
     let jspace = (1..=6).contains(&info.class);
@@ -366,17 +371,17 @@ pub(super) async fn generate(db: &Db, system: i64, mut taken: HashSet<String>) -
         _ => (4, 2),
     };
     for _ in 0..anomalies {
-        new.extend(combat_site(db, system, &info, Kind::Anomaly, &mut taken).await?);
+        new.extend(combat_site(db, sde, system, &info, Kind::Anomaly, &mut taken).await?);
     }
     for _ in 0..combat_sigs {
-        new.extend(combat_site(db, system, &info, Kind::Signature, &mut taken).await?);
+        new.extend(combat_site(db, sde, system, &info, Kind::Signature, &mut taken).await?);
     }
-    new.extend(mining_sites(db, system, &info, &mut taken).await?);
+    new.extend(mining_sites(db, sde, system, &info, &mut taken).await?);
     // A data and a relic site (two of each in null-sec).
     let hack_sites = if info.class == 9 { 2 } else { 1 };
     for _ in 0..hack_sites {
         for relic in [false, true] {
-            new.extend(hack_site(db, system, &info, relic, &mut taken).await?);
+            new.extend(hack_site(db, sde, system, &info, relic, &mut taken).await?);
         }
     }
     // Wormholes: a static out of wormhole space to known space or deeper, and in known
@@ -389,7 +394,7 @@ pub(super) async fn generate(db: &Db, system: i64, mut taken: HashSet<String>) -
         if info.class == 7 { vec![into] } else { vec![into, &[7, 8, 9]] }
     };
     for targets in wormholes {
-        if let Some((here, there)) = wormhole_pair(db, system, info.class, targets, &mut taken).await? {
+        if let Some((here, there)) = wormhole_pair(db, sde, system, info.class, targets, &mut taken).await? {
             new.push(here);
             new.push(there);
         }
@@ -399,24 +404,24 @@ pub(super) async fn generate(db: &Db, system: i64, mut taken: HashSet<String>) -
 }
 
 /// Ore anomalies everywhere, ice fields in some of known space, gas clouds to scan for.
-pub(super) async fn mining_sites(db: &Db, system: i64, info: &SystemInfo, taken: &mut HashSet<String>) -> Result<Vec<Site>, CallError> {
+pub(super) async fn mining_sites(db: &Db, sde: &Sde, system: i64, info: &SystemInfo, taken: &mut HashSet<String>) -> Result<Vec<Site>, CallError> {
     use crate::services::mining::Field;
     let jspace = (1..=6).contains(&info.class);
     let mut out = vec![];
     for _ in 0..if info.class == 9 { 2 } else { 1 } {
-        out.extend(mining_site(db, system, info, Field::Ore, taken).await?);
+        out.extend(mining_site(db, sde, system, info, Field::Ore, taken).await?);
     }
     if !jspace && rand01() < 0.3 {
-        out.extend(mining_site(db, system, info, Field::Ice, taken).await?);
+        out.extend(mining_site(db, sde, system, info, Field::Ice, taken).await?);
     }
     if jspace || info.class != 7 || rand01() < 0.5 {
-        out.extend(mining_site(db, system, info, Field::Gas, taken).await?);
+        out.extend(mining_site(db, sde, system, info, Field::Gas, taken).await?);
     }
     Ok(out)
 }
 
 /// An ore or ice anomaly, or a gas signature, named after one of the build's sites.
-pub(super) async fn mining_site(db: &Db, system: i64, info: &SystemInfo, field: crate::services::mining::Field, taken: &mut HashSet<String>) -> Result<Option<Site>, CallError> {
+pub(super) async fn mining_site(db: &Db, sde: &Sde, system: i64, info: &SystemInfo, field: crate::services::mining::Field, taken: &mut HashSet<String>) -> Result<Option<Site>, CallError> {
     use crate::services::mining::Field;
     let jspace = (1..=6).contains(&info.class);
     let (archetype, pattern) = match field {
@@ -439,7 +444,7 @@ pub(super) async fn mining_site(db: &Db, system: i64, info: &SystemInfo, field: 
         Field::Gas => (Kind::Signature, STRENGTH_LADAR, if jspace { 0.6 } else { 0.8 }),
         _ => (Kind::Anomaly, STRENGTH_GRAVIMETRIC, 1.0),
     };
-    let mut site = new_site(system, exploration_site_position(db, system).await?, kind, strength, ease, taken);
+    let mut site = new_site(system, exploration_site_position(sde, system), kind, strength, ease, taken);
     site.dungeon_id = Some(r.id);
     site.name_id = r.name_id;
     site.archetype = Some(archetype);
@@ -452,7 +457,7 @@ pub(super) async fn mining_site(db: &Db, system: i64, info: &SystemInfo, field: 
 }
 
 /// A data or relic site: the faction's (or the Sleepers') hackable ruins.
-pub(super) async fn hack_site(db: &Db, system: i64, info: &SystemInfo, relic: bool, taken: &mut HashSet<String>) -> Result<Option<Site>, CallError> {
+pub(super) async fn hack_site(db: &Db, sde: &Sde, system: i64, info: &SystemInfo, relic: bool, taken: &mut HashSet<String>) -> Result<Option<Site>, CallError> {
     let jspace = (1..=6).contains(&info.class);
     let faction = if jspace { 500021 } else { pirate_faction(info.faction, info.region) };
     // Retail naming by security: Local/Crumbling (high), Regional/Decayed (low),
@@ -493,7 +498,7 @@ pub(super) async fn hack_site(db: &Db, system: i64, info: &SystemInfo, relic: bo
     };
     let Some(r) = r.as_ref().map(HackDungeonRow::from_row) else { return Ok(None) };
     let strength = if relic { STRENGTH_MAGNETOMETRIC } else { STRENGTH_RADAR };
-    let mut site = new_site(system, exploration_site_position(db, system).await?, Kind::Signature, strength, ease, taken);
+    let mut site = new_site(system, exploration_site_position(sde, system), Kind::Signature, strength, ease, taken);
     site.dungeon_id = Some(r.id);
     site.name_id = r.name_id;
     site.archetype = Some(if relic { 44 } else { 45 });

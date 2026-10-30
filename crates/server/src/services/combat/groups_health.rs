@@ -138,8 +138,8 @@ pub(super) struct Condition {
     pub(super) shield_at: i64,
 }
 
-pub(super) async fn ship_stats(db: &Db, char_id: i64, ship: i64) -> Result<ShipStats, CallError> {
-    let fit = Fit::load(db, char_id, ship).await?;
+pub(super) async fn ship_stats(db: &Db, world: &World, char_id: i64, ship: i64) -> Result<ShipStats, CallError> {
+    let fit = Fit::load(db, world.sde().clone(), char_id, ship).await?;
     Ok(ShipStats {
         max: ATTR_HP.map(|a| fit.value(Key::Ship, a)),
         resonance: ATTR_RESONANCE.map(|layer| layer.map(|a| fit.value(Key::Ship, a))),
@@ -196,9 +196,8 @@ pub(super) async fn damage_npc(db: &Db, world: &World, system: i64, target: i64,
     let mut hp = match known {
         Some(hp) => hp,
         None => {
-            let a = attributes(db, ball.type_id).await?;
-            let max = ATTR_HP.map(|id| attr(&a, id, 0.0));
-            Hp { now: max, max, resonance: ATTR_RESONANCE.map(|layer| layer.map(|id| attr(&a, id, 1.0))) }
+            let max = ATTR_HP.map(|id| attr(world.sde(), ball.type_id, id, 0.0));
+            Hp { now: max, max, resonance: ATTR_RESONANCE.map(|layer| layer.map(|id| attr(world.sde(), ball.type_id, id, 1.0))) }
         }
     };
     let dealt = absorb(&mut hp.now, &hp.resonance, raw);
@@ -224,7 +223,7 @@ pub(super) async fn damage_npc(db: &Db, world: &World, system: i64, target: i64,
 /// (`__ship_destroyed`, handled by the pilot's connection).
 pub(super) async fn damage_player(db: &Db, world: &World, system: i64, ship: i64, char_id: i64, raw: [f64; 4], attacker: Option<i64>) -> Result<f64, CallError> {
     // Resistances and hit points as fitted right now (hardeners running, modules offline...).
-    let stats = ship_stats(db, char_id, ship).await?;
+    let stats = ship_stats(db, world, char_id, ship).await?;
     let known = state().condition.get(&ship).cloned();
     let mut cond = match known {
         Some(mut c) => {
@@ -300,7 +299,7 @@ pub(super) async fn repair_player(db: &Db, world: &World, system: i64, ship: i64
 /// A destroyed NPC pays its bounty to the pilot who killed it and leaves a wreck (its
 /// group's wreck type, sde_native.wrecks) holding loot worth about its bounty.
 pub(super) async fn reward_kill(db: &Db, world: &World, system: i64, npc: &Ball, killer: Option<i64>) -> Result<(), CallError> {
-    let bounty = attr(&attributes(db, npc.type_id).await?, ATTR_ENTITY_KILL_BOUNTY, 0.0);
+    let bounty = attr(world.sde(), npc.type_id, ATTR_ENTITY_KILL_BOUNTY, 0.0);
     if let Some(pilot) = killer.filter(|_| bounty > 0.0) {
         // A player corporation takes its tax rate of the bounty into its master wallet.
         let corp_tax = crate::dao::characters::combat::corporation_tax(db, pilot).await.map_err(db_err)?

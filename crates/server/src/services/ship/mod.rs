@@ -43,7 +43,7 @@ pub(super) async fn ship_ball(c: &Client, ship_id: i64, pos: [f64; 3]) -> Result
     let char_id = c.session.int("charid").unwrap_or(0);
     let corp = c.session.int("corpid").unwrap_or(0);
     // Movement and signature attributes as fitted (skills, modules), when the ship is the pilot's.
-    let fit = super::fit::Fit::load(&c.db, char_id, ship_id).await?;
+    let fit = super::fit::Fit::load(&c.db, c.sde.clone(), char_id, ship_id).await?;
     let fitted = |attr: i32, base: f64| match fit.value(super::fit::Key::Ship, attr) {
         v if v > 0.0 => v,
         _ => base,

@@ -34,6 +34,7 @@ pub struct Client {
     notify_rx: mpsc::UnboundedReceiver<(String, Vec<Value>)>,
     pub cfg: Arc<Config>,
     pub db: Db,
+    pub sde: Arc<crate::sde::Sde>,
     pub chat: std::sync::Arc<crate::chat::Hub>,
     pub login: Login,
     pub session: Session,
@@ -55,7 +56,7 @@ pub fn short(v: &Value) -> String {
 }
 
 impl Client {
-    pub fn new(conn: Conn, cfg: Arc<Config>, db: Db, chat: Arc<crate::chat::Hub>, world: Arc<crate::space::World>, login: Login) -> Self {
+    pub fn new(conn: Conn, cfg: Arc<Config>, db: Db, sde: Arc<crate::sde::Sde>, chat: Arc<crate::chat::Hub>, world: Arc<crate::space::World>, login: Login) -> Self {
         let session = Session::new(login.session_id);
         let (conn, inbox) = conn.split();
         let (destiny_tx, destiny_rx) = mpsc::unbounded_channel();
@@ -70,6 +71,7 @@ impl Client {
             notify_rx,
             cfg,
             db,
+            sde,
             chat,
             login,
             session,

@@ -107,7 +107,6 @@ impl Db {
         };
         // The initial checkout is retained for schema setup, then returned to the pool.
         client.batch_execute(GAME_SCHEMA).await.context("applying game schema")?;
-        let types: i64 = client.query_one("SELECT count(*) AS count FROM sde.inv_types", &[]).await.context("SDE not imported? run sde-import")?.get("count");
         drop(client);
         let db = Db { pool, online: Arc::new(AtomicI64::new(0)) };
         load_retail_prices(&db).await.context("loading retail prices")?;
@@ -128,7 +127,6 @@ impl Db {
         if n > 0 {
             info!("repriced {n} NPC market orders from retail prices");
         }
-        info!("database ready ({types} types in SDE)");
         Ok(db)
     }
 

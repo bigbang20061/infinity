@@ -1,11 +1,15 @@
-//! Solar systems in space: a server-side ballpark per system, the destiny
-//! binary state format (carbonengine destiny Thunkers.cpp WriteBallToStream),
-//! and destiny event broadcasting (michelle.py DoDestinyUpdate).
+//! Solar systems in space: a server-side ballpark per system, destiny binary state
+//! and event broadcasting. `eve/client/script/remote/michelle.py:491-532` consumes
+//! destiny updates; `eve/client/script/parklife/autopilot.py:260-261,329-332`
+//! consumes gate jump destinations.
 //!
-//! The client runs the same destiny simulation locally from the events we
-//! send; the server integrates ships with destiny's model (exponential
-//! approach to target velocity with tau = mass * agility / 1e6, warp phases
-//! from Ballpark.cpp SetupWarpConstants) to know where things are.
+//! Inherited native attributions for the binary format and warp phases are
+//! carbonengine destiny `Thunkers.cpp` WriteBallToStream and `Ballpark.cpp`
+//! SetupWarpConstants. Those native sources and `IDstConstants.h` are not present
+//! in the decoded Python tree; its consumers do not validate the byte layout or
+//! native constants. The server integrates movement with exponential velocity
+//! approach (tau = mass * agility / 1e6) and warp phases; this is not a claim of
+//! complete client simulation parity.
 //!
 //! Celestials come from the SDE; dynamic balls stay in memory. Each system
 //! owns an actor with a 100 ms tick and closure messages. Destiny stamps remain
@@ -18,6 +22,7 @@
 
 use crate::consts::{AU, DAMAGE_LAYER_COUNT, FILETIME_SECOND, SECONDS_PER_MINUTE};
 use crate::db::Db;
+use crate::sde::Sde;
 use anyhow::Result;
 use marshal::{DbRowDescriptor, DbType, Value};
 use std::collections::HashMap;
@@ -469,52 +474,44 @@ impl Pilots {
 /// Actor facade. Actor closures must never await, access the DB or call World.
 pub struct World {
     db: Db,
+    sde: Arc<Sde>,
     systems: Arc<Mutex<HashMap<i64, SystemHandle>>>,
-    loads: Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>,
     observers: Mutex<HashMap<i64, i64>>,
     pilots: Arc<Pilots>,
 }
 impl World {
-    pub fn new(db: Db, capacity: usize) -> Arc<Self> {
-        Arc::new(Self { db, systems: Default::default(), loads: Default::default(),
+    pub fn new(db: Db, sde: Arc<Sde>, capacity: usize) -> Arc<Self> {
+        Arc::new(Self { db, sde, systems: Default::default(),
             observers: Default::default(), pilots: Arc::new(Pilots { capacity, ..Pilots::default() }) })
     }
+    pub fn sde(&self) -> &Arc<Sde> { &self.sde }
     pub fn register_pilot(&self, char_id: i64, tx: NotifyTx) { self.pilots.register_pilot(char_id, tx); }
     pub fn unregister_pilot(&self, char_id: i64) { self.pilots.unregister_pilot(char_id); }
     pub fn notify_pilot(&self, char_id: i64, name: &str, args: Vec<Value>) { self.pilots.notify_pilot(char_id, name, args); }
     /// Start the destination before removing a jumping ship from its source.
-    /// Database loading is serialized per system, outside the actor.
+    /// Construction is serialized with the live-handle check.
     pub async fn system(&self, system_id: i64) -> Result<()> {
-        if self.running(system_id).is_some() { return Ok(()); }
-        let load = self.loads.lock().unwrap().entry(system_id).or_default().clone();
-        let _guard = load.lock().await;
-        if self.running(system_id).is_some() { return Ok(()); }
-        let rows = self
-            .db
-            .query(
-                "SELECT c.item_id, c.type_id, COALESCE(c.radius, t.radius, $2::float8)::float8 AS radius, c.x, c.y, c.z,
-                        COALESCE(s.owner_id, 1)::bigint AS owner_id, c.group_id::bigint,
-                        g.dest_stargate_id::bigint, g.dest_solar_system_id::bigint, gr.category_id
-                 FROM sde.map_celestials c JOIN sde.inv_types t USING (type_id)
-                 LEFT JOIN sde.inv_groups gr ON gr.group_id = c.group_id
-                 LEFT JOIN sde.sta_stations s ON s.station_id = c.item_id
-                 LEFT JOIN sde.map_stargates g ON g.stargate_id = c.item_id
-                 WHERE c.solar_system_id = $1",
-                &[&(system_id as i32), &CELESTIAL_FALLBACK_RADIUS],
-            )
-            .await?;
+        let mut systems = self.systems.lock().unwrap();
+        if systems.get(&system_id).is_some_and(|h| h.is_closed()) { systems.remove(&system_id); }
+        if systems.contains_key(&system_id) { return Ok(()); }
         let tick = now_ms();
         let mut system = System::new(system_id, self.pilots.clone());
-        for r in rows {
-            let id: i64 = r.get("item_id");
-            let pos: V3 = [r.get("x"), r.get("y"), r.get("z")];
-            let group = r.get::<_, Option<i64>>("group_id").unwrap_or(0) as i32;
-            let category = r.get::<_, Option<i32>>("category_id").unwrap_or(0);
-            if let Some(point) = warpin::warp_in_point(id, category, group, pos, r.get("radius")) {
+        for r in self.sde.map.celestials(system_id) {
+            let Some(type_id) = r.type_id.and_then(|id| i32::try_from(id).ok()) else { continue };
+            let Some(ty) = self.sde.types.get(type_id) else { continue };
+            let id = r.item_id;
+            let pos: V3 = [r.x.expect("NULL celestial x"), r.y.expect("NULL celestial y"), r.z.expect("NULL celestial z")];
+            let group = r.group_id.unwrap_or(0) as i32;
+            let category = r.group_id.and_then(|id| i32::try_from(id).ok())
+                .and_then(|id| self.sde.types.group(id)).and_then(|g| g.category_id).unwrap_or(0);
+            let radius = r.radius.or(ty.radius).unwrap_or(CELESTIAL_FALLBACK_RADIUS);
+            let owner = self.sde.map.station(id).and_then(|s| s.owner_id).unwrap_or(1);
+            if let Some(point) = warpin::warp_in_point(id, category, group, pos, radius) {
                 system.set_warp_in(id, point);
             }
             let mut slim = Vec::new();
-            if let (Some(dest_gate), Some(dest_sys)) = (r.get::<_, Option<i64>>("dest_stargate_id"), r.get::<_, Option<i64>>("dest_solar_system_id")) {
+            let gate = self.sde.map.stargate(id);
+            if let (Some(dest_gate), Some(dest_sys)) = (gate.and_then(|g| g.dest_stargate_id), gate.and_then(|g| g.dest_solar_system_id)) {
                 // A row: unpacked as (destGate, destSystem) by subwaySvc.GetPriorityLoads,
                 // read as .toCelestialID / .locationID elsewhere.
                 let jump = DbRowDescriptor::new([("toCelestialID", DbType::I4), ("locationID", DbType::I4)])
@@ -530,14 +527,14 @@ impl World {
             system.insert(
                 Ball {
                     id,
-                    type_id: r.get::<_, Option<i32>>("type_id").unwrap_or(0),
-                    owner_id: r.get("owner_id"),
-                    corp_id: r.get("owner_id"),
+                    type_id,
+                    owner_id: owner,
+                    corp_id: owner,
                     alliance_id: -1,
                     char_id: None,
                     signature_radius: None,
                     mode: MODE_RIGID,
-                    radius: r.get::<_, f64>("radius") as f32,
+                    radius: radius as f32,
                     mass: CELESTIAL_STATIC_MASS,
                     max_vel: 0.0,
                     agility: 1.0,
@@ -564,7 +561,7 @@ impl World {
         info!("loaded solar system {system_id} with {} celestials", system.balls().count());
 
         let handle = actor::start(system, system_id, Arc::downgrade(&self.systems), self.db.clone());
-        self.systems.lock().unwrap().insert(system_id, handle);
+        systems.insert(system_id, handle);
         Ok(())
     }
     fn running(&self, id: i64) -> Option<SystemHandle> {

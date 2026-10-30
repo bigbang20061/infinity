@@ -22,17 +22,16 @@ const SITE_COLUMNS: &str = "site_id, system_id, target, kind, strength_attr, eas
 pub(crate) const EXPLORATION_SITES_TABLE: &str = "game.exploration_sites";
 pub(crate) const AGENT_MISSIONS_TABLE: &str = "game.agent_missions";
 
-pub(crate) struct RepairRow { pub(crate) id: String, pub(crate) old: [f64; 3], pub(crate) planet: [f64; 3], pub(crate) radius: f64 }
-impl RepairRow { fn from_row(r: &Row) -> Self { Self { id: r.get("id"), old: [r.get("old_x"), r.get("old_y"), r.get("old_z")], planet: [r.get("planet_x"), r.get("planet_y"), r.get("planet_z")], radius: r.get("radius") } } }
-fn repair_sql(exploration: bool) -> String {
-    let (table, key) = if exploration { (EXPLORATION_SITES_TABLE, "site_id") } else { (AGENT_MISSIONS_TABLE, "(character_id, agent_id)") };
-    format!("SELECT {key}::text AS id, s.x AS old_x, s.y AS old_y, s.z AS old_z, p.x AS planet_x, p.y AS planet_y, p.z AS planet_z, COALESCE(p.radius, 0)::float8 AS radius FROM {table} s
-                     CROSS JOIN LATERAL (SELECT c.x, c.y, c.z, c.radius FROM sde.map_celestials c
-                                         WHERE c.solar_system_id = s.system_id AND c.group_id = $1
-                                         ORDER BY (c.x - s.x) ^ 2 + (c.y - s.y) ^ 2 + (c.z - s.z) ^ 2 LIMIT 1) p
-                     WHERE sqrt((p.x - s.x) ^ 2 + (p.y - s.y) ^ 2 + (p.z - s.z) ^ 2) < COALESCE(p.radius, 0) + $2")
+pub(crate) struct RepairRow { pub(crate) id: String, pub(crate) system: i64, pub(crate) old: [f64; 3] }
+impl RepairRow { fn from_row(r: &Row) -> Self { Self { id: r.get("id"), system: r.get("system_id"), old: [r.get("x"), r.get("y"), r.get("z")] } } }
+pub(crate) async fn repair_rows(ex: &(impl Executor + ?Sized), exploration: bool) -> Result<Vec<RepairRow>, Error> {
+    let sql = if exploration {
+        "SELECT site_id::text AS id, system_id, x, y, z FROM game.exploration_sites"
+    } else {
+        "SELECT (character_id, agent_id)::text AS id, system_id, x, y, z FROM game.agent_missions"
+    };
+    Ok(ex.query(sql, &[]).await?.iter().map(RepairRow::from_row).collect())
 }
-pub(crate) async fn repair_rows(ex: &(impl Executor + ?Sized), exploration: bool, planet_group: i32, clearance: f64) -> Result<Vec<RepairRow>, Error> { Ok(ex.query(&repair_sql(exploration), &[&planet_group, &clearance]).await?.iter().map(RepairRow::from_row).collect()) }
 pub(crate) async fn move_exploration(ex: &(impl Executor + ?Sized), site: i64, delta: [f64; 3]) -> Result<(), Error> {
     ex.execute("UPDATE game.exploration_sites SET x = x + $2, y = y + $3, z = z + $4,
                                 overlay_x = overlay_x + $2, overlay_y = overlay_y + $3, overlay_z = overlay_z + $4 WHERE site_id = $1", &[&site, &delta[0], &delta[1], &delta[2]]).await?;

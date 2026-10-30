@@ -14,13 +14,12 @@ pub(super) struct NpcStats {
     pub(super) optimal: f64,
     pub(super) falloff: f64,
     pub(super) damage: [f64; DAMAGE_TYPE_COUNT],
-    pub(super) missile: Option<(i32, f64, HashMap<i32, f64>)>,
+    pub(super) missile: Option<(i32, f64)>,
     pub(super) fx: Option<String>,
 }
 
-pub(super) async fn npc_stats(db: &Db, type_id: i32) -> Result<NpcStats, CallError> {
-    let a = attributes(db, type_id).await?;
-    let multiplier = attr(&a, ATTR_DAMAGE_MULTIPLIER, 1.0);
+pub(super) async fn npc_stats(db: &Db, sde: &Sde, type_id: i32) -> Result<NpcStats, CallError> {
+    let multiplier = attr(sde, type_id, ATTR_DAMAGE_MULTIPLIER, 1.0);
     let fx: Option<String> = db
         .query_opt(
             "SELECT e.guid FROM sde.type_effects te JOIN sde.dogma_effects e USING (effect_id)
@@ -30,27 +29,26 @@ pub(super) async fn npc_stats(db: &Db, type_id: i32) -> Result<NpcStats, CallErr
         .await
         .map_err(db_err)?
         .as_ref().map(GuidRow::from_row).map(|r| r.guid);
-    let missile_type = attr(&a, ATTR_ENTITY_MISSILE_TYPE, 0.0) as i32;
+    let missile_type = attr(sde, type_id, ATTR_ENTITY_MISSILE_TYPE, 0.0) as i32;
     let missile = if missile_type > 0 {
-        let charge = attributes(db, missile_type).await?;
-        Some((missile_type, attr(&a, ATTR_MISSILE_DAMAGE_MULTIPLIER, 1.0), charge))
+        Some((missile_type, attr(sde, type_id, ATTR_MISSILE_DAMAGE_MULTIPLIER, 1.0)))
     } else {
         None
     };
-    let optimal = attr(&a, ATTR_MAX_RANGE, 10_000.0);
+    let optimal = attr(sde, type_id, ATTR_MAX_RANGE, 10_000.0);
     Ok(NpcStats {
-        scan_resolution: attr(&a, ATTR_SCAN_RESOLUTION, 0.0),
+        scan_resolution: attr(sde, type_id, ATTR_SCAN_RESOLUTION, 0.0),
         repairs: (
-            attr(&a, ATTR_ENTITY_SHIELD_BOOST_AMOUNT, 0.0),
-            attr(&a, ATTR_ENTITY_ARMOR_REPAIR_AMOUNT, 0.0),
-            attr(&a, ATTR_ENTITY_ARMOR_REPAIR_DURATION, 0.0).max(attr(&a, ATTR_ENTITY_SHIELD_BOOST_DURATION, 0.0)).max(5_000.0),
+            attr(sde, type_id, ATTR_ENTITY_SHIELD_BOOST_AMOUNT, 0.0),
+            attr(sde, type_id, ATTR_ENTITY_ARMOR_REPAIR_AMOUNT, 0.0),
+            attr(sde, type_id, ATTR_ENTITY_ARMOR_REPAIR_DURATION, 0.0).max(attr(sde, type_id, ATTR_ENTITY_SHIELD_BOOST_DURATION, 0.0)).max(5_000.0),
         ),
-        fly_range: attr(&a, ATTR_ENTITY_FLY_RANGE, 7_500.0).max(1_000.0),
-        aggro_range: attr(&a, ATTR_ENTITY_ATTACK_RANGE, 0.0).max(optimal * 3.0).max(60_000.0),
-        rate_of_fire_ms: attr(&a, ATTR_RATE_OF_FIRE, 4_000.0).max(1_000.0),
+        fly_range: attr(sde, type_id, ATTR_ENTITY_FLY_RANGE, 7_500.0).max(1_000.0),
+        aggro_range: attr(sde, type_id, ATTR_ENTITY_ATTACK_RANGE, 0.0).max(optimal * 3.0).max(60_000.0),
+        rate_of_fire_ms: attr(sde, type_id, ATTR_RATE_OF_FIRE, 4_000.0).max(1_000.0),
         optimal,
-        falloff: attr(&a, ATTR_FALLOFF, 5_000.0),
-        damage: ATTR_DAMAGE.map(|id| attr(&a, id, 0.0) * multiplier),
+        falloff: attr(sde, type_id, ATTR_FALLOFF, 5_000.0),
+        damage: ATTR_DAMAGE.map(|id| attr(sde, type_id, id, 0.0) * multiplier),
         missile,
         fx,
     })
@@ -62,15 +60,15 @@ pub(super) async fn npc_stats(db: &Db, type_id: i32) -> Result<NpcStats, CallErr
 pub(super) async fn npc_shot(db: &Db, world: &Arc<World>, system: i64, id: i64, type_id: i32, stats: &NpcStats, me: Ball, victim: Ball) -> Result<(), CallError> {
     let ship = victim.id;
     let gap = (dist(me.pos, victim.pos) - me.radius as f64 - victim.radius as f64).max(0.0);
-    if let Some((charge, multiplier, c)) = &stats.missile {
+    if let Some((charge, multiplier)) = &stats.missile {
         let (charge, multiplier) = (*charge, *multiplier);
-        let velocity = attr(c, ATTR_MAX_VELOCITY, NPC_MISSILE_VELOCITY_MPS).max(1.0);
-        let flight = velocity * ms_to_seconds(attr(c, ATTR_EXPLOSION_DELAY, NPC_MISSILE_FLIGHT_MS));
+        let velocity = attr(world.sde(), charge, ATTR_MAX_VELOCITY, NPC_MISSILE_VELOCITY_MPS).max(1.0);
+        let flight = velocity * ms_to_seconds(attr(world.sde(), charge, ATTR_EXPLOSION_DELAY, NPC_MISSILE_FLIGHT_MS));
         if gap <= flight {
             let missile = Missile {
                 charge,
-                raw: ATTR_DAMAGE.map(|a| attr(c, a, 0.0) * multiplier),
-                aoe_cloud: attr(c, ATTR_AOE_CLOUD_SIZE, NPC_MISSILE_EXPLOSION_RADIUS_METRES),
+                raw: ATTR_DAMAGE.map(|a| attr(world.sde(), charge, a, 0.0) * multiplier),
+                aoe_cloud: attr(world.sde(), charge, ATTR_AOE_CLOUD_SIZE, NPC_MISSILE_EXPLOSION_RADIUS_METRES),
                 velocity,
                 flight_range: flight,
                 weapon: type_id,

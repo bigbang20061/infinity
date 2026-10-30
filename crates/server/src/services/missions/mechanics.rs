@@ -1,5 +1,11 @@
-//! Mission state, rewards and arc mechanics; completion commits before dispatching effects.
-//! Uses mission, character, item, loyalty and standing data; site simulation is separate.
+//! Mission state, offers, rewards and arc mechanics; completion commits before dispatching
+//! effects. The client renders dungeon objectives in
+//! `agentinteraction/objectivesteps.py:103-104,123-125,137-142`.
+//! Mission and dungeon candidates and messages come from runtime `sde_native` tables;
+//! placement uses the shared SDE. Mission, character, item, loyalty and standing state is
+//! stored in the game database; site simulation is separate.
+//! Rewards and placement are server policy, not a client-provided generator; complete
+//! live-server mission layouts and mechanics are not reproduced.
 use super::*;
 /// (ISK, LP) rewards by agent level.
 fn rewards(level: i64) -> (i64, i64) {
@@ -51,9 +57,9 @@ pub(super) async fn message(c: &Client, mission_id: i32, key: &str) -> Result<Op
 }
 
 /// A mission site: a point well off the surface of a random planet of the system.
-async fn mission_site_position(c: &Client, system: i64) -> Result<V3, CallError> {
-    let (base, radius) = super::site_position(&c.db, system).await?.unwrap_or(([0.0; 3], 0.0));
-    Ok(super::off_surface(base, radius, SITE_OFFSET))
+fn mission_site_position(c: &Client, system: i64) -> V3 {
+    let (base, radius) = super::site_position(&c.sde, system).unwrap_or(([0.0; 3], 0.0));
+    super::off_surface(base, radius, SITE_OFFSET)
 }
 
 /// Offer one of the build's kill missions at the agent's level, sited in the agent's system.
@@ -74,7 +80,7 @@ pub(super) async fn offer(c: &Client, agent: &Agent) -> Result<(), CallError> {
         .map_err(db_err)?
         .ok_or_else(|| CallError::Internal(anyhow::anyhow!("no level {level} kill missions")))?;
     let pick = sde_rows::Pick::from_row(&pick);
-    let pos = mission_site_position(c, agent.system_id).await?;
+    let pos = mission_site_position(c, agent.system_id);
     let (isk, lp) = rewards(agent.level);
     crate::dao::missions::offer(&c.db, &crate::dao::missions::Offer {
         character_id: me, agent_id: agent.id, mission_id: pick.mission_id, dungeon_id: pick.dungeon_id,
@@ -179,7 +185,7 @@ pub(super) async fn offer_arc(c: &Client, agent: &Agent, mission_id: i32) -> Res
     };
     let cargo_type = r.cargo_type;
     let cargo_qty: Option<i32> = cargo_type.map(|_| r.cargo_qty.unwrap_or(1).max(1));
-    let pos = mission_site_position(c, agent.system_id).await?;
+    let pos = mission_site_position(c, agent.system_id);
     crate::dao::missions::offer_arc(&c.db, &crate::dao::missions::ArcOffer {
         offer: crate::dao::missions::Offer {
             character_id: me, agent_id: agent.id, mission_id, dungeon_id: r.dungeon_id,

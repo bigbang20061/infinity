@@ -1,5 +1,12 @@
-//! dogmaIM (bound per location): item attribute/effect state for godma and
-//! clientDogmaLocation (eve/client/script/environment/godma.py ProcessAllInfo).
+//! dogmaIM, bound per location, supplies item attribute and effect state.
+//! `eve/client/script/environment/godma.py:2440-2454` consumes all-info state,
+//! and `eve/client/script/environment/godma.py:1652-1676` reads active effects.
+//! Type attributes: `eve/common/script/dogma/baseDogmaLocation.py:1960-1967`.
+//! Static dogma and type data come from the shared SDE; items, charges and online
+//! state come from the runtime game database. For absent dogma rows, mass, capacity,
+//! volume and radius fall back to typed SDE type columns: this is server schema
+//! behavior, not a validated client fallback. Effective fitting is the subset in
+//! `services/fit.rs`, not a complete implementation of client dogma.
 
 use super::{db_err, item_descriptor, keyval, Call, CallError, CallResult};
 use crate::client::{filetime_now, short, Client};
@@ -52,27 +59,18 @@ impl Item {
 }
 
 
-async fn type_attributes(c: &Client, type_id: i32) -> Result<BTreeMap<i64, f64>, CallError> {
-    let rows = c
-        .db
-        .query("SELECT attribute_id, value FROM sde.type_attributes WHERE type_id = $1", &[&type_id])
-        .await
-        .map_err(db_err)?;
-    let mut attrs: BTreeMap<i64, f64> = rows.iter().map(|r| (r.get::<_, i32>("attribute_id") as i64, r.get::<_, f64>("value"))).collect();
-    // mass, capacity, volume and radius are type columns, not dogma attribute rows.
-    let columns = c
-        .db
-        .query_opt("SELECT mass::float8, capacity::float8, volume::float8, radius::float8 FROM sde.inv_types WHERE type_id = $1", &[&type_id])
-        .await
-        .map_err(db_err)?;
-    if let Some(r) = columns {
-        for (name, attr) in [("mass", ATTR_MASS), ("capacity", ATTR_CAPACITY), ("volume", ATTR_VOLUME), ("radius", ATTR_RADIUS)] {
-            if let Some(v) = r.get::<_, Option<f64>>(name) {
+fn type_attributes(c: &Client, type_id: i32) -> BTreeMap<i64, f64> {
+    let mut attrs: BTreeMap<i64, f64> = c.sde.types.attributes(type_id)
+        .map(|(id, value)| (id as i64, value)).collect();
+    // Server typed SDE fallback when these physical attributes lack dogma rows.
+    if let Some(t) = c.sde.types.get(type_id) {
+        for (attr, value) in [(ATTR_MASS, t.mass), (ATTR_CAPACITY, t.capacity), (ATTR_VOLUME, t.volume), (ATTR_RADIUS, t.radius)] {
+            if let Some(v) = value {
                 attrs.entry(attr as i64).or_insert(v);
             }
         }
     }
-    Ok(attrs)
+    attrs
 }
 
 /// godma's activeEffects for an online module: {effectID: (itemID, charID, shipID, targetID,
@@ -116,7 +114,7 @@ async fn character_info(c: &Client) -> Result<Value, CallError> {
     let char_id = c.session.int("charid").ok_or_else(|| CallError::Internal(anyhow::anyhow!("no character selected")))?;
     let ship_id = c.session.int("shipid").unwrap_or(0);
     let character_attrs = super::skills::attributes::character_attributes(c, char_id).await?;
-    let mut attrs = type_attributes(c, TYPE_CHARACTER).await?;
+    let mut attrs = type_attributes(c, TYPE_CHARACTER);
     attrs.extend(character_attrs);
     let item = Item {
         item_id: char_id,
@@ -176,13 +174,12 @@ async fn ship_info(c: &Client) -> Result<Vec<(Value, Value)>, CallError> {
     // armor and structure as combat left them.
     super::combat::refill_capacitor(ship_id);
     let char_id = c.session.int("charid").unwrap_or(0);
-    let fit = super::fit::Fit::load(&c.db, char_id, ship_id).await?;
+    let fit = super::fit::Fit::load(&c.db, c.sde.clone(), char_id, ship_id).await?;
     let (cap, shield_max) = (fit.value(super::fit::Key::Ship, ATTR_CAPACITOR_CAPACITY), fit.value(super::fit::Key::Ship, ATTR_SHIELD_CAPACITY));
     let (shield, armor_damage, hull_damage) = super::combat::ship_condition(ship_id).unwrap_or((shield_max, 0.0, 0.0));
     for item in items {
-        let mut attrs = type_attributes(c, item.type_id).await?;
-        // godma shows attributes as given, so the ship and its modules carry their fitted
-        // values (skills, modules, rigs): the HUD's shield/armor/hull maxima, cap, speed...
+        let mut attrs = type_attributes(c, item.type_id);
+        // Supply fitted values for ship and module attributes, including HUD maxima.
         let key = if item.item_id == ship_id {
             Some(super::fit::Key::Ship)
         } else if item.location_id == ship_id {
@@ -219,7 +216,7 @@ async fn ship_info(c: &Client) -> Result<Vec<(Value, Value)>, CallError> {
     let charges = charges::positive(&c.db, ship_id).await.map_err(db_err)?;
     for r in charges {
         let (flag, type_id, qty) = (r.flag_id, r.type_id, r.quantity);
-        let mut attrs = type_attributes(c, type_id).await?;
+        let mut attrs = type_attributes(c, type_id);
         attrs.insert(ATTR_QUANTITY as i64, qty as f64);
         let key = Value::tuple([Value::Int(ship_id), Value::Int(flag as i64), Value::Int(type_id as i64)]);
         out.push((key.clone(), info_keyed(Value::None, key, attrs, vec![])));
@@ -267,7 +264,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
             let items = load_items(&c.db, ItemQuery::Id(item_id)).await.map_err(db_err)?;
             match items.into_iter().next() {
                 Some(item) => {
-                    let attrs = type_attributes(c, item.type_id).await?;
+                    let attrs = type_attributes(c, item.type_id);
                     let online = online_modules(c, item.location_id).await?.contains(&item.item_id);
                     let char_id = c.session.int("charid").unwrap_or(0);
                     let active = if online { online_effect(item.item_id, char_id, item.location_id) } else { vec![] };

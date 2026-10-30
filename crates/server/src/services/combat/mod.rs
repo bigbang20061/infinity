@@ -17,6 +17,7 @@
 //! and repair themselves; a pilot's ship can be destroyed. Active modules apply their effects
 //! (hardeners through fit, propulsion speed via destiny, repairers each cycle), and a kill
 //! pays the NPC's bounty and leaves a wreck with loot.
+//! Raw NPC, charge, and target attributes come from the shared immutable SDE.
 //! Target locks, reloads, module cycles, pulses and missile impacts use system
 //! actor timers. Database-backed effects run on deferred workers outside the actor.
 //! Reload reservations survive interruptions and return to cargo during startup; reload
@@ -45,6 +46,7 @@ use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::{Outbox, dispatch_client, dispatch_world};
 use crate::messages;
+use crate::sde::Sde;
 use crate::space::{dist, event, lock_time_ms, metres_to_km, ms_to_seconds, seconds_to_ms, now_ms, now_tick, Ball, NotifyTx, NpcAction, NpcBrain, NpcConfig, NpcEffects, NpcFuture, System, World, MODE_MISSILE, MODE_WARP};
 use marshal::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -226,8 +228,6 @@ fn ctx(c: &Client) -> Option<Ctx> {
         system_id: c.session.int("solarsystemid")?,
     })
 }
-struct AttributeRow { attribute_id: i32, value: f64 }
-impl AttributeRow { fn from_row(row: &tokio_postgres::Row) -> Self { Self { attribute_id: row.get("attribute_id"), value: row.get("value") } } }
 struct ScalarRow { value: f64 }
 impl ScalarRow { fn from_row(row: &tokio_postgres::Row) -> Self { Self { value: row.get("value") } } }
 struct WreckRow { type_id: Option<i32>, radius: f64 }
@@ -240,13 +240,8 @@ struct GuidRow { guid: String }
 impl GuidRow { fn from_row(row: &tokio_postgres::Row) -> Self { Self { guid: row.get("guid") } } }
 
 
-async fn attributes(db: &Db, type_id: i32) -> Result<HashMap<i32, f64>, CallError> {
-    let rows = db.query("SELECT attribute_id, value FROM sde.type_attributes WHERE type_id = $1", &[&type_id]).await.map_err(db_err)?;
-    Ok(rows.iter().map(AttributeRow::from_row).map(|r| (r.attribute_id, r.value)).collect())
-}
-
-fn attr(a: &HashMap<i32, f64>, id: i32, default: f64) -> f64 {
-    a.get(&id).copied().unwrap_or(default)
+fn attr(sde: &Sde, type_id: i32, id: i32, default: f64) -> f64 {
+    sde.types.attribute(type_id, id).unwrap_or(default)
 }
 
 /// Stop everything a character was doing in space (docking, jumping, logging off).
@@ -358,7 +353,7 @@ pub(super) fn pulse_effect(c: &mut Client, module: i64, effect_id: i64, target: 
 }
 
 pub async fn spawn_npc(db: Db, world: Arc<World>, system: i64, id: i64, type_id: i32, owner: Option<i64>) -> Result<(), CallError> {
-    let stats = match npc_stats(&db, type_id).await {
+    let stats = match npc_stats(&db, world.sde(), type_id).await {
         Ok(stats) => Arc::new(stats),
         Err(error) => {
             world.post(system, move |s| { s.remove_ball(id); });

@@ -1,15 +1,18 @@
 //! Exploration: cosmic anomalies and signatures, the sensor overlay, probe and
 //! directional scanning, and wormholes.
 //!
-//! The live server's dungeon layouts never shipped with the client, so a site is a point
-//! off a planet's surface tied to one of the build's dungeons for its name, faction and difficulty.
+//! No usable general live-server dungeon-layout source was validated in the decoded
+//! client tree; `eve/client/script/parklife/dungeonTracking.py:104-110` consumes room
+//! entries. This server instead places a site off a planet's surface and ties it to
+//! one of the build's dungeons for its name, faction and difficulty.
 //! Combat sites fill with that faction's NPCs when first warped to and are replaced
 //! elsewhere after their spawn group clears and the site lingers briefly. Data and relic
 //! sites hold hackable containers (services/hacking) with loot. A wormhole leads to a
 //! random system of its target class, where a K162 leads back; both ends share one mass
 //! budget and lifetime.
 //!
-//! Sites are generated per system on first visit and stored in game.exploration_sites;
+//! Static placement uses the shared SDE; generation also queries `sde` and `sde_native`
+//! tables in the runtime database. Sites are stored in `game.exploration_sites`;
 //! memory holds the systems loaded since startup. Wormholes and spawned containers are put
 //! back in space when their system is loaded again. Startup moves legacy exploration and
 //! mission sites out of planets, along with exploration overlays and asteroids.
@@ -17,7 +20,10 @@
 //! pending timers do not survive a restart.
 //! Probe charges are consumed atomically before transient probes are created.
 //!
-//! Protocol (client: scanSvc, sensorSuiteService, probescanning, explorationscanner):
+//! Client scan consumers: `eve/client/script/parklife/scanSvc.py:193-198,253-260`,
+//! `eve/client/script/parklife/directionalScanSvc.py:46-49`, and
+//! `eve/client/script/parklife/sensorSuiteService.py:502-504`.
+//! Protocol:
 //! - scanMgr.SignalTrackerRegister() -> OnSignalTrackerFullState(systemID, (anomalies,
 //!   signatures, staticSites, structures)); bound scanMgr.GetFullState() returns the tuple.
 //! - dogmaIM.LaunchProbes(launcherID, count) -> OnNewProbe(probe) per probe.
@@ -43,6 +49,7 @@ use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::{dispatch_client, Effect, Outbox};
 use crate::messages;
+use crate::sde::Sde;
 use crate::space::{dist, kg_to_tonnes, minutes_to_seconds, now_ms, Ball, World, MODE_RIGID, MODE_STOP, V3};
 use marshal::Value;
 use std::collections::{HashMap, HashSet};
@@ -251,17 +258,29 @@ struct SystemInfo {
 }
 
 
+
 /// Sites and mission sites are placed clear of planets' surfaces; ones made before that
 /// (measured from the centre, so inside large planets) are moved out at startup, with
 /// their scan overlay positions and any asteroids.
-pub async fn unbury_sites(db: &Db) -> Result<(), CallError> {
-    // (table, key column, has overlay/asteroids)
+pub async fn unbury_sites(db: &Db, sde: &Sde) -> Result<(), CallError> {
     for (table, exploration) in [(crate::dao::exploration::EXPLORATION_SITES_TABLE, true), (crate::dao::exploration::AGENT_MISSIONS_TABLE, false)] {
-        let rows = crate::dao::exploration::repair_rows(db, exploration, GROUP_PLANET, SITE_REPAIR_CLEARANCE).await.map_err(db_err)?;
+        let rows = crate::dao::exploration::repair_rows(db, exploration).await.map_err(db_err)?;
         for r in rows {
             let id = r.id;
             let old = r.old;
-            let new = off_surface(r.planet, r.radius, site_distance());
+            let nearest = sde.map.celestials(r.system)
+                .filter(|p| p.group_id == Some(i64::from(GROUP_PLANET)))
+                .filter_map(|p| {
+                    let planet = [p.x?, p.y?, p.z?];
+                    let squared = (planet[0] - old[0]).powf(2.0)
+                        + (planet[1] - old[1]).powf(2.0)
+                        + (planet[2] - old[2]).powf(2.0);
+                    Some((p.item_id, planet, p.radius.unwrap_or(0.0), squared))
+                })
+                .min_by(|a, b| a.3.total_cmp(&b.3).then_with(|| a.0.cmp(&b.0)));
+            let Some((_, planet, radius, squared)) = nearest else { continue };
+            if !(squared.sqrt() < radius + SITE_REPAIR_CLEARANCE) { continue; }
+            let new = off_surface(planet, radius, site_distance());
             let delta = [new[0] - old[0], new[1] - old[1], new[2] - old[2]];
             if exploration {
                 let site: i64 = id.parse().unwrap_or(0);

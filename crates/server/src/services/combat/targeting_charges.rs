@@ -18,8 +18,7 @@ pub(super) async fn add_target(c: &mut Client, target: i64) -> CallResult {
     let Some((ship, t)) = cx.world.with(cx.system_id, move |s| Some((s.ball(ship_id)?.clone(), s.ball(target)?.clone()))).await.flatten() else {
         return Err(user_error(messages::MSG_TARGETING_ATTEMPT_CANCELLED, vec![]));
     };
-    let fit = Fit::load(&cx.db, cx.char_id, cx.ship_id).await?;
-    let target_attrs = attributes(&cx.db, t.type_id).await?;
+    let fit = Fit::load(&cx.db, cx.world.sde().clone(), cx.char_id, cx.ship_id).await?;
     let range = fit.value(Key::Ship, ATTR_MAX_TARGET_RANGE);
     let gap = dist(ship.pos, t.pos) - t.radius as f64;
     if gap > range {
@@ -33,7 +32,7 @@ pub(super) async fn add_target(c: &mut Client, target: i64) -> CallResult {
     if targets_of(cx.char_id).len() >= max_targets.max(1) {
         return Err(user_error(messages::MSG_CUSTOM_NOTIFY, vec![("notify".into(), Value::unicode(messages::target_limit(max_targets.max(1))))]));
     }
-    let delay = lock_time_ms(fit.value(Key::Ship, ATTR_SCAN_RESOLUTION), attr(&target_attrs, ATTR_SIGNATURE_RADIUS, t.radius as f64));
+    let delay = lock_time_ms(fit.value(Key::Ship, ATTR_SCAN_RESOLUTION), attr(cx.world.sde(), t.type_id, ATTR_SIGNATURE_RADIUS, t.radius as f64));
     let attempt = NEXT_LOCK.fetch_add(1, Ordering::Relaxed);
     state().locking.insert((cx.char_id, target), attempt);
     debug!(user = c.login.user_id, "locking {target} in {delay}ms");
@@ -269,7 +268,7 @@ pub(super) async fn load_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
         apply_loads(&db, &c.world, &notify, ship, loads).await?;
         return Ok(Value::None);
     }
-    let reload_ms = match Fit::load(&c.db, owner, ship).await?.value(Key::Module(first), ATTR_RELOAD_TIME) {
+    let reload_ms = match Fit::load(&c.db, c.sde.clone(), owner, ship).await?.value(Key::Module(first), ATTR_RELOAD_TIME) {
         ms if ms > 0.0 => ms,
         _ => DEFAULT_RELOAD_MS,
     };

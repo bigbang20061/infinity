@@ -288,7 +288,7 @@ pub(super) async fn install(c: &Client, request: &Value) -> CallResult {
     let here = c.session.int("solarsystemid2").unwrap_or(0);
     let ship = c.session.int("shipid").unwrap_or(0);
     let system_graph = graph(db).await?;
-    let fit = Arc::new(Fit::load(db, me, ship).await?);
+    let fit = Arc::new(Fit::load(db, c.sde.clone(), me, ship).await?);
     let now = filetime_now();
     let j = db.transaction(
         |tx, outbox: &mut Outbox| {
