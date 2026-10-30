@@ -4,8 +4,9 @@
 //! Each character has personal folders (game.bookmark_folders) with subfolders, holding
 //! bookmarks of static locations (regions, constellations, systems, stations), of things in
 //! space, of the pilot's own position, and of scan results. A bookmark keeps the solar system
-//! it is in and its coordinates. Shared (access-group) folders aren't supported: every
-//! folder is personal.
+//! it is in and its coordinates. Deleting a subfolder only affects the specified owned folder;
+//! a missing or mismatched subfolder returns an empty list. Shared (access-group) folders aren't
+//! supported: every folder is personal.
 
 use super::{db_err, keyval, notify_error, value_id_list, value_text, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
@@ -293,7 +294,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                 |tx, _: &mut Outbox| Box::pin(async move {
                     own_folder(tx, me, folder).await?;
                     let deleted = Executor::query(tx, "DELETE FROM game.bookmarks WHERE folder_id = $1 AND subfolder_id = $2 RETURNING bookmark_id", &[&folder, &subfolder]).await.map_err(db_err)?;
-                    Executor::execute(tx, "DELETE FROM game.bookmark_subfolders WHERE subfolder_id = $1", &[&subfolder]).await.map_err(db_err)?;
+                    Executor::execute(tx, "DELETE FROM game.bookmark_subfolders WHERE subfolder_id = $1 AND folder_id = $2", &[&subfolder, &folder]).await.map_err(db_err)?;
                     Ok(Value::list(deleted.iter().map(|r| Value::Int(r.get(0)))))
                 }),
                 |value, _| async move { Ok(value) },
