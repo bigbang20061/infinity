@@ -149,7 +149,12 @@ Lifecycle:
 
 ## Development
 
-- **Builds.** Only release builds are used: `cargo build --release`, `cargo test --release`, or `docker build --target test .` to run the tests in Docker.
+- **Builds.** Only release builds are used: `cargo build --release`, `cargo test --release`, or `docker build --target test .` to run the tests in Docker. The toolchain version is pinned in `rust-toolchain.toml`.
+- **CI.** Every pull request to `main` must pass the `CI` workflow before it can merge:
+  - `test-linux`: build and tests on Linux.
+  - `build-windows`: build on Windows.
+  - Both treat compiler warnings as errors.
+  - Both build only when the pull request changes code: `crates/`, the Cargo files, `rust-toolchain.toml` or the workflows. For a pull request that changes no code, they report as skipped and it can still merge.
 - **Dev loop.** `scripts/iterate.ps1` does the following:
   - rebuilds and restarts the server container;
   - launches the client into the game;
@@ -180,6 +185,18 @@ UPDATE game.accounts SET role = role | 27021597764489216 WHERE lower(user_name) 
 | `/isk <amount>` | Add ISK to the wallet |
 | `/heal` | Repair the ship in space |
 | `/help` | List the commands |
+
+## Releases
+
+Tagged versions are published on the repository's GitHub releases page. Each release contains:
+
+- `infinity-<version>-x86_64-linux.tar.gz`
+- `infinity-<version>-x86_64-windows.zip`
+- `SHA256SUMS`
+
+Each package holds `infinity-server`, `sde-import`, `marshal-dump`, `blue-patch` and this README.
+
+To release, a maintainer pushes a tag `vMAJOR.MINOR.PATCH` that points at a commit on `main`, for example `git tag v0.1.0 && git push origin v0.1.0`. Tags with any other name do not start a release.
 
 ## License
 
