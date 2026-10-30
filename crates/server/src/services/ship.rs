@@ -568,14 +568,16 @@ pub(super) fn warp_to(c: &mut Client, object: Option<(V3, f64)>, point: V3, min_
         b.mode = MODE_WARP;
         b.goto = to;
         b.speed_fraction = 1.0;
-        b.warp = Some(Warp { from: b.pos, to, start: b.last_ms, duration: seconds_to_ms_f64(align + warp_duration(b.warp_factor as f64, distance)), factor: b.warp_factor, min_range });
+        b.warp = Some(Warp { from: b.pos, to, start: b.last_ms, duration: seconds_to_ms_f64(align + warp_duration(b.warp_factor as f64, distance)), factor: b.warp_factor });
         // Destiny only enters warp once aligned at 75% of max velocity, and thrust scales
         // with the speed fraction (Ball::IsAlignedForWarp, GotoThrust): warp at full throttle,
         // or a stopped ship sits aligning until the 180 s MAX_ALIGN_TICKS fallback.
         // effects.Warping drives the tunnel, camera and audio (and WarpOut for onlookers);
         // it follows the ball through align and warp and the client stops it on exit.
+        // `to` already includes min_range; Ballpark::RealWarp would pull the landing point
+        // back by minRange again, so the client gets 0.
         vec![
-            event(t, "WarpTo", vec![Value::Int(b.id), Value::Float(to[0]), Value::Float(to[1]), Value::Float(to[2]), Value::Float(min_range), Value::Int(b.warp_factor)]),
+            event(t, "WarpTo", vec![Value::Int(b.id), Value::Float(to[0]), Value::Float(to[1]), Value::Float(to[2]), Value::Float(0.0), Value::Int(b.warp_factor)]),
             event(t, "SetSpeedFraction", vec![Value::Int(b.id), Value::Float(1.0)]),
             special_fx(t, b.id, None, None, "effects.Warping", None),
         ]

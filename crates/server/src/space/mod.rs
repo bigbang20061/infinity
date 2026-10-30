@@ -152,7 +152,6 @@ pub struct Warp {
     /// Milliseconds.
     pub duration: f64,
     pub factor: i64,
-    pub min_range: f64,
 }
 
 #[derive(Clone)]
@@ -248,13 +247,14 @@ impl Ball {
                 }
             }
             MODE_WARP => {
-                let w = self.warp.clone().unwrap_or(Warp { from: self.pos, to: self.goto, start: now_ms(), duration: 0.0, factor: DEFAULT_WARP_FACTOR, min_range: 0.0 });
+                let w = self.warp.clone().unwrap_or(Warp { from: self.pos, to: self.goto, start: now_ms(), duration: 0.0, factor: DEFAULT_WARP_FACTOR });
                 for c in w.to {
                     o.extend_from_slice(&c.to_le_bytes());
                 }
                 o.extend_from_slice(&(destiny_stamp(w.start) as i32).to_le_bytes()); // effectStamp
                 o.extend_from_slice(&dist(w.to, w.from).to_le_bytes()); // total warp length
-                o.extend_from_slice(&(w.min_range as i64).to_le_bytes());
+                // minRange (a double in mFollowId's slot); 0 because `to` already includes it.
+                o.extend_from_slice(&0.0f64.to_le_bytes());
                 o.extend_from_slice(&w.factor.to_le_bytes());
             }
             _ => {}

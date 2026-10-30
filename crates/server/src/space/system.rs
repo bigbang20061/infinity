@@ -408,7 +408,7 @@ mod tests {
         let mut b = ball(1, None, 0.0);
         b.mode = MODE_WARP;
         b.warp = Some(Warp { from: b.pos, to: [100.0, 0.0, 0.0], start: 100,
-            duration: 1000.0, factor: 3000, min_range: 0.0 });
+            duration: 1000.0, factor: 3000 });
         s.insert(b);
         s.tick(600);
         assert_eq!(s.ball(1).unwrap().pos, [50.0, 0.0, 0.0]);
