@@ -51,8 +51,8 @@ pub use market::expire_orders as expire_market_orders;
 pub use bills::run_billing;
 pub use exploration::unbury_sites;
 
-use crate::client::{filetime_now, short, Client};
-use crate::consts::{FAR_FUTURE, GROUP_PLANET};
+use crate::client::{short, Client};
+use crate::consts::GROUP_PLANET;
 use marshal::{DbRowDescriptor, DbType, Value};
 use crate::db::Db;
 use crate::messages;
@@ -67,8 +67,6 @@ const UNIT_SPHERE_DIAMETER: f64 = 2.0;
 const SITE_DIRECTION_FLATTENING: f64 = 0.2;
 /// Design policy: guard normalization of a near-zero site direction.
 const SITE_DIRECTION_EPSILON: f64 = 1e-9;
-/// Client kiring.common.const.ANTI_ADDICTION_PASS_CODE.
-const ANTI_ADDICTION_PASS_CODE: i64 = 201;
 
 /// The pilot's ship was destroyed: eject (raised by combat through the pilot's notify channel).
 pub async fn ship_destroyed(c: &mut Client, args: &[Value]) {
@@ -189,13 +187,23 @@ pub(super) async fn has_role_or_is_ceo(db: &Db, char_id: i64, corp_id: i64, role
 }
 
 
+struct SitePositionRow { x: f64, y: f64, z: f64, radius: f64 }
+impl SitePositionRow {
+    fn from_row(row: &tokio_postgres::Row) -> Self {
+        Self { x: row.get("x"), y: row.get("y"), z: row.get("z"), radius: row.get("radius") }
+    }
+}
+
 /// Choose a planet and its radius; callers retain their fallback and offset policy.
 pub async fn site_position(db: &Db, system: i64) -> Result<Option<(V3, f64)>, CallError> {
     let planet = db.query_opt(
-        "SELECT x, y, z, COALESCE(radius, 0)::float8 FROM sde.map_celestials WHERE solar_system_id = $1 AND group_id = $2 ORDER BY random() LIMIT 1",
+        "SELECT x, y, z, COALESCE(radius, 0)::float8 AS radius FROM sde.map_celestials WHERE solar_system_id = $1 AND group_id = $2 ORDER BY random() LIMIT 1",
         &[&(system as i32), &GROUP_PLANET],
     ).await.map_err(db_err)?;
-    Ok(planet.map(|p| ([p.get(0), p.get(1), p.get(2)], p.get(3))))
+    Ok(planet.map(|p| {
+        let p = SitePositionRow::from_row(&p);
+        ([p.x, p.y, p.z], p.radius)
+    }))
 }
 
 /// A point `distance` above a body's surface, in a random direction near the system plane.
@@ -273,74 +281,24 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
     if let Some(v) = crate::retail::cached_call(call.service, call.method, call.args) {
         return Ok(v);
     }
-    let s = Value::str;
+    if call.method != "MachoResolveObject" && call.method != "MachoBindObject" {
+        if let Some(reply) = fixed::root(call) { return reply; }
+        if let Some(reply) = station::root(c, call).await { return reply; }
+    }
     match (call.service, call.method) {
         // Monikers: every bindable service lives on this node.
         (_, "MachoResolveObject") => Ok(Value::Int(c.cfg.node_id)),
         (_, "MachoBindObject") => bind_object(c, call).await,
 
-        // Which node each service lives on; empty = "any node", i.e. us.
-        ("machoNet", "GetServiceInfo") => Ok(Value::Dict(vec![])),
-        ("machoNet", "GetTime") => Ok(Value::Int(filetime_now())),
-        ("machoNet", "GetGlobalConfig") => Ok(c.cfg.global_config()),
-        ("chatAuthenticationService", "GetAuthenticationToken") => {
-            let char_id = c.session.int("charid").unwrap_or(0);
-            Ok(Value::str(c.chat.token_for(char_id)))
-        }
-        ("XmppChatMgr", "Hostname") => Ok(Value::str(&c.cfg.chat_domain)),
-        ("XmppChatMgr", "GetDeprecatedPrefsFallback") => Ok(Value::str(&c.cfg.public_host)),
-        // Session channels the client joins after chat login (xmppchatsvc._JoinSystemChannels);
-        // an empty list makes it retry every 5 seconds.
-        ("XmppChatMgr", "ResyncSystemChannelAccess") => {
-            let channels = [("local", "solarsystemid2"), ("corp", "corpid"), ("alliance", "allianceid"), ("faction", "warfactionid"), ("fleet", "fleetid")]
-                .into_iter()
-                .filter_map(|(prefix, key)| c.session.int(key).map(|id| Value::str(format!("{prefix}_{id}"))));
-            Ok(Value::list(channels))
-        }
 
         (inventory::INVENTORY, _) => inventory::inventory(c, call).await,
 
         ("config", _) => config::dispatch(c, call).await,
 
-        ("air_npe", "is_air_npe_enabled") => Ok(Value::Bool(false)),
-        // (errorID, logMode): a known error ID means "don't send me the trace".
-        ("alert", "BeanCount") => Ok(Value::tuple([Value::Int(1), s("B")])), // LOGGING_BATCHED
-        ("alert", "SendClientStackTraceAlert") => Ok(Value::tuple([Value::Int(1), s("B")])),
-        // (changes {errorHash: logMode}, flooded)
-        ("alert", "GetLogModeForError") => Ok(Value::tuple([Value::Dict(vec![]), Value::list([])])),
-
-        ("subscriptionMgr", "GetCloneGrade") => Ok(Value::Int(1)), // CLONE_STATE_OMEGA
-        ("subscriptionMgr", "GetSubscriptionTime") => Ok(Value::Int(FAR_FUTURE)),
-
-        // NetEase account/payment gateway; endpoints are never contacted here.
-        ("kiringMgr", "GetKiringConfiguration") => Ok(Value::dict([
-            ("mode", s("release")),
-            ("client_id", s("infinity-emu")),
-            (
-                "endpoints",
-                Value::dict([("mpay", s("http://127.0.0.1/")), ("billing", s("http://127.0.0.1/")), ("redirect_uri", s("http://127.0.0.1/"))]),
-            ),
-            ("channels", Value::dict([("login", s("emu")), ("pay", s("emu")), ("app", s("emu"))])),
-        ])),
-        ("kiringMgr", "IsMonochromeStyleEnabled") => Ok(Value::Bool(false)),
-        // kiring.common.const.ANTI_ADDICTION_PASS_CODE
-        ("kiringMgr", "GetFaceRecognitionCode") => Ok(Value::tuple([Value::Int(ANTI_ADDICTION_PASS_CODE), s("")])),
-        ("kiringMgr", "GetAntiAddictionCode") => Ok(Value::Int(ANTI_ADDICTION_PASS_CODE)),
-        ("kiringMgr", "IsZhStoreEnabled") => Ok(Value::Bool(false)),
-
-        ("pingService", "Ping") => Ok(Value::None),
-        // {solarSystemID: slotKey} of alternative load systems; empty = load where the character is.
-        ("populationCap", "GetCharacterLoadSlot") => Ok(Value::Dict(vec![])),
-        ("eventLog", _) => Ok(Value::None),
 
         ("charUnboundMgr", _) => charsel::dispatch(c, call).await,
         ("userSvc", "UserLogOffCharacter") => charsel::log_off(c).await,
         ("dogmaIM", _) => dogma::dispatch(c, call).await,
-        // {raceID: {solarSystemID: population}}; empty = no starter system is capped.
-        ("populationCap", "GetCharacterCreationSystemPopulations") => Ok(Value::Dict(vec![])),
-
-        // Login reward campaigns: none running.
-        ("loginCampaignManager", "get_client_campaign_state") => Ok(Value::None),
 
         _ => {
             if call.service == "invbroker" {
