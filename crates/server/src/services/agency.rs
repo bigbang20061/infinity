@@ -2,7 +2,7 @@
 //! epic arc journal messages, militia enlistment whitelists, station offices,
 //! the roguelike lab's exploration state, and client bean (telemetry) delivery.
 
-use super::{db_err, Call, CallError, CallResult};
+use super::{db_err, Call, CallResult};
 use crate::client::Client;
 use crate::consts::{FACTION_AMARR, FACTION_ANGEL_CARTEL, FACTION_CALDARI, FACTION_GALLENTE, FACTION_GURISTAS, FACTION_MINMATAR, SECONDS_PER_HOUR};
 use marshal::Value;

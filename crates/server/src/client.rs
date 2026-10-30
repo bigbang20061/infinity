@@ -53,7 +53,7 @@ pub fn short(v: &Value) -> String {
 
 impl Client {
     pub fn new(conn: Conn, cfg: Arc<Config>, db: Db, chat: Arc<crate::chat::Hub>, world: Arc<crate::space::World>, login: Login) -> Self {
-        let session = Session::new(login.session_id, login.client_id);
+        let session = Session::new(login.session_id);
         let (conn, inbox) = conn.split();
         let (destiny_tx, destiny_rx) = mpsc::unbounded_channel();
         let (notify_tx, notify_rx) = mpsc::unbounded_channel();
