@@ -3,6 +3,7 @@
 //! This DAO has no direct client mirror or wire contract; owning services supply those.
 //! Training policy, transactions, refusals, notifications and World are caller concerns.
 
+pub(crate) mod market;
 pub(crate) mod plans;
 pub(crate) mod queue;
 pub(crate) mod selection;

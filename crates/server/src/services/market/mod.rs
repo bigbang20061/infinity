@@ -13,6 +13,9 @@
 //! counted on the stargate graph (sde.map_jumps) within the region.
 
 use crate::dao::items::loading::{load_items, ItemQuery};
+use crate::dao::market::trading;
+use crate::dao::market::orders::{self, Order, Station};
+use crate::dao::market::listings::{self, Area};
 use super::wallets::{balance, credit, debit, not_enough_money};
 use super::{crowset, db_err, keyval, notify_error, user_error, value_field, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
@@ -26,6 +29,8 @@ use marshal::{DbRowDescriptor, DbType, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use tracing::{info, warn};
+mod lists;
+use lists::{best_asks, escrow, history_header, my_orders, order_history, orders, price_history, transactions};
 
 /// Existing server policy for market order maintenance cadence.
 const ORDER_MAINTENANCE_INTERVAL_SECONDS: u64 = 60;
@@ -107,88 +112,12 @@ fn valid_price(price: f64) -> Result<f64, CallError> {
     }
 }
 
-/// Columns of an order row; the client sets `jumps` itself (RefreshJumps).
-fn order_header() -> DbRowDescriptor {
-    DbRowDescriptor::new([
-        ("price", DbType::R8),
-        ("volRemaining", DbType::I4),
-        ("typeID", DbType::I4),
-        ("range", DbType::I2),
-        ("orderID", DbType::I8),
-        ("volEntered", DbType::I4),
-        ("minVolume", DbType::I4),
-        ("bid", DbType::Bool),
-        ("issueDate", DbType::FileTime),
-        ("duration", DbType::I2),
-        ("stationID", DbType::I8),
-        ("regionID", DbType::I4),
-        ("solarSystemID", DbType::I4),
-        ("constellationID", DbType::I4),
-        ("jumps", DbType::I2),
-    ])
-}
 
-const ORDER_COLUMNS: &str = "price, vol_remaining::bigint, type_id::bigint, range::bigint, order_id, vol_entered::bigint,
-    min_volume::bigint, bid, COALESCE(issued, $1), duration::bigint, station_id, region_id, solar_system_id, constellation_id";
 
 fn today() -> i64 {
     filetime_now() / FILETIME_DAY * FILETIME_DAY
 }
 
-/// `GetOrders(typeID)` -> (asks, bids) in the session's region.
-async fn orders(c: &Client, type_id: i64) -> CallResult {
-    let region = c.session.int("regionid").unwrap_or(0);
-    let rows = c
-        .db
-        .query(
-            &format!("SELECT {ORDER_COLUMNS} FROM game.market_orders WHERE type_id = $2 AND region_id = $3 AND vol_remaining > 0 ORDER BY price"),
-            &[&today(), &(type_id as i32), &region],
-        )
-        .await
-        .map_err(db_err)?;
-    let header = order_header();
-    let (mut asks, mut bids) = (vec![], vec![]);
-    for r in &rows {
-        let mut line = vec![Value::Float(r.get(0))];
-        line.extend((1..7).map(|i| Value::Int(r.get(i))));
-        line.push(Value::Bool(r.get(7)));
-        line.extend((8..14).map(|i| Value::Int(r.get(i))));
-        line.push(Value::Int(0));
-        let row = header.row(&line);
-        if r.get(7) {
-            bids.push(row)
-        } else {
-            asks.push(row)
-        }
-    }
-    Ok(Value::tuple([crowset(&header, asks), crowset(&header, bids)]))
-}
-
-/// Cheapest ask per type within `column = id`: {typeID: best}.
-async fn best_asks(c: &Client, column: &str, id: i64, as_rows: bool) -> CallResult {
-    let rows = c
-        .db
-        .query(
-            &format!(
-                "SELECT DISTINCT ON (type_id) type_id::bigint, price, vol_remaining::bigint, station_id
-                 FROM game.market_orders WHERE {column} = $1 AND NOT bid AND vol_remaining > 0 ORDER BY type_id, price"
-            ),
-            &[&id],
-        )
-        .await
-        .map_err(db_err)?;
-    // Station/system answers are tuples (marketutil.ConvertTuplesToBestByOrders); the
-    // region answer is used as-is, by attribute.
-    let header = DbRowDescriptor::new([("price", DbType::R8), ("volRemaining", DbType::I4), ("typeID", DbType::I4), ("stationID", DbType::I8)]);
-    Ok(Value::Dict(
-        rows.iter()
-            .map(|r| {
-                let line = [Value::Float(r.get(1)), Value::Int(r.get(2)), Value::Int(r.get(0)), Value::Int(r.get(3))];
-                (Value::Int(r.get(0)), if as_rows { header.row(&line) } else { Value::tuple(line) })
-            })
-            .collect(),
-    ))
-}
 
 // ---------------------------------------------------------------- trading
 
@@ -198,26 +127,18 @@ pub(super) async fn lock() -> tokio::sync::MutexGuard<'static, ()> {
     LOCK.get_or_init(Default::default).lock().await
 }
 
-#[derive(Clone, Copy)]
-pub(super) struct Station {
-    pub(super) id: i64,
-    pub(super) system: i64,
-    pub(super) constellation: i64,
-    pub(super) region: i64,
-    pub(super) owner: i64,
-}
 
 pub(super) async fn station(db: &(impl Executor + ?Sized), id: i64) -> Result<Station, CallError> {
     let r = db
         .query_opt(
-            "SELECT station_id::bigint, solar_system_id::bigint, constellation_id::bigint, region_id::bigint, COALESCE(owner_id, 0)::bigint
+            "SELECT station_id::bigint, solar_system_id::bigint, constellation_id::bigint, region_id::bigint, COALESCE(owner_id, 0)::bigint AS owner_id
              FROM sde.sta_stations WHERE station_id = $1::bigint",
             &[&id],
         )
         .await
         .map_err(db_err)?
         .ok_or_else(|| notify_error(messages::NO_MARKET_AT_LOCATION))?;
-    Ok(Station { id: r.get(0), system: r.get(1), constellation: r.get(2), region: r.get(3), owner: r.get(4) })
+    Ok(Station { id: r.get("station_id"), system: r.get("solar_system_id"), constellation: r.get("constellation_id"), region: r.get("region_id"), owner: r.get("owner_id") })
 }
 
 /// Solar system -> the systems one stargate jump away.
@@ -229,7 +150,7 @@ pub(super) async fn graph(db: &Db) -> Result<&'static HashMap<i64, Vec<i64>>, Ca
     let rows = db.query("SELECT from_solar_system_id::bigint, to_solar_system_id::bigint FROM sde.map_jumps", &[]).await.map_err(db_err)?;
     let mut g: HashMap<i64, Vec<i64>> = HashMap::new();
     for r in &rows {
-        g.entry(r.get(0)).or_default().push(r.get(1));
+        g.entry(r.get("from_solar_system_id")).or_default().push(r.get("to_solar_system_id"));
     }
     Ok(GRAPH.get_or_init(|| g))
 }
@@ -281,11 +202,8 @@ struct Skills {
 
 async fn skills(db: &(impl Executor + ?Sized), char_id: i64) -> Result<Skills, CallError> {
     let wanted = vec![SKILL_TRADE, SKILL_RETAIL, SKILL_BROKER_RELATIONS, SKILL_WHOLESALE, SKILL_MARGIN_TRADING, SKILL_ACCOUNTING, SKILL_TYCOON];
-    let rows = db
-        .query("SELECT type_id, level FROM game.skills WHERE character_id = $1 AND type_id = ANY($2)", &[&char_id, &wanted])
-        .await
-        .map_err(db_err)?;
-    let levels: HashMap<i32, i32> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
+    let rows = crate::dao::skills::market::levels(db, char_id, &wanted).await.map_err(db_err)?;
+    let levels: HashMap<i32, i32> = rows.iter().map(|r| (r.type_id, r.level)).collect();
     let l = |skill: i32| levels.get(&skill).copied().unwrap_or(0) as f64;
     Ok(Skills {
         order_cap: (5.0 + 4.0 * l(SKILL_TRADE) + 8.0 * l(SKILL_RETAIL) + 16.0 * l(SKILL_WHOLESALE) + 32.0 * l(SKILL_TYCOON)) as i64,
@@ -300,7 +218,7 @@ fn broker_fee(rate: f64, amount: f64) -> f64 {
 }
 
 async fn check_order_slots(db: &(impl Executor + ?Sized), char_id: i64, skills: &Skills) -> Result<(), CallError> {
-    let open: i64 = db.query_one("SELECT count(*) FROM game.market_orders WHERE char_id = $1", &[&char_id]).await.map_err(db_err)?.get(0);
+    let open = trading::order_count(db, char_id).await.map_err(db_err)?;
     if open >= skills.order_cap {
         return Err(notify_error(&messages::market_order_limit_message(open)));
     }
@@ -320,111 +238,24 @@ async fn require_balance(db: &(impl Executor + ?Sized), char_id: i64, amount: f6
 use super::items::{deliver, take_items};
 
 async fn record(db: &(impl Executor + ?Sized), type_id: i32, quantity: i32, price: f64, buyer: i64, seller: i64, at: &Station, now: i64) -> Result<(), CallError> {
-    db
-        .execute(
-            "INSERT INTO game.market_transactions (type_id, quantity, price, buyer_id, seller_id, station_id, region_id, date)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-            &[&type_id, &quantity, &price, &buyer, &seller, &at.id, &at.region, &now],
-        )
-        .await
-        .map_err(db_err)?;
+    trading::record(db, type_id, quantity, price, buyer, seller, at.id, at.region, now).await.map_err(db_err)?;
     Ok(())
 }
 
-struct Order {
-    pub(super) id: i64,
-    type_id: i32,
-    /// None for NPC orders.
-    char_id: Option<i64>,
-    at: Station,
-    price: f64,
-    vol_entered: i32,
-    vol_remaining: i32,
-    min_volume: i32,
-    bid: bool,
-    range: i64,
-    duration: i64,
-    issued: i64,
-    escrow: f64,
-}
-
-/// Selects every Order column; $1 is today (the issue date of NPC orders).
-const ORDER_SELECT: &str = "SELECT o.order_id, o.type_id, o.char_id, o.station_id, o.solar_system_id, o.constellation_id, o.region_id,
-        COALESCE(s.owner_id, 0)::bigint, o.price, o.vol_entered, o.vol_remaining, o.min_volume, o.bid,
-        o.range::bigint, o.duration::bigint, COALESCE(o.issued, $1), o.escrow
-    FROM game.market_orders o LEFT JOIN sde.sta_stations s ON s.station_id = o.station_id";
-
-fn order_from_row(r: &tokio_postgres::Row) -> Order {
-    Order {
-        id: r.get(0),
-        type_id: r.get(1),
-        char_id: r.get(2),
-        at: Station { id: r.get(3), system: r.get(4), constellation: r.get(5), region: r.get(6), owner: r.get(7) },
-        price: r.get(8),
-        vol_entered: r.get(9),
-        vol_remaining: r.get(10),
-        min_volume: r.get(11),
-        bid: r.get(12),
-        range: r.get(13),
-        duration: r.get(14),
-        issued: r.get(15),
-        escrow: r.get(16),
-    }
-}
 
 async fn my_order(db: &(impl Executor + ?Sized), char_id: i64, order_id: i64, now: i64) -> Result<Order, CallError> {
-    db
-        .query_opt(&format!("{ORDER_SELECT} WHERE o.order_id = $2 AND o.char_id = $3"), &[&now, &order_id, &char_id])
-        .await
-        .map_err(db_err)?
-        .map(|r| order_from_row(&r))
+    orders::my_order(db, char_id, order_id, now).await.map_err(db_err)?
         .ok_or_else(|| notify_error(messages::MARKET_ORDER_CLOSED))
 }
 
 async fn insert_order(db: &(impl Executor + ?Sized), o: &mut Order) -> Result<(), CallError> {
-    o.id = db
-        .query_one(
-            "INSERT INTO game.market_orders (type_id, char_id, station_id, solar_system_id, constellation_id, region_id, price,
-                                             vol_entered, vol_remaining, min_volume, bid, range, duration, issued, escrow)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING order_id",
-            &[
-                &o.type_id,
-                &o.char_id,
-                &o.at.id,
-                &o.at.system,
-                &o.at.constellation,
-                &o.at.region,
-                &o.price,
-                &o.vol_entered,
-                &o.vol_remaining,
-                &o.min_volume,
-                &o.bid,
-                &(o.range as i32),
-                &(o.duration as i32),
-                &o.issued,
-                &o.escrow,
-            ],
-        )
-        .await
-        .map_err(db_err)?
-        .get(0);
+    o.id = orders::insert(db, o).await.map_err(db_err)?;
     Ok(())
 }
 
 /// Move a player's order to the history.
 async fn close(db: &(impl Executor + ?Sized), o: &Order, state: i32, now: i64) -> Result<(), CallError> {
-    db
-        .execute(
-            "WITH gone AS (DELETE FROM game.market_orders WHERE order_id = $1 RETURNING *)
-             INSERT INTO game.market_order_history (order_id, type_id, char_id, station_id, region_id, price, vol_entered, vol_remaining,
-                                                    min_volume, bid, range, duration, issued, state, closed)
-             SELECT order_id, type_id, char_id, station_id, region_id, price, vol_entered, $2::int, min_volume, bid, range, duration,
-                    COALESCE(issued, $4::bigint), $3::int, $4::bigint
-             FROM gone",
-            &[&o.id, &o.vol_remaining, &state, &now],
-        )
-        .await
-        .map_err(db_err)?;
+    trading::close(db, o.id, o.vol_remaining, state, now).await.map_err(db_err)?;
     Ok(())
 }
 
@@ -479,10 +310,7 @@ async fn consume<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>,
         }
         close(db, o, STATE_CLOSED, now).await?;
     } else {
-        db
-            .execute("UPDATE game.market_orders SET vol_remaining = $2, escrow = $3 WHERE order_id = $1", &[&o.id, &o.vol_remaining, &o.escrow])
-            .await
-            .map_err(db_err)?;
+        trading::consume(db, o.id, o.vol_remaining, o.escrow).await.map_err(db_err)?;
     }
     tell_owner(outbox, o, "Modify");
     Ok(())
@@ -491,23 +319,13 @@ async fn consume<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>,
 /// Sell up to `quantity` x `type_id` at `at` to the best bids paying at least `floor`.
 /// Returns how many sold.
 async fn hit_bids(db: &(impl Executor + ?Sized), outbox: &mut Outbox<MarketEffect>, g: &HashMap<i64, Vec<i64>>, seller: i64, at: &Station, type_id: i32, floor: f64, quantity: i32, now: i64) -> Result<i32, CallError> {
-    let rows = db
-        .query(
-            &format!(
-                "{ORDER_SELECT} WHERE o.type_id = $2 AND o.region_id = $3 AND o.bid AND o.vol_remaining > 0 AND o.price >= $4::float8 - 0.005
-                 ORDER BY o.price DESC, o.issued NULLS FIRST, o.order_id"
-            ),
-            &[&(now / FILETIME_DAY * FILETIME_DAY), &type_id, &at.region, &floor],
-        )
-        .await
-        .map_err(db_err)?;
+    let rows = orders::bids(db, now / FILETIME_DAY * FILETIME_DAY, type_id, at.region, floor).await.map_err(db_err)?;
     let tax = skills(db, seller).await?.sales_tax;
     let mut left = quantity;
-    for r in &rows {
+    for mut bid in rows {
         if left == 0 {
             break;
         }
-        let mut bid = order_from_row(r);
         if !in_range(g, bid.range, &bid.at, at) {
             continue;
         }
@@ -534,22 +352,12 @@ async fn hit_bids(db: &(impl Executor + ?Sized), outbox: &mut Outbox<MarketEffec
 /// Returns (bought, spent).
 #[allow(clippy::too_many_arguments)]
 async fn lift_asks(db: &(impl Executor + ?Sized), outbox: &mut Outbox<MarketEffect>, g: &HashMap<i64, Vec<i64>>, buyer: i64, at: &Station, range: i64, type_id: i32, cap: f64, quantity: i32, from_wallet: bool, now: i64) -> Result<(i32, f64), CallError> {
-    let rows = db
-        .query(
-            &format!(
-                "{ORDER_SELECT} WHERE o.type_id = $2 AND o.region_id = $3 AND NOT o.bid AND o.vol_remaining > 0 AND o.price <= $4::float8 + 0.005
-                 ORDER BY o.price, o.issued NULLS FIRST, o.order_id"
-            ),
-            &[&(now / FILETIME_DAY * FILETIME_DAY), &type_id, &at.region, &cap],
-        )
-        .await
-        .map_err(db_err)?;
+    let rows = orders::asks(db, now / FILETIME_DAY * FILETIME_DAY, type_id, at.region, cap).await.map_err(db_err)?;
     let (mut left, mut spent) = (quantity, 0.0);
-    for r in &rows {
+    for mut ask in rows {
         if left == 0 {
             break;
         }
-        let mut ask = order_from_row(r);
         if !in_range(g, range, at, &ask.at) {
             continue;
         }
@@ -736,10 +544,7 @@ async fn modify(c: &Client, order_id: i64, new_price: f64) -> CallResult {
     o.price = new_price;
     o.escrow = escrow;
     o.issued = now;
-    db
-        .execute("UPDATE game.market_orders SET price = $2, escrow = $3, issued = $4 WHERE order_id = $1", &[&o.id, &o.price, &o.escrow, &o.issued])
-        .await
-        .map_err(db_err)?;
+    trading::reprice(db, o.id, o.price, o.escrow, o.issued).await.map_err(db_err)?;
     outbox.operation(MarketEffect::Repriced { owner: me, order: o.id, price: new_price });
     let traded = if o.bid {
         let (bought, spent) = lift_asks(db, outbox, g, me, &o.at, o.range, o.type_id, o.price, o.vol_remaining, false, now).await?;
@@ -788,12 +593,8 @@ async fn expire(db: &Db, world: &World) -> Result<(), CallError> {
     let _trading = lock().await;
     let now = filetime_now();
     db.transaction(|db, outbox: &mut Outbox<MarketEffect>| Box::pin(async move {
-        let rows = db
-            .query(&format!("{ORDER_SELECT} WHERE o.char_id IS NOT NULL AND o.issued + o.duration::bigint * $2 <= $3"), &[&(now / FILETIME_DAY * FILETIME_DAY), &FILETIME_DAY, &now])
-            .await
-            .map_err(db_err)?;
-        for r in &rows {
-            let o = order_from_row(r);
+        let rows = orders::expired(db, now / FILETIME_DAY * FILETIME_DAY, FILETIME_DAY, now).await.map_err(db_err)?;
+        for o in rows {
             close(db, &o, STATE_CLOSED, now).await?;
             refund(db, outbox, &o).await?;
             outbox.operation(MarketEffect::Expired { owner: o.char_id, order: o.id });
@@ -804,222 +605,6 @@ async fn expire(db: &Db, world: &World) -> Result<(), CallError> {
     Ok(())
 }
 
-// ---------------------------------------------------------------- order lists
-
-/// `GetCharOrders`: the character's open orders.
-async fn my_orders(c: &Client) -> CallResult {
-    let me = c.session.int("charid").unwrap_or(0);
-    let here = c.session.int("solarsystemid2").unwrap_or(0);
-    let g = graph(&c.db).await?;
-    let rows = c.db.query(&format!("{ORDER_SELECT} WHERE o.char_id = $2 ORDER BY o.order_id"), &[&today(), &me]).await.map_err(db_err)?;
-    let header = DbRowDescriptor::new([
-        ("orderID", DbType::I8),
-        ("typeID", DbType::I4),
-        ("charID", DbType::I8),
-        ("regionID", DbType::I4),
-        ("stationID", DbType::I8),
-        ("solarSystemID", DbType::I4),
-        ("constellationID", DbType::I4),
-        ("range", DbType::I2),
-        ("bid", DbType::Bool),
-        ("price", DbType::R8),
-        ("volEntered", DbType::I4),
-        ("volRemaining", DbType::I4),
-        ("issueDate", DbType::FileTime),
-        ("minVolume", DbType::I4),
-        ("duration", DbType::I2),
-        ("isCorp", DbType::Bool),
-        ("escrow", DbType::R8),
-        ("keyID", DbType::I4),
-        ("jumps", DbType::I4),
-    ]);
-    let lines = rows
-        .iter()
-        .map(|r| {
-            let o = order_from_row(r);
-            header.row(&[
-                Value::Int(o.id),
-                Value::Int(o.type_id as i64),
-                Value::Int(me),
-                Value::Int(o.at.region),
-                Value::Int(o.at.id),
-                Value::Int(o.at.system),
-                Value::Int(o.at.constellation),
-                Value::Int(o.range),
-                Value::Bool(o.bid),
-                Value::Float(o.price),
-                Value::Int(o.vol_entered as i64),
-                Value::Int(o.vol_remaining as i64),
-                Value::Int(o.issued),
-                Value::Int(o.min_volume as i64),
-                Value::Int(o.duration),
-                Value::Bool(false),
-                Value::Float(o.escrow),
-                Value::Int(ACCOUNT_CASH as i64),
-                Value::Int(jumps(g, here, o.at.system, UNREACHABLE).unwrap_or(UNREACHABLE)),
-            ])
-        })
-        .collect();
-    Ok(crowset(&header, lines))
-}
-
-/// `GetMarketOrderHistory`: the character's closed orders of the last 90 days.
-async fn order_history(c: &Client) -> CallResult {
-    let me = c.session.int("charid").unwrap_or(0);
-    let rows = c
-        .db
-        .query(
-            "SELECT order_id, type_id::bigint, region_id, station_id, range::bigint, bid, price, vol_entered::bigint, vol_remaining::bigint,
-                    issued, min_volume::bigint, duration::bigint, state::bigint, closed
-             FROM game.market_order_history WHERE char_id = $1 AND closed >= $2 ORDER BY closed DESC LIMIT 1000",
-            &[&me, &(filetime_now() - ORDER_HISTORY_DAYS * FILETIME_DAY)],
-        )
-        .await
-        .map_err(db_err)?;
-    let header = DbRowDescriptor::new([
-        ("orderID", DbType::I8),
-        ("typeID", DbType::I4),
-        ("charID", DbType::I8),
-        ("regionID", DbType::I4),
-        ("stationID", DbType::I8),
-        ("range", DbType::I2),
-        ("bid", DbType::Bool),
-        ("price", DbType::R8),
-        ("volEntered", DbType::I4),
-        ("volRemaining", DbType::I4),
-        ("issueDate", DbType::FileTime),
-        ("minVolume", DbType::I4),
-        ("duration", DbType::I2),
-        ("orderState", DbType::I4),
-        ("lastStateChange", DbType::FileTime),
-        ("isCorp", DbType::Bool),
-        ("keyID", DbType::I4),
-    ]);
-    let lines = rows
-        .iter()
-        .map(|r| {
-            header.row(&[
-                Value::Int(r.get(0)),
-                Value::Int(r.get(1)),
-                Value::Int(me),
-                Value::Int(r.get(2)),
-                Value::Int(r.get(3)),
-                Value::Int(r.get(4)),
-                Value::Bool(r.get(5)),
-                Value::Float(r.get(6)),
-                Value::Int(r.get(7)),
-                Value::Int(r.get(8)),
-                Value::Int(r.get(9)),
-                Value::Int(r.get(10)),
-                Value::Int(r.get(11)),
-                Value::Int(r.get(12)),
-                Value::Int(r.get(13)),
-                Value::Bool(false),
-                Value::Int(ACCOUNT_CASH as i64),
-            ])
-        })
-        .collect();
-    Ok(crowset(&header, lines))
-}
-
-/// `CharGetTransactions(fromDate)`: the character's fills, newest first (marketSvc.py).
-async fn transactions(c: &Client, from: Option<i64>) -> CallResult {
-    let me = c.session.int("charid").unwrap_or(0);
-    let from = from.unwrap_or(filetime_now() - DEFAULT_TRANSACTION_HISTORY_DAYS * FILETIME_DAY);
-    let rows = c
-        .db
-        .query(
-            "SELECT transaction_id, date, type_id::bigint, quantity::bigint, price, station_id, buyer_id, seller_id
-             FROM game.market_transactions WHERE (buyer_id = $1 OR seller_id = $1) AND date >= $2 ORDER BY date DESC LIMIT 2500",
-            &[&me, &from],
-        )
-        .await
-        .map_err(db_err)?;
-    let header = DbRowDescriptor::new([
-        ("transactionID", DbType::I8),
-        ("transactionDate", DbType::FileTime),
-        ("typeID", DbType::I4),
-        ("quantity", DbType::I4),
-        ("price", DbType::R8),
-        ("stationID", DbType::I8),
-        ("buyerID", DbType::I8),
-        ("sellerID", DbType::I8),
-        ("accountID", DbType::I4),
-        ("buyerAccountID", DbType::I4),
-        ("sellerAccountID", DbType::I4),
-    ]);
-    let lines = rows
-        .iter()
-        .map(|r| {
-            header.row(&[
-                Value::Int(r.get(0)),
-                Value::Int(r.get(1)),
-                Value::Int(r.get(2)),
-                Value::Int(r.get(3)),
-                Value::Float(r.get(4)),
-                Value::Int(r.get(5)),
-                Value::Int(r.get(6)),
-                Value::Int(r.get(7)),
-                Value::Int(ACCOUNT_CASH as i64),
-                Value::Int(ACCOUNT_CASH as i64),
-                Value::Int(ACCOUNT_CASH as i64),
-            ])
-        })
-        .collect();
-    Ok(crowset(&header, lines))
-}
-
-/// `GetCharEscrow`: ISK held by buy orders, and the value of items held by sell orders.
-async fn escrow(c: &Client) -> CallResult {
-    let me = c.session.int("charid").unwrap_or(0);
-    let r = c
-        .db
-        .query_one(
-            "SELECT COALESCE(sum(escrow) FILTER (WHERE bid), 0)::float8, COALESCE(sum(price * vol_remaining) FILTER (WHERE NOT bid), 0)::float8
-             FROM game.market_orders WHERE char_id = $1",
-            &[&me],
-        )
-        .await
-        .map_err(db_err)?;
-    Ok(keyval([("iskEscrow", Value::Float(r.get(0))), ("itemsEscrow", Value::Float(r.get(1)))]))
-}
-
-fn history_header() -> DbRowDescriptor {
-    DbRowDescriptor::new([
-        ("historyDate", DbType::FileTime),
-        ("lowPrice", DbType::R8),
-        ("highPrice", DbType::R8),
-        ("avgPrice", DbType::R8),
-        ("volume", DbType::I8),
-        ("orders", DbType::I4),
-    ])
-}
-
-/// Daily trading in the session's region for each type, from the year's transactions:
-/// typeID -> (days before today, today) as `dbutil.CRowset`s (marketsvc.GetHistoryRowList).
-async fn price_history(c: &Client, type_ids: &[i32]) -> Result<HashMap<i32, (Value, Value)>, CallError> {
-    let region = c.session.int("regionid").unwrap_or(0);
-    let today = today();
-    let rows = c
-        .db
-        .query(
-            "SELECT type_id, date / $3 * $3 AS day, min(price), max(price), sum(price * quantity) / sum(quantity), sum(quantity)::bigint, count(*)
-             FROM game.market_transactions WHERE region_id = $1 AND type_id = ANY($2) AND date >= $4
-             GROUP BY 1, 2 ORDER BY 1, 2",
-            &[&region, &type_ids.to_vec(), &FILETIME_DAY, &(today - PRICE_HISTORY_DAYS * FILETIME_DAY)],
-        )
-        .await
-        .map_err(db_err)?;
-    let header = history_header();
-    let mut days: HashMap<i32, (Vec<Value>, Vec<Value>)> = type_ids.iter().map(|t| (*t, (vec![], vec![]))).collect();
-    for r in &rows {
-        let (type_id, day): (i32, i64) = (r.get(0), r.get(1));
-        let row = header.row(&[Value::Int(day), Value::Float(r.get(2)), Value::Float(r.get(3)), Value::Float(r.get(4)), Value::Int(r.get(5)), Value::Int(r.get(6))]);
-        let (old, new) = days.entry(type_id).or_default();
-        (if day < today { old } else { new }).push(row);
-    }
-    Ok(days.into_iter().map(|(t, (old, new))| (t, (crowset(&header, old), crowset(&header, new)))).collect())
-}
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     if call.service != "marketProxy" {
@@ -1031,15 +616,15 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "GetOrders" => orders(c, int(0).unwrap_or(0)).await,
         "GetStationAsks" => {
             let station = c.session.int("stationid").unwrap_or(0);
-            best_asks(c, "station_id", station, false).await
+            best_asks(c, Area::Station, station, false).await
         }
         "GetSystemAsks" => {
             let system = c.session.int("solarsystemid2").unwrap_or(0);
-            best_asks(c, "solar_system_id", system, false).await
+            best_asks(c, Area::System, system, false).await
         }
         "GetRegionBest" => {
             let region = c.session.int("regionid").unwrap_or(0);
-            best_asks(c, "region_id", region, true).await
+            best_asks(c, Area::Region, region, true).await
         }
         // PlaceBuyOrder(stationID, typeID, price, quantity, orderRange, minVolume, duration, useCorp, expectedBrokersFee)
         "PlaceBuyOrder" => {
