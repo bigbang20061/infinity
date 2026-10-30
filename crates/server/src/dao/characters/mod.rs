@@ -5,6 +5,7 @@
 
 pub(crate) mod attributes;
 pub(crate) mod creation;
+pub(crate) mod crimewatch;
 pub(crate) mod members;
 pub(crate) mod persistence;
 pub(crate) mod roles;

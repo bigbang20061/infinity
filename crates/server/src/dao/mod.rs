@@ -21,6 +21,7 @@ pub(crate) mod exploration;
 pub(crate) mod industry;
 pub(crate) mod insurance;
 pub(crate) mod items;
+pub(crate) mod killmails;
 pub(crate) mod mail;
 pub(crate) mod market;
 pub(crate) mod missions;

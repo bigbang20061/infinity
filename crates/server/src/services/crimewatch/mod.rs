@@ -17,6 +17,9 @@
 //! criminal flags are in memory and do not survive a server restart.
 //! Killmail records, kill-report notifications and security penalties commit together;
 //! damage contributions remain in memory until that transaction commits.
+mod corp_registry;
+mod crimewatch;
+mod war_statistic_mgr;
 
 use super::{db_err, keyval, Call, CallError, CallResult};
 use crate::client::{filetime_now, ms_from_filetime_ticks, Client};
@@ -127,34 +130,21 @@ fn is_criminal(char_id: i64, now: i64) -> bool {
 }
 
 pub async fn security_status(db: &(impl Executor + ?Sized), char_id: i64) -> Result<f64, CallError> {
-    Ok(db
-        .query_opt("SELECT security_status FROM game.characters WHERE character_id = $1", &[&char_id])
-        .await
-        .map_err(db_err)?
-        .map(|r| r.get(0))
-        .unwrap_or(0.0))
+    Ok(crate::dao::characters::crimewatch::security(db, char_id).await.map_err(db_err)?.unwrap_or(0.0))
 }
 
 async fn system_security(db: &Db, system: i64) -> Result<f64, CallError> {
     Ok(db
-        .query_opt("SELECT COALESCE(security, 0)::float8 FROM sde.map_solar_systems WHERE solar_system_id = $1::bigint", &[&system])
+        .query_opt("SELECT COALESCE(security, 0)::float8 AS security FROM sde.map_solar_systems WHERE solar_system_id = $1::bigint", &[&system])
         .await
         .map_err(db_err)?
-        .map(|r| r.get(0))
+        .map(|r| r.get("security"))
         .unwrap_or(0.0))
 }
 
 /// Move a pilot's security status `fraction` of the way to `toward` (+10 or -10).
 async fn shift_security<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, char_id: i64, fraction: f64, toward: f64) -> Result<f64, CallError> {
-    let new: f64 = db
-        .query_one(
-            "UPDATE game.characters SET security_status = GREATEST(-10, LEAST(10, security_status + ($3 - security_status) * $2))
-             WHERE character_id = $1 RETURNING security_status",
-            &[&char_id, &fraction, &toward],
-        )
-        .await
-        .map_err(db_err)?
-        .get(0);
+    let new = crate::dao::characters::crimewatch::shift_security(db, char_id, fraction, toward).await.map_err(db_err)?;
     outbox.notify_pilot(char_id, "OnSecurityStatusUpdate", vec![Value::Float(new)]);
     Ok(new)
 }
@@ -260,8 +250,8 @@ fn clear_flag_later(db: Db, world: Arc<World>, char_id: i64, until: i64) {
             }
             break;
         }
-        let system: Option<i64> = match db.query_opt("SELECT solar_system_id FROM game.characters WHERE character_id = $1", &[&char_id]).await {
-            Ok(r) => r.and_then(|r| r.get(0)),
+        let system: Option<i64> = match crate::dao::characters::crimewatch::solar_system(&db, char_id).await {
+            Ok(system) => system,
             Err(e) => {
                 warn!("crimewatch: locating {char_id}: {e}");
                 None
@@ -357,12 +347,7 @@ async fn write_killmail<X: Send>(
     let final_blow = attackers.iter().max_by_key(|(_, c)| c.last).cloned();
     let mut blob = String::from("<doc><attackers>");
     for (char_id, c) in attackers.iter() {
-        let corp: i64 = db
-            .query_opt("SELECT corporation_id FROM game.characters WHERE character_id = $1", &[char_id])
-            .await
-            .map_err(db_err)?
-            .map(|r| r.get(0))
-            .unwrap_or(0);
+        let corp = crate::dao::characters::crimewatch::corporation(db, *char_id).await.map_err(db_err)?.unwrap_or(0);
         let sec = security_status(db, *char_id).await?;
         blob += &format!("<a c={char_id} r={corp} s={} w={} d={} t={sec:.1} />", c.ship_type, c.weapon_type, c.damage.round() as i64);
     }
@@ -373,8 +358,8 @@ async fn write_killmail<X: Send>(
     blob += "</items></doc>";
     let mut types: Vec<i32> = items.iter().map(|i| i.0).collect();
     types.push(ship_type);
-    let prices = db.query("SELECT type_id, average FROM game.retail_prices WHERE type_id = ANY($1)", &[&types]).await.map_err(db_err)?;
-    let price: HashMap<i32, f64> = prices.iter().map(|r| (r.get(0), r.get(1))).collect();
+    let prices = crate::dao::killmails::prices(db, &types).await.map_err(db_err)?;
+    let price: HashMap<i32, f64> = prices.iter().map(|r| (r.type_id, r.average)).collect();
     let isk_lost = price.get(&ship_type).copied().unwrap_or(0.0) + items.iter().map(|(t, _, _, q)| price.get(t).copied().unwrap_or(0.0) * *q as f64).sum::<f64>();
     let damage_taken: f64 = attackers.iter().map(|(_, c)| c.damage).sum();
     let (final_char, final_c) = match &final_blow {
@@ -382,7 +367,7 @@ async fn write_killmail<X: Send>(
         None => (None, Contribution::default()),
     };
     let final_corp: Option<i64> = match final_char {
-        Some(ch) => db.query_opt("SELECT corporation_id FROM game.characters WHERE character_id = $1", &[&ch]).await.map_err(db_err)?.map(|r| r.get(0)),
+        Some(ch) => crate::dao::characters::crimewatch::corporation(db, ch).await.map_err(db_err)?,
         None => None,
     };
     let final_sec = match final_char {
@@ -390,33 +375,11 @@ async fn write_killmail<X: Send>(
         None => 0.0,
     };
     let involved: Vec<i64> = attackers.iter().map(|(ch, _)| *ch).collect();
-    let kill_id: i64 = db
-        .query_one(
-            "INSERT INTO game.killmails (kill_time, solar_system_id, victim_id, victim_corp_id, victim_ship_type, damage_taken, final_char_id,
-                                         final_corp_id, final_ship_type, final_weapon_type, final_damage, final_sec_status, isk_lost,
-                                         attacker_ids, blob)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING kill_id",
-            &[
-                &now,
-                &system,
-                &victim,
-                &victim_corp,
-                &ship_type,
-                &damage_taken,
-                &final_char,
-                &final_corp,
-                &final_c.ship_type,
-                &final_c.weapon_type,
-                &final_c.damage,
-                &final_sec,
-                &isk_lost,
-                &involved,
-                &blob,
-            ],
-        )
-        .await
-        .map_err(db_err)?
-        .get(0);
+    let kill_id = crate::dao::killmails::insert(db, &crate::dao::killmails::NewKillmail {
+        now, system, victim, victim_corp, ship_type, damage_taken, final_char, final_corp,
+        final_ship_type: final_c.ship_type, final_weapon_type: final_c.weapon_type, final_damage: final_c.damage,
+        final_sec, isk_lost, involved: &involved, blob: &blob,
+    }).await.map_err(db_err)?;
 
     // Kill reports (notificationconst groupWar): the victim's, and the final blow's.
     super::mail::notify(db, outbox, victim, NOTIFICATION_KILL_REPORT_VICTIM, NOTIFICATION_GROUP_WAR, victim, &format!("{{killMailHash: '', killMailID: {kill_id}}}"))
@@ -442,94 +405,50 @@ pub async fn npc_killed(db: &Db, world: &World, char_id: i64) -> Result<(), Call
 }
 
 
-/// `GetClientStates` -> (combat timers, engagements, (criminals, suspects) in the system, safety level).
-async fn client_states(c: &Client) -> Value {
-    let me = c.session.int("charid").unwrap_or(0);
-    let here: HashSet<i64> = match c.session.int("solarsystemid") {
-        Some(system) => pilots_in(&c.world, system).await.into_iter().collect(),
-        None => HashSet::new(),
-    };
-    let now = filetime_now();
-    let st = state();
-    let pilot = st.pilots.get(&me);
-    let running = |until: Option<i64>, on: i64, off: i64| match until.filter(|u| *u > now) {
-        Some(u) => timer(on, Some(u)),
-        None => timer(off, None),
-    };
-    let timers = Value::tuple([
-        running(pilot.map(|p| p.weapons_until), WEAPONS_TIMER, WEAPONS_IDLE),
-        running(pilot.map(|p| p.pvp_until), PVP_TIMER, PVP_IDLE),
-        timer(NPC_IDLE, None),
-        running(pilot.map(|p| p.criminal_until), CRIMINAL_TIMER, CRIMINAL_IDLE),
-        timer(DISAPPROVAL_IDLE, None),
-    ]);
-    let engagements = Value::Dict(st.engagements.iter().filter(|((a, _), until)| *a == me && **until > now).map(|((_, b), until)| (Value::Int(*b), Value::Int(*until))).collect());
-    let criminals: Vec<Value> = st.pilots.iter().filter(|(ch, p)| p.criminal_until > now && here.contains(ch)).map(|(ch, _)| Value::Int(*ch)).collect();
-    Value::tuple([timers, engagements, Value::tuple([Value::List(criminals), Value::list([])]), Value::Int(SAFETY_LEVEL_FULL)])
-}
 
 /// Killmails the character was involved in (`kills`) or the victim of, newest first.
 async fn killmails(c: &Client, kills: Option<bool>, key: i64, num: i64, before: Option<i64>) -> CallResult {
-    let condition = match kills {
-        Some(true) => "$1 = ANY(attacker_ids)",
-        Some(false) => "victim_id = $1",
-        None => "kill_id = $1",
+    let filter = match kills {
+        Some(true) => crate::dao::killmails::Filter::Kills,
+        Some(false) => crate::dao::killmails::Filter::Losses,
+        None => crate::dao::killmails::Filter::Id,
     };
-    let rows = c
-        .db
-        .query(
-            &format!(
-                "SELECT kill_id, kill_time, solar_system_id, victim_id, victim_corp_id, victim_ship_type, damage_taken, final_char_id,
-                        final_corp_id, final_ship_type, final_weapon_type, final_damage, final_sec_status, isk_lost, blob
-                 FROM game.killmails WHERE {condition} AND ($2::bigint IS NULL OR kill_id < $2) ORDER BY kill_id DESC LIMIT $3"
-            ),
-            &[&key, &before, &num.clamp(1, 500)],
-        )
-        .await
-        .map_err(db_err)?;
+    let rows = crate::dao::killmails::list(&c.db, filter, key, before, num.clamp(1, 500)).await.map_err(db_err)?;
     let opt = |v: Option<i64>| v.map(Value::Int).unwrap_or(Value::None);
-    Ok(Value::list(rows.iter().map(|r| {
+    Ok(Value::list(rows.into_iter().map(|r| {
         keyval([
-            ("killID", Value::Int(r.get(0))),
-            ("killTime", Value::Int(r.get(1))),
-            ("solarSystemID", Value::Int(r.get(2))),
+            ("killID", Value::Int(r.kill_id)),
+            ("killTime", Value::Int(r.kill_time)),
+            ("solarSystemID", Value::Int(r.solar_system_id)),
             ("moonID", Value::None),
-            ("victimCharacterID", Value::Int(r.get(3))),
-            ("victimCorporationID", Value::Int(r.get(4))),
+            ("victimCharacterID", Value::Int(r.victim_id)),
+            ("victimCorporationID", Value::Int(r.victim_corp_id)),
             ("victimAllianceID", Value::None),
             ("victimFactionID", Value::None),
-            ("victimShipTypeID", Value::Int(r.get::<_, i32>(5) as i64)),
-            ("victimDamageTaken", Value::Int(r.get::<_, f64>(6).round() as i64)),
-            ("finalCharacterID", opt(r.get(7))),
-            ("finalCorporationID", opt(r.get(8))),
+            ("victimShipTypeID", Value::Int(r.victim_ship_type as i64)),
+            ("victimDamageTaken", Value::Int(r.damage_taken.round() as i64)),
+            ("finalCharacterID", opt(r.final_char_id)),
+            ("finalCorporationID", opt(r.final_corp_id)),
             ("finalAllianceID", Value::None),
             ("finalFactionID", Value::None),
-            ("finalShipTypeID", Value::Int(r.get::<_, i32>(9) as i64)),
-            ("finalWeaponTypeID", Value::Int(r.get::<_, i32>(10) as i64)),
-            ("finalDamageDone", Value::Int(r.get::<_, f64>(11).round() as i64)),
-            ("finalSecurityStatus", Value::Float(r.get(12))),
-            ("iskLost", Value::Float(r.get(13))),
+            ("finalShipTypeID", Value::Int(r.final_ship_type as i64)),
+            ("finalWeaponTypeID", Value::Int(r.final_weapon_type as i64)),
+            ("finalDamageDone", Value::Int(r.final_damage.round() as i64)),
+            ("finalSecurityStatus", Value::Float(r.final_sec_status)),
+            ("iskLost", Value::Float(r.isk_lost)),
             ("warID", Value::None),
-            ("killBlob", Value::unicode(r.get::<_, String>(14))),
+            ("killBlob", Value::unicode(r.blob)),
         ])
     })))
 }
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
-    let int = |i: usize| call.args.get(i).and_then(|v| v.as_int());
-    let me = c.session.int("charid").unwrap_or(0);
-    Some(match (call.service, call.method) {
-        ("crimewatch", "GetClientStates") => Ok(client_states(c).await),
-        ("crimewatch", "GetMySecurityStatus") => security_status(&c.db, c.session.int("charid").unwrap_or(0)).await.map(Value::Float),
-        ("crimewatch", "GetCharacterSecurityStatus") => security_status(&c.db, int(0).unwrap_or(0)).await.map(Value::Float),
-        ("crimewatch", "GetSecurityStatusTransactions") => Ok(Value::list([])),
-        // GetRecentKills(num, offset): offset is the oldest killID already shown.
-        ("corpRegistry", "GetRecentKills") => killmails(c, Some(true), me, int(0).unwrap_or(10), int(1)).await,
-        ("corpRegistry", "GetRecentLosses") => killmails(c, Some(false), me, int(0).unwrap_or(10), int(1)).await,
-        // GetKillMail(killID, hash)
-        ("warStatisticMgr", "GetKillMail") => killmails(c, None, int(0).unwrap_or(0), 1, None).await.map(|v| v.items().and_then(|k| k.first().cloned()).unwrap_or(Value::None)),
-        _ => return None,
-    })
+    match call.service {
+        "crimewatch" => crimewatch::dispatch(c, call).await,
+        "corpRegistry" => corp_registry::dispatch(c, call).await,
+        "warStatisticMgr" => war_statistic_mgr::dispatch(c, call).await,
+        _ => None,
+    }
 }
 
 #[cfg(test)] mod tests;
