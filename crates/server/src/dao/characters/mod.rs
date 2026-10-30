@@ -14,4 +14,5 @@ pub(crate) mod roles;
 pub(crate) mod routing;
 pub(crate) mod social;
 pub(crate) mod selection;
+pub(crate) mod ship;
 pub(crate) mod standings;

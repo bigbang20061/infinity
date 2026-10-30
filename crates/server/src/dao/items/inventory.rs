@@ -14,6 +14,13 @@ pub(crate) struct SlotFlag { pub flag_id: i32 }
 impl SlotFlag { fn from_row(r: &Row) -> Self { Self { flag_id: r.get("flag_id") } } }
 pub(crate) struct ItemId { pub item_id: i64 }
 impl ItemId { pub(super) fn from_row(r: &Row) -> Self { Self { item_id: r.get("item_id") } } }
+struct TypeId { type_id: i32 }
+impl TypeId { fn from_row(r: &Row) -> Self { Self { type_id: r.get("type_id") } } }
+
+/// Look up an item's type for ship and fit services.
+pub(crate) async fn type_id(ex: &(impl Executor + ?Sized), item: i64) -> Result<Option<i32>, Error> {
+    Ok(ex.query_opt("SELECT type_id FROM game.items WHERE item_id = $1", &[&item]).await?.as_ref().map(|r| TypeId::from_row(r).type_id))
+}
 
 pub(crate) async fn capacity(ex: &(impl Executor + ?Sized), id: i64, attr: i32) -> Result<Option<Capacity>, Error> {
     Ok(ex.query_opt("SELECT COALESCE((SELECT value FROM sde.type_attributes a WHERE a.type_id = i.type_id AND a.attribute_id = $2),

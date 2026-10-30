@@ -10,10 +10,18 @@ use super::{db_err, Call, CallError, CallResult};
 use crate::client::{short, Client};
 use crate::consts::{ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_SIGNATURE_RADIUS, FILETIME_SECOND, FLAG_HANGAR, TYPE_CAPSULE};
 use crate::db::outbox::{Effect, Outbox};
+use crate::dao::{characters::{ship as character_dao, selection}, items::{ship as item_dao, creation}};
 use crate::messages;
 use crate::space::{self, event, now_ms, now_tick, seconds_to_ms_f64, warp_duration, Ball, Warp, V3, CLOAK_RESTORE, MODE_FOLLOW, MODE_GOTO, MODE_ORBIT, MODE_STOP, MODE_WARP};
 use marshal::Value;
 use tracing::{info, warn};
+
+struct CelestialRow { x: f64, y: f64, z: f64, radius: f64 }
+impl CelestialRow { fn from_row(r: &tokio_postgres::Row) -> Self { Self { x: r.get("x"), y: r.get("y"), z: r.get("z"), radius: r.get("radius") } } }
+struct GateRow { dest_solar_system_id: i64, _constellation_id: Option<i64>, _region_id: Option<i64>, x: f64, y: f64, z: f64, radius: f64 }
+impl GateRow { fn from_row(r: &tokio_postgres::Row) -> Self { Self { dest_solar_system_id: r.get("dest_solar_system_id"), _constellation_id: r.get("constellation_id"), _region_id: r.get("region_id"), x: r.get("x"), y: r.get("y"), z: r.get("z"), radius: r.get("radius") } } }
+struct SystemRow { constellation_id: i64, region_id: i64 }
+impl SystemRow { fn from_row(r: &tokio_postgres::Row) -> Self { Self { constellation_id: r.get("constellation_id"), region_id: r.get("region_id") } } }
 
 const ATTR_AGILITY: i32 = 70;
 const ATTR_WARP_SPEED_MULTIPLIER: i32 = 600;
@@ -28,24 +36,10 @@ fn f(v: Option<&Value>) -> f64 {
 
 /// Build a free ship ball from the ship's type attributes.
 pub(super) async fn ship_ball(c: &Client, ship_id: i64, pos: [f64; 3]) -> Result<Ball, CallError> {
-    let r = c
-        .db
-        .query_one(
-            "SELECT i.type_id, t.radius,
-                    (SELECT value FROM sde.type_attributes WHERE type_id = i.type_id AND attribute_id = $2),
-                    (SELECT value FROM sde.type_attributes WHERE type_id = i.type_id AND attribute_id = $3),
-                    (SELECT value FROM sde.type_attributes WHERE type_id = i.type_id AND attribute_id = $4),
-                    (SELECT value FROM sde.type_attributes WHERE type_id = i.type_id AND attribute_id = $5),
-                    (SELECT value FROM sde.type_attributes WHERE type_id = i.type_id AND attribute_id = $6),
-                    t.mass
-             FROM game.items i JOIN sde.inv_types t USING (type_id) WHERE i.item_id = $1",
-            &[&ship_id, &ATTR_MASS, &ATTR_MAX_VELOCITY, &ATTR_AGILITY, &ATTR_WARP_SPEED_MULTIPLIER, &ATTR_BASE_WARP_SPEED],
-        )
-        .await
-        .map_err(db_err)?;
-    let mass = r.get::<_, Option<f64>>(2).or(r.get(7)).unwrap_or(1_000_000.0);
-    let warp_mult = r.get::<_, Option<f64>>(5).unwrap_or(1.0);
-    let base_warp = r.get::<_, Option<f64>>(6).unwrap_or(3.0);
+    let r = item_dao::ball(&c.db, ship_id, ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_AGILITY, ATTR_WARP_SPEED_MULTIPLIER, ATTR_BASE_WARP_SPEED).await.map_err(db_err)?;
+    let mass = r.mass_attr.or(r.mass).unwrap_or(1_000_000.0);
+    let warp_mult = r.warp_mult.unwrap_or(1.0);
+    let base_warp = r.base_warp.unwrap_or(3.0);
     let char_id = c.session.int("charid").unwrap_or(0);
     let corp = c.session.int("corpid").unwrap_or(0);
     // Movement and signature attributes as fitted (skills, modules), when the ship is the pilot's.
@@ -55,11 +49,11 @@ pub(super) async fn ship_ball(c: &Client, ship_id: i64, pos: [f64; 3]) -> Result
         _ => base,
     };
     let mass = fitted(ATTR_MASS, mass);
-    let radius = r.get::<_, Option<f64>>(1).unwrap_or(DEFAULT_SHIP_RADIUS) as f32;
+    let radius = r.radius.unwrap_or(DEFAULT_SHIP_RADIUS) as f32;
     let security = super::crimewatch::security_status(&c.db, char_id).await?;
     Ok(Ball {
         id: ship_id,
-        type_id: r.get(0),
+        type_id: r.type_id,
         owner_id: char_id,
         corp_id: corp,
         alliance_id: c.session.int("allianceid").unwrap_or(-1),
@@ -68,8 +62,8 @@ pub(super) async fn ship_ball(c: &Client, ship_id: i64, pos: [f64; 3]) -> Result
         radius,
         signature_radius: Some(fitted(ATTR_SIGNATURE_RADIUS, radius as f64)),
         mass,
-        max_vel: fitted(ATTR_MAX_VELOCITY, r.get::<_, Option<f64>>(3).unwrap_or(200.0)) as f32,
-        agility: fitted(ATTR_AGILITY, r.get::<_, Option<f64>>(4).unwrap_or(3.0)) as f32,
+        max_vel: fitted(ATTR_MAX_VELOCITY, r.velocity.unwrap_or(200.0)) as f32,
+        agility: fitted(ATTR_AGILITY, r.agility.unwrap_or(3.0)) as f32,
         speed_fraction: 0.0,
         pos,
         vel: [0.0; 3],
@@ -88,40 +82,6 @@ pub(super) async fn ship_ball(c: &Client, ship_id: i64, pos: [f64; 3]) -> Result
         launcher: 0,
         slim: vec![("securityStatus", Value::Float(security))],
     })
-}
-
-async fn undock(c: &mut Client) -> CallResult {
-    let (Some(station), Some(system), Some(ship)) = (c.session.int("stationid"), c.session.int("solarsystemid2"), c.session.int("shipid")) else {
-        return Err(CallError::User { msg: messages::MSG_CANT_UNDOCK_NOT_IN_STATION.into(), dict: vec![] });
-    };
-    let st = c
-        .db
-        .query_one("SELECT x, y, z, COALESCE(radius, 5000)::float8 FROM sde.map_celestials WHERE item_id = $1", &[&station])
-        .await
-        .map_err(db_err)?;
-    let spos: [f64; 3] = [st.get(0), st.get(1), st.get(2)];
-    // Leave along a fixed per-station heading.
-    let a = (station % 360) as f64 * std::f64::consts::PI / 180.0;
-    let dir = [a.cos(), 0.0, a.sin()];
-    let dist = st.get::<_, f64>(3) + 2500.0;
-    let pos = [spos[0] + dir[0] * dist, spos[1], spos[2] + dir[2] * dist];
-    let mut ball = ship_ball(c, ship, pos).await?;
-    ball.vel = [dir[0] * ball.max_vel as f64, 0.0, dir[2] * ball.max_vel as f64];
-    c.db
-        .execute(
-            "UPDATE game.items SET location_id = $2, flag_id = 0, x = $3, y = $4, z = $5 WHERE item_id = $1",
-            &[&ship, &system, &pos[0], &pos[1], &pos[2]],
-        )
-        .await
-        .map_err(db_err)?;
-    c.db
-        .execute("UPDATE game.characters SET station_id = NULL, solar_system_id = $2 WHERE character_id = $1", &[&c.session.int("charid").unwrap_or(0), &system])
-        .await
-        .map_err(db_err)?;
-    c.world.add_ship(system, ball).await.map_err(CallError::Internal)?;
-    info!(user = c.login.user_id, "ship {ship} undocked from {station} into {system}");
-    c.change_session(vec![("stationid", Value::None), ("solarsystemid", Value::Int(system))]);
-    Ok(Value::None)
 }
 
 /// Refuse docking and gate jumps while the pilot's weapons timer runs (crimewatch).
@@ -149,14 +109,8 @@ async fn dock(c: &mut Client, station: i64) -> CallResult {
     super::combat::repair(ship);
     c.world.remove_ball(system, ship).await;
     c.world.unobserve(c.login.client_id);
-    c.db
-        .execute("UPDATE game.items SET location_id = $2, flag_id = $3, x = NULL, y = NULL, z = NULL WHERE item_id = $1", &[&ship, &station, &FLAG_HANGAR])
-        .await
-        .map_err(db_err)?;
-    c.db
-        .execute("UPDATE game.characters SET station_id = $2, solar_system_id = $3 WHERE character_id = $1", &[&c.session.int("charid").unwrap_or(0), &station, &system])
-        .await
-        .map_err(db_err)?;
+    item_dao::dock(&c.db, ship, station, FLAG_HANGAR).await.map_err(db_err)?;
+    character_dao::dock(&c.db, c.session.int("charid").unwrap_or(0), station, system).await.map_err(db_err)?;
     info!(user = c.login.user_id, "ship {ship} docked at {station}");
     c.change_session(vec![("solarsystemid", Value::None), ("stationid", Value::Int(station))]);
     Ok(Value::None)
@@ -209,11 +163,11 @@ async fn stargate_jump(c: &mut Client, from_gate: i64, to_gate: i64) -> CallResu
         return Err(CallError::User { msg: messages::MSG_JUMP_GATE_HAS_NO_DESTINATION.into(), dict: vec![] });
     };
     check_weapons_timer(c, messages::WEAPONS_TIMER_JUMP)?;
-    let dest = c
+    let dest = GateRow::from_row(&c
         .db
         .query_opt(
             "SELECT g.dest_solar_system_id::bigint, s.constellation_id::bigint, s.region_id::bigint, c.x, c.y, c.z,
-                    COALESCE(c.radius, t.radius, 5000)::float8
+                    COALESCE(c.radius, t.radius, 5000)::float8 AS radius
              FROM sde.map_stargates g
              JOIN sde.map_solar_systems s ON s.solar_system_id = g.dest_solar_system_id
              JOIN sde.map_celestials c ON c.item_id = g.dest_stargate_id
@@ -223,8 +177,8 @@ async fn stargate_jump(c: &mut Client, from_gate: i64, to_gate: i64) -> CallResu
         )
         .await
         .map_err(db_err)?
-        .ok_or_else(|| CallError::User { msg: messages::MSG_JUMP_GATE_HAS_NO_DESTINATION.into(), dict: vec![] })?;
-    let dest_system: i64 = dest.get(0);
+        .ok_or_else(|| CallError::User { msg: messages::MSG_JUMP_GATE_HAS_NO_DESTINATION.into(), dict: vec![] })?);
+    let dest_system: i64 = dest.dest_solar_system_id;
 
     // In range of the gate?
     let gap = c.world.ball(system, ship).await.zip(c.world.ball(system, from_gate).await).map(|(b, gate)| {
@@ -236,9 +190,9 @@ async fn stargate_jump(c: &mut Client, from_gate: i64, to_gate: i64) -> CallResu
         return Err(CallError::User { msg: messages::MSG_NOT_CLOSE_ENOUGH_TO_JUMP.into(), dict: vec![("maxdist".into(), Value::Int(JUMP_RANGE as i64))] });
     }
     // Arrive a few kilometres off the destination gate, on a heading fixed per gate pair.
-    let gate_pos: [f64; 3] = [dest.get(3), dest.get(4), dest.get(5)];
+    let gate_pos: [f64; 3] = [dest.x, dest.y, dest.z];
     let a = ((from_gate ^ to_gate) % 360) as f64 * std::f64::consts::PI / 180.0;
-    let dist = dest.get::<_, f64>(6) + 5000.0;
+    let dist = dest.radius + 5000.0;
     let pos = [gate_pos[0] + a.cos() * dist, gate_pos[1], gate_pos[2] + a.sin() * dist];
     let out = Jump { through: from_gate, guid: "effects.JumpOut", other_type: None, dest_system, pos };
     jump_out_and_arrive(c, system, ship, char_id, out).await?;
@@ -259,12 +213,12 @@ pub(super) struct Jump {
 /// out the animation, then arrive cloaked in the destination system and move the session.
 pub(super) async fn jump_out_and_arrive(c: &mut Client, system: i64, ship: i64, char_id: i64, jump: Jump) -> Result<(), CallError> {
     let Jump { through, guid, other_type, dest_system, pos } = jump;
-    let dest = c
+    let dest = SystemRow::from_row(&c
         .db
         .query_one("SELECT constellation_id::bigint, region_id::bigint FROM sde.map_solar_systems WHERE solar_system_id = $1", &[&(dest_system as i32)])
         .await
-        .map_err(db_err)?;
-    let (constellation, region): (i64, i64) = (dest.get(0), dest.get(1));
+        .map_err(db_err)?);
+    let (constellation, region) = (dest.constellation_id, dest.region_id);
     c.world.system(dest_system).await.map_err(CallError::Internal)?;
     // Room on the other side, or a place in its jump queue.
     if let Err(position) = c.world.request_entry(dest_system, char_id).await {
@@ -295,17 +249,8 @@ pub(super) async fn jump_out_and_arrive(c: &mut Client, system: i64, ship: i64, 
     super::combat::reset(c);
     c.world.remove_ball(system, ship).await;
     c.world.unobserve(c.login.client_id);
-    c.db
-        .execute("UPDATE game.items SET location_id = $2, x = $3, y = $4, z = $5 WHERE item_id = $1", &[&ship, &dest_system, &pos[0], &pos[1], &pos[2]])
-        .await
-        .map_err(db_err)?;
-    c.db
-        .execute(
-            "UPDATE game.characters SET solar_system_id = $2, constellation_id = $3, region_id = $4 WHERE character_id = $1",
-            &[&char_id, &dest_system, &constellation, &region],
-        )
-        .await
-        .map_err(db_err)?;
+    item_dao::position(&c.db, ship, dest_system, pos).await.map_err(db_err)?;
+    character_dao::location(&c.db, char_id, dest_system, constellation, region).await.map_err(db_err)?;
     let cloak_until = crate::client::filetime_now() + JUMP_CLOAK_SECONDS * FILETIME_SECOND;
     let mut ball = ship_ball(c, ship, pos).await?;
     ball.cloak = CLOAK_RESTORE;
@@ -370,29 +315,20 @@ pub(super) async fn teleport(c: &mut Client, dest_system: i64, pos: V3) -> Resul
     c.world.system(dest_system).await.map_err(CallError::Internal)?;
     super::combat::reset(c);
     c.world.remove_ball(system, ship).await;
-    c.db
-        .execute("UPDATE game.items SET location_id = $2, x = $3, y = $4, z = $5 WHERE item_id = $1", &[&ship, &dest_system, &pos[0], &pos[1], &pos[2]])
-        .await
-        .map_err(db_err)?;
+    item_dao::position(&c.db, ship, dest_system, pos).await.map_err(db_err)?;
     let ball = ship_ball(c, ship, pos).await?;
     if dest_system == system {
         c.world.add_ship(system, ball).await.map_err(CallError::Internal)?;
         return send_state(c).await;
     }
-    let dest = c
+    let dest = SystemRow::from_row(&c
         .db
         .query_one("SELECT constellation_id::bigint, region_id::bigint FROM sde.map_solar_systems WHERE solar_system_id = $1", &[&(dest_system as i32)])
         .await
-        .map_err(db_err)?;
-    let (constellation, region): (i64, i64) = (dest.get(0), dest.get(1));
+        .map_err(db_err)?);
+    let (constellation, region) = (dest.constellation_id, dest.region_id);
     c.world.unobserve(c.login.client_id);
-    c.db
-        .execute(
-            "UPDATE game.characters SET solar_system_id = $2, constellation_id = $3, region_id = $4 WHERE character_id = $1",
-            &[&char_id, &dest_system, &constellation, &region],
-        )
-        .await
-        .map_err(db_err)?;
+    character_dao::location(&c.db, char_id, dest_system, constellation, region).await.map_err(db_err)?;
     c.world.add_ship(dest_system, ball).await.map_err(CallError::Internal)?;
     c.change_session(vec![
         ("solarsystemid", Value::Int(dest_system)),
@@ -416,61 +352,31 @@ pub async fn lose_ship(c: &mut Client, ship: i64, pos: [f64; 3]) -> Result<(), C
     if c.session.int("shipid") != Some(ship) {
         return Ok(());
     }
-    let lost_type: Option<i32> = c.db.query_opt("SELECT type_id FROM game.items WHERE item_id = $1", &[&ship]).await.map_err(db_err)?.map(|r| r.get(0));
+    let lost_type = crate::dao::items::inventory::type_id(&c.db, ship).await.map_err(db_err)?;
     // The killmail lists what went down with it: fittings, cargo and loaded charges.
-    let mut lost: super::crimewatch::Lost = c
-        .db
-        .query("SELECT type_id, flag_id, singleton, quantity FROM game.items WHERE location_id = $1", &[&ship])
-        .await
-        .map_err(db_err)?
-        .iter()
-        .map(|r| {
-            let singleton: bool = r.get(2);
-            (r.get(0), r.get(1), singleton, if singleton { 1 } else { r.get::<_, i32>(3) as i64 })
-        })
-        .collect();
-    for r in c.db.query("SELECT type_id, flag_id, quantity FROM game.module_charges WHERE ship_id = $1", &[&ship]).await.map_err(db_err)? {
-        lost.push((r.get(0), r.get(1), false, r.get::<_, i32>(2) as i64));
+    let mut lost: super::crimewatch::Lost = item_dao::lost_items(&c.db, ship).await.map_err(db_err)?
+        .iter().map(|r| (r.type_id, r.flag_id, r.singleton, if r.singleton { 1 } else { r.quantity as i64 })).collect();
+    for r in item_dao::lost_charges(&c.db, ship).await.map_err(db_err)? {
+        lost.push((r.type_id, r.flag_id, false, r.quantity as i64));
     }
     let corp = c.session.int("corpid").unwrap_or(0);
     let db = c.db.clone();
     db.transaction(
         |tx, outbox: &mut Outbox<()>| Box::pin(async move {
             let home = if lost_type == Some(TYPE_CAPSULE) {
-                let r = tx.query_one(
-                    "SELECT s.station_id::bigint, s.solar_system_id::bigint, s.constellation_id::bigint, s.region_id::bigint
-                     FROM game.characters ch JOIN sde.sta_stations s ON s.station_id = COALESCE(ch.home_station_id, ch.station_id)
-                     WHERE ch.character_id = $1", &[&char_id],
-                ).await.map_err(db_err)?;
-                Some((r.get::<_, i64>(0), r.get::<_, i64>(1), r.get::<_, i64>(2), r.get::<_, i64>(3)))
+                let r = character_dao::home(tx, char_id).await.map_err(db_err)?;
+                Some((r.station_id, r.solar_system_id, r.constellation_id, r.region_id))
             } else { None };
-            for sql in [
-                "DELETE FROM game.items WHERE location_id = $1",
-                "DELETE FROM game.module_charges WHERE ship_id = $1",
-                "DELETE FROM game.weapon_banks WHERE ship_id = $1",
-                "DELETE FROM game.items WHERE item_id = $1",
-            ] {
-                tx.execute(sql, &[&ship]).await.map_err(db_err)?;
-            }
+            item_dao::delete_lost(tx, ship).await.map_err(db_err)?;
             let capsule: i64 = if let Some((station, _, _, _)) = home {
-                tx.query_one(
-                    "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton) VALUES ($1, $2, $3, $4, 1, true) RETURNING item_id",
-                    &[&TYPE_CAPSULE, &char_id, &station, &FLAG_HANGAR],
-                ).await.map_err(db_err)?.get(0)
+                creation::rookie_ship(tx, TYPE_CAPSULE, char_id, station, FLAG_HANGAR).await.map_err(db_err)?
             } else {
-                tx.query_one(
-                    "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton, x, y, z)
-                     VALUES ($1, $2, $3, 0, 1, true, $4, $5, $6) RETURNING item_id",
-                    &[&TYPE_CAPSULE, &char_id, &system, &pos[0], &pos[1], &pos[2]],
-                ).await.map_err(db_err)?.get(0)
+                crate::dao::items::creation::positioned(tx, TYPE_CAPSULE, char_id, system, pos).await.map_err(db_err)?
             };
             if let Some((station, system, constellation, region)) = home {
-                tx.execute(
-                    "UPDATE game.characters SET ship_id = $2, station_id = $3, solar_system_id = $4, constellation_id = $5, region_id = $6 WHERE character_id = $1",
-                    &[&char_id, &capsule, &station, &system, &constellation, &region],
-                ).await.map_err(db_err)?;
+                character_dao::set_home(tx, char_id, capsule, station, system, constellation, region).await.map_err(db_err)?;
             } else {
-                tx.execute("UPDATE game.characters SET ship_id = $2 WHERE character_id = $1", &[&char_id, &capsule]).await.map_err(db_err)?;
+                selection::set_ship(tx, char_id, capsule).await.map_err(db_err)?;
             }
             outbox.operation(());
             Ok((capsule, home))
@@ -586,113 +492,13 @@ fn ensure_moving(b: &mut Ball, tick: i64, ev: &mut Vec<Value>) {
     }
 }
 
+mod ship;
+mod beyonce;
+
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
-    let a = call.args;
-    Some(match (call.service, call.method) {
-        ("ship", "Undock") => undock(c).await,
-        ("beyonce", "UpdateStateRequest") => send_state(c).await.map(|_| Value::None),
-        ("beyonce", "CmdGotoDirection") => {
-            let dir = [f(a.first()), f(a.get(1)), f(a.get(2))];
-            movement(c, move |b, t, _| {
-                b.mode = MODE_GOTO;
-                b.goto = dir;
-                let mut ev = vec![event(t, "GotoDirection", vec![Value::Int(b.id), Value::Float(dir[0]), Value::Float(dir[1]), Value::Float(dir[2])])];
-                ensure_moving(b, t, &mut ev);
-                ev
-            })
-        }
-        ("beyonce", "CmdAlignTo") => {
-            let target = call.kwargs.get("dstID").and_then(|v| v.as_int()).or_else(|| a.first().and_then(|v| v.as_int()));
-            movement(c, move |b, t, others| {
-                let Some(tp) = target.and_then(|id| others.ball(id)).map(|o| o.pos) else { return vec![] };
-                let dir = [tp[0] - b.pos[0], tp[1] - b.pos[1], tp[2] - b.pos[2]];
-                b.mode = MODE_GOTO;
-                b.goto = dir;
-                let mut ev = vec![event(t, "GotoDirection", vec![Value::Int(b.id), Value::Float(dir[0]), Value::Float(dir[1]), Value::Float(dir[2])])];
-                ensure_moving(b, t, &mut ev);
-                ev
-            })
-        }
-        ("beyonce", "CmdStop") => {
-            if let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) {
-                c.world.command(system, ship, |b, t, _| {
-                    b.mode = MODE_STOP;
-                    b.speed_fraction = 0.0;
-                    vec![event(t, "Stop", vec![Value::Int(b.id)])]
-                });
-            }
-            Ok(Value::None)
-        }
-        ("beyonce", "CmdSetSpeedFraction") => {
-            let frac = f(a.first()).clamp(0.0, 1.0) as f32;
-            movement(c, move |b, t, _| {
-                b.speed_fraction = frac;
-                vec![event(t, "SetSpeedFraction", vec![Value::Int(b.id), Value::Float(frac as f64)])]
-            })
-        }
-        ("beyonce", "CmdFollowBall") | ("beyonce", "CmdOrbit") => {
-            let target = a.first().and_then(|v| v.as_int()).unwrap_or(0);
-            let range = f(a.get(1)) as f32;
-            let orbit = call.method == "CmdOrbit";
-            movement(c, move |b, t, _| {
-                b.mode = if orbit { MODE_ORBIT } else { MODE_FOLLOW };
-                b.follow_id = target;
-                b.follow_range = range;
-                let name = if orbit { "Orbit" } else { "FollowBall" };
-                let mut ev = vec![event(t, name, vec![Value::Int(b.id), Value::Int(target), Value::Float(range as f64)])];
-                ensure_moving(b, t, &mut ev);
-                ev
-            })
-        }
-        ("beyonce", "CmdWarpToStuff") if a.first().and_then(|v| v.as_text()).as_deref() == Some("scan") => {
-            let target = a.get(1).and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
-            let min_range = call.kwargs.get("minRange").and_then(|v| v.as_float()).unwrap_or(0.0);
-            super::exploration::warp_to_scan(c, &target, min_range).await
-        }
-        ("beyonce", "CmdWarpToStuff") | ("beyonce", "CmdWarpToStuffAutopilot") => {
-            let target = a.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-            let min_range = call.kwargs.get("minRange").and_then(|v| v.as_float()).unwrap_or(0.0);
-            // 'char': a fleet member's ship.
-            let by_pilot = a.first().and_then(|v| v.as_text()).as_deref() == Some("char");
-            let found = if let Some(sys) = c.session.int("solarsystemid") {
-                c.world.with(sys, move |s| {
-                    if by_pilot { s.pilot_ball(target) } else { s.ball(target) }
-                        .map(|b| (b.id, b.pos, b.radius as f64, s.warp_in(b.id)))
-                }).await.flatten()
-            } else {
-                None
-            };
-            let Some((id, pos, radius, warp_in)) = found else {
-                return Some(Ok(Value::None));
-            };
-            // Suns, planets, moons and belts land at their warp-in point, not off the surface.
-            let warped = match warp_in {
-                Some(point) => warp_to(c, None, point, min_range),
-                None => warp_to(c, Some((pos, radius)), pos, min_range),
-            };
-            // Warping to an asteroid belt brings out its rats.
-            if let (Ok(_), false, Some(system)) = (&warped, by_pilot, c.session.int("solarsystemid")) {
-                if let Err(e) = super::exploration::belt_rats(c, system, id, pos).await {
-                    warn!(user = c.login.user_id, "belt rats at {}: {}", id, super::exploration::err_text(e));
-                }
-            }
-            warped
-        }
-        ("beyonce", "CmdStargateJump") => {
-            let from_gate = a.first().and_then(|v| v.as_int()).unwrap_or(0);
-            let to_gate = a.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-            stargate_jump(c, from_gate, to_gate).await
-        }
-        ("beyonce", "CmdDock") | ("beyonce", "CmdTurboDock") => {
-            let station = a.first().and_then(|v| v.as_int()).unwrap_or(0);
-            dock(c, station).await
-        }
-        ("beyonce", m) => {
-            warn!(user = c.login.user_id, "UNHANDLED {}::{m} args={} kwargs={}", call.service, short(&marshal::Value::Tuple(a.to_vec())), short(call.kwargs));
-            Ok(Value::None)
-        }
-        _ => return None,
-    })
+    match call.service {
+        "ship" => ship::dispatch(c, call).await,
+        "beyonce" => beyonce::dispatch(c, call).await,
+        _ => None,
+    }
 }
-
-
