@@ -14,16 +14,12 @@
 //!   the newest seasonal campaign in seasonalCampaignsLoginRewards, one claim per day.
 
 use super::dogma::load_items;
-use super::{keyval, Call, CallError, CallResult};
-use crate::client::{filetime_now, Client};
-use crate::services::charsel::FLAG_HANGAR;
+use super::{db_err, keyval, Call, CallError, CallResult};
+use crate::client::{filetime_now, unix_seconds_from_filetime, Client};
+use crate::consts::FLAG_HANGAR;
 use marshal::Value;
 use std::sync::OnceLock;
 use tracing::info;
-
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
 
 const PLX: &str = "PLX";
 const TYPE_PLEX: i32 = 44992;
@@ -33,6 +29,8 @@ const DAILY_GIFT_OFFER: i64 = 1;
 const DAILY_GIFT_TYPE: i32 = 52520;
 /// Daily turnover of login rewards and daily offers (UTC; 11:00 Beijing time).
 const TURNOVER: &str = "03:00:00";
+/// Existing server policy: daily reward turnover offset from midnight UTC, in seconds.
+const TURNOVER_OFFSET_SECONDS: i64 = 10_800;
 const REWARD_DAY_SQL: &str = "(now() AT TIME ZONE 'UTC' - interval '3 hours')::date";
 
 /// Skill points granted per redeemed type (redeem/data.py `get_redeem_data`).
@@ -261,7 +259,7 @@ fn product_json(o: &Offer) -> Value {
 
 /// `YYYY-MM-DDTHH:MM:SSZ` of the current daily period's start.
 fn period_start() -> String {
-    let secs = (filetime_now() - 116_444_736_000_000_000) / 10_000_000 - 3 * 3600;
+    let secs = unix_seconds_from_filetime(filetime_now()) - TURNOVER_OFFSET_SECONDS;
     let day = secs.div_euclid(86_400);
     // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
     let z = day + 719_468;
@@ -313,15 +311,6 @@ async fn claimed_daily_gift(c: &Client) -> Result<bool, CallError> {
 }
 
 // ---------------------------------------------------------------- PLEX and redeeming
-
-async fn plex_balance(c: &Client) -> Result<i64, CallError> {
-    Ok(c.db
-        .client
-        .query_one("SELECT plex_balance FROM game.accounts WHERE user_id = $1", &[&c.login.user_id])
-        .await
-        .map_err(db_err)?
-        .get(0))
-}
 
 /// Queue `quantity` x `type_id` on `user_id`'s redeeming queue.
 async fn grant_token(c: &Client, user_id: i64, type_id: i32, quantity: i64, label: &str) -> Result<(), CallError> {
@@ -664,7 +653,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         // get_account_balance(currency): PLEX in the vault; no other currencies.
         ("vaultManager", "get_account_balance") => {
             if call.args.first().and_then(|v| v.as_text()).as_deref() == Some(PLX) {
-                plex_balance(c).await.map(Value::Int)
+                crate::db::Db::plex_balance(&c.db.client, c.login.user_id).await.map_err(db_err).map(Value::Int)
             } else {
                 Ok(Value::Int(0))
             }

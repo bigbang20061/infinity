@@ -2,22 +2,19 @@
 //! bound inventories, which list and describe the items in a container
 //! (eve/client/script/environment/invCache.py, invCacheContainer).
 
-use super::dogma::{load_items, Item, TYPE_CHARACTER};
-use super::{keyval, Call, CallError, CallResult};
+use super::dogma::{load_items, Item};
+use super::{db_err, keyval, value_id_list, Call, CallError, CallResult};
 use crate::client::{short, Client};
-use crate::services::charsel::FLAG_HANGAR;
+use crate::consts::{ATTR_CAPACITY, CATEGORY_SHIP, FLAG_CARGO, FLAG_CORP_SAG1, FLAG_FITTING_FIRST, FLAG_FITTING_LAST, FLAG_HANGAR, FLAG_PILOT, FLAG_RIG_FIRST, FLAG_RIG_LAST, FLAG_SUBSYSTEM_FIRST, FLAG_SUBSYSTEM_LAST, IX_FLAG, IX_LOCATION_ID, IX_SINGLETON, IX_STACK_SIZE, LOCATION_JUNKYARD, ROLE_DIRECTOR, TYPE_CHARACTER};
 use marshal::Value;
 use tracing::warn;
 
 /// const.containerHangar: "my hangar in the current station".
 const CONTAINER_HANGAR: i64 = 10004;
+/// Existing server policy for the highest corporation-hangar division index.
+const MAX_CORP_HANGAR_DIVISION_INDEX: i32 = 6;
 /// Internal bound-object name for a single inventory.
 pub const INVENTORY: &str = "invInventory";
-const ATTR_CAPACITY: i32 = 38;
-
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
 
 /// Which container a bound inventory lists.
 enum Container {
@@ -73,7 +70,7 @@ async fn self_item(c: &Client, container: &Container) -> Result<Value, CallError
             type_id: TYPE_CHARACTER,
             owner_id: id,
             location_id: c.session.int("shipid").unwrap_or(0),
-            flag_id: crate::services::charsel::FLAG_PILOT,
+            flag_id: FLAG_PILOT,
             quantity: 1,
             singleton: true,
             group_id: 1,
@@ -138,21 +135,12 @@ async fn capacity(c: &Client, container: &Container) -> Result<Value, CallError>
 // ---------------------------------------------------------------- moving items
 
 const FLAG_AUTOFIT: i32 = 0;
-const FLAG_CARGO: i32 = 5;
-/// const.locationJunkyard: where items go when they stop existing.
-const LOCATION_JUNKYARD: i64 = 10;
-const CATEGORY_SHIP: i64 = 6;
 /// appConst.corpRoleHangarCanTake1; divisions 2-7 are the next bits.
 const ROLE_HANGAR_CAN_TAKE_1: i64 = 8192;
-// invCache change keys (carbon const ix*, inventorycommon const ixStackSize/ixSingleton)
-const IX_LOCATION_ID: i64 = 3;
-const IX_FLAG: i64 = 4;
-const IX_STACK_SIZE: i64 = 9;
-const IX_SINGLETON: i64 = 10;
 
 /// Fitting slot flags: low, medium, high, rig and subsystem slots.
 pub fn is_fitting_flag(flag: i32) -> bool {
-    (11..=34).contains(&flag) || (92..=99).contains(&flag) || (125..=132).contains(&flag)
+    (FLAG_FITTING_FIRST..=FLAG_FITTING_LAST).contains(&flag) || (FLAG_RIG_FIRST..=FLAG_RIG_LAST).contains(&flag) || (FLAG_SUBSYSTEM_FIRST..=FLAG_SUBSYSTEM_LAST).contains(&flag)
 }
 
 /// `OnItemChange(item, change, location)` for `item_id` as it is now in the database.
@@ -223,8 +211,8 @@ async fn move_item(c: &mut Client, container: &Container, item_id: i64, flag: Op
     // Out of a corporation hangar: the division's take role (or Director) is needed.
     if let Some(corp) = super::offices::office_owner(&c.db, item.location_id).await? {
         let (my_corp, roles) = super::corps::membership(&c.db, char_id).await?;
-        let take = ROLE_HANGAR_CAN_TAKE_1 << (item.flag_id - super::offices::FLAG_CORP_SAG1).clamp(0, 6);
-        if my_corp != corp || roles & (take | super::corps::ROLE_DIRECTOR) == 0 {
+        let take = ROLE_HANGAR_CAN_TAKE_1 << (item.flag_id - FLAG_CORP_SAG1).clamp(0, MAX_CORP_HANGAR_DIVISION_INDEX);
+        if my_corp != corp || roles & (take | ROLE_DIRECTOR) == 0 {
             return Err(CallError::User { msg: "CustomNotify".into(), dict: vec![("notify".into(), Value::unicode("你没有从该军团机库部门取出物品的职权。"))] });
         }
     }
@@ -236,11 +224,11 @@ async fn move_item(c: &mut Client, container: &Container, item_id: i64, flag: Op
                 if c.session.int("corpid") != Some(corp) {
                     return Err(CallError::User { msg: "CustomNotify".into(), dict: vec![("notify".into(), Value::unicode("这不是你军团的机库。"))] });
                 }
-                let sag = super::offices::FLAG_CORP_SAG1;
+                let sag = FLAG_CORP_SAG1;
                 (*id, corp, flag.filter(|f| (sag..sag + 7).contains(f)).unwrap_or(sag))
             }
             None => {
-                let is_ship = load_items(c, "i.item_id = $1", &[id]).await?.first().is_some_and(|i| i.category_id == CATEGORY_SHIP);
+                let is_ship = load_items(c, "i.item_id = $1", &[id]).await?.first().is_some_and(|i| i.category_id == CATEGORY_SHIP as i64);
                 let default = if is_ship { FLAG_CARGO } else { FLAG_HANGAR };
                 (*id, char_id, flag.unwrap_or(default))
             }
@@ -331,10 +319,6 @@ async fn stack_all(c: &mut Client, container: &Container, flag: Option<i64>) -> 
     Ok(())
 }
 
-fn int_list(v: Option<&Value>) -> Vec<i64> {
-    v.and_then(|v| v.items()).map(|l| l.iter().filter_map(|x| x.as_int()).collect()).unwrap_or_default()
-}
-
 /// Calls on the inventory manager (`invbroker` bound to a location).
 pub async fn broker(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     let char_id = c.session.int("charid").unwrap_or(0);
@@ -396,7 +380,7 @@ pub async fn broker(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         }
         // TrashItems(itemIDs, locationID) -> [error messages]
         "TrashItems" => {
-            let ids = int_list(call.args.first());
+            let ids = value_id_list(call.args.first());
             let r = async {
                 let items = load_items(c, "i.item_id = ANY($1) AND i.owner_id = $2", &[&ids, &char_id]).await?;
                 for item in items {
@@ -452,7 +436,7 @@ pub async fn inventory(c: &mut Client, call: &Call<'_>) -> CallResult {
         // MultiAdd(itemIDs, sourceID, flag=)
         "MultiAdd" => {
             let flag = call.kwargs.get("flag").and_then(|v| v.as_int()).map(|f| f as i32);
-            for item_id in int_list(call.args.first()) {
+            for item_id in value_id_list(call.args.first()) {
                 move_item(c, &container, item_id, flag, None).await?;
             }
             Ok(Value::None)

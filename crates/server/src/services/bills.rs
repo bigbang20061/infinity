@@ -7,31 +7,24 @@
 //! automatically from a wallet division (billMgr automatic payment settings). Billing runs
 //! every ten minutes. An office whose rent goes unpaid isn't taken away.
 
-use super::corps::{ceo_of, membership, ROLE_DIRECTOR};
-use super::{keyval, Call, CallError, CallResult};
+use super::{active_corporation_member_ids, db_err, has_role_or_is_ceo, keyval, notify_error, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
+use crate::consts::{ACCOUNT_CASH, FILETIME_DAY, RENTAL_DAYS, ROLE_ACCOUNTANT, ROLE_DIRECTOR};
 use crate::db::Db;
 use crate::space::World;
 use marshal::Value;
 use std::sync::Arc;
 use tracing::{info, warn};
 
+/// Existing server policy for billing maintenance cadence.
+const BILLING_INTERVAL_SECONDS: u64 = 600;
+
 // appConst.billType* and bill status
 const BILL_RENTAL: i32 = 2;
 const UNPAID: i32 = 0;
 const PAID: i32 = 1;
-/// appConst.corpRoleAccountant
-const ROLE_ACCOUNTANT: i64 = 256;
-/// Rent is billed this long before the period ends.
-const BILL_AHEAD: i64 = 7 * super::offices::DAY;
-
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
-
-fn notify_error(text: &str) -> CallError {
-    CallError::User { msg: "CustomNotify".into(), dict: vec![("notify".into(), Value::unicode(text))] }
-}
+/// Retained server advance-billing policy for rent before the period ends.
+const BILL_AHEAD: i64 = 7 * FILETIME_DAY;
 
 const BILL_SELECT: &str =
     "SELECT bill_id, bill_type, debtor_id, creditor_id, amount::float8, due, interest, external_id, external_id2 FROM game.bills";
@@ -65,9 +58,8 @@ pub(super) async fn bills(db: &Db, owner: i64, creditor: bool) -> CallResult {
 
 /// Tell `corp`'s online members their bills changed.
 async fn announce(db: &Db, world: &World, corp: i64) -> Result<(), CallError> {
-    let rows = db.client.query("SELECT character_id FROM game.characters WHERE corporation_id = $1 AND NOT deleted", &[&corp]).await.map_err(db_err)?;
-    for r in rows {
-        world.notify_pilot(r.get(0), "OnBillReceived", vec![]);
+    for id in active_corporation_member_ids(db, corp).await? {
+        world.notify_pilot(id, "OnBillReceived", vec![]);
     }
     Ok(())
 }
@@ -85,7 +77,7 @@ pub(super) async fn pay(db: &Db, world: &World, bill: i64, corp: Option<i64>, ke
         None => super::market::debit(db, world, debtor, amount).await?,
     }
     if super::corps::is_player_corp(creditor) {
-        super::corpwallet::corp_credit(db, world, creditor, super::corpwallet::MASTER, amount).await?;
+        super::corpwallet::corp_credit(db, world, creditor, ACCOUNT_CASH, amount).await?;
     }
     db.client.execute("UPDATE game.bills SET status = $2 WHERE bill_id = $1", &[&bill, &PAID]).await.map_err(db_err)?;
     if kind == BILL_RENTAL {
@@ -93,7 +85,7 @@ pub(super) async fn pay(db: &Db, world: &World, bill: i64, corp: Option<i64>, ke
             db.client
                 .execute(
                     "UPDATE game.offices SET rented_until = rented_until + $2 WHERE office_id = $1",
-                    &[&office, &(super::offices::RENTAL_DAYS * super::offices::DAY)],
+                    &[&office, &(RENTAL_DAYS * FILETIME_DAY)],
                 )
                 .await
                 .map_err(db_err)?;
@@ -163,14 +155,13 @@ pub async fn run_billing(db: Db, world: Arc<World>) {
         if let Err(CallError::Internal(e)) = run(&db, &world).await {
             warn!("billing failed: {e:#}");
         }
-        tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(BILLING_INTERVAL_SECONDS)).await;
     }
 }
 
 /// An accountant, director or the CEO of `corp`.
 pub(super) async fn is_accountant(db: &Db, me: i64, corp: i64) -> Result<bool, CallError> {
-    let (my_corp, roles) = membership(db, me).await?;
-    Ok(my_corp == corp && (roles & (ROLE_ACCOUNTANT | ROLE_DIRECTOR) != 0 || ceo_of(db, corp).await? == Some(me)))
+    has_role_or_is_ceo(db, me, corp, ROLE_ACCOUNTANT | ROLE_DIRECTOR).await
 }
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
@@ -186,7 +177,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "GetCorporationBillsReceivable" => bills(db, corp, true).await,
         // PayCorporationBill(billID, fromAccountKey=...)
         "PayCorporationBill" => {
-            let key = call.kwargs.get("fromAccountKey").and_then(|v| v.as_int()).or(int(1)).unwrap_or(super::corpwallet::MASTER as i64) as i32;
+            let key = call.kwargs.get("fromAccountKey").and_then(|v| v.as_int()).or(int(1)).unwrap_or(ACCOUNT_CASH as i64) as i32;
             match (is_accountant(db, me, corp).await, super::corpwallet::may_take(db, me, corp, key).await) {
                 (Ok(true), Ok(true)) => pay(db, world, int(0).unwrap_or(0), Some(corp), key).await.map(|_| Value::None),
                 (Err(e), _) | (_, Err(e)) => Err(e),
@@ -208,7 +199,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                 Err(e) => return Some(Err(db_err(e))),
             };
             let division: i32 = match db.client.query_opt("SELECT bill_division FROM game.corporations WHERE corporation_id = $1", &[&corp]).await {
-                Ok(r) => r.map(|r| r.get(0)).unwrap_or(super::corpwallet::MASTER),
+                Ok(r) => r.map(|r| r.get(0)).unwrap_or(ACCOUNT_CASH),
                 Err(e) => return Some(Err(db_err(e))),
             };
             let mut settings: Vec<(Value, Value)> = rows.iter().map(|r| (Value::Int(r.get::<_, i32>(0) as i64), Value::Bool(r.get(1)))).collect();
@@ -241,7 +232,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                                 .await
                         }
                         (None, Some("divisionID")) => {
-                            let key = v.as_int().unwrap_or(super::corpwallet::MASTER as i64) as i32;
+                            let key = v.as_int().unwrap_or(ACCOUNT_CASH as i64) as i32;
                             db.client.execute("UPDATE game.corporations SET bill_division = $2 WHERE corporation_id = $1", &[&corp, &key]).await
                         }
                         _ => continue,

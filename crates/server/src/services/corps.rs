@@ -7,11 +7,12 @@
 //! kick them, back to their school's NPC corporation. Membership changes reach an online
 //! pilot as a session change (corpid, corprole...), which also moves them to the new corp
 //! chat channel. A member's roles are one mask (game.characters.corp_roles) used for all
-//! locations. Alliances are services/alliances. Shares, titles, wallets divisions, hangars
-//! and offices aren't supported.
+//! locations. Alliances are services/alliances; titles, wallet divisions and offices are
+//! supported. Shares aren't supported.
 
-use super::{keyval, rowset, Call, CallError, CallResult};
+use super::{db_err, keyval, notify_error, row, rowset, trimmed_arg_text, value_id_list, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
+use crate::consts::{ACCOUNT_CASH, CORPORATION_TYPE_PLAYER, CORPORATION_UNLIMITED_MEMBER_LIMIT, CORP_DIVISION_NAME_COUNT, FILETIME_SECOND, FILETIME_UNIX_EPOCH, ORG_NAME_MAX_LENGTH, ORG_NAME_MIN_LENGTH, ORG_SHORT_NAME_MAX_LENGTH, ORG_SHORT_NAME_MIN_LENGTH, ROLE_DIRECTOR, TYPE_CHARACTER};
 use crate::db::Db;
 use crate::space::World;
 use marshal::{DbRowDescriptor, DbType, Value};
@@ -19,47 +20,60 @@ use tracing::info;
 
 /// appConst.corporationStartupCost
 const STARTUP_COST: f64 = 1_599_800.0;
+/// SDE invTypes: Corporation Management skill.
 const SKILL_CORPORATION_MANAGEMENT: i32 = 3363;
-const TYPE_CHARACTER: i64 = 1373;
-// appConst.corpRole*
-pub(super) const ROLE_DIRECTOR: i64 = 1;
+/// Server policy: minimum Corporation Management skill level for founding or leading a corporation.
+const MIN_CORPORATION_MANAGEMENT_LEVEL: i32 = 1;
+/// Client appConst.corpRolePersonnelManager.
 const ROLE_PERSONNEL_MANAGER: i64 = 128;
-/// The CEO holds every role.
+/// Server policy: the CEO holds every role.
 const CEO_ROLES: i64 = i64::MAX;
-// appConst.crpApplication*
+/// Server application state used by eve/client/script/ui/services/corporation.
 const APP_APPLIED: i32 = 0;
+/// Server application state used by eve/client/script/ui/services/corporation.
 const APP_RENEGOTIATED_BY_CHARACTER: i32 = 1;
+/// Server application state used by eve/client/script/ui/services/corporation.
 const APP_ACCEPTED_BY_CHARACTER: i32 = 2;
+/// Server application state used by eve/client/script/ui/services/corporation.
 const APP_REJECTED_BY_CHARACTER: i32 = 3;
+/// Server application state used by eve/client/script/ui/services/corporation.
 const APP_RENEGOTIATED_BY_CORPORATION: i32 = 5;
+/// Server application state used by eve/client/script/ui/services/corporation.
 const APP_ACCEPTED_BY_CORPORATION: i32 = 6;
+/// Server application state used by eve/client/script/ui/services/corporation.
 const APP_WITHDRAWN_BY_CHARACTER: i32 = 7;
+/// Server application state used by eve/client/script/ui/services/corporation.
 const APP_INVITED_BY_CORPORATION: i32 = 8;
+/// Server definition of application states that remain open.
 const OPEN_APPLICATION: [i32; 4] = [APP_APPLIED, APP_RENEGOTIATED_BY_CHARACTER, APP_RENEGOTIATED_BY_CORPORATION, APP_INVITED_BY_CORPORATION];
+/// Client appConst.CTV_ADD.
+const CTV_ADD: i64 = 1;
+/// Client appConst.CTV_REMOVE.
+const CTV_REMOVE: i64 = 2;
+/// Client appConst.CTV_SET.
+const CTV_SET: i64 = 3;
+/// Client corporation title mask: sixteen title bits.
+const TITLE_COUNT: usize = 16;
+/// Server policy: maximum returned historical corporation applications.
+const OLD_APPLICATION_LIMIT: i64 = 100;
+/// Server corporation header policy: initial number of shares.
+const INITIAL_SHARES: i64 = 1000;
 /// Player corporation IDs (idCheckers.IsPlayerCorporation).
 const FIRST_PLAYER_CORP: i64 = 98_000_000;
-
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
-
-fn notify_error(text: &str) -> CallError {
-    CallError::User { msg: "CustomNotify".into(), dict: vec![("notify".into(), Value::unicode(text))] }
-}
 
 pub fn is_player_corp(id: i64) -> bool {
     id >= FIRST_PLAYER_CORP
 }
 
-/// A member's roles: their own and their titles'.
-const EFFECTIVE_ROLES: &str = "(ch.corp_roles | COALESCE((SELECT bit_or(t.roles) FROM game.corp_titles t
+/// Server title model: union the member's role bits with the roles of all held titles.
+pub(super) const EFFECTIVE_ROLES_SQL: &str = "(ch.corp_roles | COALESCE((SELECT bit_or(t.roles) FROM game.corp_titles t
      WHERE t.corporation_id = ch.corporation_id AND ch.corp_title_mask & t.title_id <> 0), 0))";
 
 /// The corporation `char_id` is in, and their role mask (titles included).
 pub(super) async fn membership(db: &Db, char_id: i64) -> Result<(i64, i64), CallError> {
     let r = db
         .client
-        .query_one(&format!("SELECT ch.corporation_id, {EFFECTIVE_ROLES} FROM game.characters ch WHERE ch.character_id = $1"), &[&char_id])
+        .query_one(&format!("SELECT ch.corporation_id, {EFFECTIVE_ROLES_SQL} FROM game.characters ch WHERE ch.character_id = $1"), &[&char_id])
         .await
         .map_err(db_err)?;
     Ok((r.get(0), r.get(1)))
@@ -153,17 +167,16 @@ async fn school_corp(db: &Db, char_id: i64) -> Result<i64, CallError> {
 async fn found(c: &Client, call: &Call<'_>) -> CallResult {
     let (db, world) = (&c.db, &*c.world);
     let me = c.session.int("charid").unwrap_or(0);
-    let text = |i: usize| call.args.get(i).and_then(|v| v.as_text()).map(|t| t.trim().to_string()).unwrap_or_default();
     let int = |i: usize| call.args.get(i).and_then(|v| v.as_int()).map(|v| v as i32);
-    let (name, ticker, description, url) = (text(0), text(1).to_uppercase(), text(2), text(3));
+    let (name, ticker, description, url) = (trimmed_arg_text(call, 0), trimmed_arg_text(call, 1).to_uppercase(), trimmed_arg_text(call, 2), trimmed_arg_text(call, 3));
     let tax = call.args.get(4).and_then(|v| v.as_float()).unwrap_or(0.0).clamp(0.0, 1.0);
     let Some(station) = c.session.int("stationid") else {
         return Err(notify_error("你必须停靠在空间站内才能创建军团。"));
     };
-    if !(4..=50).contains(&name.chars().count()) {
+    if !(ORG_NAME_MIN_LENGTH..=ORG_NAME_MAX_LENGTH).contains(&name.chars().count()) {
         return Err(notify_error("军团名称长度必须为 4 到 50 个字符。"));
     }
-    if !(2..=5).contains(&ticker.chars().count()) || !ticker.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
+    if !(ORG_SHORT_NAME_MIN_LENGTH..=ORG_SHORT_NAME_MAX_LENGTH).contains(&ticker.chars().count()) || !ticker.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
         return Err(notify_error("军团代号必须为 2 到 5 个字母、数字、点或短横线。"));
     }
     let skill: i32 = db
@@ -173,7 +186,7 @@ async fn found(c: &Client, call: &Call<'_>) -> CallResult {
         .map_err(db_err)?
         .map(|r| r.get(0))
         .unwrap_or(0);
-    if skill < 1 {
+    if skill < MIN_CORPORATION_MANAGEMENT_LEVEL {
         return Err(notify_error("创建军团需要军团管理技能。"));
     }
     let (current, _) = membership(db, me).await?;
@@ -353,20 +366,20 @@ fn member_row(r: &tokio_postgres::Row, corp: i64) -> Value {
         ("divisionID", Value::Int(0)),
         ("squadronID", Value::Int(0)),
         ("blockRoles", Value::None),
-        ("accountKey", Value::Int(1000)),
+        ("accountKey", Value::Int(ACCOUNT_CASH as i64)),
     ])
 }
 
 const MEMBER_SELECT: &str = "SELECT ch.character_id, ch.corp_roles,
         COALESCE((SELECT max(e.start_date) FROM game.employment_history e WHERE e.char_id = ch.character_id AND e.corporation_id = ch.corporation_id),
-                 (extract(epoch FROM ch.created_at) * 10000000)::bigint + 116444736000000000),
-        ch.station_id, ch.solar_system_id, (extract(epoch FROM ch.logoff_at) * 10000000)::bigint + 116444736000000000,
+                 (extract(epoch FROM ch.created_at) * $3::bigint)::bigint + $4::bigint),
+        ch.station_id, ch.solar_system_id, (extract(epoch FROM ch.logoff_at) * $3::bigint)::bigint + $4::bigint,
         (SELECT type_id FROM game.items WHERE item_id = ch.ship_id), ch.corp_grantable_roles, ch.corp_title_mask, ch.corp_title
     FROM game.characters ch";
 
 async fn members(db: &Db, corp: i64, extra: &str, ids: &[i64]) -> Result<Vec<tokio_postgres::Row>, CallError> {
     db.client
-        .query(&format!("{MEMBER_SELECT} WHERE ch.corporation_id = $1 AND NOT ch.deleted {extra} ORDER BY ch.character_id"), &[&corp, &ids.to_vec()])
+        .query(&format!("{MEMBER_SELECT} WHERE ch.corporation_id = $1 AND NOT ch.deleted {extra} ORDER BY ch.character_id"), &[&corp, &ids.to_vec(), &FILETIME_SECOND, &FILETIME_UNIX_EPOCH])
         .await
         .map_err(db_err)
 }
@@ -383,10 +396,10 @@ pub async fn employment_rows(db: &Db, char_id: i64) -> Result<Vec<Value>, CallEr
         .query(
             "SELECT corporation_id, start_date FROM game.employment_history WHERE char_id = $1
              UNION ALL
-             SELECT ch.corporation_id, (extract(epoch FROM ch.created_at) * 10000000)::bigint + 116444736000000000
+             SELECT ch.corporation_id, (extract(epoch FROM ch.created_at) * $2::bigint)::bigint + $3::bigint
              FROM game.characters ch WHERE ch.character_id = $1 AND NOT EXISTS (SELECT 1 FROM game.employment_history WHERE char_id = $1)
              ORDER BY 2 DESC",
-            &[&char_id],
+            &[&char_id, &FILETIME_SECOND, &FILETIME_UNIX_EPOCH],
         )
         .await
         .map_err(db_err)?;
@@ -426,7 +439,7 @@ pub async fn corporation_line(db: &Db, corp: i64) -> Result<Option<Vec<Value>>, 
         Value::Float(r.get(4)),
         Value::Float(r.get(5)),
         Value::Float(0.0),
-        Value::Int(2), // corporationType: player
+        Value::Int(CORPORATION_TYPE_PLAYER),
         Value::Bool(true),
         Value::Bool(true),
         Value::Int(r.get(6)),
@@ -435,16 +448,16 @@ pub async fn corporation_line(db: &Db, corp: i64) -> Result<Option<Vec<Value>>, 
         Value::None,
         opt(21),
         Value::None,
-        Value::Int(1000),
+        Value::Int(INITIAL_SHARES),
         Value::Int(r.get(20)),
-        Value::Int(-1),
+        Value::Int(CORPORATION_UNLIMITED_MEMBER_LIMIT),
         Value::None,
         Value::None,
     ];
     line.extend((11..18).map(opt));
     // Hangar then wallet division names; None for the client's defaults.
     let divisions: Vec<Option<String>> = r.get::<_, Option<Vec<Option<String>>>>(23).unwrap_or_default();
-    line.extend((0..14).map(|i| divisions.get(i).cloned().flatten().filter(|n| !n.is_empty()).map(Value::unicode).unwrap_or(Value::None)));
+    line.extend((0..CORP_DIVISION_NAME_COUNT).map(|i| divisions.get(i).cloned().flatten().filter(|n| !n.is_empty()).map(Value::unicode).unwrap_or(Value::None)));
     // ..., chosenExecutorID, allowWar: wars can't be declared yet.
     line.extend([Value::Bool(r.get(19)), Value::Bool(r.get(9)), Value::Bool(r.get(10)), Value::None, Value::Int(r.get(18)), opt(22), Value::Bool(false)]);
     Ok(Some(line))
@@ -500,10 +513,7 @@ async fn update_member(db: &Db, world: &World, me: i64, args: &[Value]) -> Resul
 /// `ExecuteActions(targetIDs, [(verb, property, value)])`: appConst.CTV_ADD/REMOVE/SET on
 /// roles, grantable roles or titles of several members (bases aren't modelled).
 async fn execute_actions(db: &Db, world: &World, me: i64, call: &Call<'_>) -> Result<(), CallError> {
-    const CTV_ADD: i64 = 1;
-    const CTV_REMOVE: i64 = 2;
-    const CTV_SET: i64 = 3;
-    let targets: Vec<i64> = call.args.first().and_then(|v| v.items()).unwrap_or(&[]).iter().filter_map(|v| v.as_int()).collect();
+    let targets = value_id_list(call.args.first());
     let actions = call.args.get(1).and_then(|v| v.items()).unwrap_or(&[]);
     let (my_corp, my_roles) = membership(db, me).await?;
     let ceo = ceo_of(db, my_corp).await?;
@@ -566,7 +576,7 @@ async fn titles(db: &Db, corp: i64) -> CallResult {
         .map_err(db_err)?;
     let header = Value::list(TITLE_HEADER.iter().map(|h| Value::str(*h)));
     Ok(Value::Dict(
-        (0..16)
+        (0..TITLE_COUNT)
             .map(|bit| {
                 let id = 1i64 << bit;
                 let line: Vec<Value> = match rows.iter().find(|r| r.get::<_, i64>(0) == id) {
@@ -576,7 +586,7 @@ async fn titles(db: &Db, corp: i64) -> CallResult {
                         .collect(),
                     None => std::iter::once(Value::Int(id)).chain(std::iter::once(Value::unicode(""))).chain((2..10).map(|_| Value::Int(0))).collect(),
                 };
-                (Value::Int(id), Value::instance("carbon.common.script.sys.row.Row", [("header", header.clone()), ("line", Value::List(line))]))
+                (Value::Int(id), row(header.clone(), line))
             })
             .collect(),
     ))
@@ -606,7 +616,7 @@ async fn update_titles(db: &Db, world: &World, me: i64, corp: i64, lines: Vec<Ve
     for line in lines {
         let int = |i: usize| line.get(i).and_then(|v| v.as_int()).unwrap_or(0) & !ROLE_DIRECTOR;
         let id = line.first().and_then(|v| v.as_int()).unwrap_or(0);
-        if id <= 0 || id.count_ones() != 1 || id > 1 << 15 {
+        if id <= 0 || id.count_ones() != 1 || id > 1 << (TITLE_COUNT - 1) {
             continue;
         }
         let name = line.get(1).and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
@@ -651,9 +661,9 @@ async fn potential_ceos(db: &Db, corp: i64, ceo: i64) -> Result<Vec<i64>, CallEr
     let rows = db
         .client
         .query(
-            "SELECT ch.character_id FROM game.characters ch JOIN game.skills s ON s.character_id = ch.character_id AND s.type_id = $3 AND s.level >= 1
+            "SELECT ch.character_id FROM game.characters ch JOIN game.skills s ON s.character_id = ch.character_id AND s.type_id = $3 AND s.level >= $4
              WHERE ch.corporation_id = $1 AND ch.character_id <> $2 AND NOT ch.deleted ORDER BY ch.character_id",
-            &[&corp, &ceo, &SKILL_CORPORATION_MANAGEMENT],
+            &[&corp, &ceo, &SKILL_CORPORATION_MANAGEMENT, &MIN_CORPORATION_MANAGEMENT_LEVEL],
         )
         .await
         .map_err(db_err)?;
@@ -723,7 +733,7 @@ async fn info_window_data(db: &Db, char_id: i64) -> CallResult {
         ("allianceID".into(), r.get::<_, Option<i64>>(1).map(Value::Int).unwrap_or(Value::None)),
         ("title".into(), Value::unicode(r.get::<_, String>(2))),
     ];
-    for bit in 0..16 {
+    for bit in 0..TITLE_COUNT {
         let id = 1i64 << bit;
         let held = mask & id != 0;
         let name = names.iter().find(|n| n.get::<_, i64>(0) == id).map(|n| n.get::<_, String>(1)).unwrap_or_default();
@@ -738,7 +748,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     }
     // SetAccountKey(accountKey): the wallet division the member acts from.
     if call.method == "SetAccountKey" {
-        let key = call.args.first().and_then(|v| v.as_int()).unwrap_or(1000);
+        let key = call.args.first().and_then(|v| v.as_int()).unwrap_or(ACCOUNT_CASH as i64);
         c.change_session(vec![("corpAccountKey", Value::Int(key))]);
         return Some(Ok(Value::None));
     }
@@ -751,15 +761,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         // GetSuggestedTickerNames(name) -> [KeyVal(tickerName)]
         "GetSuggestedTickerNames" => {
             let name = call.args.first().and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
-            let initials: String = name.split_whitespace().filter_map(|w| w.chars().find(|c| c.is_ascii_alphanumeric())).collect::<String>().to_uppercase();
-            let compact: String = name.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_uppercase();
-            let mut out: Vec<String> = vec![];
-            for t in [initials.chars().take(5).collect::<String>(), compact.chars().take(5).collect(), compact.chars().take(4).collect(), compact.chars().take(3).collect()] {
-                if t.len() >= 2 && !out.contains(&t) {
-                    out.push(t);
-                }
-            }
-            Ok(Value::list(out.into_iter().map(|t| keyval([("tickerName", Value::str(t))]))))
+            Ok(Value::list(super::alliances::suggested_names(&name).into_iter().map(|t| keyval([("tickerName", Value::str(t))]))))
         }
         // (canLeave, error, errorDetails)
         "CanLeaveCurrentCorporation" => match membership(db, me).await {
@@ -784,7 +786,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "KickOutMember" | "KickOutMembers" => {
             let targets: Vec<i64> = match call.method {
                 "KickOutMember" => int(0).into_iter().collect(),
-                _ => call.args.first().and_then(|v| v.items()).unwrap_or(&[]).iter().filter_map(|v| v.as_int()).collect(),
+                _ => value_id_list(call.args.first()),
             };
             let (my_corp, roles) = match membership(db, me).await {
                 Ok(m) => m,
@@ -850,7 +852,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "GetApplications" => applications(db, "corporation_id = $1", corp, false).await,
         "GetMyOldApplications" => match db
             .client
-            .query(&format!("{APPLICATION_SELECT} WHERE character_id = $1 AND NOT (status = ANY($2)) ORDER BY application_id DESC LIMIT 100"), &[&me, &OPEN_APPLICATION.to_vec()])
+            .query(&format!("{APPLICATION_SELECT} WHERE character_id = $1 AND NOT (status = ANY($2)) ORDER BY application_id DESC LIMIT $3"), &[&me, &OPEN_APPLICATION.to_vec(), &OLD_APPLICATION_LIMIT])
             .await
         {
             Ok(rows) => Ok(Value::list(rows.iter().map(application_row))),
@@ -866,7 +868,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             Ok(rows) => {
                 let header = DbRowDescriptor::new([("ownerID", DbType::I4), ("ownerName", DbType::WStr), ("typeID", DbType::I2), ("gender", DbType::I2)]);
                 Ok(Value::list(rows.iter().map(|r| {
-                    header.row(&[Value::Int(r.get(0)), Value::unicode(r.get::<_, String>(1)), Value::Int(TYPE_CHARACTER), Value::Int(r.get(2))])
+                    header.row(&[Value::Int(r.get(0)), Value::unicode(r.get::<_, String>(1)), Value::Int(TYPE_CHARACTER as i64), Value::Int(r.get(2))])
                 })))
             }
             Err(e) => Err(db_err(e)),
@@ -883,7 +885,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             members(db, corp, "AND ch.character_id = ANY($2)", &[id]).await.map(|rows| rows.first().map(|r| member_row(r, corp)).unwrap_or(Value::None))
         }
         "GetMembersByIds" => {
-            let ids: Vec<i64> = call.args.first().and_then(|v| v.items()).unwrap_or(&[]).iter().filter_map(|v| v.as_int()).collect();
+            let ids = value_id_list(call.args.first());
             members(db, corp, "AND ch.character_id = ANY($2)", &ids).await.map(|rows| Value::list(rows.iter().map(|r| member_row(r, corp))))
         }
         "GetMemberIDsByQuery" => members(db, corp, "AND $2::bigint[] IS NOT NULL", &[]).await.map(|rows| Value::list(rows.iter().map(|r| Value::Int(r.get(0))))),
@@ -929,7 +931,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "DeleteTitle" => delete_title(db, world, me, corp, int(0).unwrap_or(0)).await.map(|_| Value::None),
         "ResignFromCEO" => resign_ceo(db, world, me, int(0)).await,
         "UpdateDivisionNames" => {
-            let names: Vec<Option<String>> = (0..14).map(|i| call.args.get(i).and_then(|v| v.as_text()).map(|t| t.into_owned())).collect();
+            let names: Vec<Option<String>> = (0..CORP_DIVISION_NAME_COUNT).map(|i| call.args.get(i).and_then(|v| v.as_text()).map(|t| t.into_owned())).collect();
             match membership(db, me).await {
                 Ok((my_corp, roles)) if my_corp == corp && roles & ROLE_DIRECTOR != 0 => db
                     .client

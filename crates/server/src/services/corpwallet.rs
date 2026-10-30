@@ -6,38 +6,29 @@
 //! corpRoleAccountCanTake role, pay out of it. Online members hear of every balance change
 //! (OnAccountChange with the division's 'cash'..'cash7' name). Journals aren't kept.
 
-use super::corps::{ceo_of, is_player_corp, membership, ROLE_DIRECTOR};
-use super::{keyval, Call, CallError, CallResult};
+use super::corps::{ceo_of, is_player_corp, membership};
+use super::{active_corporation_member_ids, db_err, has_role_or_is_ceo, keyval, notify_error, Call, CallError, CallResult};
 use crate::client::Client;
+use crate::consts::{ACCOUNT_CASH, ROLE_ACCOUNTANT, ROLE_DIRECTOR};
 use crate::db::Db;
 use crate::space::World;
 use marshal::Value;
 use tracing::info;
 
-/// appConst.accountingKeyCash: the master wallet division; the others follow it.
-pub(super) const MASTER: i32 = 1000;
+/// Client corporation wallet convention: seven account divisions.
 const DIVISIONS: i32 = 7;
-// appConst.corpRole*
-const ROLE_ACCOUNTANT: i64 = 256;
+/// Client appConst.corpRoleJuniorAccountant.
 const ROLE_JUNIOR_ACCOUNTANT: i64 = 4_503_599_627_370_496;
-/// corpRoleAccountCanTake1; the other divisions' roles are the next bits.
+/// Client appConst.corpRoleAccountCanTake1; other divisions' roles are the next bits.
 const ROLE_CAN_TAKE_1: i64 = 134_217_728;
 
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
-
-fn notify_error(text: &str) -> CallError {
-    CallError::User { msg: "CustomNotify".into(), dict: vec![("notify".into(), Value::unicode(text))] }
-}
-
 fn valid_key(key: i32) -> bool {
-    (MASTER..MASTER + DIVISIONS).contains(&key)
+    (ACCOUNT_CASH..ACCOUNT_CASH + DIVISIONS).contains(&key)
 }
 
 /// The OnAccountChange name of a division: 'cash', 'cash2' ... 'cash7'.
 fn key_name(key: i32) -> String {
-    match key - MASTER {
+    match key - ACCOUNT_CASH {
         0 => "cash".to_string(),
         n => format!("cash{}", n + 1),
     }
@@ -55,9 +46,8 @@ pub(super) async fn corp_balance(db: &Db, corp: i64, key: i32) -> Result<f64, Ca
 
 /// Tell the corporation's online members a division's new balance.
 async fn announce(db: &Db, world: &World, corp: i64, key: i32, balance: f64) -> Result<(), CallError> {
-    let rows = db.client.query("SELECT character_id FROM game.characters WHERE corporation_id = $1 AND NOT deleted", &[&corp]).await.map_err(db_err)?;
-    for r in rows {
-        world.notify_pilot(r.get(0), "OnAccountChange", vec![Value::str(key_name(key)), Value::Int(corp), Value::Float(balance)]);
+    for id in active_corporation_member_ids(db, corp).await? {
+        world.notify_pilot(id, "OnAccountChange", vec![Value::str(key_name(key)), Value::Int(corp), Value::Float(balance)]);
     }
     Ok(())
 }
@@ -104,15 +94,14 @@ pub(super) async fn corp_debit(db: &Db, world: &World, corp: i64, key: i32, amou
 
 /// Whether `char_id` may pay out of `corp`'s division `key`.
 pub(super) async fn may_take(db: &Db, char_id: i64, corp: i64, key: i32) -> Result<bool, CallError> {
-    let (my_corp, roles) = membership(db, char_id).await?;
-    let can_take = ROLE_CAN_TAKE_1 << (key - MASTER);
-    Ok(my_corp == corp && (roles & (ROLE_DIRECTOR | ROLE_ACCOUNTANT | can_take) != 0 || ceo_of(db, corp).await? == Some(char_id)))
+    let can_take = ROLE_CAN_TAKE_1 << (key - ACCOUNT_CASH);
+    has_role_or_is_ceo(db, char_id, corp, ROLE_DIRECTOR | ROLE_ACCOUNTANT | can_take).await
 }
 
 /// Pay `amount` to `to` (a character, or a player corporation's division `to_key`).
 async fn pay_to(db: &Db, world: &World, to: i64, to_key: Option<i32>, amount: f64) -> Result<(), CallError> {
     if is_player_corp(to) {
-        let key = to_key.filter(|k| valid_key(*k)).unwrap_or(MASTER);
+        let key = to_key.filter(|k| valid_key(*k)).unwrap_or(ACCOUNT_CASH);
         return corp_credit(db, world, to, key, amount).await;
     }
     let exists = db.client.query_opt("SELECT 1 FROM game.characters WHERE character_id = $1 AND NOT deleted", &[&to]).await.map_err(db_err)?.is_some();
@@ -140,7 +129,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     Some(match call.method {
         // GetCashBalance(isCorp, accountKey=...): personal balances are services/character.
         "GetCashBalance" if call.args.first().and_then(|v| v.as_int()).unwrap_or(0) != 0 => {
-            let key = key_kwarg(call, "accountKey", 1).or(c.session.int("corpAccountKey").map(|k| k as i32)).unwrap_or(MASTER);
+            let key = key_kwarg(call, "accountKey", 1).or(c.session.int("corpAccountKey").map(|k| k as i32)).unwrap_or(ACCOUNT_CASH);
             corp_balance(db, corp, key).await.map(Value::Float)
         }
         // [KeyVal(key, balance)] of the session corporation's divisions.
@@ -154,7 +143,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             };
             let readable = roles & (ROLE_DIRECTOR | ROLE_ACCOUNTANT | ROLE_JUNIOR_ACCOUNTANT) != 0 || ceo_of(db, corp).await.ok().flatten() == Some(me);
             let mut out = vec![];
-            for key in MASTER..MASTER + DIVISIONS {
+            for key in ACCOUNT_CASH..ACCOUNT_CASH + DIVISIONS {
                 let balance = if readable { corp_balance(db, corp, key).await.unwrap_or(0.0) } else { 0.0 };
                 out.push(keyval([("key", Value::Int(key as i64)), ("balance", Value::Float(balance))]));
             }
@@ -187,7 +176,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "GiveCashFromCorpAccount" => {
             let to = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
             let amount = amount_arg(call, 1);
-            let from_key = key_kwarg(call, "fromAccountKey", 2).unwrap_or(MASTER);
+            let from_key = key_kwarg(call, "fromAccountKey", 2).unwrap_or(ACCOUNT_CASH);
             let to_key = key_kwarg(call, "toAccountKey", 3);
             if amount <= 0.0 || !valid_key(from_key) || (to == corp && to_key == Some(from_key)) {
                 return Some(Err(notify_error("无效的转账。")));

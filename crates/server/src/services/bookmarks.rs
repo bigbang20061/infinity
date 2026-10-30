@@ -7,27 +7,21 @@
 //! it is in and its coordinates. Shared (access-group) folders aren't supported: every
 //! folder is personal.
 
-use super::{keyval, Call, CallError, CallResult};
+use super::{db_err, keyval, notify_error, value_id_list, value_text, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
+use crate::consts::{FILETIME_MINUTE, TYPE_SOLAR_SYSTEM};
 use crate::db::Db;
 use marshal::Value;
 
 /// appConst.ACCESS_PERSONAL
 const ACCESS_PERSONAL: i64 = 1;
-const TYPE_SOLAR_SYSTEM: i32 = 5;
+/// Server bookmark folder and memo name length limit, in characters.
 const MAX_NAME: usize = 100;
+/// Server bookmark and folder description limit, in characters.
+const MAX_DESCRIPTION: usize = 3900;
+/// Server limit on a bookmark scan-result identifier, in characters.
+const MAX_SCAN_RESULT_ID: usize = 32;
 
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
-
-fn notify_error(text: &str) -> CallError {
-    CallError::User { msg: "CustomNotify".into(), dict: vec![("notify".into(), Value::unicode(text))] }
-}
-
-fn text(v: Option<&Value>, max: usize) -> String {
-    v.and_then(|v| v.as_text()).map(|t| t.chars().take(max).collect()).unwrap_or_default()
-}
 
 fn folder_row(r: &tokio_postgres::Row, me: i64) -> Value {
     keyval([
@@ -99,7 +93,7 @@ async fn own_folder(db: &Db, me: i64, folder: i64) -> Result<(), CallError> {
 async fn add(db: &Db, me: i64, folder: i64, subfolder: Option<i64>, item: Option<i64>, type_id: Option<i32>, system: i64, pos: [f64; 3], memo: &str, note: &str, expiry_minutes: Option<i64>) -> CallResult {
     own_folder(db, me, folder).await?;
     let now = filetime_now();
-    let expiry = expiry_minutes.filter(|m| *m > 0).map(|m| now + m * 600_000_000);
+    let expiry = expiry_minutes.filter(|m| *m > 0).map(|m| now + m * FILETIME_MINUTE);
     let id: i64 = db
         .client
         .query_one(
@@ -154,7 +148,7 @@ async fn static_location(c: &Client, call: &Call<'_>) -> CallResult {
         None => (c.session.int("solarsystemid2").unwrap_or(0), Some(TYPE_SOLAR_SYSTEM), [0.0; 3]),
     };
     let folder = call.args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-    add(&c.db, me, folder, subfolder_arg(call, 5), Some(item), type_id, system, pos, &text(call.args.get(2), MAX_NAME), &text(call.args.get(3), 3900), expiry(call, 4)).await
+    add(&c.db, me, folder, subfolder_arg(call, 5), Some(item), type_id, system, pos, &value_text(call.args.get(2), MAX_NAME), &value_text(call.args.get(3), MAX_DESCRIPTION), expiry(call, 4)).await
 }
 
 /// beyonce `BookmarkLocation(itemID, folderID, name, comment, expiry, subfolderID=)`: something in
@@ -171,25 +165,21 @@ async fn space_location(c: &Client, call: &Call<'_>) -> CallResult {
     let own = Some(item) == c.session.int("shipid");
     let (item, type_id) = if own { (None, Some(TYPE_SOLAR_SYSTEM)) } else { (Some(item), Some(ball.type_id)) };
     let folder = call.args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-    add(&c.db, me, folder, subfolder_arg(call, 5), item, type_id, system, ball.pos, &text(call.args.get(2), MAX_NAME), &text(call.args.get(3), 3900), expiry(call, 4)).await
+    add(&c.db, me, folder, subfolder_arg(call, 5), item, type_id, system, ball.pos, &value_text(call.args.get(2), MAX_NAME), &value_text(call.args.get(3), MAX_DESCRIPTION), expiry(call, 4)).await
 }
 
 /// beyonce `BookmarkScanResult(locationID, name, comment, resultID, folderID, expiry, subfolderID=)`.
 async fn scan_result(c: &Client, call: &Call<'_>) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
     let system = call.args.first().and_then(|v| v.as_int()).or(c.session.int("solarsystemid2")).unwrap_or(0);
-    let target = text(call.args.get(3), 32);
+    let target = value_text(call.args.get(3), MAX_SCAN_RESULT_ID);
     let Some(pos) = super::exploration::scan_result_position(&c.db, system, me, &target).await? else {
         return Err(notify_error("请先将信号扫描到 100% 再保存位置。"));
     };
     let folder = call.args.get(4).and_then(|v| v.as_int()).unwrap_or(0);
-    add(&c.db, me, folder, subfolder_arg(call, 6), None, Some(TYPE_SOLAR_SYSTEM), system, pos, &text(call.args.get(1), MAX_NAME), &text(call.args.get(2), 3900), expiry(call, 5)).await
+    add(&c.db, me, folder, subfolder_arg(call, 6), None, Some(TYPE_SOLAR_SYSTEM), system, pos, &value_text(call.args.get(1), MAX_NAME), &value_text(call.args.get(2), MAX_DESCRIPTION), expiry(call, 5)).await
 }
 
-/// Bookmark IDs from a list or set argument.
-fn ids(v: Option<&Value>) -> Vec<i64> {
-    v.and_then(|v| v.items()).unwrap_or(&[]).iter().filter_map(|v| v.as_int()).collect()
-}
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     match (call.service, call.method) {
@@ -239,7 +229,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             .client
             .query_one(
                 "INSERT INTO game.bookmark_folders (owner_id, name, description) VALUES ($1, $2, $3) RETURNING folder_id, name, description",
-                &[&me, &text(call.args.get(1), MAX_NAME), &text(call.args.get(2), 3900)],
+                &[&me, &value_text(call.args.get(1), MAX_NAME), &value_text(call.args.get(2), MAX_DESCRIPTION)],
             )
             .await
         {
@@ -251,7 +241,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             .client
             .execute(
                 "UPDATE game.bookmark_folders SET name = $3, description = $4 WHERE folder_id = $1 AND owner_id = $2",
-                &[&int(0), &me, &text(call.args.get(1), MAX_NAME), &text(call.args.get(2), 3900)],
+                &[&int(0), &me, &value_text(call.args.get(1), MAX_NAME), &value_text(call.args.get(2), MAX_DESCRIPTION)],
             )
             .await
             .map(|_| Value::Int(ACCESS_PERSONAL))
@@ -282,7 +272,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             }
             match db
                 .client
-                .query_one("INSERT INTO game.bookmark_subfolders (folder_id, name) VALUES ($1, $2) RETURNING subfolder_id, folder_id, name", &[&folder, &text(call.args.get(1), MAX_NAME)])
+                .query_one("INSERT INTO game.bookmark_subfolders (folder_id, name) VALUES ($1, $2) RETURNING subfolder_id, folder_id, name", &[&folder, &value_text(call.args.get(1), MAX_NAME)])
                 .await
             {
                 Ok(r) => Ok(subfolder_row(&r, me)),
@@ -295,7 +285,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                 return Some(Err(e));
             }
             db.client
-                .execute("UPDATE game.bookmark_subfolders SET name = $3 WHERE subfolder_id = $2 AND folder_id = $1", &[&int(0), &int(1), &text(call.args.get(2), MAX_NAME)])
+                .execute("UPDATE game.bookmark_subfolders SET name = $3 WHERE subfolder_id = $2 AND folder_id = $1", &[&int(0), &int(1), &value_text(call.args.get(2), MAX_NAME)])
                 .await
                 .map(|n| Value::Bool(n > 0))
                 .map_err(db_err)
@@ -326,7 +316,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                 .execute(
                     "UPDATE game.bookmarks SET memo = $3, note = $4, subfolder_id = $5, folder_id = $6, expiry = CASE WHEN $7 THEN NULL ELSE expiry END
                      WHERE bookmark_id = $1 AND folder_id = $2 AND folder_id IN (SELECT folder_id FROM game.bookmark_folders WHERE owner_id = $8)",
-                    &[&int(0), &int(1), &text(call.args.get(2), MAX_NAME), &text(call.args.get(3), 3900), &call.args.get(4).and_then(|v| v.as_int()), &new_folder, &cancel, &me],
+                    &[&int(0), &int(1), &value_text(call.args.get(2), MAX_NAME), &value_text(call.args.get(3), MAX_DESCRIPTION), &call.args.get(4).and_then(|v| v.as_int()), &new_folder, &cancel, &me],
                 )
                 .await
                 .map(|_| Value::None)
@@ -334,7 +324,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         }
         // DeleteBookmarks(folderID, {bookmarkID}) -> deleted IDs
         "DeleteBookmarks" => {
-            let wanted = ids(call.args.get(1));
+            let wanted = value_id_list(call.args.get(1));
             match db
                 .client
                 .query(
@@ -350,7 +340,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         }
         // MoveBookmarksToFolderAndSubfolder(oldFolderID, folderID, subfolderID, bookmarkIDs) -> (rows, message)
         "MoveBookmarksToFolderAndSubfolder" => {
-            let (to, sub, wanted) = (int(1), call.args.get(2).and_then(|v| v.as_int()), ids(call.args.get(3)));
+            let (to, sub, wanted) = (int(1), call.args.get(2).and_then(|v| v.as_int()), value_id_list(call.args.get(3)));
             if let Err(e) = own_folder(db, me, to).await {
                 return Some(Err(e));
             }
@@ -378,7 +368,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         }
         // CopyBookmarksToFolderAndSubfolder(oldFolderID, folderID, subfolderID, bookmarkIDs) -> ({id: bookmark}, message)
         "CopyBookmarksToFolderAndSubfolder" => {
-            let (to, sub, wanted) = (int(1), call.args.get(2).and_then(|v| v.as_int()), ids(call.args.get(3)));
+            let (to, sub, wanted) = (int(1), call.args.get(2).and_then(|v| v.as_int()), value_id_list(call.args.get(3)));
             if let Err(e) = own_folder(db, me, to).await {
                 return Some(Err(e));
             }

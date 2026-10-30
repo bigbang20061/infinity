@@ -19,8 +19,10 @@ struct Site {
     after: &'static [u8],
 }
 
+/// x86 NOP opcode repeated to replace the six-byte conditional jump in blue.dll.
 const NOP6: [u8; 6] = [0x90; 6];
 
+/// Infinity blue.dll `VerifyManifestEntry` instruction signatures surrounding each jump.
 const SITES: [Site; 2] = [
     Site {
         // cmp r8, [rsp+78h] ; jne fail ; call memcmp
@@ -66,7 +68,7 @@ fn run() -> Result<(), String> {
     }
     let [path] = args.as_slice() else { return Err("usage: blue-patch [--check] <blue.dll>".into()) };
     let mut data = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
-    if data.get(..2) != Some(b"MZ") {
+    if !data.starts_with(b"MZ") {
         return Err(format!("{path}: not a PE file"));
     }
 
@@ -94,7 +96,7 @@ fn run() -> Result<(), String> {
         println!("backup written to {backup}");
     }
     for off in todo {
-        data[off..off + 6].copy_from_slice(&NOP6);
+        data[off..off + NOP6.len()].copy_from_slice(&NOP6);
     }
     std::fs::write(path, &data).map_err(|e| format!("{path}: {e}"))?;
     println!("patched {path}");

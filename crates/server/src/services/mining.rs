@@ -5,7 +5,8 @@
 //! the system: ores by the system's security band, sized in the thousands of m3 each.
 //! Exploration's ore, ice and gas sites get fields of their own (services/exploration).
 //! Rocks are stored in game.asteroids and shrink as they are mined; an emptied belt
-//! grows back after BELT_REGROW_SECS.
+//! grows back after BELT_REGROW_SECS, scheduled on its system actor. Depletion
+//! timestamps persist; timers are restored when the system's fields are loaded.
 //!
 //! A mining module runs through combat's activation loop (the `miningLaser` /
 //! `miningClouds` effects): at the end of each cycle `extract` moves its yield
@@ -18,27 +19,16 @@
 //! Reprocessing Efficiency and the item's own processing skill, less a 5% tax in ISK.
 
 use super::fit::{Fit, Key};
-use super::{keyval, Call, CallError, CallResult};
-use crate::client::{filetime_now, Client};
+use super::{db_err, keyval, notify_error, rand01, rand_dir, value_id_list, Call, CallError, CallResult};
+use crate::client::{filetime_now, unix_ms_from_filetime_ceil, Client};
+use crate::consts::{ATTR_CAPACITY, ATTR_MAX_RANGE, FILETIME_SECOND, FLAG_CARGO, FLAG_HANGAR, GROUP_ASTEROID_BELT, IX_LOCATION_ID, IX_STACK_SIZE};
 use crate::db::Db;
-use crate::space::{now_tick, Ball, NotifyTx, World, MODE_RIGID, V3};
+use crate::space::{dist, now_ms, Ball, NotifyTx, World, MODE_RIGID, V3};
 use marshal::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use tracing::{info, warn};
 
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
-
-fn notify_err(msg: &str) -> CallError {
-    CallError::User { msg: "CustomNotify".into(), dict: vec![("notify".into(), Value::unicode(msg))] }
-}
-
-const SEC: i64 = 10_000_000;
-const GROUP_ASTEROID_BELT: i32 = 9;
-const ATTR_CAPACITY: i32 = 38;
-const ATTR_MAX_RANGE: i32 = 54;
 const ATTR_MINING_AMOUNT: i32 = 77;
 const ATTR_MINING_HOLD: i32 = 1556; // generalMiningHoldCapacity
 const ATTR_WASTE_MULTIPLIER: i32 = 3153;
@@ -47,32 +37,16 @@ const ATTR_CRIT_CHANCE: i32 = 5967;
 const ATTR_CRIT_BONUS: i32 = 5969;
 const ATTR_PROCESSING_SKILL: i32 = 790; // reprocessingSkillType
 const FLAG_MINING_HOLD: i32 = 134; // flagGeneralMiningHold
-const IX_LOCATION_ID: i64 = 3;
-const IX_STACK_SIZE: i64 = 9;
 const SKILL_REPROCESSING: i32 = 3385;
 const SKILL_REPROCESSING_EFFICIENCY: i32 = 3389;
 const SKILL_SCRAPMETAL: i32 = 12196;
-/// An emptied belt grows back after this long.
-const BELT_REGROW_SECS: i64 = 2 * 3600;
+/// Server policy: an emptied belt grows back after two hours.
+const BELT_REGROW_SECS: i64 = 7200;
 /// NPC station reprocessing: base yield and tax (of the materials' value, in ISK).
 const STATION_EFFICIENCY: f64 = 0.5;
 const STATION_TAX: f64 = 0.05;
 /// The ship mining scanner reaches this far (m).
 const SCAN_RANGE: f64 = 500_000.0;
-
-fn rand01() -> f64 {
-    (crate::handshake::rand_i64() as u64 >> 11) as f64 / (1u64 << 53) as f64
-}
-
-fn rand_dir() -> V3 {
-    let (z, a) = (rand01() * 2.0 - 1.0, rand01() * std::f64::consts::TAU);
-    let r = (1.0 - z * z).sqrt();
-    [r * a.cos(), z, r * a.sin()]
-}
-
-fn dist(a: V3, b: V3) -> f64 {
-    ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
-}
 
 // ---------------------------------------------------------------- fields
 
@@ -151,6 +125,7 @@ fn rock_ball(id: i64, type_id: i32, pos: V3, radius: f32) -> Ball {
         corp_id: 1,
         alliance_id: -1,
         char_id: None,
+        signature_radius: None,
         mode: MODE_RIGID,
         radius,
         mass: 1e34,
@@ -167,7 +142,7 @@ fn rock_ball(id: i64, type_id: i32, pos: V3, radius: f32) -> Ball {
         massive: true,
         warp: None,
         warp_factor: 0,
-        last_tick: now_tick(),
+        last_ms: now_ms(),
         cloak: 0,
         cloak_until: 0,
         health: [1.0; 3],
@@ -278,8 +253,9 @@ pub async fn ensure_fields(db: &Db, world: &Arc<World>, system: i64) -> Result<(
             .await
             .map_err(db_err)?
             .map(|r| r.get(0));
-        let regrow_at = depleted.flatten().map(|t| t + BELT_REGROW_SECS * SEC);
+        let regrow_at = depleted.flatten().map(|t| t + BELT_REGROW_SECS * FILETIME_SECOND);
         if regrow_at.is_some_and(|t| t > now) {
+            world.system(system).await.map_err(CallError::Internal)?;
             schedule_regrow(db.clone(), world.clone(), system, belt, [b.get(1), b.get(2), b.get(3)], regrow_at.unwrap_or(now));
             continue;
         }
@@ -303,26 +279,31 @@ async fn grow_belt(db: &Db, world: &World, system: i64, belt: i64, center: V3, s
 }
 
 fn schedule_regrow(db: Db, world: Arc<World>, system: i64, belt: i64, center: V3, at: i64) {
-    tokio::spawn(async move {
-        let wait = ((at - filetime_now()) / SEC).max(0) as u64;
-        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
-        let result = async {
-            let (security, jspace) = system_band(&db, system).await?;
-            grow_belt(&db, &world, system, belt, center, security, jspace).await
-        };
-        if let Err(e) = result.await {
-            warn!("mining: regrowing belt {belt}: {}", match e {
-                CallError::Internal(e) => format!("{e:#}"),
-                CallError::User { msg, .. } => msg,
+    let deadline_ms = unix_ms_from_filetime_ceil(at);
+    let world_ref = Arc::downgrade(&world);
+    world.post(system, move |s| {
+        s.schedule_at(deadline_ms, move |s| {
+            s.defer(async move {
+                let Some(world) = world_ref.upgrade() else { return };
+                let result = async {
+                    let (security, jspace) = system_band(&db, system).await?;
+                    grow_belt(&db, &world, system, belt, center, security, jspace).await
+                };
+                if let Err(e) = result.await {
+                    warn!("mining: regrowing belt {belt}: {}", match e {
+                        CallError::Internal(e) => format!("{e:#}"),
+                        CallError::User { msg, .. } => msg,
+                    });
+                }
             });
-        }
+        });
     });
 }
 
 /// A rock is gone: out of space and the database; an emptied belt starts growing back.
 async fn exhaust(db: &Db, world: &Arc<World>, id: i64) -> Result<(), CallError> {
     let Some(rock) = state().rocks.remove(&id) else { return Ok(()) };
-    world.remove_ball(rock.system, id);
+    world.remove_ball(rock.system, id).await;
     db.client.execute("DELETE FROM game.asteroids WHERE asteroid_id = $1", &[&id]).await.map_err(db_err)?;
     let field_empty = !state().rocks.values().any(|r| r.field == rock.field);
     if !field_empty {
@@ -336,7 +317,7 @@ async fn exhaust(db: &Db, world: &Arc<World>, id: i64) -> Result<(), CallError> 
     if let Some(b) = belt {
         let now = filetime_now();
         db.client.execute("UPDATE game.asteroid_fields SET depleted_at = $2 WHERE field_id = $1", &[&rock.field, &now]).await.map_err(db_err)?;
-        schedule_regrow(db.clone(), world.clone(), rock.system, rock.field, [b.get(0), b.get(1), b.get(2)], now + BELT_REGROW_SECS * SEC);
+        schedule_regrow(db.clone(), world.clone(), rock.system, rock.field, [b.get(0), b.get(1), b.get(2)], now + BELT_REGROW_SECS * FILETIME_SECOND);
         info!("mining: belt {} in {} mined out", rock.field, rock.system);
     }
     Ok(())
@@ -409,9 +390,13 @@ fn tell(notify: &NotifyTx, text: &str) {
 #[allow(clippy::too_many_arguments)]
 pub async fn extract(db: &Db, world: &Arc<World>, notify: &NotifyTx, char_id: i64, ship: i64, system: i64, fit: &Fit, module: i64, target: i64) -> Result<bool, CallError> {
     let Some(rock) = state().rocks.get(&target).cloned() else { return Ok(false) };
-    let balls = world.balls_snapshot(system).unwrap_or_default();
-    let (Some(me), Some(it)) = (balls.get(&ship), balls.get(&target)) else { return Ok(false) };
-    if dist(me.pos, it.pos) - me.radius as f64 - it.radius as f64 > fit.value(Key::Module(module), ATTR_MAX_RANGE) {
+    let Some((gap, pilots)) = world.with(system, move |s| {
+        let (me, it) = (s.ball(ship)?, s.ball(target)?);
+        let gap = dist(me.pos, it.pos) - me.radius as f64 - it.radius as f64;
+        let pilots: Vec<i64> = s.pilots().filter_map(|b| b.char_id.filter(|c| *c != char_id)).collect();
+        Some((gap, pilots))
+    }).await.flatten() else { return Ok(false) };
+    if gap > fit.value(Key::Module(module), ATTR_MAX_RANGE) {
         tell(notify, "目标超出了采矿设备的范围。");
         return Ok(false);
     }
@@ -433,7 +418,7 @@ pub async fn extract(db: &Db, world: &Arc<World>, notify: &NotifyTx, char_id: i6
     units = units.min(rock.quantity);
     // Into the mining hold, or the cargo hold of ships without one.
     let hold = fit.value(Key::Ship, ATTR_MINING_HOLD);
-    let (flag, capacity) = if hold > 0.0 { (FLAG_MINING_HOLD, hold) } else { (super::combat::FLAG_CARGO, fit.value(Key::Ship, ATTR_CAPACITY)) };
+    let (flag, capacity) = if hold > 0.0 { (FLAG_MINING_HOLD, hold) } else { (FLAG_CARGO, fit.value(Key::Ship, ATTR_CAPACITY)) };
     let used: f64 = db
         .client
         .query_one(
@@ -469,8 +454,8 @@ pub async fn extract(db: &Db, world: &Arc<World>, notify: &NotifyTx, char_id: i6
         ])],
     ));
     // Others mining the same rock see it shrink.
-    for b in balls.values().filter(|b| b.char_id.is_some_and(|c| c != char_id)) {
-        world.notify_pilot(b.char_id.unwrap_or(0), "OnOreMinedByOther", vec![Value::Int(target), Value::Int(taken + wasted_units)]);
+    for pilot in pilots {
+        world.notify_pilot(pilot, "OnOreMinedByOther", vec![Value::Int(target), Value::Int(taken + wasted_units)]);
     }
     if left == 0 {
         exhaust(db, world, target).await?;
@@ -484,18 +469,19 @@ pub async fn extract(db: &Db, world: &Arc<World>, notify: &NotifyTx, char_id: i6
 }
 
 /// miningScanMgr.perform_scan() -> [(asteroidID, typeID, quantity)] within reach.
-fn perform_scan(c: &Client) -> Value {
+async fn perform_scan(c: &Client) -> Value {
     let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) else { return Value::None };
-    let balls = c.world.balls_snapshot(system).unwrap_or_default();
-    let Some(me) = balls.get(&ship) else { return Value::None };
-    let rocks: Vec<(i64, Rock)> = state().rocks.iter().filter(|(_, r)| r.system == system).map(|(id, r)| (*id, r.clone())).collect();
-    Value::List(
-        rocks
-            .into_iter()
-            .filter(|(id, _)| balls.get(id).is_some_and(|b| dist(b.pos, me.pos) <= SCAN_RANGE))
-            .map(|(id, r)| Value::tuple([Value::Int(id), Value::Int(r.type_id as i64), Value::Int(r.quantity)]))
-            .collect(),
-    )
+    let rocks: Vec<(i64, i32, i64)> = state().rocks.iter().filter(|(_, r)| r.system == system).map(|(id, r)| (*id, r.type_id, r.quantity)).collect();
+    c.world.with(system, move |s| {
+        let me = s.ball(ship)?;
+        Some(Value::List(
+            rocks
+                .into_iter()
+                .filter(|(id, _, _)| s.ball(*id).is_some_and(|b| dist(b.pos, me.pos) <= SCAN_RANGE))
+                .map(|(id, type_id, quantity)| Value::tuple([Value::Int(id), Value::Int(type_id as i64), Value::Int(quantity)]))
+                .collect(),
+        ))
+    }).await.flatten().unwrap_or(Value::None)
 }
 
 // ---------------------------------------------------------------- reprocessing
@@ -595,10 +581,6 @@ async fn reprocessable(c: &Client, ids: &[i64]) -> Result<Vec<super::dogma::Item
     super::dogma::load_items(c, "i.item_id = ANY($1) AND i.owner_id = $2 AND (i.location_id = $3 OR i.location_id = $4)", &[&ids.to_vec(), &char_id, &station, &ship]).await
 }
 
-fn id_list(v: Option<&Value>) -> Vec<i64> {
-    v.and_then(|v| v.items()).map(|l| l.iter().filter_map(|x| x.as_int()).collect()).unwrap_or_default()
-}
-
 /// Bound reprocessingSvc (Moniker('reprocessingSvc', stationID)).
 async fn reprocessing(c: &mut Client, call: &Call<'_>) -> CallResult {
     let char_id = c.session.int("charid").unwrap_or(0);
@@ -606,7 +588,7 @@ async fn reprocessing(c: &mut Client, call: &Call<'_>) -> CallResult {
         // GetQuotes(itemIDs, activeShipID) -> (stationTax, {typeID|None: stationEfficiency}, {itemID: quote})
         "GetQuotes" => {
             let mut quotes = vec![];
-            for item in reprocessable(c, &id_list(call.args.first())).await? {
+            for item in reprocessable(c, &value_id_list(call.args.first())).await? {
                 if let Some(q) = quote(c, char_id, &item).await? {
                     quotes.push((Value::Int(item.item_id), quote_value(item.item_id, &q)));
                 }
@@ -621,10 +603,10 @@ async fn reprocessing(c: &mut Client, call: &Call<'_>) -> CallResult {
         // Reprocess(itemIDs, fromLocationID, ownerID, outputLocationID, outputFlagID)
         //   -> (reprocessed itemIDs, {typeID: quantity})
         "Reprocess" => {
-            let station = c.session.int("stationid").ok_or_else(|| notify_err("你必须停靠在空间站里才能进行精炼。"))?;
+            let station = c.session.int("stationid").ok_or_else(|| notify_error("你必须停靠在空间站里才能进行精炼。"))?;
             let out_location = call.args.get(3).and_then(|v| v.as_int()).unwrap_or(station);
-            let out_flag = call.args.get(4).and_then(|v| v.as_int()).map(|f| f as i32).unwrap_or(super::charsel::FLAG_HANGAR);
-            let items = reprocessable(c, &id_list(call.args.first())).await?;
+            let out_flag = call.args.get(4).and_then(|v| v.as_int()).map(|f| f as i32).unwrap_or(FLAG_HANGAR);
+            let items = reprocessable(c, &value_id_list(call.args.first())).await?;
             let mut done = vec![];
             let mut output: HashMap<i32, i64> = HashMap::new();
             let mut tax = 0.0;
@@ -667,7 +649,7 @@ async fn reprocessing(c: &mut Client, call: &Call<'_>) -> CallResult {
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     match (call.service, call.method) {
-        ("miningScanMgr", "perform_scan") => Some(Ok(perform_scan(c))),
+        ("miningScanMgr", "perform_scan") => Some(Ok(perform_scan(c).await)),
         ("reprocessingSvc", _) if call.bound => Some(reprocessing(c, call).await),
         _ => None,
     }
@@ -676,6 +658,13 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regrowth_deadline_rounds_up_to_milliseconds() {
+        let whole = crate::client::filetime_from_unix_ms(42);
+        assert_eq!(unix_ms_from_filetime_ceil(whole), 42);
+        assert_eq!(unix_ms_from_filetime_ceil(whole + 1), 43);
+    }
 
     #[test]
     fn ore_bands_follow_security() {

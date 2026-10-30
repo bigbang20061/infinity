@@ -1,14 +1,25 @@
-//! Character-scoped services once in game: charMgr, account, station guests,
-//! online status and the skill handler.
+//! Character-scoped services once in game: charMgr, account, station guests and
+//! online status, including paperdolls, assets, repairs and private notes.
+//!
+//! Client service paths include `invCache` global inventory and `charMgr` for
+//! assets and notes, `repairSvc` for quotes and repairs, `structureAssetSafety`
+//! for safety lists, and `bannedwords` for word checks. Asset worth uses market
+//! asks; repair quotes report zero damage and cost because docking repairs ships.
+//! Notes are private to a character and blank notes are deleted.
+//!
+//! Data comes from `game.characters`, `game.items`, `game.market_orders`,
+//! `game.char_notes`, `sde.sta_stations` and `sde.type_attributes`. Asset safety
+//! lists are empty because player structures are not modelled; the server does
+//! not enforce its own banned words, while the client checks retail regexes.
+//! Contacts and several station systems return empty or no-op responses.
 
-use super::{keyval, rowset, Call, CallError, CallResult};
+use super::{db_err, keyval, rowset, value_id_list, Call, CallError, CallResult};
 use crate::client::Client;
-use crate::services::dogma::TYPE_CHARACTER;
+use crate::consts::{ATTR_STRUCTURE_HP, FILETIME_SECOND, FILETIME_UNIX_EPOCH, TYPE_CHARACTER};
 use marshal::Value;
 
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
+/// Client paperdoll.State.no_recustomization protocol state.
+const PAPERDOLL_NO_RECUSTOMIZATION: i64 = 0;
 
 fn char_id(c: &Client) -> i64 {
     c.session.int("charid").unwrap_or(0)
@@ -20,9 +31,9 @@ async fn public_info(c: &Client, id: i64) -> Result<Value, CallError> {
         .client
         .query_opt(
             "SELECT name, corporation_id, race_id, bloodline_id, ancestry_id, school_id, gender_id,
-                    (extract(epoch FROM created_at) * 10000000)::bigint + 116444736000000000
+                    (extract(epoch FROM created_at) * $2::bigint)::bigint + $3::bigint
              FROM game.characters WHERE character_id = $1",
-            &[&id],
+            &[&id, &FILETIME_SECOND, &FILETIME_UNIX_EPOCH],
         )
         .await
         .map_err(db_err)?;
@@ -161,7 +172,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             public_info(c, id).await.map(|info| if info.is_none() { info } else { Value::list([info]) })
         }
         // ---- paperdoll ----
-        ("charMgr", "GetPaperdollState") => Ok(Value::Int(0)), // paperdoll.State.no_recustomization
+        ("charMgr", "GetPaperdollState") => Ok(Value::Int(PAPERDOLL_NO_RECUSTOMIZATION)),
         ("paperDollServer", "GetMyPaperDollData") | ("paperDollServer", "GetPaperDollData") => {
             let id = call.args.first().and_then(|v| v.as_int()).unwrap_or(me);
             doll_blob(c, id, "appearance").await.map(|mut v| {
@@ -231,14 +242,14 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         // costToRepairOneUnitOfDamage)]}. Docking already repairs ships (combat::repair), so
         // nothing in a station is damaged.
         ("repairSvc", "GetRepairQuotes") => {
-            let ids: Vec<i64> = call.args.first().and_then(|v| v.items()).unwrap_or(&[]).iter().filter_map(|v| v.as_int()).collect();
+            let ids = value_id_list(call.args.first());
             match c
                 .db
                 .client
                 .query(
-                    "SELECT i.item_id, i.type_id::bigint, COALESCE((SELECT value FROM sde.type_attributes a WHERE a.type_id = i.type_id AND a.attribute_id = 9), 0)::float8
+                    "SELECT i.item_id, i.type_id::bigint, COALESCE((SELECT value FROM sde.type_attributes a WHERE a.type_id = i.type_id AND a.attribute_id = $3), 0)::float8
                      FROM game.items i WHERE i.item_id = ANY($1) AND i.owner_id = $2",
-                    &[&ids, &me],
+                    &[&ids, &me, &ATTR_STRUCTURE_HP],
                 )
                 .await
             {

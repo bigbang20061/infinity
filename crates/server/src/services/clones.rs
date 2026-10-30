@@ -7,25 +7,19 @@
 //! less per Infomorph Synchronizing level. Implants aren't modelled, so clones carry none
 //! and cost nothing. Ship-borne clone vat bays aren't supported.
 
-use super::{crowset, Call, CallError, CallResult};
+use super::{crowset, db_err, notify_error, value_text, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
-use crate::services::charsel::FLAG_HANGAR;
+use crate::consts::{FILETIME_HOUR, FLAG_HANGAR, TYPE_CAPSULE};
 use marshal::{DbRowDescriptor, DbType, Value};
 use tracing::info;
 
-const HOUR: i64 = 36_000_000_000;
-const TYPE_CAPSULE: i32 = 670;
 const SKILL_INFOMORPH_PSYCHOLOGY: i32 = 24242;
 const SKILL_ADVANCED_INFOMORPH_PSYCHOLOGY: i32 = 33407;
 const SKILL_INFOMORPH_SYNCHRONIZING: i32 = 33399;
-
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
-
-fn notify_error(text: &str) -> CallError {
-    CallError::User { msg: "CustomNotify".into(), dict: vec![("notify".into(), Value::unicode(text))] }
-}
+/// Existing server policy: base jump clone cooldown before skill reduction, in hours.
+const BASE_JUMP_COOLDOWN_HOURS: i64 = 24;
+/// Existing server policy: maximum jump clone name characters.
+const MAX_CLONE_NAME_LENGTH: usize = 100;
 
 async fn skill(c: &Client, me: i64, skill: i32) -> Result<i64, CallError> {
     Ok(c.db
@@ -90,10 +84,10 @@ async fn jump(c: &mut Client, me: i64, dest: i64, clone_id: i64) -> CallResult {
     };
     let last: Option<i64> =
         c.db.client.query_one("SELECT last_clone_jump FROM game.characters WHERE character_id = $1", &[&me]).await.map_err(db_err)?.get(0);
-    let cooldown = (24 - skill(c, me, SKILL_INFOMORPH_SYNCHRONIZING).await?) * HOUR;
+    let cooldown = (BASE_JUMP_COOLDOWN_HOURS - skill(c, me, SKILL_INFOMORPH_SYNCHRONIZING).await?) * FILETIME_HOUR;
     let now = filetime_now();
     if let Some(ready) = last.map(|l| l + cooldown).filter(|r| *r > now) {
-        let hours = (ready - now) as f64 / HOUR as f64;
+        let hours = (ready - now) as f64 / FILETIME_HOUR as f64;
         return Err(notify_error(&format!("你需要再等 {hours:.1} 小时才能再次进行远距克隆跳跃。")));
     }
     let target = c
@@ -178,7 +172,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         },
         // SetJumpCloneName(cloneID, name)
         "SetJumpCloneName" => {
-            let name: String = call.args.get(1).and_then(|v| v.as_text()).map(|t| t.chars().take(100).collect()).unwrap_or_default();
+            let name = value_text(call.args.get(1), MAX_CLONE_NAME_LENGTH);
             c.db.client
                 .execute("UPDATE game.jump_clones SET name = $3 WHERE clone_id = $1 AND owner_id = $2", &[&int(0), &me, &name])
                 .await

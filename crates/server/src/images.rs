@@ -17,12 +17,18 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
 
+/// Server image-upload size limit, in bytes.
 const MAX_UPLOAD: usize = 8 * 1024 * 1024;
+/// Server-supported image categories from the client image URL convention.
 const KINDS: [&str; 5] = ["Character", "Corporation", "Alliance", "Type", "Render"];
-/// Sizes the image server offers.
+/// Image sizes offered by the upstream image server, in pixels.
 const SIZES: [u32; 6] = [32, 64, 128, 256, 512, 1024];
-/// Character and corporation IDs from here on are players' (this server's own).
+/// Server image policy: character and corporation IDs from here on are local.
 const FIRST_PLAYER_ID: u64 = 90_000_000;
+/// Server upstream image request timeout, in seconds.
+const UPSTREAM_TIMEOUT_SECONDS: u64 = 10;
+/// Upstream type icon maximum size, in pixels.
+const MAX_TYPE_ICON_SIZE: u32 = 64;
 
 /// The upstream image server, if any.
 #[derive(Clone)]
@@ -34,19 +40,19 @@ impl Upstream {
         if base.is_empty() {
             return Upstream(None);
         }
-        let client = reqwest::Client::builder().user_agent("infinity-emulator image cache").timeout(std::time::Duration::from_secs(10)).build();
+        let client = reqwest::Client::builder().user_agent("infinity-emulator image cache").timeout(std::time::Duration::from_secs(UPSTREAM_TIMEOUT_SECONDS)).build();
         Upstream(client.ok().map(|c| Arc::new((base.to_string(), c))))
     }
 
     /// `<kind>/<id>_<size>.<ext>` on images.evetech.net, for images that are the same there.
     fn url(&self, kind: &str, id: u64, size: u32) -> Option<String> {
         let (base, _) = self.0.as_deref()?;
-        let size = SIZES.into_iter().find(|s| *s >= size).unwrap_or(1024);
+        let size = SIZES.into_iter().find(|s| *s >= size).unwrap_or(SIZES[SIZES.len() - 1]);
         Some(match kind {
             "Character" if id < FIRST_PLAYER_ID => format!("{base}/characters/{id}/portrait?size={size}"),
             "Corporation" if id < FIRST_PLAYER_ID => format!("{base}/corporations/{id}/logo?size={size}"),
             "Alliance" if id < FIRST_PLAYER_ID => format!("{base}/alliances/{id}/logo?size={size}"),
-            "Type" => format!("{base}/types/{id}/icon?size={}", size.min(64)),
+            "Type" => format!("{base}/types/{id}/icon?size={}", size.min(MAX_TYPE_ICON_SIZE)),
             "Render" => format!("{base}/types/{id}/render?size={size}"),
             _ => return None,
         })

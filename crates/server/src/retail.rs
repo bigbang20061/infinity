@@ -11,6 +11,13 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 use tracing::warn;
 
+/// Retail gateway's captured achievements CDN version.
+const ACHIEVEMENTS_VERSION: (u32, u32, u32) = (1, 0, 7);
+/// Retail gateway's captured titles CDN version.
+const TITLES_VERSION: (u32, u32, u32) = (1, 0, 0);
+/// Retail gateway's captured map tags CDN version.
+const MAPTAGS_VERSION: (u32, u32, u32) = (1, 1366, 0);
+
 /// A content CDN file and the version the retail gateway announced for it.
 pub struct CdnFile {
     pub data: &'static [u8],
@@ -19,9 +26,9 @@ pub struct CdnFile {
 
 pub fn cdn(name: &str) -> Option<CdnFile> {
     let (data, version): (&'static [u8], _) = match name {
-        "achievements" => (include_bytes!("../retail/cdn/achievements.bin"), (1, 0, 7)),
-        "titles" => (include_bytes!("../retail/cdn/titles.bin"), (1, 0, 0)),
-        "maptags" => (include_bytes!("../retail/cdn/maptags.bin"), (1, 1366, 0)),
+        "achievements" => (include_bytes!("../retail/cdn/achievements.bin"), ACHIEVEMENTS_VERSION),
+        "titles" => (include_bytes!("../retail/cdn/titles.bin"), TITLES_VERSION),
+        "maptags" => (include_bytes!("../retail/cdn/maptags.bin"), MAPTAGS_VERSION),
         _ => return None,
     };
     Some(CdnFile { data, version })

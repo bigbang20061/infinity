@@ -1,11 +1,28 @@
 //! Public gateway request handlers, keyed by request message full name.
 //! Returning `Ok(None)` makes the gateway answer with an empty matching response.
 
-use super::{message, Caller, Gateway};
+use super::{message, response_name, Caller, Gateway, UUID_LEN};
 use crate::cdn;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use prost_reflect::{DynamicMessage, MessageDescriptor, ReflectMessage, Value as PV};
+
+/// Server representation of the five equal insurgency stages.
+const INSURGENCY_STAGE_COUNT: u64 = 5;
+/// Gateway PLEX vault protocol: one PLEX is 100 hundredths.
+const PLEX_HUNDREDTHS: i64 = 100;
+/// RFC 4122 version field in the seventh UUID byte.
+const UUID_VERSION_INDEX: usize = 6;
+/// RFC 4122 variant field in the ninth UUID byte.
+const UUID_VARIANT_INDEX: usize = 8;
+/// RFC 4122 version field payload mask.
+const UUID_VERSION_MASK: u8 = 0x0f;
+/// RFC 4122 random UUID version.
+const UUID_VERSION_V4: u8 = 0x40;
+/// RFC 4122 variant field payload mask.
+const UUID_VARIANT_MASK: u8 = 0x3f;
+/// RFC 4122 variant bits.
+const UUID_VARIANT_RFC4122: u8 = 0x80;
 
 pub async fn handle(gw: &Gateway, caller: &Caller, name: &str, req: &DynamicMessage) -> Result<Option<DynamicMessage>> {
     match name {
@@ -47,10 +64,10 @@ fn identifier(parent: &MessageDescriptor, field: &str, sequential: PV) -> Result
 fn stage_thresholds(request: &str) -> Result<DynamicMessage> {
     let mut rsp = response_for(request)?;
     let mut thresholds = vec![];
-    for k in 1..=5u64 {
+    for k in 1..=INSURGENCY_STAGE_COUNT {
         let mut f = child(&rsp.descriptor(), "thresholds")?;
         set(&mut f, "numerator", PV::U64(k))?;
-        set(&mut f, "denominator", PV::U64(5))?;
+        set(&mut f, "denominator", PV::U64(INSURGENCY_STAGE_COUNT))?;
         thresholds.push(PV::Message(f));
     }
     set(&mut rsp, "thresholds", PV::List(thresholds))?;
@@ -80,9 +97,9 @@ async fn names_by_user(gw: &Gateway, caller: &Caller) -> Result<DynamicMessage> 
 async fn plex_balance(gw: &Gateway, caller: &Caller) -> Result<DynamicMessage> {
     let mut rsp = response_for("eve_public.plex.vault.api.BalanceRequest")?;
     let user = caller.user_id.context("no user")?;
-    let plex: i64 = db(gw)?.query_one("SELECT plex_balance FROM game.accounts WHERE user_id = $1", &[&user]).await?.get(0);
+    let plex = crate::db::Db::plex_balance(db(gw)?, user).await?;
     let mut balance = child(&rsp.descriptor(), "balance")?;
-    set(&mut balance, "total_in_cents", PV::I64(plex * 100))?;
+    set(&mut balance, "total_in_cents", PV::I64(plex * PLEX_HUNDREDTHS))?;
     set(&mut rsp, "balance", PV::Message(balance))?;
     Ok(rsp)
 }
@@ -91,8 +108,8 @@ async fn plex_balance(gw: &Gateway, caller: &Caller) -> Result<DynamicMessage> {
 
 fn new_uuid() -> Vec<u8> {
     let mut id = [crate::handshake::rand_i64().to_le_bytes(), crate::handshake::rand_i64().to_le_bytes()].concat();
-    id[6] = (id[6] & 0x0f) | 0x40;
-    id[8] = (id[8] & 0x3f) | 0x80;
+    id[UUID_VERSION_INDEX] = (id[UUID_VERSION_INDEX] & UUID_VERSION_MASK) | UUID_VERSION_V4;
+    id[UUID_VARIANT_INDEX] = (id[UUID_VARIANT_INDEX] & UUID_VARIANT_MASK) | UUID_VARIANT_RFC4122;
     id
 }
 
@@ -181,7 +198,7 @@ async fn skill_plan(gw: &Gateway, caller: &Caller, name: &str, req: &DynamicMess
         "GetActiveRequest" => {
             let row = db.query_opt(&format!("SELECT {PLAN_COLUMNS} FROM game.skill_plans WHERE character_id = $1 AND active"), &[&me]).await?;
             // No active plan: the all-zero uuid.
-            let plan = row.as_ref().map(|r| r.get::<_, Vec<u8>>(4)).unwrap_or_else(|| vec![0u8; 16]);
+            let plan = row.as_ref().map(|r| r.get::<_, Vec<u8>>(4)).unwrap_or_else(|| vec![0u8; UUID_LEN]);
             set(&mut rsp, "skill_plan", PV::Message(plan_identifier(&desc, "skill_plan", plan)?))?;
             if let Some(row) = row {
                 set(&mut rsp, "skill_plan_info", PV::Message(plan_attributes(&desc, "skill_plan_info", &row)?))?;
@@ -215,7 +232,7 @@ async fn skill_plan(gw: &Gateway, caller: &Caller, name: &str, req: &DynamicMess
 }
 
 fn response_for(request: &str) -> Result<DynamicMessage> {
-    let name = request.strip_suffix("Request").map(|s| format!("{s}Response")).context("not a request")?;
+    let name = response_name(request).context("not a request")?;
     Ok(DynamicMessage::new(message(&name).with_context(|| format!("no {name}"))?))
 }
 
@@ -254,10 +271,10 @@ const CAREERS: [i32; 4] = [1, 2, 3, 4];
 /// Career goal ids: one top-level goal per career path (careergoals/client/goal_data_controller.py
 /// needs `career_path_goal_definition` for every career).
 fn career_goal_uuid(career: i32) -> Bytes {
-    let mut id = [0u8; 16];
-    id[6] = 0x40;
-    id[8] = 0x80;
-    id[15] = career as u8;
+    let mut id = [0u8; UUID_LEN];
+    id[UUID_VERSION_INDEX] = UUID_VERSION_V4;
+    id[UUID_VARIANT_INDEX] = UUID_VARIANT_RFC4122;
+    id[UUID_LEN - 1] = career as u8;
     Bytes::copy_from_slice(&id)
 }
 

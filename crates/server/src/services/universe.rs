@@ -1,28 +1,32 @@
 //! Map, corporation and wallet-side services the neocom windows load from
 //! (eve/client/script/ui/shared/maps, mapView, neocom/corporation, wallet).
+//! Corporation rows come from `sde.crp_npc_corporations` or `game.corporations`;
+//! character corporation lookup uses `game.characters` and `sde.npc_characters`.
+//! Public corporation rows include `allowWar` (false for NPC corporations).
+//! NPC corporation trading is not modelled: `GetCorpInfo` returns an empty list.
+//! Many map, wallet and war queries likewise return empty fallback data.
 
-use super::{rowset, Call, CallError, CallResult};
+use super::{db_err, row, rowset, Call, CallError, CallResult};
 use crate::client::Client;
+use crate::consts::{CORPORATION_TYPE_NPC, CORPORATION_UNLIMITED_MEMBER_LIMIT, CORP_DIVISION_NAME_COUNT, FACTION_AMARR, FACTION_CALDARI, FACTION_GALLENTE, FACTION_MINMATAR};
 use marshal::Value;
-
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
-
-/// `carbon.common.script.sys.row.Row(header, line)`
-fn row(header: &[&str], line: Vec<Value>) -> Value {
-    Value::instance(
-        "carbon.common.script.sys.row.Row",
-        [("header", Value::list(header.iter().map(|h| Value::str(*h)))), ("line", Value::List(line))],
-    )
-}
 
 /// Faction warfare warzones: (warzoneID, the two factions fighting over it).
 const WARZONES: &[(i64, [i64; 2])] = &[
-    (1, [500003, 500002]), // Amarr Empire / Minmatar Republic
-    (2, [500001, 500004]), // Caldari State / Gallente Federation
+    (1, [FACTION_AMARR, FACTION_MINMATAR]), // Amarr Empire / Minmatar Republic
+    (2, [FACTION_CALDARI, FACTION_GALLENTE]), // Caldari State / Gallente Federation
 ];
 
+/// Server default NPC corporation shares in public corporation information.
+const NPC_CORPORATION_SHARES: i64 = 1000;
+/// Client corporation row: optional logo shape, colour and typeface fields.
+const CORP_LOGO_FIELDS: usize = 7;
+/// Server default industry cost modifier for each solar system.
+const INDUSTRY_COST_MODIFIER: f64 = 0.001;
+/// Server default maximum dynamic resource output.
+const DYNAMIC_RESOURCE_MAX_OUTPUT: f64 = 2.0;
+
+/// Public corporation row consumed by eve/client/script/ui/shared/neocom/corporation.
 const CORP_HEADER: &[&str] = &[
     "corporationID",
     "corporationName",
@@ -83,15 +87,15 @@ async fn corporation(c: &Client, corp_id: i64) -> Result<Value, CallError> {
         .client
         .query_opt(
             "SELECT name, COALESCE(data->'description'->>'en', ''), ticker, tax_rate, ceo_id::bigint, station_id::bigint,
-                    race_id::bigint, faction_id::bigint, COALESCE(member_limit, -1)::bigint,
+                    race_id::bigint, faction_id::bigint, COALESCE(member_limit::bigint, $2::bigint),
                     (SELECT count(*) FROM game.characters ch WHERE ch.corporation_id = $1::bigint AND NOT ch.deleted)
              FROM sde.crp_npc_corporations WHERE corporation_id = $1::bigint",
-            &[&corp_id],
+            &[&corp_id, &CORPORATION_UNLIMITED_MEMBER_LIMIT],
         )
         .await
         .map_err(db_err)?;
     let Some(r) = r else {
-        return Ok(super::corps::corporation_line(&c.db, corp_id).await?.map(|line| row(CORP_HEADER, line)).unwrap_or(Value::None));
+        return Ok(super::corps::corporation_line(&c.db, corp_id).await?.map(|line| row(Value::list(CORP_HEADER.iter().map(|h| Value::str(*h))), line)).unwrap_or(Value::None));
     };
     let opt = |v: Option<i64>| v.map(Value::Int).unwrap_or(Value::None);
     let s = |v: Option<String>| Value::unicode(v.unwrap_or_default());
@@ -104,7 +108,7 @@ async fn corporation(c: &Client, corp_id: i64) -> Result<Value, CallError> {
         Value::Float(r.get::<_, Option<f64>>(3).unwrap_or(0.0)),
         Value::Float(0.0),
         Value::Float(0.0),
-        Value::Int(1), // corporationType: NPC
+        Value::Int(CORPORATION_TYPE_NPC),
         Value::Bool(false),
         Value::Bool(true),
         opt(r.get(4)),
@@ -113,17 +117,17 @@ async fn corporation(c: &Client, corp_id: i64) -> Result<Value, CallError> {
         opt(r.get(6)),
         Value::None,
         opt(r.get(7)),
-        Value::Int(1000),
+        Value::Int(NPC_CORPORATION_SHARES),
         Value::Int(r.get::<_, i64>(9)),
         Value::Int(r.get::<_, i64>(8)),
         Value::None,
         Value::None,
     ];
-    line.extend(std::iter::repeat_n(Value::None, 7)); // shapes, colours, typeface
-    line.extend(std::iter::repeat_n(Value::None, 14)); // division names
+    line.extend(std::iter::repeat_n(Value::None, CORP_LOGO_FIELDS)); // shapes, colours, typeface
+    line.extend(std::iter::repeat_n(Value::None, CORP_DIVISION_NAME_COUNT)); // division names
     // ..., chosenExecutorID, allowWar (no wars can be declared on NPC corporations)
     line.extend([Value::Bool(false), Value::Bool(false), Value::Bool(false), Value::None, Value::None, Value::None, Value::Bool(false)]);
-    Ok(row(CORP_HEADER, line))
+    Ok(row(Value::list(CORP_HEADER.iter().map(|h| Value::str(*h))), line))
 }
 
 async fn station_counts(c: &Client) -> Result<Value, CallError> {
@@ -138,7 +142,7 @@ async fn station_counts(c: &Client) -> Result<Value, CallError> {
 
 async fn industry_cost_modifiers(c: &Client) -> Result<Value, CallError> {
     let rows = c.db.client.query("SELECT solar_system_id::bigint FROM sde.map_solar_systems", &[]).await.map_err(db_err)?;
-    Ok(Value::Dict(rows.iter().map(|r| (Value::Int(r.get(0)), Value::Float(0.001))).collect()))
+    Ok(Value::Dict(rows.iter().map(|r| (Value::Int(r.get(0)), Value::Float(INDUSTRY_COST_MODIFIER))).collect()))
 }
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
@@ -172,7 +176,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         // Bounty output range and its equilibrium (mapFilterDynamicBounty reads all three).
         ("dynamicResourceCacheMgr", "GetDynamicResourceSettings") => Value::dict([
             ("minOutput", Value::Float(0.0)),
-            ("maxOutput", Value::Float(2.0)),
+            ("maxOutput", Value::Float(DYNAMIC_RESOURCE_MAX_OUTPUT)),
             ("equilibriumValue", Value::Float(1.0)),
         ]),
         ("structureDirectory", "GetSolarSystemsWithBeacons") => Value::list([]),

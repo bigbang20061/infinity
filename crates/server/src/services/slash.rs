@@ -6,18 +6,14 @@
 //! `SlashCmd('/')` answers with the command list in a UserError's `reason`
 //! (svc_slash.FetchRemoteCommandList evals what follows ': ').
 
-use super::{Call, CallError, CallResult};
+use super::{db_err, Call, CallError, CallResult};
 use crate::client::Client;
-use crate::services::charsel::FLAG_HANGAR;
+use crate::consts::{FLAG_CARGO, FLAG_HANGAR, GM_ROLES};
 use marshal::Value;
 use tracing::info;
 
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
-
-/// ROLE_GML | ROLE_GMH | ROLE_LEGIONEER | ROLE_WORLDMOD (carbon serviceConst).
-pub const GM_ROLES: i64 = 18014398509481984 | 9007199254740992 | 262144 | 4096;
+/// Server design: clearance in metres when teleporting to an item.
+const TELEPORT_CLEARANCE: f64 = 5000.0;
 
 const COMMANDS: [(&str, &str); 9] = [
     ("tr", "/tr me <itemID|characterID|solarSystemID|stationID|celestialID> — teleport"),
@@ -70,8 +66,8 @@ async fn tr(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
     }
     let here = c.session.int("solarsystemid").unwrap_or(0);
     // Something in this system's ballpark.
-    if let Some(b) = c.world.balls_snapshot(here).and_then(|balls| balls.get(&id).cloned()) {
-        let pos = [b.pos[0] + b.radius as f64 + 5000.0, b.pos[1], b.pos[2]];
+    if let Some((ball_pos, radius)) = c.world.with(here, move |s| s.ball(id).map(|b| (b.pos, b.radius))).await.flatten() {
+        let pos = [ball_pos[0] + radius as f64 + TELEPORT_CLEARANCE, ball_pos[1], ball_pos[2]];
         super::ship::teleport(c, here, pos).await?;
         return Ok(format!("teleported to {id}"));
     }
@@ -100,7 +96,7 @@ async fn tr(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
         .await
         .map_err(db_err)?
     {
-        let pos = [p.get::<_, f64>(1) + p.get::<_, f64>(4) + 5000.0, p.get(2), p.get(3)];
+        let pos = [p.get::<_, f64>(1) + p.get::<_, f64>(4) + TELEPORT_CLEARANCE, p.get(2), p.get(3)];
         super::ship::teleport(c, p.get(0), pos).await?;
         return Ok(format!("teleported to {id}"));
     }
@@ -118,9 +114,9 @@ async fn tr(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
         .map_err(db_err)?;
     if let Some(r) = at {
         let system: i64 = r.get(0);
-        let pos = [r.get::<_, f64>(1) + 5000.0, r.get(2), r.get(3)];
-        let live = c.world.balls_snapshot(system).and_then(|b| b.values().find(|b| b.char_id == Some(id) || b.id == id).map(|b| b.pos));
-        let pos = live.map(|p| [p[0] + 5000.0, p[1], p[2]]).unwrap_or(pos);
+        let pos = [r.get::<_, f64>(1) + TELEPORT_CLEARANCE, r.get(2), r.get(3)];
+        let live = c.world.with(system, move |s| s.pilot_ball(id).or_else(|| s.ball(id)).map(|b| b.pos)).await.flatten();
+        let pos = live.map(|p| [p[0] + TELEPORT_CLEARANCE, p[1], p[2]]).unwrap_or(pos);
         super::ship::teleport(c, system, pos).await?;
         return Ok(format!("teleported to {id} in {system}"));
     }
@@ -134,7 +130,7 @@ async fn create(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
     let char_id = c.session.int("charid").unwrap_or(0);
     let (location, flag) = match (c.session.int("stationid"), c.session.int("shipid")) {
         (Some(station), _) => (station, FLAG_HANGAR),
-        (None, Some(ship)) => (ship, super::combat::FLAG_CARGO),
+        (None, Some(ship)) => (ship, FLAG_CARGO),
         _ => return Err(slash_error("nowhere to put it".into())),
     };
     super::combat::deposit(c, char_id, location, flag, type_id, qty, 0).await?;

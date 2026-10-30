@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-# Release-only build (no debug target, per AGENTS.md).
+# Release-only build (no debug target, per AGENT.md).
 
 FROM rust:1.97-slim-bookworm AS build
 WORKDIR /src

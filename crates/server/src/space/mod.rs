@@ -6,7 +6,16 @@
 //! send; the server integrates ships with destiny's model (exponential
 //! approach to target velocity with tau = mass * agility / 1e6, warp phases
 //! from Ballpark.cpp SetupWarpConstants) to know where things are.
+//!
+//! Celestials come from the SDE; dynamic balls stay in memory. Each system
+//! owns an actor with a 100 ms tick and closure messages. Destiny stamps remain
+//! whole seconds. NPC decisions, spawn groups and closure timers live in the actor;
+//! NPC combat effects run sequentially and deferred jobs concurrently outside it.
+//! Timers fire on ticks in deadline and scheduling order; persistent timers and
+//! position snapshots are not supported.
+//! Shared vector distances are defined here for simulation and service callers.
 
+use crate::consts::{AU, DAMAGE_LAYER_COUNT, FILETIME_SECOND, SECONDS_PER_MINUTE};
 use crate::db::Db;
 use anyhow::Result;
 use marshal::{DbRowDescriptor, DbType, Value};
@@ -14,6 +23,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tracing::info;
+
+mod actor;
+mod system;
+mod npc;
+pub use npc::{HOSTILE_TO_ALL, NpcAction, NpcBrain, NpcConfig, NpcEffects, NpcFuture};
+pub use system::System;
+use actor::SystemHandle;
 
 // DSTBALLMODE
 pub const MODE_GOTO: u8 = 0;
@@ -33,9 +49,40 @@ pub const CLOAK_RESTORE: u8 = 2;
 const DESTINY_FULLSTATE: u8 = 0;
 const DESTINY_BALLS: u8 = 1;
 
-const AU: f64 = 0.1495978707e12;
+/// SI time conversion.
+const MILLISECONDS_PER_SECOND: i64 = 1000;
+/// SI distance conversion.
+const METRES_PER_KILOMETRE: f64 = 1000.0;
+/// SI mass conversion: kilograms per tonne.
+const KILOGRAMS_PER_TONNE: f64 = 1000.0;
+/// Existing normalization tolerance.
+const VECTOR_LENGTH_EPSILON: f64 = 1e-9;
+/// Existing player targeting formula, preserved by D17.
+const LOCK_TIME_FACTOR_SECONDS: f64 = 40_000.0;
+/// Existing player targeting minimum.
+const MIN_LOCK_TIME_SECONDS: f64 = 0.5;
+/// Existing player targeting maximum.
+const MAX_LOCK_TIME_SECONDS: f64 = 60.0;
+/// Existing missing-warp-state serialization default.
+const DEFAULT_WARP_FACTOR: i64 = 3000;
+/// Existing server damage-state placeholder policy.
+const DAMAGE_STATE_SHIELD_RECHARGE_TAU: f64 = 100_000.0;
+/// Existing destiny mass/agility integration scale.
+const MASS_AGILITY_SCALE: f64 = 1e6;
+/// Existing server integration floor.
+const MIN_MOVEMENT_TAU_SECONDS: f64 = 0.1;
+/// Carbonengine Ballpark::SetupWarpConstants.
+const MAX_WARP_DECELERATION: f64 = 2.0;
+/// Existing server fallback for missing celestial radii.
+const CELESTIAL_FALLBACK_RADIUS: f64 = 1000.0;
+/// Existing server rigid-celestial representation.
+const CELESTIAL_STATIC_MASS: f64 = 1e34;
+
+/// Carbonengine warp factor to AU per second.
 const WARP_FACTOR_TO_AU_PER_SECOND: f64 = 0.001;
+/// Carbonengine warp factor to acceleration.
 const WARP_FACTOR_TO_ACCELERATION: f64 = 1.0 / 1000.0;
+/// Carbonengine warp factor to deceleration.
 const WARP_FACTOR_TO_DECELERATION: f64 = 1.0 / 3000.0;
 
 pub type V3 = [f64; 3];
@@ -52,25 +99,57 @@ fn scale(a: V3, s: f64) -> V3 {
 fn len(a: V3) -> f64 {
     (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt()
 }
+/// Euclidean distance between two positions.
+pub fn dist(a: V3, b: V3) -> f64 {
+    len(sub(a, b))
+}
 fn norm(a: V3) -> V3 {
     let l = len(a);
-    if l < 1e-9 {
+    if l < VECTOR_LENGTH_EPSILON {
         [1.0, 0.0, 0.0]
     } else {
         scale(a, 1.0 / l)
     }
 }
 
-/// Destiny tick counter: one per simulated second.
+/// Convert Unix milliseconds to a whole-second destiny stamp.
+pub fn destiny_stamp(unix_ms: i64) -> i64 { unix_ms / MILLISECONDS_PER_SECOND }
+/// Convert milliseconds to seconds.
+pub fn ms_to_seconds(ms: f64) -> f64 { ms / MILLISECONDS_PER_SECOND as f64 }
+/// Convert minutes to seconds without discarding fractional minutes.
+pub fn minutes_to_seconds(minutes: f64) -> f64 { minutes * SECONDS_PER_MINUTE as f64 }
+/// Convert seconds to milliseconds without discarding fractions.
+pub fn seconds_to_ms_f64(seconds: f64) -> f64 { seconds * MILLISECONDS_PER_SECOND as f64 }
+/// Convert seconds to whole milliseconds.
+pub fn seconds_to_ms(seconds: f64) -> u64 { seconds_to_ms_f64(seconds) as u64 }
+/// Convert kilograms to tonnes.
+pub fn kg_to_tonnes(kg: f64) -> f64 { kg / KILOGRAMS_PER_TONNE }
+/// Convert metres to kilometres.
+pub fn metres_to_km(metres: f64) -> f64 { metres / METRES_PER_KILOMETRE }
+/// Shared player and NPC targeting duration from effective dogma attributes.
+pub fn lock_time_ms(scan_resolution: f64, signature_radius: f64) -> u64 {
+    let signature = signature_radius.max(1.0).asinh();
+    seconds_to_ms((LOCK_TIME_FACTOR_SECONDS / (scan_resolution.max(1.0) * signature * signature))
+        .clamp(MIN_LOCK_TIME_SECONDS, MAX_LOCK_TIME_SECONDS))
+}
+
+/// Simulation clock in Unix milliseconds (not a Destiny event stamp).
+pub fn now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64
+}
+
+/// Destiny event stamp in whole Unix seconds.
 pub fn now_tick() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64
+    destiny_stamp(now_ms())
 }
 
 #[derive(Clone)]
 pub struct Warp {
     pub from: V3,
     pub to: V3,
+    /// Unix milliseconds.
     pub start: i64,
+    /// Milliseconds.
     pub duration: f64,
     pub factor: i64,
     pub min_range: f64,
@@ -86,6 +165,8 @@ pub struct Ball {
     pub char_id: Option<i64>,
     pub mode: u8,
     pub radius: f32,
+    /// Cached effective pilot-ship dogma signature radius for actor targeting; not serialized to destiny.
+    pub signature_radius: Option<f64>,
     pub mass: f64,
     pub max_vel: f32,
     pub agility: f32,
@@ -100,13 +181,14 @@ pub struct Ball {
     pub massive: bool,
     pub warp: Option<Warp>,
     pub warp_factor: i64,
-    pub last_tick: i64,
+    /// Last integration time in Unix milliseconds; missiles retain their launch time.
+    pub last_ms: i64,
     /// Cloak mode (0 = visible). Cloaked balls exist only for their owner.
     pub cloak: u8,
     /// When an arrival cloak lapses (FILETIME), to tell a lapse from a later cloak.
     pub cloak_until: i64,
     /// Shield, armor and structure left, as fractions (damage state).
-    pub health: [f64; 3],
+    pub health: [f64; DAMAGE_LAYER_COUNT],
     /// For missiles: the ship that launched it (destiny's mOwnerId).
     pub launcher: i64,
     /// Extra slim item fields (jumps for gates, names...).
@@ -160,18 +242,18 @@ impl Ball {
                 o.extend_from_slice(&self.follow_id.to_le_bytes());
                 o.extend_from_slice(&self.follow_range.to_le_bytes());
                 o.extend_from_slice(&self.launcher.to_le_bytes());
-                o.extend_from_slice(&(self.last_tick as i32).to_le_bytes()); // effectStamp: launch tick
+                o.extend_from_slice(&(destiny_stamp(self.last_ms) as i32).to_le_bytes()); // effectStamp: launch tick
                 for c in self.goto {
                     o.extend_from_slice(&c.to_le_bytes());
                 }
             }
             MODE_WARP => {
-                let w = self.warp.clone().unwrap_or(Warp { from: self.pos, to: self.goto, start: now_tick(), duration: 0.0, factor: 3000, min_range: 0.0 });
+                let w = self.warp.clone().unwrap_or(Warp { from: self.pos, to: self.goto, start: now_ms(), duration: 0.0, factor: DEFAULT_WARP_FACTOR, min_range: 0.0 });
                 for c in w.to {
                     o.extend_from_slice(&c.to_le_bytes());
                 }
-                o.extend_from_slice(&(w.start as i32).to_le_bytes()); // effectStamp
-                o.extend_from_slice(&len(sub(w.to, w.from)).to_le_bytes()); // total warp length
+                o.extend_from_slice(&(destiny_stamp(w.start) as i32).to_le_bytes()); // effectStamp
+                o.extend_from_slice(&dist(w.to, w.from).to_le_bytes()); // total warp length
                 o.extend_from_slice(&(w.min_range as i64).to_le_bytes());
                 o.extend_from_slice(&w.factor.to_le_bytes());
             }
@@ -183,7 +265,7 @@ impl Ball {
     pub fn damage_state(&self) -> Value {
         let [shield, armor, hull] = self.health;
         Value::tuple([
-            Value::tuple([Value::Float(shield), Value::Float(100000.0), Value::Int(crate::client::filetime_now())]),
+            Value::tuple([Value::Float(shield), Value::Float(DAMAGE_STATE_SHIELD_RECHARGE_TAU), Value::Int(crate::client::filetime_now())]),
             Value::Float(armor),
             Value::Float(hull),
         ])
@@ -209,63 +291,52 @@ impl Ball {
         Value::instance("eve.common.script.util.slimItem.SlimItem", fields)
     }
 
-    /// Advance free balls to `tick` (server-side approximation of Ballpark::Evolve).
-    fn evolve(&mut self, tick: i64, others: &HashMap<i64, V3>) {
-        // Missiles fly client-side; the server only times their impact, and their
-        // last_tick stays the launch tick (the stream's effectStamp).
-        if self.mode == MODE_MISSILE {
+    /// Exact integration for a constant target velocity over elapsed milliseconds.
+    fn evolve(&mut self, ms: i64, others: &HashMap<i64, V3>) {
+        // Missile launch time is also the stream's effectStamp.
+        if self.mode == MODE_MISSILE { return; }
+        if !self.free || ms <= self.last_ms {
+            self.last_ms = self.last_ms.max(ms);
             return;
         }
-        if !self.free || tick <= self.last_tick {
-            self.last_tick = self.last_tick.max(tick);
-            return;
-        }
-        if let Some(w) = self.warp.clone() {
-            let t = (tick - w.start) as f64;
-            if t >= w.duration {
+        if let Some(w) = &self.warp {
+            let elapsed = (ms - w.start) as f64;
+            if elapsed >= w.duration {
                 self.pos = w.to;
-                self.vel = [0.0; 3];
+                self.vel = V3::default();
                 self.warp = None;
                 self.mode = MODE_STOP;
                 self.speed_fraction = 0.0;
             } else {
-                let frac = (t / w.duration.max(1.0)).clamp(0.0, 1.0);
-                self.pos = add(w.from, scale(sub(w.to, w.from), frac));
+                self.pos = add(w.from, scale(sub(w.to, w.from), (elapsed / w.duration.max(1.0)).clamp(0.0, 1.0)));
             }
-            self.last_tick = tick;
+            self.last_ms = ms;
             return;
         }
-        let tau = (self.mass * self.agility as f64 / 1e6).max(0.1);
-        for _ in self.last_tick..tick {
-            let target_speed = (self.max_vel * self.speed_fraction) as f64;
-            let target_vel = match self.mode {
-                MODE_GOTO => scale(norm(self.goto), target_speed),
-                MODE_FOLLOW | MODE_ORBIT => match others.get(&self.follow_id) {
-                    Some(&p) => {
-                        let d = sub(p, self.pos);
-                        if len(d) <= self.follow_range as f64 + self.radius as f64 {
-                            [0.0; 3]
-                        } else {
-                            scale(norm(d), target_speed)
-                        }
-                    }
-                    None => [0.0; 3],
-                },
-                _ => [0.0; 3],
-            };
-            let k = (-1.0 / tau).exp();
-            let new_vel = add(target_vel, scale(sub(self.vel, target_vel), k));
-            self.pos = add(self.pos, scale(add(self.vel, new_vel), 0.5));
-            self.vel = new_vel;
-        }
-        self.last_tick = tick;
+        let dt = ms_to_seconds((ms - self.last_ms) as f64);
+        let tau = (self.mass * self.agility as f64 / MASS_AGILITY_SCALE).max(MIN_MOVEMENT_TAU_SECONDS);
+        let speed = (self.max_vel * self.speed_fraction) as f64;
+        let target = match self.mode {
+            MODE_GOTO => scale(norm(self.goto), speed),
+            MODE_FOLLOW | MODE_ORBIT => others.get(&self.follow_id).map(|&p| {
+                let d = sub(p, self.pos);
+                if len(d) <= self.follow_range as f64 + self.radius as f64 { V3::default() }
+                else { scale(norm(d), speed) }
+            }).unwrap_or_default(),
+            _ => V3::default(),
+        };
+        let decay = (-dt / tau).exp();
+        let delta = sub(self.vel, target);
+        self.pos = add(self.pos, add(scale(target, dt), scale(delta, tau * -(-dt / tau).exp_m1())));
+        self.vel = add(target, scale(delta, decay));
+        self.last_ms = ms;
     }
 }
 
 /// Ballpark::SetupWarpConstants -> total warp duration in seconds.
 pub fn warp_duration(factor: f64, distance: f64) -> f64 {
     let accel = factor * WARP_FACTOR_TO_ACCELERATION;
-    let decel = (factor * WARP_FACTOR_TO_DECELERATION).min(2.0);
+    let decel = (factor * WARP_FACTOR_TO_DECELERATION).min(MAX_WARP_DECELERATION);
     let speed = (factor * WARP_FACTOR_TO_AU_PER_SECOND * AU).min((distance + 1.0) * accel * decel / (accel + decel));
     let accel_t = (speed / accel).ln() / accel;
     let cruise_t = (distance / speed) - (1.0 / accel) - (1.0 / decel) + (1.0 / speed);
@@ -279,7 +350,6 @@ pub type NotifyTx = mpsc::UnboundedSender<(String, Vec<Value>)>;
 
 /// Jump keys from the jump queue stay valid this long (s).
 pub const JUMP_KEY_LIFE: i64 = 60;
-const SEC: i64 = 10_000_000;
 
 /// Pilots waiting to jump into a full system, and the entry keys already issued.
 #[derive(Default)]
@@ -298,94 +368,46 @@ fn add_balls_event(tick: i64, ball: &Ball) -> Value {
     event(tick, "AddBalls", vec![chunk])
 }
 
-struct System {
-    balls: HashMap<i64, Ball>,
-    /// clientID -> (ego ship, push channel)
-    observers: HashMap<i64, (i64, DestinyTx)>,
-}
-
-impl System {
-    fn positions(&self) -> HashMap<i64, V3> {
-        self.balls.iter().map(|(k, b)| (*k, b.pos)).collect()
-    }
-    fn evolve_all(&mut self, tick: i64) {
-        let pos = self.positions();
-        for b in self.balls.values_mut() {
-            b.evolve(tick, &pos);
-        }
-    }
-    fn broadcast(&self, events: Vec<Value>) {
-        for (_, tx) in self.observers.values() {
-            let _ = tx.send(events.clone());
-        }
-    }
-    /// Events about `ball`: everyone sees them, unless it is cloaked (then only its pilot).
-    fn broadcast_about(&self, ball: &Ball, events: Vec<Value>) {
-        if ball.cloak == 0 {
-            return self.broadcast(events);
-        }
-        for (ego, tx) in self.observers.values() {
-            if *ego == ball.id {
-                let _ = tx.send(events.clone());
-            }
-        }
-    }
-}
-
 /// `(stamp, (funcName, args))`
 pub fn event(tick: i64, name: &str, args: Vec<Value>) -> Value {
     Value::tuple([Value::Int(tick), Value::tuple([Value::str(name), Value::Tuple(args)])])
 }
 
-pub struct World {
-    db: Db,
-    systems: Mutex<HashMap<i64, System>>,
-    /// Pilots allowed in space per solar system before jumps queue (0 = unlimited).
+/// Shared notification registry and admission queues, safe to use inside an actor.
+#[derive(Default)]
+pub struct Pilots {
     capacity: usize,
+    notify: Mutex<HashMap<i64, NotifyTx>>,
     queues: Mutex<HashMap<i64, JumpQueue>>,
-    /// charID -> notification channel of the client playing it.
-    pilots: Mutex<HashMap<i64, NotifyTx>>,
 }
-
-impl World {
-    pub fn new(db: Db, capacity: usize) -> Arc<World> {
-        Arc::new(World { db, systems: Mutex::new(HashMap::new()), capacity, queues: Default::default(), pilots: Default::default() })
-    }
-
+impl Pilots {
     pub fn register_pilot(&self, char_id: i64, tx: NotifyTx) {
-        self.pilots.lock().unwrap().insert(char_id, tx);
+        self.notify.lock().unwrap().insert(char_id, tx);
     }
 
     pub fn unregister_pilot(&self, char_id: i64) {
-        self.pilots.lock().unwrap().remove(&char_id);
+        self.notify.lock().unwrap().remove(&char_id);
         for q in self.queues.lock().unwrap().values_mut() {
             q.waiting.retain(|c| *c != char_id);
         }
     }
 
     pub fn notify_pilot(&self, char_id: i64, event: &str, args: Vec<Value>) {
-        if let Some(tx) = self.pilots.lock().unwrap().get(&char_id) {
+        if let Some(tx) = self.notify.lock().unwrap().get(&char_id) {
             let _ = tx.send((event.to_string(), args));
         }
     }
-
-    /// Pilots in space in `system_id`.
-    fn population(&self, system_id: i64) -> usize {
-        self.systems.lock().unwrap().get(&system_id).map(|s| s.balls.values().filter(|b| b.char_id.is_some()).count()).unwrap_or(0)
-    }
-
     /// May `char_id` jump into `system_id` now? `Err(position)` puts them in its jump queue
     /// (jumpQueue.py); a key issued from the queue lets them in within JUMP_KEY_LIFE.
-    pub fn request_entry(&self, system_id: i64, char_id: i64) -> Result<(), i64> {
+    pub fn request_entry(&self, system_id: i64, char_id: i64, population: usize) -> Result<(), i64> {
         if self.capacity == 0 {
             return Ok(());
         }
-        let population = self.population(system_id);
         {
             let mut queues = self.queues.lock().unwrap();
             let q = queues.entry(system_id).or_default();
             let now = crate::client::filetime_now();
-            q.keys.retain(|_, issued| now - *issued < JUMP_KEY_LIFE * SEC);
+            q.keys.retain(|_, issued| now - *issued < JUMP_KEY_LIFE * FILETIME_SECOND);
             if q.keys.remove(&char_id).is_some() {
                 q.waiting.retain(|c| *c != char_id);
                 return Ok(());
@@ -397,7 +419,7 @@ impl World {
                 q.waiting.push(char_id);
             }
         }
-        self.pump_queue(system_id);
+        self.pump_queue(system_id, population);
         let queues = self.queues.lock().unwrap();
         let Some(q) = queues.get(&system_id) else { return Err(1) };
         if q.keys.contains_key(&char_id) {
@@ -410,16 +432,15 @@ impl World {
     }
 
     /// Issue entry keys for free room in `system_id` and tell everyone queued for it.
-    pub fn pump_queue(&self, system_id: i64) {
+    pub fn pump_queue(&self, system_id: i64, population: usize) {
         if self.capacity == 0 {
             return;
         }
-        let population = self.population(system_id);
         let (update, recipients) = {
             let mut queues = self.queues.lock().unwrap();
             let Some(q) = queues.get_mut(&system_id) else { return };
             let now = crate::client::filetime_now();
-            q.keys.retain(|_, issued| now - *issued < JUMP_KEY_LIFE * SEC);
+            q.keys.retain(|_, issued| now - *issued < JUMP_KEY_LIFE * FILETIME_SECOND);
             while !q.waiting.is_empty() && population + q.keys.len() < self.capacity {
                 let next = q.waiting.remove(0);
                 q.keys.insert(next, now);
@@ -440,28 +461,47 @@ impl World {
             self.notify_pilot(char_id, "OnJumpQueueUpdate", update.clone());
         }
     }
+}
 
-    /// Load a solar system's celestials (once).
-    async fn ensure_loaded(&self, system_id: i64) -> Result<()> {
-        if self.systems.lock().unwrap().contains_key(&system_id) {
-            return Ok(());
-        }
+/// Actor facade. Actor closures must never await, access the DB or call World.
+pub struct World {
+    db: Db,
+    systems: Arc<Mutex<HashMap<i64, SystemHandle>>>,
+    loads: Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>,
+    observers: Mutex<HashMap<i64, i64>>,
+    pilots: Arc<Pilots>,
+}
+impl World {
+    pub fn new(db: Db, capacity: usize) -> Arc<Self> {
+        Arc::new(Self { db, systems: Default::default(), loads: Default::default(),
+            observers: Default::default(), pilots: Arc::new(Pilots { capacity, ..Pilots::default() }) })
+    }
+    pub fn register_pilot(&self, char_id: i64, tx: NotifyTx) { self.pilots.register_pilot(char_id, tx); }
+    pub fn unregister_pilot(&self, char_id: i64) { self.pilots.unregister_pilot(char_id); }
+    pub fn notify_pilot(&self, char_id: i64, name: &str, args: Vec<Value>) { self.pilots.notify_pilot(char_id, name, args); }
+    /// Start the destination before removing a jumping ship from its source.
+    /// Database loading is serialized per system, outside the actor.
+    pub async fn system(&self, system_id: i64) -> Result<()> {
+        if self.running(system_id).is_some() { return Ok(()); }
+        let load = self.loads.lock().unwrap().entry(system_id).or_default().clone();
+        let _guard = load.lock().await;
+        if self.running(system_id).is_some() { return Ok(()); }
         let rows = self
             .db
             .client
             .query(
-                "SELECT c.item_id, c.type_id, COALESCE(c.radius, t.radius, 1000)::float8, c.x, c.y, c.z,
+                "SELECT c.item_id, c.type_id, COALESCE(c.radius, t.radius, $2::float8)::float8, c.x, c.y, c.z,
                         COALESCE(s.owner_id, 1)::bigint, c.group_id::bigint,
                         g.dest_stargate_id::bigint, g.dest_solar_system_id::bigint
                  FROM sde.map_celestials c JOIN sde.inv_types t USING (type_id)
                  LEFT JOIN sde.sta_stations s ON s.station_id = c.item_id
                  LEFT JOIN sde.map_stargates g ON g.stargate_id = c.item_id
                  WHERE c.solar_system_id = $1",
-                &[&(system_id as i32)],
+                &[&(system_id as i32), &CELESTIAL_FALLBACK_RADIUS],
             )
             .await?;
-        let tick = now_tick();
-        let mut balls = HashMap::new();
+        let tick = now_ms();
+        let mut system = System::new(system_id, self.pilots.clone());
         for r in rows {
             let id: i64 = r.get(0);
             let mut slim = Vec::new();
@@ -478,8 +518,7 @@ impl World {
                 slim.push(("destinationSuppressionStageAndMaximum", pair()));
                 slim.push(("localSuppressionStageAndMaximum", pair()));
             }
-            balls.insert(
-                id,
+            system.insert(
                 Ball {
                     id,
                     type_id: r.get::<_, Option<i32>>(1).unwrap_or(0),
@@ -487,15 +526,16 @@ impl World {
                     corp_id: r.get(6),
                     alliance_id: -1,
                     char_id: None,
+                    signature_radius: None,
                     mode: MODE_RIGID,
                     radius: r.get::<_, f64>(2) as f32,
-                    mass: 1e34,
+                    mass: CELESTIAL_STATIC_MASS,
                     max_vel: 0.0,
                     agility: 1.0,
                     speed_fraction: 0.0,
                     pos: [r.get(3), r.get(4), r.get(5)],
-                    vel: [0.0; 3],
-                    goto: [0.0; 3],
+                    vel: V3::default(),
+                    goto: V3::default(),
                     follow_id: 0,
                     follow_range: 0.0,
                     free: false,
@@ -503,7 +543,7 @@ impl World {
                     massive: true,
                     warp: None,
                     warp_factor: 0,
-                    last_tick: tick,
+                    last_ms: tick,
                     cloak: 0,
                     cloak_until: 0,
                     health: [1.0; 3],
@@ -512,185 +552,96 @@ impl World {
                 },
             );
         }
-        info!("loaded solar system {system_id} with {} celestials", balls.len());
-        self.systems.lock().unwrap().entry(system_id).or_insert(System { balls, observers: HashMap::new() });
+        info!("loaded solar system {system_id} with {} celestials", system.balls().count());
+
+        let handle = actor::start(system, system_id, Arc::downgrade(&self.systems));
+        self.systems.lock().unwrap().insert(system_id, handle);
         Ok(())
     }
-
-    /// Every ball in `system_id`, evolved to now.
-    pub fn balls_snapshot(&self, system_id: i64) -> Option<HashMap<i64, Ball>> {
-        let mut s = self.systems.lock().unwrap();
-        let sys = s.get_mut(&system_id)?;
-        sys.evolve_all(now_tick());
-        Some(sys.balls.clone())
+    fn running(&self, id: i64) -> Option<SystemHandle> {
+        let mut systems = self.systems.lock().unwrap();
+        if systems.get(&id).is_some_and(|h| h.is_closed()) { systems.remove(&id); }
+        systems.get(&id).cloned()
     }
-
-    pub async fn ball(&self, system_id: i64, id: i64) -> Option<Ball> {
-        let mut s = self.systems.lock().unwrap();
-        let sys = s.get_mut(&system_id)?;
-        sys.evolve_all(now_tick());
-        sys.balls.get(&id).cloned()
+    /// No implicit loading. A missing/dead actor returns None.
+    pub async fn with<R: Send + 'static>(&self, id: i64, f: impl FnOnce(&mut System) -> R + Send + 'static) -> Option<R> {
+        let handle = self.running(id)?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        handle.send(Box::new(move |s| { let _ = tx.send(f(s)); })).ok()?;
+        rx.await.ok()
     }
-
-    /// Put a ship ball into a system and tell everyone already there.
-    pub async fn add_ship(&self, system_id: i64, ball: Ball) -> Result<()> {
-        self.ensure_loaded(system_id).await?;
-        let mut s = self.systems.lock().unwrap();
-        let sys = s.get_mut(&system_id).unwrap();
-        let tick = now_tick();
-        sys.evolve_all(tick);
-        // A cloaked arrival is only for its pilot, who gets it with SetState.
-        if ball.cloak == 0 {
-            sys.broadcast(vec![add_balls_event(tick, &ball)]);
+    /// No implicit loading; no-op if the system is not running.
+    pub fn post(&self, id: i64, f: impl FnOnce(&mut System) + Send + 'static) {
+        if let Some(handle) = self.running(id) { let _ = handle.send(Box::new(f)); }
+    }
+    /// No implicit loading; no-op if the system is not running. The delay starts
+    /// when the actor processes this message; the closure runs on a due tick (D3).
+    pub fn schedule(&self, system: i64, delay_ms: u64, f: impl FnOnce(&mut System) + Send + 'static) {
+        self.post(system, move |s| s.schedule(delay_ms, f));
+    }
+    /// Wait for a timer tick without loading a missing system.
+    pub async fn after(&self, system: i64, delay_ms: u64) -> bool {
+        actor::after(self.running(system), delay_ms).await
+    }
+    pub async fn ball(&self, system: i64, id: i64) -> Option<Ball> {
+        self.with(system, move |s| s.ball(id).cloned()).await.flatten()
+    }
+    pub async fn add_ship(&self, system: i64, ball: Ball) -> Result<()> {
+        self.system(system).await?;
+        self.with(system, move |s| s.add_ship(ball)).await.ok_or_else(|| anyhow::anyhow!("system actor stopped"))
+    }
+    pub async fn remove_ball(&self, system: i64, id: i64) -> Option<Ball> {
+        self.with(system, move |s| s.remove_ball(id)).await.flatten()
+    }
+    pub async fn destroy_ball(&self, system: i64, id: i64) -> Option<Ball> {
+        self.with(system, move |s| s.destroy_ball(id)).await.flatten()
+    }
+    pub async fn uncloak(&self, system: i64, id: i64) -> bool {
+        self.with(system, move |s| s.uncloak(id)).await.unwrap_or(false)
+    }
+    pub async fn request_entry(&self, system: i64, pilot: i64) -> Result<(), i64> {
+        self.with(system, move |s| s.request_entry(pilot)).await.unwrap_or(Err(1))
+    }
+    pub fn set_health(&self, system: i64, id: i64, health: [f64; DAMAGE_LAYER_COUNT]) {
+        self.post(system, move |s| s.set_health(id, health));
+    }
+    pub fn broadcast(&self, system: i64, about: i64, events: Vec<Value>) {
+        self.post(system, move |s| s.broadcast(about, events));
+    }
+    pub fn command(&self, system: i64, ship: i64, f: impl FnOnce(&mut Ball, i64, &System) -> Vec<Value> + Send + 'static) {
+        self.post(system, move |s| s.command(ship, f));
+    }
+    pub async fn observe(&self, system: i64, client: i64, ego: i64, tx: DestinyTx) -> Result<Value> {
+        self.system(system).await?;
+        let previous = self.observers.lock().unwrap().insert(client, system);
+        if let Some(previous) = previous.filter(|&p| p != system) {
+            self.with(previous, move |s| s.unobserve(client)).await;
         }
-        sys.balls.insert(ball.id, ball);
-        Ok(())
+        self.with(system, move |s| s.observe(client, ego, tx)).await.ok_or_else(|| anyhow::anyhow!("system actor stopped"))
+    }
+    pub fn unobserve(&self, client: i64) {
+        let system = self.observers.lock().unwrap().remove(&client);
+        if let Some(system) = system { self.post(system, move |s| s.unobserve(client)); }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn seconds_to_milliseconds_preserves_fractions() {
+        assert_eq!(seconds_to_ms_f64(0.0015), 1.5);
+        assert_eq!(seconds_to_ms_f64(-0.0015), -1.5);
+        assert_eq!(seconds_to_ms(0.0015), 1);
     }
 
-    /// Remove a ball (docking, jumping, logoff) and tell observers.
-    pub fn remove_ball(&self, system_id: i64, id: i64) -> Option<Ball> {
-        let b = {
-            let mut s = self.systems.lock().unwrap();
-            let sys = s.get_mut(&system_id)?;
-            sys.evolve_all(now_tick());
-            let b = sys.balls.remove(&id);
-            sys.observers.retain(|_, (ego, _)| *ego != id);
-            if b.as_ref().is_some_and(|b| b.cloak == 0) {
-                sys.broadcast(vec![event(now_tick(), "RemoveBalls", vec![Value::list([Value::Int(id)])])]);
-            }
-            b
-        };
-        // Someone left: room for whoever is queued to jump in.
-        self.pump_queue(system_id);
-        b
-    }
 
-    /// Blow a ball up: everyone sees it explode (TerminalPlayDestructionEffect with
-    /// destructionType.EXPLOSION, in the same batch as its RemoveBalls; michelle.DoDestinyUpdate).
-    pub fn destroy_ball(&self, system_id: i64, id: i64) -> Option<Ball> {
-        let mut s = self.systems.lock().unwrap();
-        let sys = s.get_mut(&system_id)?;
-        let tick = now_tick();
-        sys.evolve_all(tick);
-        let b = sys.balls.remove(&id)?;
-        sys.broadcast(vec![
-            event(tick, "TerminalPlayDestructionEffect", vec![Value::Int(id), Value::Int(3)]),
-            event(tick, "RemoveBalls", vec![Value::list([Value::Int(id)])]),
-        ]);
-        Some(b)
-    }
-
-    /// Update a ball's damage state and tell everyone who can see it.
-    pub fn set_health(&self, system_id: i64, id: i64, health: [f64; 3]) {
-        let mut s = self.systems.lock().unwrap();
-        let Some(sys) = s.get_mut(&system_id) else { return };
-        let Some(b) = sys.balls.get_mut(&id) else { return };
-        b.health = health;
-        let b = b.clone();
-        sys.broadcast_about(&b, vec![event(now_tick(), "OnDamageStateChange", vec![Value::Int(id), b.damage_state()])]);
-    }
-
-    /// Broadcast destiny events about `about` (special effects...) without changing it.
-    pub fn broadcast(&self, system_id: i64, about: i64, events: Vec<Value>) {
-        let s = self.systems.lock().unwrap();
-        let Some(sys) = s.get(&system_id) else { return };
-        match sys.balls.get(&about) {
-            Some(b) => sys.broadcast_about(b, events),
-            None => sys.broadcast(events),
-        }
-    }
-
-    /// Drop `ship`'s cloak: its pilot's park uncloaks it, everyone else has it added.
-    /// Returns whether it was cloaked.
-    pub fn uncloak(&self, system_id: i64, ship: i64) -> bool {
-        let mut s = self.systems.lock().unwrap();
-        let Some(sys) = s.get_mut(&system_id) else { return false };
-        let tick = now_tick();
-        sys.evolve_all(tick);
-        let Some(ball) = sys.balls.get_mut(&ship) else { return false };
-        if ball.cloak == 0 {
-            return false;
-        }
-        ball.cloak = 0;
-        let add = add_balls_event(tick, ball);
-        let own = event(tick, "UncloakBall", vec![Value::Int(ship)]);
-        for (ego, tx) in sys.observers.values() {
-            let _ = tx.send(vec![if *ego == ship { own.clone() } else { add.clone() }]);
-        }
-        true
-    }
-
-    /// Lapse an arrival cloak set to end at `until`, unless it was already dropped or renewed.
-    pub fn expire_cloak(&self, system_id: i64, ship: i64, until: i64) -> bool {
-        let current = self.systems.lock().unwrap().get(&system_id).and_then(|s| s.balls.get(&ship)).map(|b| (b.cloak, b.cloak_until));
-        match current {
-            Some((cloak, end)) if cloak != 0 && end == until => self.uncloak(system_id, ship),
-            _ => false,
-        }
-    }
-
-    /// Register a client as watching `system_id` with `ego` as its ship and
-    /// return the SetState event for it.
-    pub async fn observe(&self, system_id: i64, client_id: i64, ego: i64, tx: DestinyTx) -> Result<Value> {
-        self.ensure_loaded(system_id).await?;
-        let mut s = self.systems.lock().unwrap();
-        let sys = s.get_mut(&system_id).unwrap();
-        let tick = now_tick();
-        sys.evolve_all(tick);
-        sys.observers.insert(client_id, (ego, tx));
-        let mut state = vec![DESTINY_FULLSTATE];
-        state.extend_from_slice(&(tick as i32).to_le_bytes());
-        let mut slims = Vec::new();
-        let mut damage = Vec::new();
-        for b in sys.balls.values().filter(|b| b.cloak == 0 || b.id == ego) {
-            b.write(&mut state);
-            slims.push(b.slim_item());
-            if b.free {
-                damage.push((Value::Int(b.id), b.damage_state()));
-            }
-        }
-        let sol = Value::instance(
-            "eve.common.script.util.slimItem.SlimItem",
-            [("itemID", Value::Int(system_id)), ("typeID", Value::Int(5)), ("ownerID", Value::Int(1))],
-        );
-        let bag = Value::instance(
-            "utillib.KeyVal",
-            [
-                ("state", Value::str(state)),
-                ("ego", Value::Int(ego)),
-                ("slims", Value::List(slims)),
-                ("damageState", Value::Dict(damage)),
-                ("effectStates", Value::list([])),
-                ("allianceBridges", Value::list([])),
-                ("droneState", Value::list([])),
-                ("solItem", sol),
-                ("industryLevel", Value::Int(0)),
-                ("researchLevel", Value::Int(0)),
-                ("dbuffState", Value::list([])),
-            ],
-        );
-        Ok(event(tick, "SetState", vec![bag]))
-    }
-
-    pub fn unobserve(&self, client_id: i64) {
-        for sys in self.systems.lock().unwrap().values_mut() {
-            sys.observers.remove(&client_id);
-        }
-    }
-
-    /// Apply a movement command to `ship` and broadcast the matching destiny event(s).
-    pub fn command(&self, system_id: i64, ship: i64, f: impl FnOnce(&mut Ball, i64, &HashMap<i64, Ball>) -> Vec<Value>) -> Option<Ball> {
-        let mut s = self.systems.lock().unwrap();
-        let sys = s.get_mut(&system_id)?;
-        let tick = now_tick();
-        sys.evolve_all(tick);
-        let others = sys.balls.clone();
-        let ball = sys.balls.get_mut(&ship)?;
-        let events = f(ball, tick, &others);
-        let snapshot = ball.clone();
-        if !events.is_empty() {
-            sys.broadcast_about(&snapshot, events);
-        }
-        Some(snapshot)
+    #[test]
+    fn lock_time_clamps_floors_and_calculates_interior() {
+        assert_eq!(lock_time_ms(1.0, 1.0), 60_000);
+        assert_eq!(lock_time_ms(1e9, 1e9), 500);
+        assert_eq!(lock_time_ms(-10.0, 0.0), lock_time_ms(1.0, 1.0));
+        let expected = (40_000.0 / (200.0 * 50.0_f64.asinh().powi(2)) * 1000.0) as u64;
+        assert_eq!(lock_time_ms(200.0, 50.0), expected);
     }
 }

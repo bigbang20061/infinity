@@ -9,8 +9,26 @@ use anyhow::{anyhow, bail, Context, Result};
 use marshal::Value;
 use tracing::{info, warn};
 
+/// Client GPS compatibility handshake secret key.
 const HANDSHAKE_SECRET_KEY: i64 = 170472;
-const PASSWORD_VERSION: i64 = 2; // client sends a hash, never the plaintext
+/// Client GPS password version: the client sends a hash, not plaintext.
+const PASSWORD_VERSION: i64 = 2;
+/// Client GPS compatibility request tuple length.
+const COMPATIBILITY_FIELDS: usize = 6;
+/// Server Placebo handshake challenge length in bytes.
+const SERVER_CHALLENGE_BYTES: usize = 64;
+/// CRC-CCITT as used by Python binascii.crc_hqx.
+const CRC_BITS_PER_BYTE: u32 = 8;
+/// CRC-CCITT high bit used by binascii.crc_hqx.
+const CRC_HIGH_BIT: u16 = 0x8000;
+/// CRC-CCITT polynomial used by binascii.crc_hqx.
+const CRC_POLYNOMIAL: u16 = 0x1021;
+/// Server random identifier policy: discard two high bits to keep IDs positive.
+const RANDOM_ID_SHIFT: u32 = 2;
+/// Server GPS response: the first logon queue position.
+const LOGON_QUEUE_POSITION: i64 = 1;
+/// CPython marshal string encoding of the handshake function expression `{}`.
+const HANDSHAKE_FUNCTION: &[u8] = b"s\x02\x00\x00\x00{}";
 
 /// What a finished handshake hands to the session layer.
 pub struct Login {
@@ -30,9 +48,9 @@ pub fn placebo_hash(args: Vec<Value>) -> Value {
 /// CRC-CCITT as in `binascii.crc_hqx` (poly 0x1021, MSB first).
 fn crc_hqx(data: &[u8], mut crc: u16) -> u16 {
     for &b in data {
-        crc ^= (b as u16) << 8;
-        for _ in 0..8 {
-            crc = if crc & 0x8000 != 0 { (crc << 1) ^ 0x1021 } else { crc << 1 };
+        crc ^= (b as u16) << CRC_BITS_PER_BYTE;
+        for _ in 0..CRC_BITS_PER_BYTE {
+            crc = if crc & CRC_HIGH_BIT != 0 { (crc << 1) ^ CRC_POLYNOMIAL } else { crc << 1 };
         }
     }
     crc
@@ -64,7 +82,7 @@ pub async fn run(conn: &mut Conn, cfg: &Config, db: &Db, client_id: i64) -> Resu
         // Step 1: client compatibility tuple.
         let Some(step1) = conn.recv().await? else { return Ok(None) };
         let s1 = step1.items().ok_or_else(|| anyhow!("step1 is not a tuple: {step1:?}"))?;
-        if s1.len() != 6 || s1[0].as_int() != Some(HANDSHAKE_SECRET_KEY) {
+        if s1.len() != COMPATIBILITY_FIELDS || s1[0].as_int() != Some(HANDSHAKE_SECRET_KEY) {
             bail!("bad compatibility handshake: {step1:?}");
         }
         if s1[1].as_int() != Some(cfg.macho_version) || s1[4].as_int() != Some(cfg.boot_build) {
@@ -79,7 +97,7 @@ pub async fn run(conn: &mut Conn, cfg: &Config, db: &Db, client_id: i64) -> Resu
         }
         if is_marker(&step2, "QC") {
             info!("status probe from {}", conn.peer);
-            conn.send(&Value::Int(1)).await?; // logon queue position
+            conn.send(&Value::Int(LOGON_QUEUE_POSITION)).await?; // logon queue position
             continue;
         }
         // (publicKeyVersion, cryptoRequest) -> placebo context needs nothing.
@@ -107,13 +125,13 @@ pub async fn run(conn: &mut Conn, cfg: &Config, db: &Db, client_id: i64) -> Resu
             ("boot_region", Value::str(&cfg.boot_region)),
             ("cluster_usercount", Value::Int(db.online_count())),
             ("proxy_nodeid", Value::Int(cfg.node_id)),
-            ("user_logonqueueposition", Value::Int(1)),
+            ("user_logonqueueposition", Value::Int(LOGON_QUEUE_POSITION)),
             ("config_vals", cfg.global_config()),
         ]);
         // Placebo Sign(x) == (x, 0). The "handshake function" is CPython-marshalled
         // and eval()'d by the client; the string "{}" evaluates to an empty dict.
-        let handshake_func = Value::str(b"s\x02\x00\x00\x00{}");
-        let server_challenge = Value::str(vec![0u8; 64]);
+        let handshake_func = Value::str(HANDSHAKE_FUNCTION);
+        let server_challenge = Value::str(vec![0u8; SERVER_CHALLENGE_BYTES]);
         conn.send(&Value::tuple([server_challenge, Value::tuple([handshake_func, Value::Int(0)]), Value::Dict(vec![]), response]))
             .await?;
 
@@ -168,7 +186,7 @@ pub fn rand_i64() -> i64 {
     use std::hash::{BuildHasher, Hasher};
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
     h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
-    (h.finish() >> 2) as i64
+    (h.finish() >> RANDOM_ID_SHIFT) as i64
 }
 
 #[cfg(test)]

@@ -6,9 +6,10 @@
 //! carry the fleet in their session (fleetid, wingid, squadid, fleetrole), which also puts
 //! them in the fleet chat channel; joins, departures and changes are pushed to every member
 //! (OnFleetJoin, OnFleetLeave, OnFleetMemberChanged...). A pilot who logs off leaves.
-//! Fleet warps, boosts, ads and the fleet finder aren't supported.
+//! The fleet finder returns an empty advert dictionary: fleets are not advertised.
+//! Fleet warps, boosts and advertising are not supported.
 
-use super::{keyval, Call, CallError, CallResult};
+use super::{keyval, notify_error, value_text, Call, CallError, CallResult};
 use crate::client::Client;
 use crate::space::World;
 use marshal::Value;
@@ -17,16 +18,24 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use tracing::info;
 
-// evefleet.const
+/// Client evefleet.const fleet leader role.
 const ROLE_LEADER: i64 = 1;
+/// Client evefleet.const fleet member role.
 const ROLE_MEMBER: i64 = 4;
+/// Client evefleet.const no fleet job.
 const JOB_NONE: i64 = 0;
+/// Client evefleet.const fleet creator job.
 const JOB_CREATOR: i64 = 2;
+/// Client evefleet.const absent wing or squad ID.
 const NONE_ID: i64 = -1;
+/// Server fleet policy: maximum fleet membership.
 const MAX_MEMBERS: usize = 256;
+/// Server fleet policy: maximum wing and squad name length.
 const MAX_NAME_LENGTH: usize = 20;
+/// Server allocation policy: first process-local fleet, wing or squad ID.
+const FIRST_FLEET_ID: i64 = 1;
 
-static NEXT_ID: AtomicI64 = AtomicI64::new(1);
+static NEXT_ID: AtomicI64 = AtomicI64::new(FIRST_FLEET_ID);
 
 #[derive(Clone)]
 struct Member {
@@ -70,10 +79,6 @@ fn state() -> MutexGuard<'static, State> {
 
 fn next_id() -> i64 {
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
-}
-
-fn notify_error(text: &str) -> CallError {
-    CallError::User { msg: "CustomNotify".into(), dict: vec![("notify".into(), Value::unicode(text))] }
 }
 
 fn member_value(char_id: i64, m: &Member) -> Value {
@@ -464,7 +469,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         // ChangeWingName(wingID, name) / ChangeSquadName(squadID, name)
         "ChangeWingName" | "ChangeSquadName" => {
             let id = int(0).unwrap_or(0);
-            let name: String = call.args.get(1).and_then(|v| v.as_text()).map(|t| t.chars().take(MAX_NAME_LENGTH).collect()).unwrap_or_default();
+            let name = value_text(call.args.get(1), MAX_NAME_LENGTH);
             let mut st = state();
             match st.fleets.get_mut(&fleet_id) {
                 Some(f) if is_leader(f, me) => {

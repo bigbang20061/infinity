@@ -2,8 +2,9 @@
 //! Formulas match characterskills/util.py: SP(level) = ceil(250 * rank * 2^(2.5(level-1))),
 //! SP/minute = primary + secondary / 2.
 
-use super::{keyval, Call, CallError, CallResult};
+use super::{db_err, keyval, Call, CallError, CallResult};
 use crate::client::{filetime_now, short, Client};
+use crate::consts::FILETIME_MINUTE;
 use marshal::Value;
 use std::collections::HashMap;
 use tracing::{info, warn};
@@ -11,22 +12,38 @@ use tracing::{info, warn};
 /// Internal bound-object name for skillMgr2.GetMySkillHandler.
 pub const SKILL_HANDLER: &str = "skillHandler";
 
+/// SDE dgmAttributeTypes: primaryAttribute.
 const ATTR_PRIMARY: i32 = 180;
+/// SDE dgmAttributeTypes: secondaryAttribute.
 const ATTR_SECONDARY: i32 = 181;
+/// SDE dgmAttributeTypes: skillTimeConstant.
 const ATTR_RANK: i32 = 275;
-const FILETIME_PER_MINUTE: f64 = 60.0 * 10_000_000.0;
-/// Attribute IDs charisma..willpower.
-pub const CHAR_ATTRIBUTES: [i64; 5] = [164, 165, 166, 167, 168];
-
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
+/// Server fallback rank when an SDE skill rank attribute is missing.
+const FALLBACK_SKILL_RANK: f64 = 1.0;
+/// SDE dgmAttributeTypes: charisma, intelligence, memory, perception, willpower.
+const CHAR_ATTRIBUTES: [i64; 5] = [164, 165, 166, 167, 168];
+/// Client characterskills/util.py skill point formula base.
+const SKILL_POINT_BASE: f64 = 250.0;
+/// Client characterskills/util.py skill point formula exponential base.
+const SKILL_LEVEL_BASE: f64 = 2.0;
+/// Client characterskills/util.py skill point formula exponent multiplier.
+const SKILL_LEVEL_EXPONENT: f64 = 2.5;
+/// Client characterskills/util.py maximum trained skill level.
+const MAX_SKILL_LEVEL: i64 = 5;
+/// Server fallback for missing SDE bloodline attributes.
+const FALLBACK_BLOODLINE_ATTRIBUTE: i32 = 5;
+/// Server character attribute calculation offset.
+const CHARACTER_ATTRIBUTE_OFFSET: f64 = 17.0;
+/// Server fallback for missing training attributes.
+const FALLBACK_TRAINING_ATTRIBUTE: f64 = 20.0;
+/// Client characterskills/util.py secondary attribute divisor.
+const SECONDARY_ATTRIBUTE_DIVISOR: f64 = 2.0;
 
 pub fn sp_for_level(rank: f64, level: i64) -> i64 {
     if level <= 0 {
         return 0;
     }
-    (250.0 * rank * 2f64.powf(2.5 * (level.min(5) - 1) as f64)).ceil() as i64
+    (SKILL_POINT_BASE * rank * SKILL_LEVEL_BASE.powf(SKILL_LEVEL_EXPONENT * (level.min(MAX_SKILL_LEVEL) - 1) as f64)).ceil() as i64
 }
 
 /// Character attribute values {attributeID: value}.
@@ -41,7 +58,7 @@ pub async fn character_attributes(c: &Client, char_id: i64) -> Result<HashMap<i6
         )
         .await
         .map_err(db_err)?;
-    Ok(CHAR_ATTRIBUTES.iter().enumerate().map(|(i, a)| (*a, r.get::<_, Option<i32>>(i).unwrap_or(5) as f64 + 17.0)).collect())
+    Ok(CHAR_ATTRIBUTES.iter().enumerate().map(|(i, a)| (*a, r.get::<_, Option<i32>>(i).unwrap_or(FALLBACK_BLOODLINE_ATTRIBUTE) as f64 + CHARACTER_ATTRIBUTE_OFFSET)).collect())
 }
 
 struct SkillType {
@@ -60,7 +77,7 @@ async fn skill_type(c: &Client, type_id: i32) -> Result<SkillType, CallError> {
         )
         .await
         .map_err(db_err)?;
-    let mut t = SkillType { rank: 1.0, primary: 165, secondary: 166 };
+    let mut t = SkillType { rank: FALLBACK_SKILL_RANK, primary: CHAR_ATTRIBUTES[1], secondary: CHAR_ATTRIBUTES[2] };
     for r in rows {
         let v: f64 = r.get(1);
         match r.get::<_, i32>(0) {
@@ -168,10 +185,10 @@ async fn skills_dict(c: &Client, char_id: i64) -> Result<Value, CallError> {
         .db
         .client
         .query(
-            "SELECT s.type_id, s.level, s.skill_points, COALESCE(a.value, 1)
+            "SELECT s.type_id, s.level, s.skill_points, COALESCE(a.value, $3::float8)
              FROM game.skills s LEFT JOIN sde.type_attributes a ON a.type_id = s.type_id AND a.attribute_id = $2
              WHERE s.character_id = $1",
-            &[&char_id, &ATTR_RANK],
+            &[&char_id, &ATTR_RANK, &FALLBACK_SKILL_RANK],
         )
         .await
         .map_err(db_err)?;
@@ -278,9 +295,9 @@ async fn save_queue(c: &Client, char_id: i64, queue: &Value, activate: bool) -> 
         let (cur_level, cur_sp) = current.get(&(type_id as i32)).copied().unwrap_or((0, 0));
         let start_sp = if cur_level as i64 == to_level - 1 { cur_sp.max(sp_for_level(st.rank, to_level - 1)) } else { sp_for_level(st.rank, to_level - 1) };
         let dest_sp = sp_for_level(st.rank, to_level);
-        let rate = attrs.get(&st.primary).copied().unwrap_or(20.0) + attrs.get(&st.secondary).copied().unwrap_or(20.0) / 2.0;
+        let rate = attrs.get(&st.primary).copied().unwrap_or(FALLBACK_TRAINING_ATTRIBUTE) + attrs.get(&st.secondary).copied().unwrap_or(FALLBACK_TRAINING_ATTRIBUTE) / SECONDARY_ATTRIBUTE_DIVISOR;
         let (start, end) = if activate {
-            let end = t + (((dest_sp - start_sp).max(0) as f64 / rate) * FILETIME_PER_MINUTE) as i64;
+            let end = t + (((dest_sp - start_sp).max(0) as f64 / rate) * FILETIME_MINUTE as f64) as i64;
             let s = t;
             t = end;
             (Some(s), Some(end))

@@ -14,30 +14,45 @@
 //! that traded on the retail market, at one LP per 2,000 ISK of retail value plus 1,000 ISK
 //! per LP.
 
-use super::{keyval, rowset, Call, CallError, CallResult};
+use super::{db_err, keyval, notify_error, rowset, Call, CallError, CallResult};
 use crate::client::Client;
 use crate::db::Db;
 use crate::space::World;
 use marshal::Value;
 use tracing::info;
 
-/// A completed mission's standing gain with the agent's corporation per agent level;
-/// the agent gets twice that, the faction a fifth.
+/// Server mission policy: corporation gain per agent level.
 const MISSION_CORP_GAIN: f64 = 0.01;
-/// Declining or quitting a mission.
+/// Server mission policy: decline or quit standing loss.
 const DECLINE_LOSS: f64 = -0.01;
-/// LP store pricing: ISK of retail value per LP, and ISK charged per LP.
+/// Server LP store policy: retail ISK value per LP.
 const ISK_VALUE_PER_LP: f64 = 2000.0;
+/// Server LP store policy: ISK charged per LP.
 const ISK_PER_LP: i64 = 1000;
+/// SDE metaGroups: faction.
 const META_GROUP_FACTION: f64 = 4.0;
-
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
-
-fn notify_error(text: &str) -> CallError {
-    CallError::User { msg: "CustomNotify".into(), dict: vec![("notify".into(), Value::unicode(text))] }
-}
+/// Client standings convention: absolute standing limit.
+const STANDING_LIMIT: f64 = 10.0;
+/// Client standingsvc.GetEffectiveStandingWithAgent rejection threshold.
+const AGENT_STANDING_REJECTION: f64 = -2.0;
+/// Server mission policy: agent gain multiplier.
+const MISSION_AGENT_GAIN_MULTIPLIER: f64 = 2.0;
+/// Server mission policy: faction gain divisor.
+const MISSION_FACTION_GAIN_DIVISOR: f64 = 5.0;
+/// Server LP store policy: offer prices are rounded to this LP increment.
+const LP_PRICE_INCREMENT: i64 = 25;
+/// Server LP store policy: minimum LP price.
+const MIN_LP_PRICE: i64 = 100;
+/// Server LP store policy: maximum quantity per purchase.
+const MAX_OFFER_COUNT: i64 = 1000;
+/// Client standingsvc agent access: required standing for levels 2 through 5.
+const AGENT_LEVEL_STANDINGS: [f64; 4] = [1.0, 3.0, 5.0, 7.0];
+/// Client standingsvc agent access: level two.
+const AGENT_LEVEL_TWO: i64 = 2;
+/// Client standingsvc agent access: level three.
+const AGENT_LEVEL_THREE: i64 = 3;
+/// Client standingsvc agent access: level four.
+const AGENT_LEVEL_FOUR: i64 = 4;
 
 pub async fn standing(db: &Db, char_id: i64, from: i64) -> Result<f64, CallError> {
     Ok(db
@@ -55,7 +70,7 @@ pub async fn modify(db: &Db, world: &World, char_id: i64, from: i64, change: f64
         return Ok(());
     }
     let old = standing(db, char_id, from).await?;
-    let new = if change > 0.0 { old + (10.0 - old) * change } else { old + (10.0 + old) * change }.clamp(-10.0, 10.0);
+    let new = if change > 0.0 { old + (STANDING_LIMIT - old) * change } else { old + (STANDING_LIMIT + old) * change }.clamp(-STANDING_LIMIT, STANDING_LIMIT);
     db.client
         .execute(
             "INSERT INTO game.standings (char_id, from_id, standing) VALUES ($1, $2, $3)
@@ -73,26 +88,26 @@ pub async fn modify(db: &Db, world: &World, char_id: i64, from: i64, change: f64
 pub async fn effective(db: &Db, char_id: i64, agent: i64, corp: i64, faction: i64) -> Result<f64, CallError> {
     let s = [standing(db, char_id, faction).await?, standing(db, char_id, corp).await?, standing(db, char_id, agent).await?];
     let min = s.iter().copied().fold(f64::INFINITY, f64::min);
-    Ok(if min <= -2.0 { min } else { s.iter().copied().fold(f64::NEG_INFINITY, f64::max) })
+    Ok(if min <= AGENT_STANDING_REJECTION { min } else { s.iter().copied().fold(f64::NEG_INFINITY, f64::max) })
 }
 
 /// The effective standing an agent of `level` asks for.
 pub fn required_for_level(level: i64) -> f64 {
     match level {
         ..=1 => f64::NEG_INFINITY,
-        2 => 1.0,
-        3 => 3.0,
-        4 => 5.0,
-        _ => 7.0,
+        AGENT_LEVEL_TWO => AGENT_LEVEL_STANDINGS[0],
+        AGENT_LEVEL_THREE => AGENT_LEVEL_STANDINGS[1],
+        AGENT_LEVEL_FOUR => AGENT_LEVEL_STANDINGS[2],
+        _ => AGENT_LEVEL_STANDINGS[3],
     }
 }
 
 /// A mission was completed for an agent of `level`.
 pub async fn mission_completed(db: &Db, world: &World, char_id: i64, agent: i64, corp: i64, faction: i64, level: i64) -> Result<(), CallError> {
     let gain = MISSION_CORP_GAIN * level.max(1) as f64;
-    modify(db, world, char_id, agent, gain * 2.0).await?;
+    modify(db, world, char_id, agent, gain * MISSION_AGENT_GAIN_MULTIPLIER).await?;
     modify(db, world, char_id, corp, gain).await?;
-    modify(db, world, char_id, faction, gain / 5.0).await
+    modify(db, world, char_id, faction, gain / MISSION_FACTION_GAIN_DIVISOR).await
 }
 
 /// A mission was declined or quit.
@@ -154,7 +169,7 @@ async fn offers(db: &Db, corp: i64) -> Result<Vec<(i32, i64, i64)>, CallError> {
     Ok(rows
         .iter()
         .map(|r| {
-            let lp = (((r.get::<_, f64>(1) / ISK_VALUE_PER_LP) / 25.0).round() as i64 * 25).max(100);
+            let lp = (((r.get::<_, f64>(1) / ISK_VALUE_PER_LP) / LP_PRICE_INCREMENT as f64).round() as i64 * LP_PRICE_INCREMENT).max(MIN_LP_PRICE);
             (r.get(0), lp, lp * ISK_PER_LP)
         })
         .collect())
@@ -168,7 +183,7 @@ async fn take_offer(c: &Client, corp: i64, offer: i64, count: i64) -> CallResult
     let Some(station) = c.session.int("stationid") else {
         return Err(notify_error("你必须停靠在空间站内才能使用忠诚点商店。"));
     };
-    let count = count.clamp(1, 1000);
+    let count = count.clamp(1, MAX_OFFER_COUNT);
     let Some((type_id, lp, isk)) = offers(db, corp).await?.into_iter().find(|o| o.0 as i64 == offer) else {
         return Err(notify_error("该兑换项已不可用。"));
     };

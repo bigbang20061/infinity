@@ -7,34 +7,32 @@
 //! (0.5) to Platinum (1.0); it runs for 12 weeks. Destroyed ships pay their owner and post an
 //! insurance payout notification.
 
-use super::{keyval, Call, CallError, CallResult};
+use super::{db_err, keyval, notify_error, value_id_list, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
+use crate::consts::{CATEGORY_SHIP, FILETIME_DAY};
 use crate::db::Db;
 use crate::space::World;
 use marshal::Value;
 use tracing::info;
 
-const DAY: i64 = 864_000_000_000;
+/// Server insurance policy: twelve-week contract duration.
 const CONTRACT_DAYS: i64 = 84;
-const CATEGORY_SHIP: i32 = 6;
-// insuranceConst
+/// Client insuranceConst package price base fraction.
 const BASE_FRACTION: f64 = 0.4;
+/// Client insuranceConst package price multiplier.
 const FRACTION_INCREMENT: f64 = 0.5;
+/// Client insuranceConst insurance package payout fractions.
 const FRACTIONS: [f64; 6] = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
-// notificationconst
+/// Client notificationconst insurance payout type.
 const NOTIFICATION_PAYOUT: i32 = 35;
+/// Client notificationconst insurance issued type.
 const NOTIFICATION_ISSUED: i32 = 55;
+/// Client notificationconst insurance group.
 const NOTIFICATION_GROUP_INSURANCE: i32 = 11;
-/// The insurance company that signs contracts and payouts (Secure Commerce Commission).
+/// SDE NPC corporations: Secure Commerce Commission signs insurance.
 const INSURER: i64 = 1000132;
-
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
-
-fn notify_error(text: &str) -> CallError {
-    CallError::User { msg: "CustomNotify".into(), dict: vec![("notify".into(), Value::unicode(text))] }
-}
+/// Server insurance quote policy: permitted absolute difference in ISK.
+const QUOTE_TOLERANCE_ISK: f64 = 1.0;
 
 /// What a ship type is insured for (the payout at fraction 1.0); 0 if it can't be insured.
 async fn value(db: &Db, type_id: i32) -> Result<f64, CallError> {
@@ -77,7 +75,7 @@ async fn insure(c: &Client, call: &Call<'_>) -> CallResult {
         return Err(notify_error("只能为你自己已组装的舰船投保。"));
     }
     let full = value(db, item.type_id).await?;
-    let Some(fraction) = FRACTIONS.iter().copied().find(|f| (full * (f - BASE_FRACTION) * FRACTION_INCREMENT - amount).abs() < 1.0) else {
+    let Some(fraction) = FRACTIONS.iter().copied().find(|f| (full * (f - BASE_FRACTION) * FRACTION_INCREMENT - amount).abs() < QUOTE_TOLERANCE_ISK) else {
         return Err(notify_error("保险报价已过期，请重新打开窗口。"));
     };
     let existing = db.client.query_opt(&format!("{CONTRACT_SELECT} WHERE ship_id = $1"), &[&ship]).await.map_err(db_err)?;
@@ -90,7 +88,7 @@ async fn insure(c: &Client, call: &Call<'_>) -> CallResult {
         .execute(
             "INSERT INTO game.insurance (ship_id, owner_id, type_id, fraction, start_date, end_date) VALUES ($1, $2, $3, $4, $5, $6)
              ON CONFLICT (ship_id) DO UPDATE SET owner_id = $2, type_id = $3, fraction = $4, start_date = $5, end_date = $6",
-            &[&ship, &me, &item.type_id, &fraction, &now, &(now + CONTRACT_DAYS * DAY)],
+            &[&ship, &me, &item.type_id, &fraction, &now, &(now + CONTRACT_DAYS * FILETIME_DAY)],
         )
         .await
         .map_err(db_err)?;
@@ -114,7 +112,7 @@ pub async fn ship_destroyed(db: &Db, world: &World, ship: i64) -> Result<(), Cal
     if end < filetime_now() {
         return Ok(());
     }
-    let payout = (value(db, type_id).await? * fraction * 100.0).round() / 100.0;
+    let payout = super::market::round2(value(db, type_id).await? * fraction);
     super::market::credit(db, world, owner, payout).await?;
     let data = format!("{{amount: {payout}, itemID: {ship}, typeID: {type_id}, payout: 0}}");
     super::mail::notify(db, world, owner, NOTIFICATION_PAYOUT, NOTIFICATION_GROUP_INSURANCE, INSURER, &data).await?;
@@ -131,7 +129,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     Some(match call.method {
         "GetInsurancePrice" => value(db, call.args.first().and_then(|v| v.as_int()).unwrap_or(0) as i32).await.map(Value::Float),
         "GetInsurancePrices" => {
-            let types: Vec<i64> = call.args.first().and_then(|v| v.items()).unwrap_or(&[]).iter().filter_map(|v| v.as_int()).collect();
+            let types = value_id_list(call.args.first());
             let mut out = vec![];
             for t in types {
                 match value(db, t as i32).await {

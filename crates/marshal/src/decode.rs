@@ -3,7 +3,10 @@
 use crate::dbrow::{rle_unpack, DbRowDescriptor};
 use crate::{strings, tag, Error, Value};
 
+/// Server codec design: maximum nested objects accepted before rejecting a stream.
 const RECURSION_LIMIT: usize = 1000;
+/// Server codec design: cap initial dictionary allocation for untrusted stream counts.
+const DICT_INITIAL_CAPACITY_LIMIT: usize = 4096;
 
 /// Decode one marshal stream (`0x7E` / `0x7D` header).
 pub fn loads(buf: &[u8]) -> Result<Value, Error> {
@@ -165,7 +168,7 @@ impl<'a> Reader<'a> {
             tag::LIST1 => Value::List(vec![self.object()?]),
             tag::DICT => {
                 let n = self.size()?;
-                let mut pairs = Vec::with_capacity(n.min(4096));
+                let mut pairs = Vec::with_capacity(n.min(DICT_INITIAL_CAPACITY_LIMIT));
                 for _ in 0..n {
                     // Value is written before key.
                     let v = self.object()?;
@@ -240,7 +243,7 @@ pub(crate) fn long_from_le(b: &[u8]) -> Value {
     let mut b = b;
     while b.len() > 8 {
         let (last, prev) = (b[b.len() - 1], b[b.len() - 2]);
-        if (last == 0 && prev & 0x80 == 0) || (last == 0xFF && prev & 0x80 != 0) {
+        if crate::redundant_sign_byte(last, prev) {
             b = &b[..b.len() - 1];
         } else {
             break;

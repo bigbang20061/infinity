@@ -5,6 +5,7 @@
 //! `marshalstrings.py` swaps in a build table and immediately swaps it back, so
 //! this default is what goes over the wire. Index on the wire is 1-based.
 
+/// `MARSHAL_STRINGS` in carbonengine/blue `Marshal.cpp`, in wire index order.
 pub const STRING_TABLE: [&str; 195] = [
     "*corpid", "*locationid", "age", "Asteroid", "authentication", "ballID", "beyonce", "bloodlineID",
     "capacity", "categoryID", "character", "characterID", "characterName", "characterType", "charID",

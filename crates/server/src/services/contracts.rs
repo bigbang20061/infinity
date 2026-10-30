@@ -17,11 +17,11 @@
 //! supported yet.
 
 use super::dogma::{load_items_db, Item};
-use super::market::{credit, debit, deliver, lock, notify_error, round2, station, take_items};
-use super::{keyval, Call, CallError, CallResult};
+use super::market::{credit, debit, deliver, lock, round2, station, take_items};
+use super::{db_err, keyval, notify_error, user_error, value_id_list, value_text, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
+use crate::consts::{ACCOUNT_CASH, FILETIME_DAY, FILETIME_MINUTE, FLAG_HANGAR, IX_LOCATION_ID, LOCATION_JUNKYARD};
 use crate::db::Db;
-use crate::services::charsel::FLAG_HANGAR;
 use crate::space::World;
 use marshal::{DbRowDescriptor, DbType, Value};
 use std::collections::HashMap;
@@ -29,11 +29,9 @@ use std::sync::Arc;
 use tokio_postgres::types::ToSql;
 use tracing::{info, warn};
 
-const MINUTE: i64 = 600_000_000;
-const DAY: i64 = 864_000_000_000;
-const IX_LOCATION_ID: i64 = 3;
-const LOCATION_JUNKYARD: i64 = 10;
-const ACCOUNT_CASH: i64 = 1000;
+/// Existing server policy for auction maintenance cadence.
+const AUCTION_MAINTENANCE_INTERVAL_SECONDS: u64 = 60;
+
 const TYPE_PLASTIC_WRAP: i32 = 3468;
 
 // appConst.conType*
@@ -65,14 +63,6 @@ const NUM_CONTRACTS_BY_ADVSKILL: [i64; 6] = [21, 22, 23, 24, 25, 26];
 const CONTRACTS_PER_PAGE: usize = 100;
 const MAX_SEARCH_RESULTS: usize = 1000;
 const MAX_ITEMS: usize = 500;
-
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
-
-fn user_error(msg: &str) -> CallError {
-    CallError::User { msg: msg.into(), dict: vec![] }
-}
 
 /// Attribute of a client object: an old-style instance, a new-style one (contracts.ContractStruct
 /// pickles as a NewObj with its __dict__ as state), or a dict.
@@ -138,7 +128,7 @@ impl Contract {
     }
 
     fn overdue(&self, now: i64) -> bool {
-        self.status == STATUS_IN_PROGRESS && self.accepted + self.num_days as i64 * DAY <= now
+        self.status == STATUS_IN_PROGRESS && self.accepted + self.num_days as i64 * FILETIME_DAY <= now
     }
 
     /// May `char_id` (of `corp_id`) take this contract?
@@ -154,18 +144,18 @@ impl Contract {
             ("issuerID", int(self.issuer)),
             ("issuerCorpID", int(self.issuer_corp)),
             ("issuerAllianceID", Value::None),
-            ("issuerWalletKey", int(ACCOUNT_CASH)),
+            ("issuerWalletKey", int(ACCOUNT_CASH as i64)),
             ("forCorp", Value::Bool(false)),
             ("availability", int(if self.assignee == 0 { AVAIL_PUBLIC } else { AVAIL_MYSELF })),
             ("assigneeID", int(self.assignee)),
             ("acceptorID", int(self.acceptor)),
-            ("acceptorWalletKey", int(ACCOUNT_CASH)),
+            ("acceptorWalletKey", int(ACCOUNT_CASH as i64)),
             ("dateIssued", int(self.issued)),
             ("dateExpired", int(self.expires)),
             ("dateAccepted", int(self.accepted)),
             ("dateCompleted", int(self.completed)),
             ("numDays", int(self.num_days as i64)),
-            ("expires", int(self.accepted + self.num_days as i64 * DAY)),
+            ("expires", int(self.accepted + self.num_days as i64 * FILETIME_DAY)),
             ("startStationID", int(self.start)),
             ("startSolarSystemID", int(self.start_system)),
             ("startRegionID", int(self.start_region)),
@@ -230,7 +220,7 @@ async fn contracts(db: &Db, where_sql: &str, params: &[&(dyn ToSql + Sync)]) -> 
 }
 
 async fn contract(db: &Db, id: i64) -> Result<Contract, CallError> {
-    contracts(db, "c.contract_id = $1", &[&id]).await?.pop().ok_or_else(|| user_error("ConContractNotFound"))
+    contracts(db, "c.contract_id = $1", &[&id]).await?.pop().ok_or_else(|| user_error("ConContractNotFound", vec![]))
 }
 
 async fn set_status(db: &Db, k: &mut Contract, status: i32) -> Result<(), CallError> {
@@ -443,7 +433,7 @@ async fn create(c: &Client, info: &Value) -> CallResult {
     let corp = c.session.int("corpid").unwrap_or(0);
     let int = |k: &str| field(info, k).and_then(|v| v.as_int()).unwrap_or(0);
     let money = |k: &str| round2(field(info, k).and_then(|v| v.as_float()).unwrap_or(0.0));
-    let text = |k: &str, max: usize| field(info, k).and_then(|v| v.as_text()).map(|t| t.chars().take(max).collect::<String>()).unwrap_or_default();
+    let text = |k: &str, max: usize| value_text(field(info, k), max);
     if truthy(field(info, "forCorp")) {
         return Err(notify_error("暂不支持军团合同。"));
     }
@@ -546,7 +536,7 @@ async fn create(c: &Client, info: &Value) -> CallResult {
                     &num_days,
                     &STATUS_OUTSTANDING,
                     &now,
-                    &(now + minutes * MINUTE),
+                    &(now + minutes * FILETIME_MINUTE),
                 ],
             )
             .await
@@ -592,7 +582,7 @@ async fn accept(c: &Client, id: i64) -> CallResult {
     let mut k = contract(db, id).await?;
     let now = filetime_now();
     if k.status != STATUS_OUTSTANDING || k.expired(now) {
-        return Err(user_error("ConContractNotOutstanding"));
+        return Err(user_error("ConContractNotOutstanding", vec![]));
     }
     if k.issuer == me {
         return Err(notify_error("你不能接受自己的合同。"));
@@ -764,7 +754,7 @@ async fn place_bid(c: &Client, id: i64, amount: f64) -> CallResult {
     let mut k = contract(db, id).await?;
     let now = filetime_now();
     if k.kind != TYPE_AUCTION || k.status != STATUS_OUTSTANDING || k.expired(now) {
-        return Err(user_error("ConContractNotOutstanding"));
+        return Err(user_error("ConContractNotOutstanding", vec![]));
     }
     if k.issuer == me {
         return Err(notify_error("你不能对自己的拍卖出价。"));
@@ -813,7 +803,7 @@ async fn settle(db: &Db, world: &World, k: &mut Contract, winner: i64, amount: f
 /// Settle expired auctions with bids, once a minute.
 pub async fn settle_auctions(db: Db, world: Arc<World>) {
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(AUCTION_MAINTENANCE_INTERVAL_SECONDS)).await;
         if let Err(CallError::Internal(e)) = settle_expired(&db, &world).await {
             warn!("settling auctions failed: {e:#}");
         }
@@ -980,7 +970,7 @@ async fn needing_attention(db: &Db, me: i64) -> Result<Vec<Contract>, CallError>
         db,
         "(c.issuer_id = $1 AND ((c.status = $2 AND c.date_expired <= $3) OR c.status = $4))
          OR ((c.issuer_id = $1 OR c.acceptor_id = $1) AND c.status = $5 AND c.date_accepted + c.num_days::bigint * $6 <= $3)",
-        &[&me, &STATUS_OUTSTANDING, &now, &STATUS_REJECTED, &STATUS_IN_PROGRESS, &DAY],
+        &[&me, &STATUS_OUTSTANDING, &now, &STATUS_REJECTED, &STATUS_IN_PROGRESS, &FILETIME_DAY],
     )
     .await
 }
@@ -1123,7 +1113,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         }
         // DeleteMultipleContracts([contractID]) -> (deleted, failed)
         "DeleteMultipleContracts" => {
-            let ids: Vec<i64> = call.args.first().and_then(|v| v.items()).unwrap_or(&[]).iter().filter_map(|v| v.as_int()).collect();
+            let ids = value_id_list(call.args.first());
             let _trading = lock().await;
             let (mut deleted, mut failed) = (vec![], vec![]);
             for id in ids {
@@ -1177,7 +1167,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "GetItemsInContainer" => items_in(c, int(1), false).await,
         // GetNumItemsInContainers(stationID, [containerID], forCorp, flag) -> {containerID: count}
         "GetNumItemsInContainers" => {
-            let ids: Vec<i64> = call.args.get(1).and_then(|v| v.items()).unwrap_or(&[]).iter().filter_map(|v| v.as_int()).collect();
+            let ids = value_id_list(call.args.get(1));
             match c
                 .db
                 .client

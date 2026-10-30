@@ -1,6 +1,7 @@
 //! One logged-in client: the machoNet packet loop after the handshake.
 
 use crate::conn::{Conn, Writer};
+use crate::consts::{FILETIME_SECOND, FILETIME_UNIX_EPOCH};
 use crate::db::Db;
 use crate::handshake::Login;
 use crate::macho::{cmd, Address, Packet, ERR_WRAPPEDEXCEPTION};
@@ -12,6 +13,11 @@ use marshal::Value;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+
+/// Windows FILETIME uses 100 ns ticks, hence 10,000 ticks per millisecond.
+const FILETIME_TICKS_PER_MS: i64 = 10_000;
+/// Windows FILETIME tick duration in nanoseconds.
+const FILETIME_TICK_NS: u32 = 100;
 
 pub struct Client {
     pub conn: Writer,
@@ -195,7 +201,7 @@ impl Client {
             self.world.unregister_pilot(char_id);
         }
         if let (Some(system), Some(ship)) = (self.session.int("solarsystemid"), self.session.int("shipid")) {
-            if let Some(b) = self.world.remove_ball(system, ship) {
+            if let Some(b) = self.world.remove_ball(system, ship).await {
                 self.db
                     .client
                     .execute("UPDATE game.items SET x = $2, y = $3, z = $4 WHERE item_id = $1", &[&ship, &b.pos[0], &b.pos[1], &b.pos[2]])
@@ -326,8 +332,71 @@ pub fn user_error(msg: &str, dict: Vec<(String, Value)>) -> Value {
     }
 }
 
+/// Convert a millisecond duration to FILETIME ticks.
+pub fn filetime_ticks_from_ms(ms: f64) -> i64 {
+    (ms * FILETIME_TICKS_PER_MS as f64) as i64
+}
+
+/// Convert a signed FILETIME duration to whole milliseconds, truncating toward zero.
+pub fn ms_from_filetime_ticks(ticks: i64) -> i64 {
+    ticks / FILETIME_TICKS_PER_MS
+}
+/// Convert a FILETIME timestamp to Unix seconds, truncating toward zero.
+pub fn unix_seconds_from_filetime(ticks: i64) -> i64 {
+    ((i128::from(ticks) - i128::from(FILETIME_UNIX_EPOCH)) / i128::from(FILETIME_SECOND)) as i64
+}
+
+/// Convert a signed whole-second duration to FILETIME ticks.
+pub fn filetime_ticks_from_seconds(seconds: i64) -> i64 {
+    seconds * FILETIME_SECOND
+}
+
+/// Convert a FILETIME timestamp to Unix milliseconds, rounding toward positive infinity.
+pub fn unix_ms_from_filetime_ceil(ticks: i64) -> i64 {
+    let delta = i128::from(ticks) - i128::from(FILETIME_UNIX_EPOCH);
+    let divisor = i128::from(FILETIME_TICKS_PER_MS);
+    (delta.div_euclid(divisor) + i128::from(delta.rem_euclid(divisor) != 0)) as i64
+}
+
+
+/// Convert Unix milliseconds to Windows FILETIME without losing integer precision.
+pub fn filetime_from_unix_ms(ms: i64) -> i64 {
+    FILETIME_UNIX_EPOCH + ms * FILETIME_TICKS_PER_MS
+}
+
 /// Windows FILETIME (100ns since 1601), the unit of `blue.os.GetWallclockTime()`.
 pub fn filetime_now() -> i64 {
     let unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-    116_444_736_000_000_000 + (unix.as_nanos() / 100) as i64
+    FILETIME_UNIX_EPOCH + (unix.as_nanos() / u128::from(FILETIME_TICK_NS)) as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unix_milliseconds_convert_to_filetime() {
+        assert_eq!(filetime_from_unix_ms(0), FILETIME_UNIX_EPOCH);
+        assert_eq!(filetime_from_unix_ms(1), FILETIME_UNIX_EPOCH + 10_000);
+        assert_eq!(filetime_from_unix_ms(-1), FILETIME_UNIX_EPOCH - 10_000);
+    }
+
+    #[test]
+    fn signed_filetime_seconds_conversions() {
+        assert_eq!(unix_seconds_from_filetime(FILETIME_UNIX_EPOCH + FILETIME_SECOND + 1), 1);
+        assert_eq!(unix_seconds_from_filetime(FILETIME_UNIX_EPOCH - FILETIME_SECOND - 1), -1);
+        assert_eq!(unix_seconds_from_filetime(FILETIME_UNIX_EPOCH - 1), 0);
+        assert_eq!(filetime_ticks_from_seconds(2), 2 * FILETIME_SECOND);
+        assert_eq!(filetime_ticks_from_seconds(-2), -2 * FILETIME_SECOND);
+        assert_eq!(filetime_ticks_from_seconds(0), 0);
+    }
+
+    #[test]
+    fn filetime_timestamp_milliseconds_round_up() {
+        assert_eq!(unix_ms_from_filetime_ceil(FILETIME_UNIX_EPOCH), 0);
+        assert_eq!(unix_ms_from_filetime_ceil(FILETIME_UNIX_EPOCH + FILETIME_TICKS_PER_MS), 1);
+        assert_eq!(unix_ms_from_filetime_ceil(FILETIME_UNIX_EPOCH + FILETIME_TICKS_PER_MS + 1), 2);
+        assert_eq!(unix_ms_from_filetime_ceil(FILETIME_UNIX_EPOCH - FILETIME_TICKS_PER_MS), -1);
+        assert_eq!(unix_ms_from_filetime_ceil(FILETIME_UNIX_EPOCH - FILETIME_TICKS_PER_MS + 1), 0);
+    }
 }

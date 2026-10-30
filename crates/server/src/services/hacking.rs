@@ -12,20 +12,14 @@
 //! and a node trade strength against coherence on each attack; destroying the core wins
 //! and opens the container, losing all coherence fails the attempt (it can be retried).
 
-use super::{Call, CallError, CallResult};
+use super::{db_err, notify_error, rand01, Call, CallError, CallResult};
 use crate::client::Client;
+use crate::consts::{ATTR_MAX_RANGE, ATTR_REQUIRED_SKILL_1, SKILL_ARCHAEOLOGY, SKILL_HACKING};
+use crate::space::{dist, metres_to_km};
 use marshal::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use tracing::info;
-
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
-
-fn notify_err(msg: &str) -> CallError {
-    CallError::User { msg: "CustomNotify".into(), dict: vec![("notify".into(), Value::unicode(msg))] }
-}
 
 // hackingcommon.hackingConstants
 const GAMETYPE_HACKING: i64 = 0;
@@ -72,9 +66,7 @@ const EVENT_HONEYPOT_HEALING: i64 = 307;
 const EVENT_DISTANCEINDICATOR: i64 = 308;
 
 const EFFECT_DO_HACKING: i64 = 1738;
-const ATTR_MAX_RANGE: i32 = 54;
 const ATTR_DURATION: i32 = 73;
-const ATTR_REQUIRED_SKILL_1: i32 = 182;
 const ATTR_VIRUS_COHERENCE: i32 = 1909;
 const ATTR_VIRUS_STRENGTH: i32 = 1910;
 const ATTR_VIRUS_SLOTS: i32 = 1911;
@@ -89,10 +81,6 @@ const SUPPRESSION: i64 = 10;
 const RESTORATION_HEAL: i64 = 10;
 
 type Coord = (i64, i64);
-
-fn rand01() -> f64 {
-    (crate::handshake::rand_i64() as u64 >> 11) as f64 / (1u64 << 53) as f64
-}
 
 fn rand_below(n: usize) -> usize {
     (rand01() * n as f64) as usize % n.max(1)
@@ -445,10 +433,10 @@ pub async fn start(c: &mut Client, module: i64, target: Option<i64>) -> CallResu
     };
     let Some(container) = target else { return Err(CallError::User { msg: "DeniedActivateTargetNotPresent".into(), dict: vec![] }) };
     let Some(site) = super::exploration::hack_target(container) else {
-        return Err(notify_err("分析仪只能用于数据和遗迹地点的容器。"));
+        return Err(notify_error("分析仪只能用于数据和遗迹地点的容器。"));
     };
     if site.hacked {
-        return Err(notify_err("这个容器已经被破解了。"));
+        return Err(notify_error("这个容器已经被破解了。"));
     }
     let r = c
         .db
@@ -468,17 +456,18 @@ pub async fn start(c: &mut Client, module: i64, target: Option<i64>) -> CallResu
         .map_err(db_err)?;
     let Some(r) = r else { return Ok(Value::None) };
     let (module_type, skill, range, duration): (i32, i32, f64, f64) = (r.get(0), r.get(1), r.get(2), r.get(3));
-    let needed = if site.relic { super::exploration::SKILL_ARCHAEOLOGY } else { super::exploration::SKILL_HACKING };
+    let needed = if site.relic { SKILL_ARCHAEOLOGY } else { SKILL_HACKING };
     if skill != needed {
-        return Err(notify_err(if site.relic { "这是遗迹容器，需要使用遗迹分析仪。" } else { "这是数据容器，需要使用数据分析仪。" }));
+        return Err(notify_error(if site.relic { "这是遗迹容器，需要使用遗迹分析仪。" } else { "这是数据容器，需要使用数据分析仪。" }));
     }
-    let balls = c.world.balls_snapshot(system).unwrap_or_default();
-    let (Some(me), Some(can)) = (balls.get(&ship), balls.get(&container)) else {
+    let Some(gap) = c.world.with(system, move |s| {
+        let (me, can) = (s.ball(ship)?, s.ball(container)?);
+        Some(dist(me.pos, can.pos) - me.radius as f64 - can.radius as f64)
+    }).await.flatten() else {
         return Err(CallError::User { msg: "DeniedActivateTargetNotPresent".into(), dict: vec![] });
     };
-    let gap = ((me.pos[0] - can.pos[0]).powi(2) + (me.pos[1] - can.pos[1]).powi(2) + (me.pos[2] - can.pos[2]).powi(2)).sqrt() - me.radius as f64 - can.radius as f64;
     if gap > range {
-        return Err(notify_err(&format!("目标太远了（{:.1} 公里），分析仪的范围是 {:.1} 公里。", gap / 1000.0, range / 1000.0)));
+        return Err(notify_error(&format!("目标太远了（{:.1} 公里），分析仪的范围是 {:.1} 公里。", metres_to_km(gap), metres_to_km(range))));
     }
     let level: f64 = c
         .db

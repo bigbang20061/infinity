@@ -5,34 +5,23 @@
 //! bulletins, and its diplomats and directors its contacts and labels; for an alliance,
 //! those of its executor corporation do.
 
-use super::corps::{membership, ROLE_DIRECTOR};
-use super::{crowset, keyval, Call, CallError, CallResult};
+use super::corps::membership;
+use super::{crowset, db_err, keyval, notify_error, value_ids, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
+use crate::consts::ROLE_DIRECTOR;
 use crate::db::Db;
 use marshal::{DbRowDescriptor, DbType, Value};
 
-// appConst.corpRole*
+/// Client appConst.corpRoleChatManager.
 const ROLE_CHAT_MANAGER: i64 = 36_028_797_018_963_968;
+/// Client appConst.corpRoleDiplomat.
 const ROLE_DIPLOMAT: i64 = 17_179_869_184;
+/// Player alliance ID range, matching the server's game.alliances sequence.
+const FIRST_PLAYER_ALLIANCE: i64 = 99_000_000;
 /// base_corporation.MAX_NUM_BULLETINS
 const MAX_BULLETINS: i64 = 10;
-
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
-
-fn notify_error(text: &str) -> CallError {
-    CallError::User { msg: "CustomNotify".into(), dict: vec![("notify".into(), Value::unicode(text))] }
-}
-
-/// Integer IDs from a list argument (or a single ID).
-fn ids(v: Option<&Value>) -> Vec<i64> {
-    match v {
-        Some(Value::Int(i)) => vec![*i],
-        Some(v) => v.items().map(|it| it.iter().filter_map(|x| x.as_int()).collect()).unwrap_or_default(),
-        None => vec![],
-    }
-}
+/// Server label-mask policy: exclusive upper bit position for positive i64 labels.
+const LABEL_BIT_END: u32 = 62;
 
 /// The owner a call is for: the bound corporation, or the bound alliance.
 fn owner(c: &Client, call: &Call<'_>) -> Option<i64> {
@@ -47,7 +36,7 @@ fn owner(c: &Client, call: &Call<'_>) -> Option<i64> {
 /// corporation (an alliance).
 async fn may(db: &Db, me: i64, owner: i64, roles: i64) -> Result<bool, CallError> {
     let (corp, my_roles) = membership(db, me).await?;
-    let acting_corp = if owner >= 99_000_000 {
+    let acting_corp = if owner >= FIRST_PLAYER_ALLIANCE {
         db.client
             .query_opt("SELECT executor_corp_id FROM game.alliances WHERE alliance_id = $1 AND NOT deleted", &[&owner])
             .await
@@ -213,7 +202,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "DeleteBulletin" => done(db.client.execute("DELETE FROM game.org_bulletins WHERE bulletin_id = $1 AND owner_id = $2", &[&int(0).unwrap_or(0), &owner]).await),
         // UpdateBulletinOrder([bulletinID, ...])
         "UpdateBulletinOrder" => {
-            for (i, id) in ids(call.args.first()).iter().enumerate() {
+            for (i, id) in value_ids(call.args.first()).iter().enumerate() {
                 if let Err(e) = db.client.execute("UPDATE game.org_bulletins SET sort_order = $3 WHERE bulletin_id = $1 AND owner_id = $2", &[id, &owner, &(i as i32)]).await {
                     return Some(Err(db_err(e)));
                 }
@@ -232,14 +221,14 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                 .await,
         ),
         "RemoveCorporateContacts" | "RemoveAllianceContacts" => {
-            done(db.client.execute("DELETE FROM game.org_contacts WHERE owner_id = $1 AND contact_id = ANY($2)", &[&owner, &ids(call.args.first())]).await)
+            done(db.client.execute("DELETE FROM game.org_contacts WHERE owner_id = $1 AND contact_id = ANY($2)", &[&owner, &value_ids(call.args.first())]).await)
         }
         // EditContactsRelationshipID(contactIDs, relationshipID)
         "EditContactsRelationshipID" => done(
             db.client
                 .execute(
                     "UPDATE game.org_contacts SET relationship_id = $3 WHERE owner_id = $1 AND contact_id = ANY($2)",
-                    &[&owner, &ids(call.args.first()), &relationship(1).unwrap_or(0.0)],
+                    &[&owner, &value_ids(call.args.first()), &relationship(1).unwrap_or(0.0)],
                 )
                 .await,
         ),
@@ -256,7 +245,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                 Ok(rows) => rows.iter().map(|r| r.get(0)).collect(),
                 Err(e) => return Some(Err(db_err(e))),
             };
-            let Some(id) = (0..62).map(|b| 1i64 << b).find(|b| !used.contains(b)) else {
+            let Some(id) = (0..LABEL_BIT_END).map(|b| 1i64 << b).find(|b| !used.contains(b)) else {
                 return Some(Err(notify_error("标签数量已达上限。")));
             };
             db.client
@@ -292,7 +281,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             } else {
                 "UPDATE game.org_contacts SET label_mask = label_mask & ~$3 WHERE owner_id = $1 AND contact_id = ANY($2)"
             };
-            done(db.client.execute(sql, &[&owner, &ids(call.args.first()), &int(1).unwrap_or(0)]).await)
+            done(db.client.execute(sql, &[&owner, &value_ids(call.args.first()), &int(1).unwrap_or(0)]).await)
         }
         _ => return None,
     })

@@ -17,7 +17,7 @@ tokio-postgres = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Debug builds are intentionally never used (see AGENTS.md); keep release lean.
+# Debug builds are intentionally never used (see AGENT.md); keep release lean.
 [profile.release]
 opt-level = 3
 lto = "thin"

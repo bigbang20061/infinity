@@ -1,5 +1,7 @@
 //! PostgreSQL access. One pipelined connection shared by all tasks.
+//! The shared account PLEX query returns whole PLEX; wire-unit conversion is the caller's policy.
 
+use crate::consts::{NPC_BID_RATIO, ROLE_PLAYER_LOGIN};
 use anyhow::{Context, Result};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
@@ -9,11 +11,12 @@ use tracing::{error, info};
 const GAME_SCHEMA: &str = include_str!("../sql/game_schema.sql");
 const MARKET_SEED: &str = include_str!("../sql/market_seed.sql");
 
-/// ROLE_PLAYER | ROLE_LOGIN (carbon/common/script/sys/serviceConst.py).
-pub const ROLE_PLAYER_LOGIN: i64 = 2305843009213693952 | 4611686018427387904;
-
-/// NPC buy orders pay this fraction of the NPC sell price.
-pub const NPC_BID_RATIO: f64 = 0.8;
+/// Existing server policy for the first database reconnect delay.
+const RECONNECT_INITIAL_DELAY_SECONDS: u64 = 1;
+/// Existing server policy for the largest database reconnect retry delay.
+const RECONNECT_MAX_RETRY_DELAY_SECONDS: u64 = 16;
+/// Existing server policy for exponential database reconnect backoff.
+const RECONNECT_BACKOFF_FACTOR: u64 = 2;
 
 #[derive(Clone)]
 pub struct Db {
@@ -28,15 +31,20 @@ pub struct Account {
 }
 
 impl Db {
+    /// Account vault balance in whole PLEX, shared by the store and public gateway.
+    pub async fn plex_balance(client: &Client, user_id: i64) -> Result<i64, tokio_postgres::Error> {
+        Ok(client.query_one("SELECT plex_balance FROM game.accounts WHERE user_id = $1", &[&user_id]).await?.get(0))
+    }
+
     pub async fn connect(url: &str) -> Result<Db> {
-        let mut delay = 1;
+        let mut delay = RECONNECT_INITIAL_DELAY_SECONDS;
         let (client, conn) = loop {
             match tokio_postgres::connect(url, NoTls).await {
                 Ok(c) => break c,
-                Err(e) if delay <= 16 => {
+                Err(e) if delay <= RECONNECT_MAX_RETRY_DELAY_SECONDS => {
                     info!("database not ready ({e}); retrying in {delay}s");
                     tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-                    delay *= 2;
+                    delay *= RECONNECT_BACKOFF_FACTOR;
                 }
                 Err(e) => return Err(e).context("connecting to PostgreSQL"),
             }

@@ -1,29 +1,52 @@
 //! charUnboundMgr: character selection and creation before a character is
 //! chosen (loginCharacterselection/charselData.py, eve/client/script/ui/login).
 
-use super::{keyval, Call, CallError, CallResult};
+use super::corps::EFFECTIVE_ROLES_SQL;
+use super::{db_err, keyval, trimmed_arg_text, Call, CallError, CallResult};
 use crate::client::{short, Client};
+use crate::consts::{ACCOUNT_CASH, FAR_FUTURE, FILETIME_SECOND, FILETIME_UNIX_EPOCH, FLAG_HANGAR};
 use anyhow::Context;
 use marshal::Value;
 use tracing::{info, warn};
 
+/// Server character-selection policy: slots per account.
 const CHARACTER_SLOTS: i64 = 3;
-/// chooseNameSection.py result codes.
+/// Client chooseNameSection.py valid-name result.
 const NAME_VALID: i64 = 1;
+/// Client chooseNameSection.py short-name result.
 const NAME_TOO_SHORT: i64 = -1;
+/// Client chooseNameSection.py long-name result.
 const NAME_TOO_LONG: i64 = -2;
+/// Client chooseNameSection.py illegal-character result.
 const NAME_ILLEGAL_CHARACTER: i64 = -5;
+/// Client chooseNameSection.py too-many-spaces result.
 const NAME_TOO_MANY_SPACES: i64 = -6;
+/// Client chooseNameSection.py consecutive-spaces result.
 const NAME_CONSECUTIVE_SPACES: i64 = -7;
+/// Client chooseNameSection.py unavailable-name result.
 const NAME_UNAVAILABLE: i64 = -101;
-
-fn db_err(e: tokio_postgres::Error) -> CallError {
-    CallError::Internal(e.into())
-}
-
-fn arg_text(call: &Call<'_>, i: usize) -> String {
-    call.args.get(i).and_then(|v| v.as_text()).map(|s| s.trim().to_string()).unwrap_or_default()
-}
+/// Server name validation policy: minimum character count.
+const MIN_NAME_LENGTH: usize = 3;
+/// Server name validation policy: maximum character count.
+const MAX_NAME_LENGTH: usize = 37;
+/// Server name validation policy: maximum spaces.
+const MAX_NAME_SPACES: usize = 2;
+/// SDE invTypes: Velator, the fallback rookie ship.
+const FALLBACK_ROOKIE_SHIP: i32 = 606;
+/// SDE chrRaces: Caldari, used when the creation argument is missing.
+const FALLBACK_RACE_ID: i64 = 1;
+/// SDE chrBloodlines: Deteis, used when the creation argument is missing.
+const FALLBACK_BLOODLINE_ID: i64 = 1;
+/// Server policy: number of random-name attempts.
+const RANDOM_NAME_ATTEMPTS: usize = 50;
+/// Server random-name policy: lowest numerical suffix.
+const RANDOM_NAME_SUFFIX_START: usize = 100;
+/// Server random-name policy: number of possible suffixes.
+const RANDOM_NAME_SUFFIX_COUNT: usize = 900;
+/// Server starting balance policy, in ISK.
+const STARTING_BALANCE: i64 = 5_000_000;
+/// Server deletion policy: guard against a stray click.
+const BIOMASS_DELAY_SECS: i64 = 30;
 
 fn arg_int(call: &Call<'_>, i: usize) -> Option<i64> {
     call.args.get(i).and_then(|v| v.as_int())
@@ -31,10 +54,10 @@ fn arg_int(call: &Call<'_>, i: usize) -> Option<i64> {
 
 fn name_shape_code(name: &str) -> i64 {
     let n = name.chars().count();
-    if n < 3 {
+    if n < MIN_NAME_LENGTH {
         return NAME_TOO_SHORT;
     }
-    if n > 37 {
+    if n > MAX_NAME_LENGTH {
         return NAME_TOO_LONG;
     }
     if !name.chars().all(|c| c.is_alphanumeric() || c == ' ' || c == '-' || c == '\'') {
@@ -43,7 +66,7 @@ fn name_shape_code(name: &str) -> i64 {
     if name.contains("  ") {
         return NAME_CONSECUTIVE_SPACES;
     }
-    if name.matches(' ').count() > 2 {
+    if name.matches(' ').count() > MAX_NAME_SPACES {
         return NAME_TOO_MANY_SPACES;
     }
     NAME_VALID
@@ -94,11 +117,11 @@ async fn character_rows(c: &Client) -> Result<Vec<Value>, CallError> {
         .client
         .query(
             "SELECT ch.character_id, ch.name, ch.corporation_id, ch.station_id, ch.solar_system_id, ch.balance::float8, ch.skill_points,
-                    (extract(epoch FROM ch.logoff_at) * 10000000)::bigint + 116444736000000000,
+                    (extract(epoch FROM ch.logoff_at) * $2::bigint)::bigint + $3::bigint,
                     ch.gender_id, ch.bloodline_id, ch.race_id, ship.type_id, ch.delete_prepare_at
              FROM game.characters ch LEFT JOIN game.items ship ON ship.item_id = ch.ship_id
              WHERE ch.user_id = $1 AND NOT ch.deleted ORDER BY ch.character_id",
-            &[&c.login.user_id],
+            &[&c.login.user_id, &FILETIME_SECOND, &FILETIME_UNIX_EPOCH],
         )
         .await
         .map_err(db_err)?;
@@ -121,7 +144,7 @@ async fn character_rows(c: &Client) -> Result<Vec<Value>, CallError> {
                 ("genderID", Value::Int(r.get::<_, i32>(8) as i64)),
                 ("bloodlineID", Value::Int(r.get::<_, i32>(9) as i64)),
                 ("raceID", Value::Int(r.get::<_, i32>(10) as i64)),
-                ("shipTypeID", r.get::<_, Option<i32>>(11).map(|t| Value::Int(t as i64)).unwrap_or(Value::Int(606))),
+                ("shipTypeID", r.get::<_, Option<i32>>(11).map(|t| Value::Int(t as i64)).unwrap_or(Value::Int(FALLBACK_ROOKIE_SHIP as i64))),
                 ("gender", Value::Int(r.get::<_, i32>(8) as i64)),
                 ("balanceChange", Value::Float(0.0)),
                 ("paperdollState", Value::Int(0)),
@@ -142,9 +165,6 @@ async fn character_rows(c: &Client) -> Result<Vec<Value>, CallError> {
         .collect())
 }
 
-/// A character submitted to the biomass queue can be deleted after this long (retail
-/// waits hours; this server only guards against a stray click).
-const BIOMASS_DELAY_SECS: i64 = 30;
 
 /// userSvc.UserLogOffCharacter(): back to character selection. The character leaves the
 /// game as on a disconnect and the session drops everything about it.
@@ -173,10 +193,6 @@ async fn own_character(c: &Client, call: &Call<'_>) -> Result<i64, CallError> {
     Ok(char_id)
 }
 
-/// inventory flags (inventorycommon.const)
-pub const FLAG_HANGAR: i32 = 4;
-pub const FLAG_PILOT: i32 = 57;
-
 /// Give the character a rookie ship in their station hangar if they have none.
 async fn ensure_ship(c: &Client, char_id: i64, race_id: i32, station_id: i64) -> Result<i64, CallError> {
     if let Some(r) = c
@@ -198,7 +214,7 @@ async fn ensure_ship(c: &Client, char_id: i64, race_id: i32, station_id: i64) ->
         .await
         .map_err(db_err)?
         .map(|r| r.get(0))
-        .unwrap_or(606); // Velator
+        .unwrap_or(FALLBACK_ROOKIE_SHIP);
     let ship_id: i64 = c
         .db
         .client
@@ -221,11 +237,10 @@ async fn select_character(c: &mut Client, char_id: i64) -> Result<(), CallError>
         .db
         .client
         .query_opt(
-            "SELECT corporation_id, station_id, solar_system_id, constellation_id, region_id, gender_id, bloodline_id, race_id, name,
-                    corp_roles | COALESCE((SELECT bit_or(t.roles) FROM game.corp_titles t
-                                            WHERE t.corporation_id = ch.corporation_id AND ch.corp_title_mask & t.title_id <> 0), 0),
+            &format!("SELECT corporation_id, station_id, solar_system_id, constellation_id, region_id, gender_id, bloodline_id, race_id, name,
+                    {EFFECTIVE_ROLES_SQL},
                     (SELECT alliance_id FROM game.corporations co WHERE co.corporation_id = ch.corporation_id)
-             FROM game.characters ch WHERE character_id = $1 AND user_id = $2 AND NOT deleted",
+             FROM game.characters ch WHERE character_id = $1 AND user_id = $2 AND NOT deleted"),
             &[&char_id, &c.login.user_id],
         )
         .await
@@ -275,7 +290,7 @@ async fn select_character(c: &mut Client, char_id: i64) -> Result<(), CallError>
         ("rolesAtBase", int(roles)),
         ("rolesAtHQ", int(roles)),
         ("rolesAtOther", int(roles)),
-        ("corpAccountKey", int(1000)),
+        ("corpAccountKey", int(ACCOUNT_CASH as i64)),
         ("genderID", int(r.get::<_, i32>(5) as i64)),
         ("bloodlineID", int(r.get::<_, i32>(6) as i64)),
         ("raceID", int(race as i64)),
@@ -307,8 +322,8 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
                 .db
                 .client
                 .query_one(
-                    "SELECT (extract(epoch FROM created_at) * 10000000)::bigint + 116444736000000000 FROM game.accounts WHERE user_id = $1",
-                    &[&c.login.user_id],
+                    "SELECT (extract(epoch FROM created_at) * $2::bigint)::bigint + $3::bigint FROM game.accounts WHERE user_id = $1",
+                    &[&c.login.user_id, &FILETIME_SECOND, &FILETIME_UNIX_EPOCH],
                 )
                 .await
                 .map_err(db_err)?
@@ -318,7 +333,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
                 ("maxCharacterSlots", Value::Int(CHARACTER_SLOTS)),
                 ("userName", Value::unicode(c.login.user_name.clone())),
                 ("creationDate", Value::Int(created)),
-                ("subscriptionEndTime", Value::Int(super::FAR_FUTURE)),
+                ("subscriptionEndTime", Value::Int(FAR_FUTURE)),
             ]);
             Ok(Value::tuple([
                 Value::list([user]),
@@ -341,7 +356,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
         // PrepareCharacterForDelete(charID) -> when it can be deleted (FILETIME).
         "PrepareCharacterForDelete" => {
             let char_id = own_character(c, call).await?;
-            let when = crate::client::filetime_now() + BIOMASS_DELAY_SECS * 10_000_000;
+            let when = crate::client::filetime_now() + BIOMASS_DELAY_SECS * FILETIME_SECOND;
             c.db.client.execute("UPDATE game.characters SET delete_prepare_at = $2 WHERE character_id = $1", &[&char_id, &when]).await.map_err(db_err)?;
             info!(user = c.login.user_id, "character {char_id} submitted to the biomass queue");
             Ok(Value::Int(when))
@@ -379,13 +394,13 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
         // gatekeeper cohorts (feature flags) the user belongs to.
         "GetCohortsForUser" => Ok(Value::list([])),
 
-        "ValidateNameEx" => Ok(Value::Int(name_code(c, &arg_text(call, 0)).await?)),
+        "ValidateNameEx" => Ok(Value::Int(name_code(c, &trimmed_arg_text(call, 0)).await?)),
         "GetValidRandomName" => {
             const FIRST: [&str; 12] = ["Aren", "Kael", "Sora", "Veyra", "Toma", "Ilsa", "Daro", "Mira", "Lukas", "Nadia", "Joren", "Tessa"];
             const LAST: [&str; 12] = ["Vale", "Okaro", "Thorne", "Kassen", "Ruun", "Halvik", "Moreau", "Sandor", "Ikonen", "Drake", "Arvel", "Castor"];
-            for _ in 0..50 {
+            for _ in 0..RANDOM_NAME_ATTEMPTS {
                 let r = crate::handshake::rand_i64() as usize;
-                let name = format!("{} {} {}", FIRST[r % 12], LAST[(r / 12) % 12], 100 + (r / 144) % 900);
+                let name = format!("{} {} {}", FIRST[r % FIRST.len()], LAST[(r / FIRST.len()) % LAST.len()], RANDOM_NAME_SUFFIX_START + (r / (FIRST.len() * LAST.len())) % RANDOM_NAME_SUFFIX_COUNT);
                 if name_code(c, &name).await? == NAME_VALID {
                     return Ok(Value::unicode(name));
                 }
@@ -395,13 +410,13 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
 
         // (name, raceID, bloodlineID, genderID, ancestryID, appearance, portrait, schoolID, ?, qaStarterSystemID)
         "CreateCharacterWithDoll" => {
-            let name = arg_text(call, 0);
+            let name = trimmed_arg_text(call, 0);
             let code = name_code(c, &name).await?;
             if code != NAME_VALID {
                 return Err(CallError::User { msg: "CharNameInvalid".into(), dict: vec![] });
             }
-            let race_id = arg_int(call, 1).unwrap_or(1);
-            let bloodline_id = arg_int(call, 2).unwrap_or(1);
+            let race_id = arg_int(call, 1).unwrap_or(FALLBACK_RACE_ID);
+            let bloodline_id = arg_int(call, 2).unwrap_or(FALLBACK_BLOODLINE_ID);
             let gender_id = arg_int(call, 3).unwrap_or(0);
             let ancestry_id = arg_int(call, 4);
             let school_id = arg_int(call, 7);
@@ -414,7 +429,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
                 .query_one(
                     "INSERT INTO game.characters (user_id, name, race_id, bloodline_id, gender_id, ancestry_id, school_id,
                          corporation_id, station_id, solar_system_id, constellation_id, region_id, balance, appearance, portrait, home_station_id)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 5000000, $13, $14, $9) RETURNING character_id",
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $15::bigint, $13, $14, $9) RETURNING character_id",
                     &[
                         &c.login.user_id,
                         &name,
@@ -430,6 +445,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
                         &region,
                         &appearance,
                         &portrait,
+                        &STARTING_BALANCE,
                     ],
                 )
                 .await
