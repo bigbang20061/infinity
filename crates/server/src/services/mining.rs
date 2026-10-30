@@ -24,6 +24,7 @@ use super::{db_err, keyval, notify_error, rand01, rand_dir, value_id_list, Call,
 use crate::client::{filetime_now, unix_ms_from_filetime_ceil, Client};
 use crate::consts::{ATTR_CAPACITY, ATTR_MAX_RANGE, FILETIME_SECOND, FLAG_CARGO, FLAG_HANGAR, GROUP_ASTEROID_BELT, IX_FLAG, IX_LOCATION_ID, IX_STACK_SIZE};
 use crate::db::Db;
+use crate::messages;
 use crate::space::{dist, now_ms, Ball, NotifyTx, World, MODE_RIGID, V3};
 use marshal::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -374,7 +375,7 @@ async fn store(db: &Db, notify: &NotifyTx, owner: i64, ship: i64, flag: i32, typ
 }
 
 fn tell(notify: &NotifyTx, text: &str) {
-    let _ = notify.send(("OnRemoteMessage".into(), vec![Value::str("CustomNotify"), Value::dict([("notify", Value::unicode(text))])]));
+    let _ = notify.send(("OnRemoteMessage".into(), vec![Value::str(messages::MSG_CUSTOM_NOTIFY), Value::dict([("notify", Value::unicode(text))])]));
 }
 
 /// The end of a mining cycle of `module` on rock `target`: move the yield to the hold.
@@ -389,7 +390,7 @@ pub async fn extract(db: &Db, world: &Arc<World>, notify: &NotifyTx, char_id: i6
         Some((gap, pilots))
     }).await.flatten() else { return Ok(false) };
     if gap > fit.value(Key::Module(module), ATTR_MAX_RANGE) {
-        tell(notify, "目标超出了采矿设备的范围。");
+        tell(notify, messages::TARGET_OUTSIDE_MINING_RANGE);
         return Ok(false);
     }
     let unit_volume: f64 = db
@@ -452,7 +453,7 @@ pub async fn extract(db: &Db, world: &Arc<World>, notify: &NotifyTx, char_id: i6
         return Ok(false);
     }
     if taken < units {
-        tell(notify, if flag == FLAG_MINING_HOLD { "你的采矿舱已经满了。" } else { "你的货柜舱已经满了。" });
+        tell(notify, if flag == FLAG_MINING_HOLD { messages::MINING_HOLD_FULL } else { messages::CARGO_HOLD_FULL });
         return Ok(false);
     }
     Ok(true)
@@ -507,7 +508,7 @@ struct Quote {
 }
 
 fn output_overflow() -> CallError {
-    notify_error("精炼产物数量超过物品堆叠容量。")
+    notify_error(messages::REPROCESS_OUTPUT_STACK_LIMIT)
 }
 
 fn add_output(total: i64, amount: i64) -> Result<i64, CallError> {
@@ -602,7 +603,7 @@ async fn reprocessing(c: &mut Client, call: &Call<'_>) -> CallResult {
         // Reprocess(itemIDs, fromLocationID, ownerID, outputLocationID, outputFlagID)
         //   -> (reprocessed itemIDs, {typeID: quantity})
         "Reprocess" => {
-            let station = c.session.int("stationid").ok_or_else(|| notify_error("你必须停靠在空间站里才能进行精炼。"))?;
+            let station = c.session.int("stationid").ok_or_else(|| notify_error(messages::MUST_DOCK_TO_REPROCESS))?;
             let out_location = call.args.get(3).and_then(|v| v.as_int()).unwrap_or(station);
             let out_flag = call.args.get(4).and_then(|v| v.as_int()).map(|f| f as i32).unwrap_or(FLAG_HANGAR);
             let items = reprocessable(c, &value_id_list(call.args.first())).await?;
@@ -646,7 +647,7 @@ async fn reprocessing(c: &mut Client, call: &Call<'_>) -> CallResult {
                             inserts.insert(type_id, quantity);
                         }
                     }
-                    apply(tx, &changes, "该物品的数量不足。").await?;
+                    apply(tx, &changes, messages::INSUFFICIENT_ITEM_QUANTITY).await?;
                     for (&id, change) in &changes {
                         if change.quantity.is_some() {
                             super::inventory::notify_item_change(tx, outbox, id, vec![(IX_STACK_SIZE, Value::Int(change.expected_quantity as i64))]).await?;
@@ -666,7 +667,7 @@ async fn reprocessing(c: &mut Client, call: &Call<'_>) -> CallResult {
                         let row = tx.query_opt(
                             "UPDATE game.characters SET balance = balance - $2::float8::numeric WHERE character_id = $1 AND balance >= $2::float8::numeric RETURNING balance::float8",
                             &[&char_id, &tax],
-                        ).await.map_err(db_err)?.ok_or_else(|| notify_error("你的 ISK 余额不足以支付精炼税。"))?;
+                        ).await.map_err(db_err)?.ok_or_else(|| notify_error(messages::INSUFFICIENT_ISK_FOR_REPROCESSING_TAX))?;
                         outbox.notify_client("OnAccountChange", vec![Value::str("cash"), Value::Int(char_id), Value::Float(row.get(0))]);
                     }
                     Ok::<_, CallError>(Arc::clone(&plan))

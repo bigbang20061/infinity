@@ -14,6 +14,7 @@ use crate::consts::{FILETIME_MINUTE, TYPE_SOLAR_SYSTEM};
 use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::Outbox;
+use crate::messages;
 use marshal::Value;
 
 /// appConst.ACCESS_PERSONAL
@@ -85,7 +86,7 @@ async fn own_folder(db: &(impl Executor + ?Sized), me: i64, folder: i64) -> Resu
     if mine {
         Ok(())
     } else {
-        Err(CallError::User { msg: "BookmarkFolderNoLongerThere".into(), dict: vec![] })
+        Err(CallError::User { msg: messages::MSG_BOOKMARK_FOLDER_NO_LONGER_THERE.into(), dict: vec![] })
     }
 }
 
@@ -156,11 +157,11 @@ async fn static_location(c: &Client, call: &Call<'_>) -> CallResult {
 async fn space_location(c: &Client, call: &Call<'_>) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
     let Some(system) = c.session.int("solarsystemid") else {
-        return Err(CallError::User { msg: "BkmMustBeInFlight".into(), dict: vec![] });
+        return Err(CallError::User { msg: messages::MSG_BKM_MUST_BE_IN_FLIGHT.into(), dict: vec![] });
     };
     let item = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
     let Some(ball) = c.world.ball(system, item).await else {
-        return Err(notify_error("目标已不在原处。"));
+        return Err(notify_error(messages::BOOKMARK_TARGET_MOVED_OR_MISSING));
     };
     let own = Some(item) == c.session.int("shipid");
     let (item, type_id) = if own { (None, Some(TYPE_SOLAR_SYSTEM)) } else { (Some(item), Some(ball.type_id)) };
@@ -174,7 +175,7 @@ async fn scan_result(c: &Client, call: &Call<'_>) -> CallResult {
     let system = call.args.first().and_then(|v| v.as_int()).or(c.session.int("solarsystemid2")).unwrap_or(0);
     let target = value_text(call.args.get(3), MAX_SCAN_RESULT_ID);
     let Some(pos) = super::exploration::scan_result_position(&c.db, system, me, &target).await? else {
-        return Err(notify_error("请先将信号扫描到 100% 再保存位置。"));
+        return Err(notify_error(messages::BOOKMARK_REQUIRES_FULL_SCAN));
     };
     let folder = call.args.get(4).and_then(|v| v.as_int()).unwrap_or(0);
     add(&c.db, me, folder, subfolder_arg(call, 6), None, Some(TYPE_SOLAR_SYSTEM), system, pos, &value_text(call.args.get(1), MAX_NAME), &value_text(call.args.get(2), MAX_DESCRIPTION), expiry(call, 5)).await
@@ -259,7 +260,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             Ok(r) => Ok(r.map(|r| folder_row(&r, me)).unwrap_or(Value::None)),
             Err(e) => Err(db_err(e)),
         },
-        "AddToKnownFolders" | "UpdateKnownFolderState" => Err(notify_error("暂不支持共享书签文件夹。")),
+        "AddToKnownFolders" | "UpdateKnownFolderState" => Err(notify_error(messages::SHARED_BOOKMARK_FOLDERS_UNSUPPORTED)),
         "RemoveFromKnownFolders" => Ok(Value::None),
         // CreateSubfolder(folderID, name)
         "CreateSubfolder" => {

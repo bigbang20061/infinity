@@ -10,6 +10,7 @@ use crate::client::{short, Client};
 use crate::consts::{ATTR_CAPACITY, CATEGORY_SHIP, FLAG_CARGO, FLAG_CORP_SAG1, FLAG_FITTING_FIRST, FLAG_FITTING_LAST, FLAG_HANGAR, FLAG_PILOT, FLAG_RIG_FIRST, FLAG_RIG_LAST, FLAG_SUBSYSTEM_FIRST, FLAG_SUBSYSTEM_LAST, IX_FLAG, IX_LOCATION_ID, IX_SINGLETON, IX_STACK_SIZE, LOCATION_JUNKYARD, ROLE_DIRECTOR, TYPE_CHARACTER};
 use crate::db::executor::Executor;
 use crate::db::outbox::{dispatch_client, Outbox};
+use crate::messages;
 use marshal::Value;
 use std::collections::BTreeMap;
 use tracing::warn;
@@ -169,7 +170,7 @@ pub(super) async fn split_stack(db: &(impl Executor + ?Sized), item: &Item, quan
         "UPDATE game.items SET quantity = quantity - $2 WHERE item_id = $1 AND quantity = $3 AND owner_id = $4 AND location_id = $5 AND flag_id = $6 AND singleton = $7 AND NOT singleton AND quantity > $2 AND $2 > 0",
         &[&item.item_id, &quantity, &item.quantity, &item.owner_id, &item.location_id, &item.flag_id, &item.singleton],
     ).await.map_err(db_err)?;
-    if affected == 0 { return Err(notify_error("无法这样拆分该堆叠。")); }
+    if affected == 0 { return Err(notify_error(messages::STACK_CANNOT_BE_SPLIT)); }
     let new_id: i64 = db.query_one(
         "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton) VALUES ($1, $2, $3, $4, $5, $6) RETURNING item_id",
         &[&item.type_id, &owner, &location, &flag, &quantity, &singleton],
@@ -228,14 +229,14 @@ async fn move_item(c: &mut Client, container: &Container, item_id: i64, flag: Op
     let char_id = c.session.int("charid").unwrap_or(0);
     let Some(item) = load_items(c, "i.item_id = $1", &[&item_id]).await?.into_iter().next() else { return Ok(None) };
     if Some(item_id) == c.session.int("shipid") && matches!(container, Container::Item(_)) {
-        return Err(CallError::User { msg: "CanNotPlaceActiveShipInAnotherHangar".into(), dict: vec![] });
+        return Err(CallError::User { msg: messages::MSG_CAN_NOT_PLACE_ACTIVE_SHIP_IN_ANOTHER_HANGAR.into(), dict: vec![] });
     }
     // Out of a corporation hangar: the division's take role (or Director) is needed.
     if let Some(corp) = super::offices::office_owner(&c.db, item.location_id).await? {
         let (my_corp, roles) = super::corps::membership(&c.db, char_id).await?;
         let take = ROLE_HANGAR_CAN_TAKE_1 << (item.flag_id - FLAG_CORP_SAG1).clamp(0, MAX_CORP_HANGAR_DIVISION_INDEX);
         if my_corp != corp || roles & (take | ROLE_DIRECTOR) == 0 {
-            return Err(CallError::User { msg: "CustomNotify".into(), dict: vec![("notify".into(), Value::unicode("你没有从该军团机库部门取出物品的职权。"))] });
+            return Err(CallError::User { msg: messages::MSG_CUSTOM_NOTIFY.into(), dict: vec![("notify".into(), Value::unicode(messages::NO_CORPORATION_HANGAR_TAKE_ROLE))] });
         }
     }
     let (location, owner, mut flag) = match container {
@@ -244,7 +245,7 @@ async fn move_item(c: &mut Client, container: &Container, item_id: i64, flag: Op
             // Into a corporation hangar: the corporation owns what's in it.
             Some(corp) => {
                 if c.session.int("corpid") != Some(corp) {
-                    return Err(CallError::User { msg: "CustomNotify".into(), dict: vec![("notify".into(), Value::unicode("这不是你军团的机库。"))] });
+                    return Err(CallError::User { msg: messages::MSG_CUSTOM_NOTIFY.into(), dict: vec![("notify".into(), Value::unicode(messages::NOT_YOUR_CORPORATION_HANGAR))] });
                 }
                 let sag = FLAG_CORP_SAG1;
                 (*id, corp, flag.filter(|f| (sag..sag + 7).contains(f)).unwrap_or(sag))
@@ -304,7 +305,7 @@ fn plan_merges(items: &[Item], ops: &[(i64, i64, i64)]) -> Result<BTreeMap<i64, 
         let (Some(&(src, Some(src_qty))), Some(&(dst, Some(dst_qty)))) = (states.get(&source), states.get(&dest)) else { continue };
         if src.type_id != dst.type_id || src.singleton || dst.singleton || src_qty <= 0 { continue; }
         let take = requested.clamp(1, i64::from(src_qty)) as i32;
-        let total = dst_qty.checked_add(take).ok_or_else(|| notify_error("该物品的数量不足。"))?;
+        let total = dst_qty.checked_add(take).ok_or_else(|| notify_error(messages::INSUFFICIENT_ITEM_QUANTITY))?;
         states.get_mut(&source).unwrap().1 = if take == src_qty { None } else { Some(src_qty - take) };
         states.get_mut(&dest).unwrap().1 = Some(total);
     }
@@ -315,7 +316,7 @@ fn plan_merges(items: &[Item], ops: &[(i64, i64, i64)]) -> Result<BTreeMap<i64, 
 
 async fn apply_merges<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, items: Vec<Item>, ops: &[(i64, i64, i64)]) -> Result<(), CallError> {
     let changes = plan_merges(&items, ops)?;
-    super::item_quantities::apply(db, &changes, "该物品的数量不足。").await?;
+    super::item_quantities::apply(db, &changes, messages::INSUFFICIENT_ITEM_QUANTITY).await?;
     for item in items {
         if let Some(change) = changes.get(&item.item_id) {
             if change.quantity.is_none() {
@@ -389,8 +390,8 @@ pub async fn broker(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "GetInventoryFromId" => {
             let id = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
             if super::exploration::container_locked(id) {
-                let msg = Value::unicode("这个容器被锁住了。用数据分析仪或遗迹分析仪破解它。");
-                return Some(Err(CallError::User { msg: "CustomNotify".into(), dict: vec![("notify".into(), msg)] }));
+                let msg = Value::unicode(messages::CONTAINER_LOCKED_NEEDS_ANALYZER);
+                return Some(Err(CallError::User { msg: messages::MSG_CUSTOM_NOTIFY.into(), dict: vec![("notify".into(), msg)] }));
             }
             c.bind(INVENTORY, Value::tuple([Value::Int(id)]))
         }

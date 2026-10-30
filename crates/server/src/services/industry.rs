@@ -22,6 +22,7 @@ use crate::consts::{BLUEPRINT_COPY_QUANTITY, BLUEPRINT_INFINITE_RUNS, FILETIME_D
 use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::{dispatch_world, Outbox};
+use crate::messages;
 use marshal::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -181,7 +182,7 @@ async fn blueprint(db: &(impl Executor + ?Sized), item_id: i64) -> Result<Bluepr
         )
         .await
         .map_err(db_err)?
-        .ok_or_else(|| user_error("BlueprintNotFound", vec![]))?;
+        .ok_or_else(|| user_error(messages::MSG_BLUEPRINT_NOT_FOUND, vec![]))?;
     let (singleton, quantity): (bool, i32) = (r.get(4), r.get(5));
     Ok(Blueprint {
         item_id: r.get(0),
@@ -292,7 +293,7 @@ async fn facilities(db: &(impl Executor + ?Sized), where_sql: &str, arg: i64) ->
 }
 
 async fn facility(db: &(impl Executor + ?Sized), id: i64) -> Result<Facility, CallError> {
-    facilities(db, "s.station_id = $3::bigint", id).await?.pop().ok_or_else(|| notify_error("该空间站没有工业服务。"))
+    facilities(db, "s.station_id = $3::bigint", id).await?.pop().ok_or_else(|| notify_error(messages::NO_INDUSTRIAL_SERVICES))
 }
 
 /// The owner's materials in their item hangar at a facility: typeID -> quantity.
@@ -410,7 +411,7 @@ async fn job(db: &Db, id: i64) -> Result<Job, CallError> {
         .await
         .map_err(db_err)?
         .map(|r| job_from_row(&r))
-        .ok_or_else(|| user_error("IndustryJobNotFound", vec![]))
+        .ok_or_else(|| user_error(messages::MSG_INDUSTRY_JOB_NOT_FOUND, vec![]))
 }
 
 fn tell_job<X>(outbox: &mut Outbox<X>, j: &Job) {
@@ -530,7 +531,7 @@ async fn plan(
         _ => {}
     }
     if seconds - seconds / runs as f64 > MAX_RUN_LENGTH {
-        return Err(notify_error("该项目耗时过长，请减少流程数。"));
+        return Err(notify_error(messages::INDUSTRY_PROJECT_TOO_LONG));
     }
 
     // Cost: the estimated item value, scaled per activity.
@@ -577,7 +578,7 @@ async fn install(c: &Client, request: &Value) -> CallResult {
     let licensed_runs = int("licensedRuns").unwrap_or(1).max(1) as i32;
     let account_owner = request.get("account").and_then(|v| v.items()).and_then(|a| a.first()).and_then(|v| v.as_int()).unwrap_or(me);
     if account_owner != me {
-        return Err(notify_error("暂不支持军团工业项目。"));
+        return Err(notify_error(messages::CORPORATION_INDUSTRY_UNSUPPORTED));
     }
     let requested: HashMap<i32, i64> = match request.get("materials") {
         Some(Value::Dict(pairs)) => pairs.iter().filter_map(|(k, v)| Some((k.as_int()? as i32, v.as_int().unwrap_or(0)))).collect(),
@@ -599,7 +600,7 @@ async fn install(c: &Client, request: &Value) -> CallResult {
             Box::pin(async move {
                 let mut bp = blueprint(tx, blueprint_id).await?;
                 if bp.owner != me {
-                    return Err(user_error("IndustryBlueprintAccessDenied", vec![]));
+                    return Err(user_error(messages::MSG_INDUSTRY_BLUEPRINT_ACCESS_DENIED, vec![]));
                 }
                 let busy: bool = tx
                     .query_one("SELECT EXISTS (SELECT 1 FROM game.industry_jobs WHERE blueprint_id = $1 AND status = $2)", &[&bp.item_id, &INDUSTRY_JOB_STATUS_INSTALLED])
@@ -607,22 +608,22 @@ async fn install(c: &Client, request: &Value) -> CallResult {
                     .map_err(db_err)?
                     .get(0);
                 if busy {
-                    return Err(notify_error("该蓝图正在被一个项目使用。"));
+                    return Err(notify_error(messages::BLUEPRINT_IN_USE));
                 }
                 let fac = facility(tx, facility_id).await?;
                 if !fac.activities().contains(&activity_id) {
-                    return Err(notify_error("该空间站不提供这项活动。"));
+                    return Err(notify_error(messages::INDUSTRY_ACTIVITY_UNAVAILABLE));
                 }
                 if bp.station != Some(fac.id) {
-                    return Err(notify_error("蓝图必须位于该设施中。"));
+                    return Err(notify_error(messages::BLUEPRINT_MUST_BE_AT_FACILITY));
                 }
                 let Some(act) = activity(tx, bp.type_id, activity_id).await? else {
-                    return Err(notify_error("该蓝图不能用于这项活动。"));
+                    return Err(notify_error(messages::BLUEPRINT_ACTIVITY_INVALID));
                 };
                 // Originals research and copy; only copies are invented from.
                 let needs_original = matches!(activity_id, RESEARCH_TIME | RESEARCH_MATERIAL | COPYING);
                 if needs_original && bp.copy || activity_id == INVENTION && !bp.copy {
-                    return Err(notify_error("该蓝图不能用于这项活动。"));
+                    return Err(notify_error(messages::BLUEPRINT_ACTIVITY_INVALID));
                 }
                 let max_runs = match activity_id {
                     RESEARCH_TIME => (MAX_TIME_EFFICIENCY - bp.te) / 2,
@@ -631,18 +632,18 @@ async fn install(c: &Client, request: &Value) -> CallResult {
                     _ => MAX_RUNS_HARD_CAP,
                 };
                 if runs > max_runs || (activity_id == COPYING && licensed_runs > act.max_production_limit) {
-                    return Err(notify_error("流程数超出了蓝图允许的范围。"));
+                    return Err(notify_error(messages::BLUEPRINT_RUN_COUNT_EXCEEDED));
                 }
                 let skill_rows = tx.query("SELECT type_id, level FROM game.skills WHERE character_id = $1", &[&me]).await.map_err(db_err)?;
                 let skills: HashMap<i32, i32> = skill_rows.iter().map(|r| (r.get(0), r.get(1))).collect();
                 if let Some((skill, level)) = act.skills.iter().find(|(s, l)| skills.get(s).copied().unwrap_or(0) < *l) {
-                    return Err(notify_error(&format!("该项目需要技能 {skill} 达到 {level} 级。")));
+                    return Err(notify_error(&messages::required_skill_message(skill, level)));
                 }
                 // Remote jobs need Supply Chain Management / Scientific Networking.
                 let reach_skill = if activity_id == MANUFACTURING { SKILL_SUPPLY_CHAIN_MANAGEMENT } else { SKILL_SCIENTIFIC_NETWORKING };
                 let reach = DISTANCE_PER_LEVEL[skills.get(&reach_skill).copied().unwrap_or(0).clamp(0, 5) as usize];
                 if jumps(system_graph, here, fac.system, reach).is_none() {
-                    return Err(notify_error("该设施超出了你的远程工业范围。"));
+                    return Err(notify_error(messages::FACILITY_OUTSIDE_REMOTE_INDUSTRY_RANGE));
                 }
                 let slots = if activity_id == MANUFACTURING {
                     fit.value(Key::Char, ATTR_MANUFACTURE_SLOT_LIMIT)
@@ -657,7 +658,7 @@ async fn install(c: &Client, request: &Value) -> CallResult {
                     [RESEARCH_TIME, RESEARCH_MATERIAL, COPYING, INVENTION].iter().map(|a| counts.get(a).copied().unwrap_or(0)).sum()
                 };
                 if used >= slots {
-                    return Err(notify_error(&format!("你在这项活动上的全部 {slots} 个工作槽位都已占用。")));
+                    return Err(notify_error(&messages::industry_slots_full_message(slots)));
                 }
                 let optional = if activity_id == INVENTION {
                     let mut decryptor = None;
@@ -679,7 +680,7 @@ async fn install(c: &Client, request: &Value) -> CallResult {
 
                 let have = available(tx, me, fac.id).await?;
                 if let Some((t, q)) = p.materials.iter().find(|(t, q)| have.get(t).copied().unwrap_or(0) < *q) {
-                    return Err(notify_error(&format!("你需要在此处物品机库中准备 {q} 个类型 {t}。")));
+                    return Err(notify_error(&messages::required_materials_message(q, t)));
                 }
                 debit(tx, outbox, me, p.total_cost).await?;
                 for (type_id, quantity) in &p.materials {
@@ -704,7 +705,7 @@ async fn install(c: &Client, request: &Value) -> CallResult {
                     let location: i64 =
                         tx.query_one("SELECT location_id FROM game.items WHERE item_id = $1", &[&bp.item_id]).await.map_err(db_err)?.get(0);
                     if bp.quantity > 1 {
-                        let stack = load_items_db(tx, "i.item_id = $1", &[&bp.item_id]).await?.pop().ok_or_else(|| user_error("BlueprintNotFound", vec![]))?;
+                        let stack = load_items_db(tx, "i.item_id = $1", &[&bp.item_id]).await?.pop().ok_or_else(|| user_error(messages::MSG_BLUEPRINT_NOT_FOUND, vec![]))?;
                         take_items(tx, outbox, stack, 1).await?;
                         bp.item_id = tx
                             .query_one(
@@ -888,7 +889,7 @@ async fn deliver_job<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox
         .await
         .map_err(db_err)?;
     if affected == 0 {
-        return Err(notify_error("该项目已经交付。"));
+        return Err(notify_error(messages::INDUSTRY_PROJECT_ALREADY_DELIVERED));
     }
     tell_job(outbox, j);
     Ok(())
@@ -900,13 +901,13 @@ async fn complete(c: &Client, id: i64) -> Result<(), CallError> {
     let _trading = lock().await;
     let j = job(db, id).await?;
     if j.owner != me && j.installer != me {
-        return Err(user_error("IndustryJobAccessDenied", vec![]));
+        return Err(user_error(messages::MSG_INDUSTRY_JOB_ACCESS_DENIED, vec![]));
     }
     if j.status != INDUSTRY_JOB_STATUS_INSTALLED {
-        return Err(notify_error("该项目已经交付。"));
+        return Err(notify_error(messages::INDUSTRY_PROJECT_ALREADY_DELIVERED));
     }
     if j.end > filetime_now() {
-        return Err(notify_error("该项目尚未完成。"));
+        return Err(notify_error(messages::INDUSTRY_PROJECT_NOT_COMPLETE));
     }
     let successful = if j.activity == INVENTION { (0..j.runs).filter(|_| rand01() < j.probability).count() as i32 } else { j.runs };
     let completed = filetime_now();
@@ -977,7 +978,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
 
         ("industryManager", "InstallJob") => match call.args.first() {
             Some(request) => install(c, request).await,
-            None => Err(notify_error("没有要安装的项目。")),
+            None => Err(notify_error(messages::NO_PROJECT_TO_INSTALL)),
         },
         // GetJobsByOwner(ownerID, includeCompleted)
         ("industryManager", "GetJobsByOwner") => {
@@ -1041,7 +1042,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                         Err(e) => Err(db_err(e)),
                     }
                 }
-                Ok(_) => Err(notify_error("该项目无法取消。")),
+                Ok(_) => Err(notify_error(messages::INDUSTRY_PROJECT_CANNOT_CANCEL)),
                 Err(e) => Err(e),
             }
         }

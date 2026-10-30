@@ -5,6 +5,7 @@ use super::corps::EFFECTIVE_ROLES_SQL;
 use super::{db_err, keyval, trimmed_arg_text, Call, CallError, CallResult};
 use crate::client::{short, Client};
 use crate::consts::{ACCOUNT_CASH, FAR_FUTURE, FILETIME_SECOND, FILETIME_UNIX_EPOCH, FLAG_HANGAR};
+use crate::messages;
 use anyhow::Context;
 use marshal::Value;
 use tracing::{info, warn};
@@ -186,7 +187,7 @@ async fn own_character(c: &Client, call: &Call<'_>) -> Result<i64, CallError> {
         .query_opt("SELECT 1 FROM game.characters WHERE character_id = $1 AND user_id = $2 AND NOT deleted", &[&char_id, &c.login.user_id])
         .await
         .map_err(db_err)?
-        .ok_or_else(|| CallError::User { msg: "CharacterNotFound".into(), dict: vec![] })?;
+        .ok_or_else(|| CallError::User { msg: messages::MSG_CHARACTER_NOT_FOUND.into(), dict: vec![] })?;
     Ok(char_id)
 }
 
@@ -238,7 +239,7 @@ async fn select_character(c: &mut Client, char_id: i64) -> Result<(), CallError>
         )
         .await
         .map_err(db_err)?
-        .ok_or_else(|| CallError::User { msg: "CharacterNotFound".into(), dict: vec![] })?;
+        .ok_or_else(|| CallError::User { msg: messages::MSG_CHARACTER_NOT_FOUND.into(), dict: vec![] })?;
     let station: Option<i64> = r.get(1);
     let system: i64 = r.get(2);
     let race: i32 = r.get(7);
@@ -367,7 +368,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
                 .await
                 .map_err(db_err)?;
             if deleted == 0 {
-                return Ok(Value::str("CharacterNotReadyForDeletion"));
+                return Ok(Value::str(messages::MSG_CHARACTER_NOT_READY_FOR_DELETION));
             }
             info!(user = c.login.user_id, "character {char_id} deleted");
             Ok(Value::None)
@@ -384,11 +385,11 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
 
         "ValidateNameEx" => Ok(Value::Int(name_code(c, &trimmed_arg_text(call, 0)).await?)),
         "GetValidRandomName" => {
-            const FIRST: [&str; 12] = ["Aren", "Kael", "Sora", "Veyra", "Toma", "Ilsa", "Daro", "Mira", "Lukas", "Nadia", "Joren", "Tessa"];
-            const LAST: [&str; 12] = ["Vale", "Okaro", "Thorne", "Kassen", "Ruun", "Halvik", "Moreau", "Sandor", "Ikonen", "Drake", "Arvel", "Castor"];
+            const FIRST: [&str; 12] = [messages::RANDOM_FIRST_AREN, messages::RANDOM_FIRST_KAEL, messages::RANDOM_FIRST_SORA, messages::RANDOM_FIRST_VEYRA, messages::RANDOM_FIRST_TOMA, messages::RANDOM_FIRST_ILSA, messages::RANDOM_FIRST_DARO, messages::RANDOM_FIRST_MIRA, messages::RANDOM_FIRST_LUKAS, messages::RANDOM_FIRST_NADIA, messages::RANDOM_FIRST_JOREN, messages::RANDOM_FIRST_TESSA];
+            const LAST: [&str; 12] = [messages::RANDOM_LAST_VALE, messages::RANDOM_LAST_OKARO, messages::RANDOM_LAST_THORNE, messages::RANDOM_LAST_KASSEN, messages::RANDOM_LAST_RUUN, messages::RANDOM_LAST_HALVIK, messages::RANDOM_LAST_MOREAU, messages::RANDOM_LAST_SANDOR, messages::RANDOM_LAST_IKONEN, messages::RANDOM_LAST_DRAKE, messages::RANDOM_LAST_ARVEL, messages::RANDOM_LAST_CASTOR];
             for _ in 0..RANDOM_NAME_ATTEMPTS {
                 let r = crate::handshake::rand_i64() as usize;
-                let name = format!("{} {} {}", FIRST[r % FIRST.len()], LAST[(r / FIRST.len()) % LAST.len()], RANDOM_NAME_SUFFIX_START + (r / (FIRST.len() * LAST.len())) % RANDOM_NAME_SUFFIX_COUNT);
+                let name = messages::random_character_name(FIRST[r % FIRST.len()], LAST[(r / FIRST.len()) % LAST.len()], RANDOM_NAME_SUFFIX_START + (r / (FIRST.len() * LAST.len())) % RANDOM_NAME_SUFFIX_COUNT);
                 if name_code(c, &name).await? == NAME_VALID {
                     return Ok(Value::unicode(name));
                 }
@@ -401,7 +402,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
             let name = trimmed_arg_text(call, 0);
             let code = name_code(c, &name).await?;
             if code != NAME_VALID {
-                return Err(CallError::User { msg: "CharNameInvalid".into(), dict: vec![] });
+                return Err(CallError::User { msg: messages::MSG_CHAR_NAME_INVALID.into(), dict: vec![] });
             }
             let race_id = arg_int(call, 1).unwrap_or(FALLBACK_RACE_ID);
             let bloodline_id = arg_int(call, 2).unwrap_or(FALLBACK_BLOODLINE_ID);

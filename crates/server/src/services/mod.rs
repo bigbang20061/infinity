@@ -53,6 +53,7 @@ use crate::client::{filetime_now, short, Client};
 use crate::consts::{FAR_FUTURE, GROUP_PLANET};
 use marshal::{DbRowDescriptor, DbType, Value};
 use crate::db::Db;
+use crate::messages;
 use crate::space::V3;
 use tracing::warn;
 
@@ -131,7 +132,7 @@ pub fn user_error(msg: &str, dict: Vec<(String, Value)>) -> CallError {
 }
 
 pub fn notify_error(text: impl Into<String>) -> CallError {
-    user_error("CustomNotify", vec![("notify".into(), Value::unicode(text.into()))])
+    user_error(messages::MSG_CUSTOM_NOTIFY, vec![("notify".into(), Value::unicode(text.into()))])
 }
 
 /// Read a call argument as text, trimming whitespace; missing or non-text arguments become empty.

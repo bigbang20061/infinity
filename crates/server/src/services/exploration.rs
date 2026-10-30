@@ -32,6 +32,7 @@ use crate::consts::{ATTR_EXPLOSION_DELAY, ATTR_REQUIRED_SKILL_1, AU, FACTION_AMA
 use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::{dispatch_client, Effect, Outbox};
+use crate::messages;
 use crate::space::{dist, kg_to_tonnes, minutes_to_seconds, now_ms, Ball, World, MODE_RIGID, MODE_STOP, V3};
 use marshal::Value;
 use std::collections::{HashMap, HashSet};
@@ -1052,7 +1053,7 @@ pub async fn launch_probes(c: &mut Client, call: &Call<'_>) -> CallResult {
         .await
         .map_err(db_err)?
     else {
-        return Err(CallError::User { msg: "NoCharges".into(), dict: vec![] });
+        return Err(CallError::User { msg: messages::MSG_NO_CHARGES.into(), dict: vec![] });
     };
     let (type_id, have): (i32, i32) = (loaded.get(0), loaded.get(1));
     let out = state().probes.values().filter(|p| p.char_id == char_id && p.system == system).count();
@@ -1082,7 +1083,7 @@ pub async fn launch_probes(c: &mut Client, call: &Call<'_>) -> CallResult {
                 tx.query_opt("DELETE FROM game.module_charges WHERE ship_id = $1 AND flag_id = $2 AND type_id = $3 AND quantity = $4 RETURNING quantity", &[&ship, &flag, &type_id, &have]).await.map_err(db_err)?.map(|_| 0)
             } else {
                 tx.query_opt("UPDATE game.module_charges SET quantity = quantity - $4 WHERE ship_id = $1 AND flag_id = $2 AND type_id = $3 AND quantity >= $4 RETURNING quantity", &[&ship, &flag, &type_id, &take]).await.map_err(db_err)?.map(|r| r.get::<_, i32>(0))
-            }.ok_or_else(|| super::notify_error("探针发射器中的探针数量不足。"))?;
+            }.ok_or_else(|| super::notify_error(messages::INSUFFICIENT_PROBE_LAUNCHER_PROBES))?;
             outbox.notify_client("OnModuleAttributeChanges", vec![super::combat::quantity_change(char_id, ship, flag, type_id, remaining as i64, (remaining + take) as i64)]);
             outbox.operation(Launch::Probes);
             Ok::<(), CallError>(())
@@ -1715,9 +1716,9 @@ pub(super) async fn scan_result_position(db: &Db, system: i64, char_id: i64, tar
 pub async fn warp_to_scan(c: &mut Client, target: &str, min_range: f64) -> CallResult {
     let (Some(system), Some(char_id)) = (c.session.int("solarsystemid"), c.session.int("charid")) else { return Ok(Value::None) };
     let site = system_sites(system).into_iter().find(|s| s.target == target);
-    let Some(site) = site else { return Err(notify_error("扫描结果已经消失。")) };
+    let Some(site) = site else { return Err(notify_error(messages::SCAN_RESULT_GONE)) };
     if site.kind == Kind::Signature && !is_scanned(&c.db, char_id, site.id).await? {
-        return Err(notify_error("你需要先将该信号扫描到 100% 才能跃迁过去。"));
+        return Err(notify_error(messages::SIGNATURE_REQUIRES_FULL_SCAN_FOR_WARP));
     }
     if site.wormhole.is_some() {
         ensure_wormhole_ball(&c.db, &c.world, site.id).await?;
@@ -1762,25 +1763,25 @@ async fn wormhole_jump(c: &mut Client, wormhole_id: i64) -> CallResult {
         return Ok(Value::None);
     };
     let Some((site, w)) = state().sites.get(&wormhole_id).and_then(|s| s.wormhole.clone().map(|w| (s.clone(), w))) else {
-        return Err(notify_error("这个虫洞已经坍塌了。"));
+        return Err(notify_error(messages::WORMHOLE_COLLAPSED));
     };
     let Some((gap, mass)) = c.world.with(system, move |s| {
         let (me, hole) = (s.ball(ship)?, s.ball(wormhole_id)?);
         Some((dist(me.pos, hole.pos) - hole.radius as f64 - me.radius as f64, me.mass))
     }).await.flatten() else { return Ok(Value::None) };
     if gap > WORMHOLE_JUMP_RANGE {
-        return Err(CallError::User { msg: "NotCloseEnoughToJump".into(), dict: vec![("maxdist".into(), Value::Int(WORMHOLE_JUMP_RANGE as i64))] });
+        return Err(CallError::User { msg: messages::MSG_NOT_CLOSE_ENOUGH_TO_JUMP.into(), dict: vec![("maxdist".into(), Value::Int(WORMHOLE_JUMP_RANGE as i64))] });
     }
     if polarization(char_id, wormhole_id).is_some() {
-        return Err(notify_error("这个虫洞对你的舰船处于极化状态，暂时无法再次跃迁。"));
+        return Err(notify_error(messages::WORMHOLE_POLARIZED_FOR_SHIP));
     }
     if mass > w.jump_mass {
-        return Err(notify_error(format!("你的舰船太重了，无法通过这个虫洞（最大 {:.0} 吨）。", kg_to_tonnes(w.jump_mass))));
+        return Err(notify_error(messages::wormhole_mass_limit(kg_to_tonnes(w.jump_mass))));
     }
     // The far side: its K162 (or the hole this K162 answers) goes into space now.
     ensure_loaded(&c.db, &c.world, w.dest_system).await?;
     ensure_wormhole_ball(&c.db, &c.world, w.other).await?;
-    let Some(exit) = state().sites.get(&w.other).map(|s| s.pos) else { return Err(notify_error("这个虫洞已经坍塌了。")) };
+    let Some(exit) = state().sites.get(&w.other).map(|s| s.pos) else { return Err(notify_error(messages::WORMHOLE_COLLAPSED)) };
     let pos = offset(exit, 4000.0 + rand01() * 2000.0);
     let jump = super::ship::Jump { through: wormhole_id, guid: "effects.JumpOutWormhole", other_type: Some(w.dest_class), dest_system: w.dest_system, pos };
     super::ship::jump_out_and_arrive(c, system, ship, char_id, jump).await?;
@@ -2098,13 +2099,13 @@ pub(super) async fn container_hacked(db: &Db, world: &Arc<World>, container: i64
 // ---------------------------------------------------------------- GM commands (services/slash)
 
 fn gm_error(text: &str) -> CallError {
-    CallError::User { msg: "SlashError".into(), dict: vec![("reason".into(), Value::unicode(text))] }
+    CallError::User { msg: messages::MSG_SLASH_ERROR.into(), dict: vec![("reason".into(), Value::unicode(text))] }
 }
 
 /// /wh: a wormhole (in this system if there is one), scanned down and in space, with the
 /// GM teleported next to it.
 pub(super) async fn gm_wormhole(c: &mut Client) -> Result<String, CallError> {
-    let (Some(system), Some(char_id)) = (c.session.int("solarsystemid"), c.session.int("charid")) else { return Err(gm_error("undock first")) };
+    let (Some(system), Some(char_id)) = (c.session.int("solarsystemid"), c.session.int("charid")) else { return Err(gm_error(messages::GM_UNDOCK_FIRST)) };
     ensure_loaded(&c.db, &c.world, system).await?;
     ensure_static_exit(&c.db, &c.world, system).await?;
     let mut here: Vec<Site> = system_sites(system).into_iter().filter(|s| s.wormhole.is_some() && polarization(char_id, s.id).is_none()).collect();
@@ -2117,22 +2118,22 @@ pub(super) async fn gm_wormhole(c: &mut Client) -> Result<String, CallError> {
                 .query_opt("SELECT site_id, system_id FROM game.exploration_sites WHERE wh_type IS NOT NULL ORDER BY random() LIMIT 1", &[])
                 .await
                 .map_err(db_err)?
-                .ok_or_else(|| gm_error("no wormholes anywhere yet"))?;
+                .ok_or_else(|| gm_error(messages::GM_NO_WORMHOLES))?;
             let (id, other_system): (i64, i64) = (r.get(0), r.get(1));
             ensure_loaded(&c.db, &c.world, other_system).await?;
-            state().sites.get(&id).cloned().ok_or_else(|| gm_error("that wormhole just closed"))?
+            state().sites.get(&id).cloned().ok_or_else(|| gm_error(messages::GM_WORMHOLE_CLOSED))?
         }
     };
-    let w = site.wormhole.clone().ok_or_else(|| gm_error("not a wormhole"))?;
+    let w = site.wormhole.clone().ok_or_else(|| gm_error(messages::GM_NOT_WORMHOLE))?;
     mark_scanned(&c.db, char_id, site.id).await?;
     ensure_wormhole_ball(&c.db, &c.world, site.id).await?;
     super::ship::teleport(c, site.system, [site.pos[0] + 6000.0, site.pos[1], site.pos[2]]).await?;
-    Ok(format!("wormhole {} (type {}) in {} -> system {} (class {})", site.target, w.type_id, site.system, w.dest_system, w.dest_class))
+    Ok(messages::gm_wormhole_result(&site.target, w.type_id, site.system, w.dest_system, w.dest_class))
 }
 
 /// /scanall: every signature in the system scanned down for the GM.
 pub(super) async fn gm_scan_all(c: &mut Client) -> Result<String, CallError> {
-    let (Some(system), Some(char_id)) = (c.session.int("solarsystemid"), c.session.int("charid")) else { return Err(gm_error("undock first")) };
+    let (Some(system), Some(char_id)) = (c.session.int("solarsystemid"), c.session.int("charid")) else { return Err(gm_error(messages::GM_UNDOCK_FIRST)) };
     ensure_loaded(&c.db, &c.world, system).await?;
     let sites = system_sites(system);
     for s in sites.iter().filter(|s| s.kind == Kind::Signature) {
@@ -2141,12 +2142,12 @@ pub(super) async fn gm_scan_all(c: &mut Client) -> Result<String, CallError> {
     let results: Vec<Value> = sites.iter().map(|s| result_value(s, 1.0, 0.0)).collect();
     state().reported.insert((char_id, system), sites.iter().map(|s| s.target.clone()).collect());
     c.notify("OnSystemScanStopped", vec![Value::list([]), Value::List(results), Value::list([])]);
-    Ok(format!("{} sites scanned", sites.len()))
+    Ok(messages::gm_sites_scanned(sites.len()))
 }
 
 /// /sites: what this system holds.
 pub(super) async fn gm_sites(c: &mut Client) -> Result<String, CallError> {
-    let Some(system) = c.session.int("solarsystemid") else { return Err(gm_error("undock first")) };
+    let Some(system) = c.session.int("solarsystemid") else { return Err(gm_error(messages::GM_UNDOCK_FIRST)) };
     ensure_loaded(&c.db, &c.world, system).await?;
     let mut lines = vec![];
     for s in system_sites(system) {
@@ -2160,13 +2161,13 @@ pub(super) async fn gm_sites(c: &mut Client) -> Result<String, CallError> {
             None => None,
         };
         let what = match (&s.wormhole, s.strength_attr) {
-            (Some(w), _) => format!("wormhole {} -> {} (class {})", w.type_id, w.dest_system, w.dest_class),
-            (None, STRENGTH_RADAR) => "data".into(),
-            (None, STRENGTH_MAGNETOMETRIC) => "relic".into(),
-            _ => "combat".into(),
+            (Some(w), _) => messages::gm_wormhole_site(w.type_id, w.dest_system, w.dest_class),
+            (None, STRENGTH_RADAR) => messages::GM_SITE_DATA.into(),
+            (None, STRENGTH_MAGNETOMETRIC) => messages::GM_SITE_RELIC.into(),
+            _ => messages::GM_SITE_COMBAT.into(),
         };
-        let kind = if s.kind == Kind::Anomaly { "anomaly" } else { "signature" };
-        lines.push(format!("{} {kind} {what} {}", s.target, name.unwrap_or_default()));
+        let kind = if s.kind == Kind::Anomaly { messages::GM_SITE_ANOMALY } else { messages::GM_SITE_SIGNATURE };
+        lines.push(messages::gm_site_row(&s.target, kind, &what, &name.unwrap_or_default()));
     }
     lines.sort();
     Ok(lines.join("\n"))

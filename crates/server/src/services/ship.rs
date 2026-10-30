@@ -10,6 +10,7 @@ use super::{db_err, Call, CallError, CallResult};
 use crate::client::{short, Client};
 use crate::consts::{ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_SIGNATURE_RADIUS, FILETIME_SECOND, FLAG_HANGAR, TYPE_CAPSULE};
 use crate::db::outbox::{Effect, Outbox};
+use crate::messages;
 use crate::space::{self, event, now_ms, now_tick, seconds_to_ms_f64, warp_duration, Ball, Warp, V3, CLOAK_RESTORE, MODE_FOLLOW, MODE_GOTO, MODE_ORBIT, MODE_STOP, MODE_WARP};
 use marshal::Value;
 use tracing::{info, warn};
@@ -91,7 +92,7 @@ pub(super) async fn ship_ball(c: &Client, ship_id: i64, pos: [f64; 3]) -> Result
 
 async fn undock(c: &mut Client) -> CallResult {
     let (Some(station), Some(system), Some(ship)) = (c.session.int("stationid"), c.session.int("solarsystemid2"), c.session.int("shipid")) else {
-        return Err(CallError::User { msg: "CantUndockNotInStation".into(), dict: vec![] });
+        return Err(CallError::User { msg: messages::MSG_CANT_UNDOCK_NOT_IN_STATION.into(), dict: vec![] });
     };
     let st = c
         .db
@@ -130,8 +131,8 @@ fn check_weapons_timer(c: &Client, what: &str) -> Result<(), CallError> {
         Some(until) => {
             let secs = ((until - crate::client::filetime_now()) / 10_000_000).max(1);
             Err(CallError::User {
-                msg: "CustomNotify".into(),
-                dict: vec![("notify".into(), Value::unicode(format!("武器计时器仍在生效，{secs} 秒内无法{what}。")))],
+                msg: messages::MSG_CUSTOM_NOTIFY.into(),
+                dict: vec![("notify".into(), Value::unicode(messages::weapons_timer_message(secs, what)))],
             })
         }
         None => Ok(()),
@@ -140,9 +141,9 @@ fn check_weapons_timer(c: &Client, what: &str) -> Result<(), CallError> {
 
 async fn dock(c: &mut Client, station: i64) -> CallResult {
     let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) else {
-        return Err(CallError::User { msg: "DockingRequestDenied".into(), dict: vec![] });
+        return Err(CallError::User { msg: messages::MSG_DOCKING_REQUEST_DENIED.into(), dict: vec![] });
     };
-    check_weapons_timer(c, "停靠")?;
+    check_weapons_timer(c, messages::WEAPONS_TIMER_DOCK)?;
     super::combat::reset(c);
     // Station services patch the ship up.
     super::combat::repair(ship);
@@ -205,9 +206,9 @@ const UE_LOCID: i64 = 3;
 /// arrive, cloaked, next to its destination gate in the neighbouring system.
 async fn stargate_jump(c: &mut Client, from_gate: i64, to_gate: i64) -> CallResult {
     let (Some(system), Some(ship), Some(char_id)) = (c.session.int("solarsystemid"), c.session.int("shipid"), c.session.int("charid")) else {
-        return Err(CallError::User { msg: "JumpGateHasNoDestination".into(), dict: vec![] });
+        return Err(CallError::User { msg: messages::MSG_JUMP_GATE_HAS_NO_DESTINATION.into(), dict: vec![] });
     };
-    check_weapons_timer(c, "跳跃")?;
+    check_weapons_timer(c, messages::WEAPONS_TIMER_JUMP)?;
     let dest = c
         .db
         .query_opt(
@@ -222,7 +223,7 @@ async fn stargate_jump(c: &mut Client, from_gate: i64, to_gate: i64) -> CallResu
         )
         .await
         .map_err(db_err)?
-        .ok_or_else(|| CallError::User { msg: "JumpGateHasNoDestination".into(), dict: vec![] })?;
+        .ok_or_else(|| CallError::User { msg: messages::MSG_JUMP_GATE_HAS_NO_DESTINATION.into(), dict: vec![] })?;
     let dest_system: i64 = dest.get(0);
 
     // In range of the gate?
@@ -232,7 +233,7 @@ async fn stargate_jump(c: &mut Client, from_gate: i64, to_gate: i64) -> CallResu
             - b.radius as f64
     });
     if gap.is_none_or(|g| g > JUMP_RANGE) {
-        return Err(CallError::User { msg: "NotCloseEnoughToJump".into(), dict: vec![("maxdist".into(), Value::Int(JUMP_RANGE as i64))] });
+        return Err(CallError::User { msg: messages::MSG_NOT_CLOSE_ENOUGH_TO_JUMP.into(), dict: vec![("maxdist".into(), Value::Int(JUMP_RANGE as i64))] });
     }
     // Arrive a few kilometres off the destination gate, on a heading fixed per gate pair.
     let gate_pos: [f64; 3] = [dest.get(3), dest.get(4), dest.get(5)];
@@ -364,7 +365,7 @@ fn special_fx_stop(tick: i64, ship: i64, guid: &str) -> Value {
 /// the client gets a fresh ballpark; elsewhere the session moves as on a jump.
 pub(super) async fn teleport(c: &mut Client, dest_system: i64, pos: V3) -> Result<(), CallError> {
     let (Some(system), Some(ship), Some(char_id)) = (c.session.int("solarsystemid"), c.session.int("shipid"), c.session.int("charid")) else {
-        return Err(CallError::User { msg: "CustomNotify".into(), dict: vec![("notify".into(), Value::unicode("你必须在太空中。"))] });
+        return Err(CallError::User { msg: messages::MSG_CUSTOM_NOTIFY.into(), dict: vec![("notify".into(), Value::unicode(messages::MUST_BE_IN_SPACE))] });
     };
     c.world.system(dest_system).await.map_err(CallError::Internal)?;
     super::combat::reset(c);

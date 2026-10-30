@@ -10,6 +10,7 @@ use super::{crowset, db_err, keyval, notify_error, value_ids, Call, CallError, C
 use crate::client::{filetime_now, Client};
 use crate::consts::ROLE_DIRECTOR;
 use crate::db::Db;
+use crate::messages;
 use marshal::{DbRowDescriptor, DbType, Value};
 
 /// Client appConst.corpRoleChatManager.
@@ -102,8 +103,8 @@ async fn add_bulletin(db: &Db, me: i64, owner: i64, call: &Call<'_>) -> CallResu
                 .map_err(db_err)?
                 .map(|r| r.get(0));
             match current {
-                None => return Err(CallError::User { msg: "CorpBulletinNotFound".into(), dict: vec![] }),
-                Some(t) if seen.is_some_and(|s| s < t) => return Err(CallError::User { msg: "CorpBulletinHasBeenEdited".into(), dict: vec![] }),
+                None => return Err(CallError::User { msg: messages::MSG_CORP_BULLETIN_NOT_FOUND.into(), dict: vec![] }),
+                Some(t) if seen.is_some_and(|s| s < t) => return Err(CallError::User { msg: messages::MSG_CORP_BULLETIN_HAS_BEEN_EDITED.into(), dict: vec![] }),
                 Some(_) => {}
             }
             db
@@ -117,7 +118,7 @@ async fn add_bulletin(db: &Db, me: i64, owner: i64, call: &Call<'_>) -> CallResu
         None => {
             let count: i64 = db.query_one("SELECT count(*) FROM game.org_bulletins WHERE owner_id = $1", &[&owner]).await.map_err(db_err)?.get(0);
             if count >= MAX_BULLETINS {
-                return Err(CallError::User { msg: "CorpTooManyBulletins".into(), dict: vec![] });
+                return Err(CallError::User { msg: messages::MSG_CORP_TOO_MANY_BULLETINS.into(), dict: vec![] });
             }
             db
                 .execute(
@@ -188,7 +189,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     if let Some(roles) = needed {
         match may(db, me, owner, roles).await {
             Ok(true) => {}
-            Ok(false) => return Some(Err(notify_error("你没有执行此操作所需的职权。"))),
+            Ok(false) => return Some(Err(notify_error(messages::INSUFFICIENT_ROLE_FOR_OPERATION))),
             Err(e) => return Some(Err(e)),
         }
     }
@@ -235,7 +236,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             let name = call.args.first().and_then(|v| v.as_text()).map(|t| t.trim().to_string()).unwrap_or_default();
             let color = int(1).map(|c| c as i32);
             if name.is_empty() {
-                return Some(Err(CallError::User { msg: "MailLabelMustProvideName".into(), dict: vec![] }));
+                return Some(Err(CallError::User { msg: messages::MSG_MAIL_LABEL_MUST_PROVIDE_NAME.into(), dict: vec![] }));
             }
             // A label's ID is its bit in the contacts' labelMask: the lowest free one.
             let used: Vec<i64> = match db.query("SELECT label_id FROM game.org_labels WHERE owner_id = $1", &[&owner]).await {
@@ -243,7 +244,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                 Err(e) => return Some(Err(db_err(e))),
             };
             let Some(id) = (0..LABEL_BIT_END).map(|b| 1i64 << b).find(|b| !used.contains(b)) else {
-                return Some(Err(notify_error("标签数量已达上限。")));
+                return Some(Err(notify_error(messages::LABEL_LIMIT_REACHED)));
             };
             db
                 .execute("INSERT INTO game.org_labels (owner_id, label_id, name, color) VALUES ($1, $2, $3, $4)", &[&owner, &id, &name, &color])

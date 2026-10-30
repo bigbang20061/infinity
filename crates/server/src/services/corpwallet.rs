@@ -13,6 +13,7 @@ use crate::consts::{ACCOUNT_CASH, ROLE_ACCOUNTANT, ROLE_DIRECTOR};
 use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::{Outbox, dispatch_world};
+use crate::messages;
 use marshal::Value;
 use tracing::info;
 
@@ -84,7 +85,7 @@ pub(super) async fn corp_debit<X: Send>(db: &(impl Executor + ?Sized), outbox: &
     match row {
         Some(r) => announce(db, outbox, corp, key, r.get(0)).await,
         None => Err(CallError::User {
-            msg: "NotEnoughMoney".into(),
+            msg: messages::MSG_NOT_ENOUGH_MONEY.into(),
             dict: vec![("balance".into(), Value::Float(corp_balance(db, corp, key).await?)), ("amount".into(), Value::Float(amount))],
         }),
     }
@@ -104,7 +105,7 @@ async fn pay_to<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, 
     }
     let exists = db.query_opt("SELECT 1 FROM game.characters WHERE character_id = $1 AND NOT deleted", &[&to]).await.map_err(db_err)?.is_some();
     if !exists {
-        return Err(notify_error("只能向玩家角色或玩家军团转账。"));
+        return Err(notify_error(messages::TRANSFER_RECIPIENT_NOT_PLAYER));
     }
     super::market::credit(db, outbox, to, amount).await
 }
@@ -152,7 +153,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             let to = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
             let amount = amount_arg(call, 1);
             if amount <= 0.0 || to == me {
-                return Some(Err(notify_error("无效的转账。")));
+                return Some(Err(notify_error(messages::TRANSFER_INVALID)));
             }
             let to_key = key_kwarg(call, "toAccountKey", 3);
             let _trading = super::market::lock().await;
@@ -175,11 +176,11 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             let from_key = key_kwarg(call, "fromAccountKey", 2).unwrap_or(ACCOUNT_CASH);
             let to_key = key_kwarg(call, "toAccountKey", 3);
             if amount <= 0.0 || !valid_key(from_key) || (to == corp && to_key == Some(from_key)) {
-                return Some(Err(notify_error("无效的转账。")));
+                return Some(Err(notify_error(messages::TRANSFER_INVALID)));
             }
             match may_take(db, me, corp, from_key).await {
                 Ok(true) => {}
-                Ok(false) => return Some(Err(notify_error("你没有从该部门钱包取款的职权。"))),
+                Ok(false) => return Some(Err(notify_error(messages::DEPARTMENT_WALLET_WITHDRAW_UNAUTHORIZED))),
                 Err(e) => return Some(Err(e)),
             }
             let _trading = super::market::lock().await;

@@ -15,6 +15,7 @@ use crate::client::{filetime_now, Client};
 use crate::consts::FILETIME_MINUTE;
 use crate::db::Db;
 use crate::db::{executor::Executor, outbox::Outbox};
+use crate::messages;
 use marshal::Value;
 use std::io::Write;
 use tracing::info;
@@ -105,17 +106,17 @@ async fn send(c: &Client, call: &Call<'_>) -> CallResult {
     let body = call.args.get(4).and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
     let (reply_to, forwarded_from) = (call.args.get(5).and_then(|v| v.as_int()).unwrap_or(0), call.args.get(6).and_then(|v| v.as_int()).unwrap_or(0));
     if to_list.is_some() {
-        return Err(notify_error("暂不支持邮件列表。"));
+        return Err(notify_error(messages::MAILING_LISTS_UNSUPPORTED));
     }
     if to_chars.is_empty() && to_corp.is_none() {
-        return Err(notify_error("请至少选择一名收件人。"));
+        return Err(notify_error(messages::MAIL_RECIPIENT_REQUIRED));
     }
     if to_chars.len() > MAX_RECIPIENTS {
-        return Err(notify_error("收件人过多。"));
+        return Err(notify_error(messages::TOO_MANY_MAIL_RECIPIENTS));
     }
     if let Some(corp) = to_corp {
         if c.session.int("corpid") != Some(corp) {
-            return Err(notify_error("你只能给自己的军团发送邮件。"));
+            return Err(notify_error(messages::MAIL_ONLY_TO_OWN_CORPORATION));
         }
     }
     let sent = filetime_now() / FILETIME_MINUTE * FILETIME_MINUTE;
@@ -254,7 +255,7 @@ async fn create_label(c: &Client, name: &str, color: Option<i64>) -> CallResult 
     let me = c.session.int("charid").unwrap_or(0);
     let used: Vec<i32> = c.db.query("SELECT label_id FROM game.mail_labels WHERE char_id = $1", &[&me]).await.map_err(db_err)?.iter().map(|r| r.get(0)).collect();
     let Some(id) = (FIRST_CUSTOM_LABEL_BIT..CUSTOM_LABEL_BIT_END).map(|b| 1i32 << b).filter(|b| *b >= FIRST_CUSTOM_LABEL).find(|b| !used.contains(b)) else {
-        return Err(notify_error("标签数量已达上限。"));
+        return Err(notify_error(messages::LABEL_LIMIT_REACHED));
     };
     c.db
         .execute("INSERT INTO game.mail_labels (char_id, label_id, name, color) VALUES ($1, $2, $3, $4)", &[&me, &id, &name, &color.map(|c| c as i32)])
@@ -395,7 +396,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             };
             result.map(|_| Value::None).map_err(db_err)
         }
-        ("mailingListsMgr", "Create") => Err(notify_error("暂不支持邮件列表。")),
+        ("mailingListsMgr", "Create") => Err(notify_error(messages::MAILING_LISTS_UNSUPPORTED)),
 
         ("notificationMgr", "GetAllNotifications") => {
             let from = call.kwargs.get("fromID").and_then(|v| v.as_int()).or(int(0)).unwrap_or(0);

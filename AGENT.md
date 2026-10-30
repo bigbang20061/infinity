@@ -24,6 +24,7 @@ These rules apply to anyone changing this repository, coding agents and humans a
   - Name every value as a `const`. Its doc comment states the source: a client constant (file and name), an SDE ID, a carbonengine value, or a design decision of this server. A constant only one module uses sits at the top of that module. A game-data constant used by more than one module is defined once in `consts.rs` and imported (see Shared helpers); never redefine it locally, and never give two different meanings the same name (an effect ID and an effect category, seconds and FILETIME units).
   - Values the SDE or dogma data provides are read from that data, not copied. For example, lock time comes from the ship's scan resolution and the target's signature radius, for players and NPCs alike.
   - Deployment settings (addresses, ports, capacities) come from `Config` environment variables.
+  - Player-visible text and client message names are never written inline; they are defined in `messages.rs` (see Player-visible text).
   - Unit conversions go through the shared helpers, never inline factors such as `* 10_000` or `/ 1000`.
   - Exempt: `0` and `1` as identities, array indices, and test fixtures.
 - **No duplicated helpers.** Before writing a helper, search for an existing one. A helper needed by more than one module lives in one shared place (see Shared helpers); never copy it into another module.
@@ -76,6 +77,7 @@ Any other tag starts nothing.
 | Image server and content CDN | `images.rs`, `cdn.rs` |
 | Captured retail data | `retail.rs` and `crates/server/retail/` |
 | Database access and schema | `db/mod.rs` (`Db`: pool, statement methods, startup), `db/transaction.rs` (`Db::transaction`), `db/executor.rs` (`Executor`), `db/outbox.rs` (`Outbox`), `crates/server/sql/game_schema.sql` |
+| Player-visible text and client message names | `messages.rs` |
 | Wire format | `crates/marshal` |
 
 ## 4. Conventions
@@ -139,6 +141,12 @@ Any other tag starts nothing.
 ### Player-visible text
 
 - The Infinity client runs in Simplified Chinese. Any text a player sees, such as notify messages, mail, agent lines and default names, is written in Simplified Chinese, matching the existing strings.
+- Every such text is defined once in `crates/server/src/messages.rs`, in the section for its feature, and call sites refer to it as `messages::NAME`.
+  - Plain text is a `const`.
+  - Text that carries values is a function in the same file that returns `String`; no other file formats player-visible text.
+  - Client message names (the keys of the client's message catalogue passed to `user_error`, `CallError::User` or a notification, such as `CustomNotify`) are `MSG_` consts in their own section.
+  - Reuse an existing entry when the meaning is the same; add a new one when it differs.
+  - Not messages: names read from the SDE or written by players, and protocol identifiers such as service, method and notification names (`OnItemChange`).
 - Everything else (code, comments, logs, docs) stays in English.
 
 ### Shared state and concurrency

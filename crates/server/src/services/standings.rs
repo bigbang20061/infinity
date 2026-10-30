@@ -19,6 +19,7 @@ use crate::client::Client;
 use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::{dispatch_world, Outbox};
+use crate::messages;
 use crate::space::World;
 use marshal::Value;
 use tracing::info;
@@ -135,7 +136,7 @@ pub async fn add_lp<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<
     }
     let before = lp_balance(db, char_id, corp).await?;
     if before + amount < 0 {
-        return Err(notify_error(&format!("你在该军团只有 {before} 忠诚点。")));
+        return Err(notify_error(&messages::loyalty_balance_message(before)));
     }
     db
         .execute(
@@ -180,17 +181,17 @@ async fn take_offer(c: &Client, corp: i64, offer: i64, count: i64) -> CallResult
     let (db, world) = (&c.db, &*c.world);
     let me = c.session.int("charid").unwrap_or(0);
     let Some(station) = c.session.int("stationid") else {
-        return Err(notify_error("你必须停靠在空间站内才能使用忠诚点商店。"));
+        return Err(notify_error(messages::STATION_DOCK_REQUIRED_FOR_LP_STORE));
     };
     let count = count.clamp(1, MAX_OFFER_COUNT);
     let Some((type_id, lp, isk)) = offers(db, corp).await?.into_iter().find(|o| o.0 as i64 == offer) else {
-        return Err(notify_error("该兑换项已不可用。"));
+        return Err(notify_error(messages::LP_OFFER_UNAVAILABLE));
     };
     let _trading = super::market::lock().await;
     db.transaction(
         |tx, outbox| Box::pin(async move {
             if lp_balance(tx, me, corp).await? < lp * count {
-                return Err(notify_error("你的忠诚点不足。"));
+                return Err(notify_error(messages::INSUFFICIENT_LOYALTY_POINTS));
             }
             super::market::debit(tx, outbox, me, (isk * count) as f64).await?;
             add_lp(tx, outbox, me, corp, -lp * count).await?;
@@ -240,7 +241,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             })
         }
         ("LPStoreMgr", "TakeOfferForCharacter") => take_offer(c, int(0), int(1), call.args.get(2).and_then(|v| v.as_int()).unwrap_or(1)).await,
-        ("LPStoreMgr", "TakeOfferForCorporation") => Err(notify_error("暂不支持军团忠诚点钱包。")),
+        ("LPStoreMgr", "TakeOfferForCorporation") => Err(notify_error(messages::CORPORATION_LP_WALLET_UNSUPPORTED)),
         _ => return None,
     })
 }

@@ -12,6 +12,7 @@ use crate::client::{filetime_now, Client};
 use crate::consts::{FILETIME_HOUR, FLAG_HANGAR, TYPE_CAPSULE};
 use crate::db::executor::Executor;
 use crate::db::outbox::{Effect, Outbox};
+use crate::messages;
 use marshal::{DbRowDescriptor, DbType, Value};
 use tracing::info;
 
@@ -66,22 +67,22 @@ async fn clone_state(c: &Client, me: i64) -> CallResult {
 
 async fn install(c: &Client, me: i64) -> CallResult {
     let Some(station) = c.session.int("stationid") else {
-        return Err(notify_error("你必须停靠在空间站内才能安装远距克隆。"));
+        return Err(notify_error(messages::STATION_DOCK_REQUIRED_FOR_JUMP_CLONE_INSTALL));
     };
     let max = skill(c, me, SKILL_INFOMORPH_PSYCHOLOGY).await? + skill(c, me, SKILL_ADVANCED_INFOMORPH_PSYCHOLOGY).await?;
     let rows = c.db.query("SELECT location_id FROM game.jump_clones WHERE owner_id = $1", &[&me]).await.map_err(db_err)?;
     if rows.iter().any(|r| r.get::<_, i64>(0) == station) {
-        return Err(notify_error("你在这个空间站已经有一个远距克隆。"));
+        return Err(notify_error(messages::JUMP_CLONE_ALREADY_AT_STATION));
     }
     if rows.len() as i64 >= max {
-        return Err(notify_error(&format!("你的意识形态心理学技能允许 {max} 个远距克隆。")));
+        return Err(notify_error(&messages::jump_clone_limit(max)));
     }
     let inserted = c.db.execute(
         "INSERT INTO game.jump_clones (owner_id, location_id) SELECT $1, $2 WHERE NOT EXISTS (SELECT 1 FROM game.jump_clones WHERE owner_id = $1 AND location_id = $2)",
         &[&me, &station],
     ).await.map_err(db_err)?;
     if inserted == 0 {
-        return Err(notify_error("你在这个空间站已经有一个远距克隆。"));
+        return Err(notify_error(messages::JUMP_CLONE_ALREADY_AT_STATION));
     }
     info!("clones: {me} installed a jump clone at {station}");
     c.world.notify_pilot(me, "OnJumpCloneCacheInvalidated", vec![]);
@@ -91,7 +92,7 @@ async fn install(c: &Client, me: i64) -> CallResult {
 /// `CloneJump(destLocationID, cloneID, cost, confirmed)`.
 async fn jump(c: &mut Client, me: i64, dest: i64, clone_id: i64) -> CallResult {
     let Some(station) = c.session.int("stationid") else {
-        return Err(CallError::User { msg: "NotAtStation".into(), dict: vec![] });
+        return Err(CallError::User { msg: messages::MSG_NOT_AT_STATION.into(), dict: vec![] });
     };
     let now = filetime_now();
     let ship = c.session.int("shipid");
@@ -103,17 +104,17 @@ async fn jump(c: &mut Client, me: i64, dest: i64, clone_id: i64) -> CallResult {
             let cooldown = (BASE_JUMP_COOLDOWN_HOURS - level) * FILETIME_HOUR;
             if let Some(ready) = last.map(|l| l + cooldown).filter(|r| *r > now) {
                 let hours = (ready - now) as f64 / FILETIME_HOUR as f64;
-                return Err(notify_error(&format!("你需要再等 {hours:.1} 小时才能再次进行远距克隆跳跃。")));
+                return Err(notify_error(&messages::jump_clone_cooldown(hours)));
             }
             let target = Executor::query_opt(tx,
                 "SELECT s.station_id::bigint, s.solar_system_id::bigint, s.constellation_id::bigint, s.region_id::bigint
                  FROM game.jump_clones j JOIN sde.sta_stations s ON s.station_id::bigint = j.location_id
                  WHERE j.clone_id = $1 AND j.owner_id = $2 AND j.location_id = $3",
                 &[&clone_id, &me, &dest],
-            ).await.map_err(db_err)?.ok_or_else(|| notify_error("该远距克隆已不在原处。"))?;
+            ).await.map_err(db_err)?.ok_or_else(|| notify_error(messages::JUMP_CLONE_NOT_FOUND))?;
             let (to, system, constellation, region): (i64, i64, i64, i64) = (target.get(0), target.get(1), target.get(2), target.get(3));
             if to == station {
-                return Err(notify_error("你已经在该空间站中。"));
+                return Err(notify_error(messages::ALREADY_AT_JUMP_CLONE_DESTINATION));
             }
             Executor::execute(tx, "DELETE FROM game.jump_clones WHERE clone_id = $1", &[&clone_id]).await.map_err(db_err)?;
             Executor::execute(tx, "INSERT INTO game.jump_clones (owner_id, location_id) SELECT $1, $2 WHERE NOT EXISTS (SELECT 1 FROM game.jump_clones WHERE owner_id = $1 AND location_id = $2)", &[&me, &station]).await.map_err(db_err)?;
@@ -166,7 +167,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "ValidateInstallJumpClone" => Ok(Value::list([])),
         "GetPriceForClone" => Ok(Value::Float(0.0)),
         "InstallCloneInStation" => install(c, me).await,
-        "InstallCloneInStructure" => Err(notify_error("暂不支持建筑。")),
+        "InstallCloneInStructure" => Err(notify_error(messages::CLONE_STRUCTURE_INSTALL_UNSUPPORTED)),
         "DestroyInstalledClone" => match c.db.execute("DELETE FROM game.jump_clones WHERE clone_id = $1 AND owner_id = $2", &[&int(0), &me]).await {
             Ok(_) => {
                 c.world.notify_pilot(me, "OnJumpCloneCacheInvalidated", vec![]);

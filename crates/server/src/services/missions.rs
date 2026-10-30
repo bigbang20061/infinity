@@ -26,6 +26,7 @@
 use super::{db_err, keyval, rand01, rand_dir, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
 use crate::consts::{FLAG_CARGO, FLAG_HANGAR, IX_STACK_SIZE, TYPE_SOLAR_SYSTEM};
+use crate::messages;
 use crate::space::{dist, now_ms, Ball, MODE_STOP, V3};
 use marshal::Value;
 use std::collections::{HashMap, HashSet};
@@ -1031,18 +1032,18 @@ async fn view(c: &Client, m: &Mission, agent: &Agent) -> Result<(Value, Value), 
             actions(&[(ACT_ACCEPT, BTN_ACCEPT), (ACT_DECLINE, BTN_DECLINE)]),
         )
     } else if ready(c, m, agent).await? {
-        let done = if m.kind == Kind::Kill { "你已经清除了目标。完成任务，领取你的报酬吧。" } else { "一切就绪。完成任务，领取你的报酬吧。" };
+        let done = if m.kind == Kind::Kill { messages::MISSION_TARGET_CLEARED_COMPLETE } else { messages::MISSION_READY_COMPLETE };
         (Value::unicode(done), actions(&[(ACT_COMPLETE, BTN_COMPLETE), (ACT_QUIT, BTN_QUIT)]))
     } else if m.kind != Kind::Kill {
         let hint = match m.kind {
-            Kind::Talk | Kind::Courier if m.dest_agent.is_some() => "去找我说的那个人吧，完成后在那里交付。",
-            Kind::Courier | Kind::Trade => "把货物带到这个空间站的机库里，然后再来找我。",
-            _ => "我们还有事情没办完。",
+            Kind::Talk | Kind::Courier if m.dest_agent.is_some() => messages::MISSION_FIND_AGENT_DELIVER,
+            Kind::Courier | Kind::Trade => messages::MISSION_DELIVER_TO_STATION_HANGAR,
+            _ => messages::MISSION_INCOMPLETE,
         };
         (says(c, m, "messages.root.missioninprogress.agentsays", hint).await?, actions(&[(ACT_QUIT, BTN_QUIT)]))
     } else {
         (
-            says(c, m, "messages.root.missioninprogress.agentsays", "目标还在那里。完成后回来向我报告。").await?,
+            says(c, m, "messages.root.missioninprogress.agentsays", messages::MISSION_TARGET_REMAINS).await?,
             actions(&[(ACT_QUIT, BTN_QUIT)]),
         )
     })
@@ -1066,24 +1067,24 @@ async fn do_action(c: &mut Client, agent: &Agent, action: Option<i64>) -> CallRe
     if let Some(m) = delivery {
         if action == Some(ACT_DELIVER) {
             finish(c, &m, agent, None).await?;
-            let s = says(c, &m, "messages.mission.completed.agentsays", "干得好。").await?;
+            let s = says(c, &m, "messages.mission.completed.agentsays", messages::MISSION_WELL_DONE).await?;
             return conversation(s, actions(&[(ACT_REQUEST, BTN_REQUEST)]), last_action(true, false, false));
         }
         if matches!(action, None | Some(ACT_REQUEST)) {
-            return conversation(Value::unicode("我一直在等你。"), actions(&[(ACT_DELIVER, BTN_COMPLETE)]), none());
+            return conversation(Value::unicode(messages::MISSION_WAITING_FOR_PILOT), actions(&[(ACT_DELIVER, BTN_COMPLETE)]), none());
         }
     }
     let arc_agent = is_arc_agent(c, agent.id).await?;
     if agent.type_id != AGENT_TYPE_BASIC && !arc_agent {
-        return conversation(Value::unicode("我目前没有可以交给你的任务。"), Value::list([]), none());
+        return conversation(Value::unicode(messages::NO_MISSION_AVAILABLE), Value::list([]), none());
     }
     let current = mission_with(c, agent.id).await?;
     match (action, current) {
-        (None, None) => conversation(Value::unicode("你好，飞行员。我这里有些工作需要人手。"), actions(&[(ACT_REQUEST, BTN_REQUEST)]), none()),
-        (None, Some(_)) => conversation(Value::unicode("我们还有事情没办完。"), actions(&[(ACT_VIEW, BTN_VIEW)]), none()),
+        (None, None) => conversation(Value::unicode(messages::MISSION_GREETING_WITH_WORK), actions(&[(ACT_REQUEST, BTN_REQUEST)]), none()),
+        (None, Some(_)) => conversation(Value::unicode(messages::MISSION_INCOMPLETE), actions(&[(ACT_VIEW, BTN_VIEW)]), none()),
         (Some(ACT_REQUEST), None) if arc_agent => {
             let Some(step) = next_arc_step(c, agent.id).await? else {
-                return conversation(Value::unicode("现在我这里没有你的事。"), Value::list([]), none());
+                return conversation(Value::unicode(messages::NO_CURRENT_MISSION), Value::list([]), none());
             };
             offer_arc(c, agent, step).await?;
             c.notify("OnAgentMissionChange", vec![Value::str("offered"), Value::Int(agent.id)]);
@@ -1096,7 +1097,7 @@ async fn do_action(c: &mut Client, agent: &Agent, action: Option<i64>) -> CallRe
             let needed = super::standings::required_for_level(agent.level);
             let have = super::standings::effective(&c.db, me, agent.id, agent.corp_id, agent.faction_id).await?;
             if have < needed {
-                let text = format!("我只和信誉良好的飞行员合作。你需要对我、我的军团或势力拥有至少 {needed:.1} 的有效声望（目前为 {have:.2}）。");
+                let text = messages::mission_standing_requirement_message(needed, have);
                 return conversation(Value::unicode(text), Value::list([]), none());
             }
             offer(c, agent).await?;
@@ -1114,7 +1115,7 @@ async fn do_action(c: &mut Client, agent: &Agent, action: Option<i64>) -> CallRe
                 set_arc_state(c, arc, m.mission_id, "accepted").await?;
             }
             finish(c, &m, agent, Some((choice - ACT_OPTION) as usize)).await?;
-            let s = says(c, &m, "messages.mission.completed.agentsays", "就这么定了。").await?;
+            let s = says(c, &m, "messages.mission.completed.agentsays", messages::MISSION_ACCEPTED_CONFIRMATION).await?;
             conversation(s, actions(&[(ACT_REQUEST, BTN_REQUEST)]), last_action(true, false, false))
         }
         (Some(ACT_ACCEPT), Some(m)) if m.state == STATE_OFFERED => {
@@ -1131,7 +1132,7 @@ async fn do_action(c: &mut Client, agent: &Agent, action: Option<i64>) -> CallRe
             }
             info!(user = c.login.user_id, "agent {}: mission {} accepted", agent.id, m.mission_id);
             c.notify("OnAgentMissionChange", vec![Value::str("accepted"), Value::Int(agent.id)]);
-            let s = says(c, &m, "messages.mission.accepted.agentsays", "很好。目标位置已经加入你的日志，出发吧。").await?;
+            let s = says(c, &m, "messages.mission.accepted.agentsays", messages::MISSION_ACCEPTED_DESTINATION_LOGGED).await?;
             conversation(s, actions(&[(ACT_QUIT, BTN_QUIT)]), none())
         }
         (Some(ACT_DECLINE), Some(m)) if m.state == STATE_OFFERED => {
@@ -1139,12 +1140,12 @@ async fn do_action(c: &mut Client, agent: &Agent, action: Option<i64>) -> CallRe
             let me = c.session.int("charid").unwrap_or(0);
             super::standings::mission_declined(&c.db, &c.world, me, agent.id, agent.corp_id).await?;
             c.notify("OnAgentMissionChange", vec![Value::str("offer_declined"), Value::Int(agent.id)]);
-            let s = says(c, &m, "messages.mission.declined.agentsays", "好吧，也许下次吧。").await?;
+            let s = says(c, &m, "messages.mission.declined.agentsays", messages::MISSION_DECLINED).await?;
             conversation(s, Value::list([]), last_action(false, true, false))
         }
         (Some(ACT_COMPLETE), Some(m)) if ready(c, &m, agent).await? => {
             finish(c, &m, agent, None).await?;
-            let s = says(c, &m, "messages.mission.completed.agentsays", "干得漂亮！这是你的报酬。").await?;
+            let s = says(c, &m, "messages.mission.completed.agentsays", messages::MISSION_REWARD_DELIVERY).await?;
             let next = if m.arc_id.is_some() { actions(&[(ACT_REQUEST, BTN_REQUEST)]) } else { Value::list([]) };
             conversation(s, next, last_action(true, false, false))
         }
@@ -1159,7 +1160,7 @@ async fn do_action(c: &mut Client, agent: &Agent, action: Option<i64>) -> CallRe
                 set_arc_state(c, arc, retry, "unlocked").await?;
             }
             c.notify("OnAgentMissionChange", vec![Value::str("quit"), Value::Int(agent.id)]);
-            let s = says(c, &m, "messages.mission.quitted.agentsays", "真遗憾。也许下次你能做到。").await?;
+            let s = says(c, &m, "messages.mission.quitted.agentsays", messages::MISSION_QUIT).await?;
             conversation(s, Value::list([]), last_action(false, false, true))
         }
         (_, current) => match current {
@@ -1167,7 +1168,7 @@ async fn do_action(c: &mut Client, agent: &Agent, action: Option<i64>) -> CallRe
                 let (s, a) = view(c, &m, agent).await?;
                 conversation(s, a, none())
             }
-            None => conversation(Value::unicode("你好，飞行员。"), actions(&[(ACT_REQUEST, BTN_REQUEST)]), none()),
+            None => conversation(Value::unicode(messages::PILOT_GREETING), actions(&[(ACT_REQUEST, BTN_REQUEST)]), none()),
         },
     }
 }
