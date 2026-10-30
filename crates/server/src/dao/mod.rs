@@ -15,6 +15,7 @@ pub(crate) mod bookmarks;
 pub(crate) mod calendar;
 pub(crate) mod characters;
 pub(crate) mod contracts;
+pub(crate) mod corporations;
 pub(crate) mod exploration;
 pub(crate) mod industry;
 pub(crate) mod insurance;
