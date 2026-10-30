@@ -21,6 +21,8 @@ pub struct System {
     observers: HashMap<i64, (i64, DestinyTx)>,
     registry: Arc<Pilots>,
     positions: HashMap<i64, V3>,
+    /// Celestial warp-in points (warpin.rs), by celestial ID.
+    warp_ins: HashMap<i64, V3>,
     pending: Option<HashMap<i64, Vec<Value>>>,
     timers: BTreeMap<(i64, u64), Timer>,
     timer_sequence: u64,
@@ -56,6 +58,8 @@ impl System {
             tracing::warn!(system = self.id, "space effects worker unavailable");
         }
     }
+    pub fn warp_in(&self, id: i64) -> Option<V3> { self.warp_ins.get(&id).copied() }
+    pub(super) fn set_warp_in(&mut self, id: i64, point: V3) { self.warp_ins.insert(id, point); }
     pub fn ball(&self, id: i64) -> Option<&Ball> {
         self.balls.get(&id)
     }

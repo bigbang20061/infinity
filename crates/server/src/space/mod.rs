@@ -27,6 +27,7 @@ use tracing::info;
 mod actor;
 mod system;
 mod npc;
+mod warpin;
 pub use npc::{HOSTILE_TO_ALL, NpcAction, NpcBrain, NpcConfig, NpcEffects, NpcFuture};
 pub use system::System;
 use actor::SystemHandle;
@@ -492,8 +493,9 @@ impl World {
             .query(
                 "SELECT c.item_id, c.type_id, COALESCE(c.radius, t.radius, $2::float8)::float8, c.x, c.y, c.z,
                         COALESCE(s.owner_id, 1)::bigint, c.group_id::bigint,
-                        g.dest_stargate_id::bigint, g.dest_solar_system_id::bigint
+                        g.dest_stargate_id::bigint, g.dest_solar_system_id::bigint, gr.category_id
                  FROM sde.map_celestials c JOIN sde.inv_types t USING (type_id)
+                 LEFT JOIN sde.inv_groups gr ON gr.group_id = c.group_id
                  LEFT JOIN sde.sta_stations s ON s.station_id = c.item_id
                  LEFT JOIN sde.map_stargates g ON g.stargate_id = c.item_id
                  WHERE c.solar_system_id = $1",
@@ -504,6 +506,12 @@ impl World {
         let mut system = System::new(system_id, self.pilots.clone());
         for r in rows {
             let id: i64 = r.get(0);
+            let pos: V3 = [r.get(3), r.get(4), r.get(5)];
+            let group = r.get::<_, Option<i64>>(7).unwrap_or(0) as i32;
+            let category = r.get::<_, Option<i32>>(10).unwrap_or(0);
+            if let Some(point) = warpin::warp_in_point(id, category, group, pos, r.get(2)) {
+                system.set_warp_in(id, point);
+            }
             let mut slim = Vec::new();
             if let (Some(dest_gate), Some(dest_sys)) = (r.get::<_, Option<i64>>(8), r.get::<_, Option<i64>>(9)) {
                 // A row: unpacked as (destGate, destSystem) by subwaySvc.GetPriorityLoads,
@@ -533,7 +541,7 @@ impl World {
                     max_vel: 0.0,
                     agility: 1.0,
                     speed_fraction: 0.0,
-                    pos: [r.get(3), r.get(4), r.get(5)],
+                    pos,
                     vel: V3::default(),
                     goto: V3::default(),
                     follow_id: 0,

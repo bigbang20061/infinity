@@ -550,18 +550,17 @@ fn movement(c: &mut Client, f: impl FnOnce(&mut Ball, i64, &space::System) -> Ve
 
 /// Warp the session's ship to `point`. With `object` (position, radius) it lands
 /// `min_range` (at least 2.5 km) off that object's surface on the near side; without,
-/// at the point itself (bookmarks, mission sites).
+/// `min_range` short of the point itself (bookmarks, mission sites, warp-in points),
+/// as Ballpark::RealWarp places it.
 pub(super) fn warp_to(c: &mut Client, object: Option<(V3, f64)>, point: V3, min_range: f64) -> CallResult {
     movement(c, move |b, t, _| {
-        let to = match object {
-            Some((pos, radius)) => {
-                let away = [b.pos[0] - pos[0], b.pos[1] - pos[1], b.pos[2] - pos[2]];
-                let l = (away[0] * away[0] + away[1] * away[1] + away[2] * away[2]).sqrt().max(1.0);
-                let stand_off = radius + b.radius as f64 + min_range.max(2500.0);
-                [pos[0] + away[0] / l * stand_off, pos[1] + away[1] / l * stand_off, pos[2] + away[2] / l * stand_off]
-            }
-            None => point,
+        let (center, stand_off) = match object {
+            Some((pos, radius)) => (pos, radius + b.radius as f64 + min_range.max(2500.0)),
+            None => (point, min_range.max(0.0)),
         };
+        let away = [b.pos[0] - center[0], b.pos[1] - center[1], b.pos[2] - center[2]];
+        let l = (away[0] * away[0] + away[1] * away[1] + away[2] * away[2]).sqrt().max(1.0);
+        let to = [center[0] + away[0] / l * stand_off, center[1] + away[1] / l * stand_off, center[2] + away[2] / l * stand_off];
         let distance = ((to[0] - b.pos[0]).powi(2) + (to[1] - b.pos[1]).powi(2) + (to[2] - b.pos[2]).powi(2)).sqrt();
         let tau = (b.mass * b.agility as f64 / 1e6).max(0.1);
         let align = -tau * 0.25f64.ln();
@@ -663,15 +662,19 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             let found = if let Some(sys) = c.session.int("solarsystemid") {
                 c.world.with(sys, move |s| {
                     if by_pilot { s.pilot_ball(target) } else { s.ball(target) }
-                        .map(|b| (b.id, b.pos, b.radius as f64))
+                        .map(|b| (b.id, b.pos, b.radius as f64, s.warp_in(b.id)))
                 }).await.flatten()
             } else {
                 None
             };
-            let Some((id, pos, radius)) = found else {
+            let Some((id, pos, radius, warp_in)) = found else {
                 return Some(Ok(Value::None));
             };
-            let warped = warp_to(c, Some((pos, radius)), pos, min_range);
+            // Suns, planets, moons and belts land at their warp-in point, not off the surface.
+            let warped = match warp_in {
+                Some(point) => warp_to(c, None, point, min_range),
+                None => warp_to(c, Some((pos, radius)), pos, min_range),
+            };
             // Warping to an asteroid belt brings out its rats.
             if let (Ok(_), false, Some(system)) = (&warped, by_pilot, c.session.int("solarsystemid")) {
                 if let Err(e) = super::exploration::belt_rats(c, system, id, pos).await {
