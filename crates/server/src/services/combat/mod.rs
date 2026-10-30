@@ -19,8 +19,8 @@
 //! pays the NPC's bounty and leaves a wreck with loot.
 //! Target locks, reloads, module cycles, pulses and missile impacts use system
 //! actor timers. Database-backed effects run on deferred workers outside the actor.
-//! Reload reservations and delayed completion are separate atomic database phases; a
-//! server interruption between them can leave reserved ammunition uncompleted.
+//! Reload reservations survive interruptions and return to cargo during startup; reload
+//! timers remain memory-only and are not resumed.
 //! Dropped cycle owners release their own in-memory activation markers without notifications.
 //! Reset clears a pilot's targets and pending locks and stops only that pilot's modules.
 //! Missiles in flight use a temporary, nonpersistent ID namespace.
@@ -256,6 +256,8 @@ pub fn reset(c: &Client) {
 }
 
 
+mod reload_recovery;
+pub(crate) use reload_recovery::recover_pending_reloads;
 mod targeting_charges;
 use targeting_charges::*;
 mod groups_health;
