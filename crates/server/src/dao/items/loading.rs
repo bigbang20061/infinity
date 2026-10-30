@@ -1,4 +1,5 @@
 //! Inventory item row loading from `game.items` and `sde.inv_types`.
+//! Quantity-ordered queries use quantity and item ID; other queries use item ID.
 //! This DAO has no direct client mirror or wire contract; owning services supply those.
 //! Transactions, refusals, notifications and World are caller concerns.
 
@@ -61,13 +62,18 @@ pub(crate) async fn load_items(ex: &(impl Executor + ?Sized), query: ItemQuery<'
         OwnerLocation(..) => "i.owner_id = $1 AND i.location_id = $2",
         OwnerLocationFlag(..) => "i.owner_id = $1 AND i.location_id = $2 AND i.flag_id = $3",
         LocationFlagTypeOwnerStack(..) => "i.location_id = $1 AND i.flag_id = $2 AND i.type_id = $3 AND i.owner_id = $4 AND NOT i.singleton",
-        OwnerLocationFlagTypeDescending(..) => "i.owner_id = $1 AND i.location_id = $2 AND i.flag_id = $3 AND i.type_id = $4 ORDER BY i.quantity DESC, i.item_id",
-        OwnerLocationFlagTypeStackAscending(..) => "i.owner_id = $1 AND i.location_id = $2 AND i.flag_id = $3 AND i.type_id = $4 AND NOT i.singleton ORDER BY i.quantity, i.item_id",
+        OwnerLocationFlagTypeDescending(..) => "i.owner_id = $1 AND i.location_id = $2 AND i.flag_id = $3 AND i.type_id = $4",
+        OwnerLocationFlagTypeStackAscending(..) => "i.owner_id = $1 AND i.location_id = $2 AND i.flag_id = $3 AND i.type_id = $4 AND NOT i.singleton",
         OwnerTypeTwoLocations(..) => "i.owner_id = $1 AND i.type_id = $2 AND ((i.location_id = $3 AND i.flag_id = $4) OR (i.location_id = $5 AND i.flag_id = $6))",
+    };
+    let order = match &query {
+        OwnerLocationFlagTypeDescending(..) => "i.quantity DESC, i.item_id",
+        OwnerLocationFlagTypeStackAscending(..) => "i.quantity, i.item_id",
+        _ => "i.item_id",
     };
     let sql = format!("SELECT i.item_id, i.type_id, i.owner_id, i.location_id, i.flag_id, i.quantity, i.singleton,
                         t.group_id::bigint, t.category_id::bigint, i.custom_info
-                 FROM game.items i JOIN sde.inv_types t USING (type_id) WHERE {filter} ORDER BY i.item_id");
+                 FROM game.items i JOIN sde.inv_types t USING (type_id) WHERE {filter} ORDER BY {order}");
     let rows = match &query {
         Id(a) | Location(a) | OwnerExceptSelf(a) => ex.query(&sql, &[a]).await?,
         Ids(a) => ex.query(&sql, &[a]).await?,
