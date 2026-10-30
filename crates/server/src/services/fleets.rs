@@ -271,7 +271,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "GetActiveBridgeForShip" => Ok(Value::None),
         "GetFleetComposition" => {
             let ids: Vec<i64> = state().fleets.get(&fleet_id).map(|f| f.members.keys().copied().collect()).unwrap_or_default();
-            match c.db.client.query("SELECT ch.character_id, ch.solar_system_id, ch.station_id, i.type_id FROM game.characters ch LEFT JOIN game.items i ON i.item_id = ch.ship_id WHERE ch.character_id = ANY($1)", &[&ids]).await {
+            match c.db.query("SELECT ch.character_id, ch.solar_system_id, ch.station_id, i.type_id FROM game.characters ch LEFT JOIN game.items i ON i.item_id = ch.ship_id WHERE ch.character_id = ANY($1)", &[&ids]).await {
                 Ok(rows) => Ok(Value::list(rows.iter().map(|r| {
                     keyval([
                         ("characterID", Value::Int(r.get(0))),
@@ -305,7 +305,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             }
             let name: String = c
                 .db
-                .client
                 .query_opt("SELECT name FROM game.characters WHERE character_id = $1", &[&me])
                 .await
                 .ok()

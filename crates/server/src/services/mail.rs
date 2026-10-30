@@ -14,7 +14,7 @@ use super::{db_err, keyval, notify_error, value_id_list, value_text, Call, CallE
 use crate::client::{filetime_now, Client};
 use crate::consts::FILETIME_MINUTE;
 use crate::db::Db;
-use crate::space::World;
+use crate::db::{executor::Executor, outbox::Outbox};
 use marshal::Value;
 use std::io::Write;
 use tracing::info;
@@ -73,10 +73,9 @@ const HEADER_SELECT: &str = "SELECT m.message_id, m.sender_id, m.to_character_id
 /// `SyncMail(firstID, lastID)` -> KeyVal(newMail, oldMail, mailStatus).
 async fn sync(c: &Client, last_id: i64) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
-    let new = c.db.client.query(&format!("{HEADER_SELECT} WHERE s.char_id = $1 AND m.message_id > $2 ORDER BY m.message_id"), &[&me, &last_id]).await.map_err(db_err)?;
+    let new = c.db.query(&format!("{HEADER_SELECT} WHERE s.char_id = $1 AND m.message_id > $2 ORDER BY m.message_id"), &[&me, &last_id]).await.map_err(db_err)?;
     let status = c
         .db
-        .client
         .query("SELECT message_id, status_mask::bigint, label_mask::bigint FROM game.mail_status WHERE char_id = $1", &[&me])
         .await
         .map_err(db_err)?;
@@ -122,7 +121,6 @@ async fn send(c: &Client, call: &Call<'_>) -> CallResult {
     let sent = filetime_now() / FILETIME_MINUTE * FILETIME_MINUTE;
     let to_text = to_chars.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
     let id: i64 = db
-        .client
         .query_one(
             "INSERT INTO game.mail_messages (sender_id, to_character_ids, to_corp_or_alliance_id, title, body, sent_date)
              VALUES ($1, $2, $3, $4, $5, $6) RETURNING message_id",
@@ -149,7 +147,7 @@ async fn send(c: &Client, call: &Call<'_>) -> CallResult {
         None => boxes.push((me, STATUS_READ, LABEL_SENT)),
     }
     for (ch, status, labels) in &boxes {
-        db.client
+        db
             .execute(
                 "INSERT INTO game.mail_status (message_id, char_id, status_mask, label_mask) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
                 &[&id, ch, status, labels],
@@ -159,7 +157,7 @@ async fn send(c: &Client, call: &Call<'_>) -> CallResult {
     }
     for (original, bit) in [(reply_to, STATUS_REPLIED), (forwarded_from, STATUS_FORWARDED)] {
         if original > 0 {
-            db.client
+            db
                 .execute("UPDATE game.mail_status SET status_mask = status_mask | $3 WHERE message_id = $1 AND char_id = $2", &[&original, &me, &bit])
                 .await
                 .map_err(db_err)?;
@@ -191,7 +189,6 @@ async fn body(c: &Client, id: i64, mark_read: bool) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
     let Some(r) = c
         .db
-        .client
         .query_opt("SELECT m.body FROM game.mail_messages m JOIN game.mail_status s USING (message_id) WHERE m.message_id = $1 AND s.char_id = $2", &[&id, &me])
         .await
         .map_err(db_err)?
@@ -213,9 +210,9 @@ async fn set_bits(db: &Db, me: i64, (which, mask): (&str, Option<i32>), ids: &[i
     let sql = format!("UPDATE game.mail_status SET status_mask = {set} WHERE char_id = $1 AND {which}");
     let ids = ids.to_vec();
     if let Some(mask) = mask {
-        db.client.execute(&sql, &[&me, &ids, &bits, &mask]).await.map_err(db_err)?;
+        db.execute(&sql, &[&me, &ids, &bits, &mask]).await.map_err(db_err)?;
     } else {
-        db.client.execute(&sql, &[&me, &ids, &bits]).await.map_err(db_err)?;
+        db.execute(&sql, &[&me, &ids, &bits]).await.map_err(db_err)?;
     }
     Ok(())
 }
@@ -235,7 +232,7 @@ fn selector(method: &str) -> (&'static str, Option<i32>) {
 
 async fn labels(c: &Client) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
-    let rows = c.db.client.query("SELECT label_id::bigint, name, color::bigint FROM game.mail_labels WHERE char_id = $1", &[&me]).await.map_err(db_err)?;
+    let rows = c.db.query("SELECT label_id::bigint, name, color::bigint FROM game.mail_labels WHERE char_id = $1", &[&me]).await.map_err(db_err)?;
     Ok(Value::Dict(
         rows.iter()
             .map(|r| {
@@ -255,11 +252,11 @@ async fn labels(c: &Client) -> CallResult {
 
 async fn create_label(c: &Client, name: &str, color: Option<i64>) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
-    let used: Vec<i32> = c.db.client.query("SELECT label_id FROM game.mail_labels WHERE char_id = $1", &[&me]).await.map_err(db_err)?.iter().map(|r| r.get(0)).collect();
+    let used: Vec<i32> = c.db.query("SELECT label_id FROM game.mail_labels WHERE char_id = $1", &[&me]).await.map_err(db_err)?.iter().map(|r| r.get(0)).collect();
     let Some(id) = (FIRST_CUSTOM_LABEL_BIT..CUSTOM_LABEL_BIT_END).map(|b| 1i32 << b).filter(|b| *b >= FIRST_CUSTOM_LABEL).find(|b| !used.contains(b)) else {
         return Err(notify_error("标签数量已达上限。"));
     };
-    c.db.client
+    c.db
         .execute("INSERT INTO game.mail_labels (char_id, label_id, name, color) VALUES ($1, $2, $3, $4)", &[&me, &id, &name, &color.map(|c| c as i32)])
         .await
         .map_err(db_err)?;
@@ -271,10 +268,9 @@ async fn create_label(c: &Client, name: &str, color: Option<i64>) -> CallResult 
 /// Post a notification to a character (and show it at once if they're online). `data` is
 /// the YAML mapping the client's formatter for `type_id` reads; `group` is its
 /// notificationconst group.
-pub async fn notify(db: &Db, world: &World, receiver: i64, type_id: i32, group: i32, sender: i64, data: &str) -> Result<(), CallError> {
+pub async fn notify<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, receiver: i64, type_id: i32, group: i32, sender: i64, data: &str) -> Result<(), CallError> {
     let created = filetime_now();
     let id: i64 = db
-        .client
         .query_one(
             "INSERT INTO game.notifications (receiver_id, type_id, group_id, sender_id, created, data) VALUES ($1, $2, $3, $4, $5, $6) RETURNING notification_id",
             &[&receiver, &type_id, &group, &sender, &created, &data],
@@ -282,7 +278,7 @@ pub async fn notify(db: &Db, world: &World, receiver: i64, type_id: i32, group: 
         .await
         .map_err(db_err)?
         .get(0);
-    world.notify_pilot(receiver, "OnNotificationReceived", vec![Value::Int(id), Value::Int(type_id as i64), Value::Int(sender), Value::Int(created), Value::str(data)]);
+    outbox.notify_pilot(receiver, "OnNotificationReceived", vec![Value::Int(id), Value::Int(type_id as i64), Value::Int(sender), Value::Int(created), Value::str(data)]);
     Ok(())
 }
 
@@ -290,7 +286,6 @@ async fn notifications(c: &Client, where_sql: &str, arg: i64) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
     let rows = c
         .db
-        .client
         .query(
             &format!(
                 "SELECT notification_id, type_id::bigint, sender_id, processed, created, data FROM game.notifications
@@ -321,7 +316,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         ("mailMgr", "SyncMail") => sync(c, int(1).unwrap_or(0)).await,
         ("mailMgr", "GetMailHeaders") => {
             let wanted = value_id_list(call.args.first());
-            match db.client.query(&format!("{HEADER_SELECT} WHERE s.char_id = $1 AND m.message_id = ANY($2)"), &[&me, &wanted]).await {
+            match db.query(&format!("{HEADER_SELECT} WHERE s.char_id = $1 AND m.message_id = ANY($2)"), &[&me, &wanted]).await {
                 Ok(rows) => Ok(header_rows(&rows)),
                 Err(e) => Err(db_err(e)),
             }
@@ -345,14 +340,13 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             set_bits(db, me, selector(m), &arg, STATUS_TRASHED, false).await.map(|_| Value::None)
         }
         ("mailMgr", "EmptyTrash") => db
-            .client
             .execute("DELETE FROM game.mail_status WHERE char_id = $1 AND status_mask & $2 <> 0", &[&me, &STATUS_TRASHED])
             .await
             .map(|_| Value::None)
             .map_err(db_err),
         ("mailMgr", "DeleteMail") => {
             let wanted = value_id_list(call.args.first());
-            db.client.execute("DELETE FROM game.mail_status WHERE char_id = $1 AND message_id = ANY($2)", &[&me, &wanted]).await.map(|_| Value::None).map_err(db_err)
+            db.execute("DELETE FROM game.mail_status WHERE char_id = $1 AND message_id = ANY($2)", &[&me, &wanted]).await.map(|_| Value::None).map_err(db_err)
         }
         ("mailMgr", "GetLabels") => labels(c).await,
         // CreateLabel(name, color) -> labelID
@@ -364,7 +358,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         ("mailMgr", "EditLabel") => {
             let name = call.args.get(1).and_then(|v| v.as_text()).map(|t| t.into_owned());
             let color = int(2).map(|c| c as i32);
-            db.client
+            db
                 .execute(
                     "UPDATE game.mail_labels SET name = COALESCE($3, name), color = COALESCE($4, color) WHERE char_id = $1 AND label_id = $2",
                     &[&me, &(int(0).unwrap_or(0) as i32), &name, &color],
@@ -375,9 +369,8 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         }
         ("mailMgr", "DeleteLabel") => {
             let label = int(0).unwrap_or(0) as i32;
-            match db.client.execute("DELETE FROM game.mail_labels WHERE char_id = $1 AND label_id = $2", &[&me, &label]).await {
+            match db.execute("DELETE FROM game.mail_labels WHERE char_id = $1 AND label_id = $2", &[&me, &label]).await {
                 Ok(_) => db
-                    .client
                     .execute("UPDATE game.mail_status SET label_mask = label_mask & ~($2::int) WHERE char_id = $1", &[&me, &label])
                     .await
                     .map(|_| Value::None)
@@ -396,9 +389,9 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             };
             let sql = format!("UPDATE game.mail_status SET label_mask = {set} WHERE char_id = $1 AND message_id = ANY($2)");
             let result = if let Some(mask) = mask {
-                db.client.execute(&sql, &[&me, &wanted, &label, &mask]).await
+                db.execute(&sql, &[&me, &wanted, &label, &mask]).await
             } else {
-                db.client.execute(&sql, &[&me, &wanted, &label]).await
+                db.execute(&sql, &[&me, &wanted, &label]).await
             };
             result.map(|_| Value::None).map_err(db_err)
         }
@@ -412,37 +405,35 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         ("notificationMgr", "GetByGroupID") => notifications(c, "group_id::bigint = $2", int(0).unwrap_or(MISSING_NOTIFICATION_GROUP as i64)).await,
         ("notificationMgr", "MarkAsProcessed") => {
             let wanted = value_id_list(call.args.first());
-            db.client
+            db
                 .execute("UPDATE game.notifications SET processed = true WHERE receiver_id = $1 AND notification_id = ANY($2)", &[&me, &wanted])
                 .await
                 .map(|_| Value::None)
                 .map_err(db_err)
         }
         ("notificationMgr", "MarkGroupAsProcessed") => db
-            .client
             .execute("UPDATE game.notifications SET processed = true WHERE receiver_id = $1 AND group_id = $2", &[&me, &(int(0).unwrap_or(MISSING_NOTIFICATION_GROUP as i64) as i32)])
             .await
             .map(|_| Value::None)
             .map_err(db_err),
         ("notificationMgr", "MarkAllAsProcessed") => {
-            db.client.execute("UPDATE game.notifications SET processed = true WHERE receiver_id = $1", &[&me]).await.map(|_| Value::None).map_err(db_err)
+            db.execute("UPDATE game.notifications SET processed = true WHERE receiver_id = $1", &[&me]).await.map(|_| Value::None).map_err(db_err)
         }
         ("notificationMgr", "DeleteNotifications") => {
             let wanted = value_id_list(call.args.first());
-            db.client
+            db
                 .execute("DELETE FROM game.notifications WHERE receiver_id = $1 AND notification_id = ANY($2)", &[&me, &wanted])
                 .await
                 .map(|_| Value::None)
                 .map_err(db_err)
         }
         ("notificationMgr", "DeleteGroupNotifications") => db
-            .client
             .execute("DELETE FROM game.notifications WHERE receiver_id = $1 AND group_id = $2", &[&me, &(int(0).unwrap_or(MISSING_NOTIFICATION_GROUP as i64) as i32)])
             .await
             .map(|_| Value::None)
             .map_err(db_err),
         ("notificationMgr", "DeleteAllNotifications") => {
-            db.client.execute("DELETE FROM game.notifications WHERE receiver_id = $1", &[&me]).await.map(|_| Value::None).map_err(db_err)
+            db.execute("DELETE FROM game.notifications WHERE receiver_id = $1", &[&me]).await.map(|_| Value::None).map_err(db_err)
         }
         ("notificationMgr", "LogNotificationInteraction") => Ok(Value::None),
         _ => return None,

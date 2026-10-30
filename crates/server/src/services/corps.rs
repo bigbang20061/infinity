@@ -14,6 +14,8 @@ use super::{db_err, keyval, notify_error, row, rowset, trimmed_arg_text, value_i
 use crate::client::{filetime_now, Client};
 use crate::consts::{ACCOUNT_CASH, CORPORATION_TYPE_PLAYER, CORPORATION_UNLIMITED_MEMBER_LIMIT, CORP_DIVISION_NAME_COUNT, FILETIME_SECOND, FILETIME_UNIX_EPOCH, ORG_NAME_MAX_LENGTH, ORG_NAME_MIN_LENGTH, ORG_SHORT_NAME_MAX_LENGTH, ORG_SHORT_NAME_MIN_LENGTH, ROLE_DIRECTOR, TYPE_CHARACTER};
 use crate::db::Db;
+use crate::db::executor::Executor;
+use crate::db::outbox::{dispatch_world, Outbox};
 use crate::space::World;
 use marshal::{DbRowDescriptor, DbType, Value};
 use tracing::info;
@@ -70,9 +72,8 @@ pub(super) const EFFECTIVE_ROLES_SQL: &str = "(ch.corp_roles | COALESCE((SELECT 
      WHERE t.corporation_id = ch.corporation_id AND ch.corp_title_mask & t.title_id <> 0), 0))";
 
 /// The corporation `char_id` is in, and their role mask (titles included).
-pub(super) async fn membership(db: &Db, char_id: i64) -> Result<(i64, i64), CallError> {
+pub(super) async fn membership(db: &(impl Executor + ?Sized), char_id: i64) -> Result<(i64, i64), CallError> {
     let r = db
-        .client
         .query_one(&format!("SELECT ch.corporation_id, {EFFECTIVE_ROLES_SQL} FROM game.characters ch WHERE ch.character_id = $1"), &[&char_id])
         .await
         .map_err(db_err)?;
@@ -87,9 +88,8 @@ async fn refresh_roles(db: &Db, world: &World, char_id: i64) -> Result<(), CallE
     Ok(())
 }
 
-pub(super) async fn ceo_of(db: &Db, corp: i64) -> Result<Option<i64>, CallError> {
+pub(super) async fn ceo_of(db: &(impl Executor + ?Sized), corp: i64) -> Result<Option<i64>, CallError> {
     Ok(db
-        .client
         .query_opt("SELECT ceo_id FROM game.corporations WHERE corporation_id = $1 AND NOT deleted", &[&corp])
         .await
         .map_err(db_err)?
@@ -98,9 +98,9 @@ pub(super) async fn ceo_of(db: &Db, corp: i64) -> Result<Option<i64>, CallError>
 
 /// Move a character into `corp` with `roles`, recording the employment and updating their
 /// session if they're online.
-async fn set_corp(db: &Db, world: &World, char_id: i64, corp: i64, roles: i64) -> Result<(), CallError> {
+async fn set_corp<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, char_id: i64, corp: i64, roles: i64, now: i64) -> Result<(), CallError> {
     let (hq, alliance): (Option<i64>, Option<i64>) = if is_player_corp(corp) {
-        db.client
+        db
             .query_opt("SELECT station_id, alliance_id FROM game.corporations WHERE corporation_id = $1", &[&corp])
             .await
             .map_err(db_err)?
@@ -108,14 +108,13 @@ async fn set_corp(db: &Db, world: &World, char_id: i64, corp: i64, roles: i64) -
             .unwrap_or_default()
     } else {
         let hq = db
-            .client
             .query_opt("SELECT station_id::bigint FROM sde.crp_npc_corporations WHERE corporation_id = $1::bigint", &[&corp])
             .await
             .map_err(db_err)?
             .and_then(|r| r.get(0));
         (hq, None)
     };
-    db.client
+    db
         .execute(
             "UPDATE game.characters SET corporation_id = $2, corp_roles = $3, corp_grantable_roles = 0, corp_title_mask = 0, corp_title = ''
              WHERE character_id = $1",
@@ -123,12 +122,12 @@ async fn set_corp(db: &Db, world: &World, char_id: i64, corp: i64, roles: i64) -
         )
         .await
         .map_err(db_err)?;
-    db.client
-        .execute("INSERT INTO game.employment_history (char_id, corporation_id, start_date) VALUES ($1, $2, $3)", &[&char_id, &corp, &filetime_now()])
+    db
+        .execute("INSERT INTO game.employment_history (char_id, corporation_id, start_date) VALUES ($1, $2, $3)", &[&char_id, &corp, &now])
         .await
         .map_err(db_err)?;
     let pair = |k: &str, v: Value| Value::tuple([Value::str(k), v]);
-    world.notify_pilot(
+    outbox.notify_pilot(
         char_id,
         "__session",
         vec![
@@ -142,14 +141,12 @@ async fn set_corp(db: &Db, world: &World, char_id: i64, corp: i64, roles: i64) -
             pair("hqID", hq.map(Value::Int).unwrap_or(Value::None)),
         ],
     );
-    info!("corporations: {char_id} is now in {corp}");
     Ok(())
 }
 
 /// The NPC corporation of the character's school.
-async fn school_corp(db: &Db, char_id: i64) -> Result<i64, CallError> {
+async fn school_corp(db: &(impl Executor + ?Sized), char_id: i64) -> Result<i64, CallError> {
     let r = db
-        .client
         .query_one(
             "SELECT COALESCE(
                  (SELECT (s.data->>'corporationID')::bigint FROM sde_native.schools s WHERE s.key = ch.school_id::text),
@@ -180,7 +177,6 @@ async fn found(c: &Client, call: &Call<'_>) -> CallResult {
         return Err(notify_error("军团代号必须为 2 到 5 个字母、数字、点或短横线。"));
     }
     let skill: i32 = db
-        .client
         .query_opt("SELECT level FROM game.skills WHERE character_id = $1 AND type_id = $2", &[&me, &SKILL_CORPORATION_MANAGEMENT])
         .await
         .map_err(db_err)?
@@ -194,7 +190,6 @@ async fn found(c: &Client, call: &Call<'_>) -> CallResult {
         return Err(notify_error("你已是 CEO，请先辞职或关闭你的军团。"));
     }
     let taken: bool = db
-        .client
         .query_one(
             "SELECT EXISTS (SELECT 1 FROM game.corporations WHERE NOT deleted AND (lower(name) = lower($1) OR upper(ticker) = $2))
                  OR EXISTS (SELECT 1 FROM sde.crp_npc_corporations WHERE lower(name) = lower($1) OR upper(ticker) = $2)",
@@ -207,51 +202,41 @@ async fn found(c: &Client, call: &Call<'_>) -> CallResult {
         return Err(notify_error("该军团名称或代号已被占用。"));
     }
     let _trading = super::market::lock().await;
-    super::market::debit(db, world, me, STARTUP_COST).await?;
-    let id: i64 = db
-        .client
-        .query_one(
-            "INSERT INTO game.corporations (name, ticker, description, url, tax_rate, ceo_id, creator_id, station_id, is_recruiting, friendly_fire,
-                                            shape1, shape2, shape3, color1, color2, color3, typeface, created)
-             VALUES ($1, $2, $3, $4, $5, $6, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) RETURNING corporation_id",
-            &[
-                &name,
-                &ticker,
-                &description,
-                &url,
-                &tax,
-                &me,
-                &station,
-                &(call.args.get(12).and_then(|v| v.as_int()).unwrap_or(1) != 0),
-                &matches!(call.args.get(13), Some(Value::Bool(true))),
-                &int(5),
-                &int(6),
-                &int(7),
-                &int(8),
-                &int(9),
-                &int(10),
-                &int(11),
-                &filetime_now(),
-            ],
-        )
-        .await
-        .map_err(db_err)?
-        .get(0);
-    set_corp(db, world, me, id, CEO_ROLES).await?;
+    let now = filetime_now();
+    let recruiting = call.args.get(12).and_then(|v| v.as_int()).unwrap_or(1) != 0;
+    let friendly = matches!(call.args.get(13), Some(Value::Bool(true)));
+    let shapes = [int(5), int(6), int(7), int(8), int(9), int(10), int(11)];
+    let id = db.transaction(
+        |tx, outbox| {
+            let (name, ticker, description, url) = (name.clone(), ticker.clone(), description.clone(), url.clone());
+            Box::pin(async move {
+                super::market::debit(tx, outbox, me, STARTUP_COST).await?;
+                let id: i64 = tx.query_one(
+                    "INSERT INTO game.corporations (name, ticker, description, url, tax_rate, ceo_id, creator_id, station_id, is_recruiting, friendly_fire,
+                                                    shape1, shape2, shape3, color1, color2, color3, typeface, created)
+                     VALUES ($1, $2, $3, $4, $5, $6, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) RETURNING corporation_id",
+                    &[&name, &ticker, &description, &url, &tax, &me, &station, &recruiting, &friendly,
+                      &shapes[0], &shapes[1], &shapes[2], &shapes[3], &shapes[4], &shapes[5], &shapes[6], &now],
+                ).await.map_err(db_err)?.get(0);
+                set_corp(tx, outbox, me, id, CEO_ROLES, now).await?;
+                Ok(id)
+            })
+        },
+        |id, outbox| async move { dispatch_world(id, outbox, world) },
+    ).await?;
     info!("corporations: {me} founded {id} [{ticker}] {name}");
     Ok(Value::Int(id))
 }
 
 /// Leave (or be kicked from) a player corporation, back to the school's NPC corporation.
 /// A CEO can only leave as the last member, which closes the corporation.
-async fn leave(db: &Db, world: &World, char_id: i64) -> Result<(), CallError> {
+async fn leave_inner<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, char_id: i64, now: i64) -> Result<(), CallError> {
     let (corp, _) = membership(db, char_id).await?;
     if !is_player_corp(corp) {
         return Err(notify_error("不能用这种方式退出 NPC 军团。"));
     }
     if ceo_of(db, corp).await? == Some(char_id) {
         let others: i64 = db
-            .client
             .query_one("SELECT count(*) FROM game.characters WHERE corporation_id = $1 AND character_id <> $2 AND NOT deleted", &[&corp, &char_id])
             .await
             .map_err(db_err)?
@@ -259,12 +244,19 @@ async fn leave(db: &Db, world: &World, char_id: i64) -> Result<(), CallError> {
         if others > 0 {
             return Err(notify_error("军团还有其他成员时，CEO 不能退出。"));
         }
-        super::alliances::leave_alliance(db, world, corp).await?;
-        db.client.execute("UPDATE game.corporations SET deleted = true, ceo_id = NULL WHERE corporation_id = $1", &[&corp]).await.map_err(db_err)?;
-        info!("corporations: {corp} closed");
+        super::alliances::leave_alliance(db, outbox, corp, now).await?;
+        db.execute("UPDATE game.corporations SET deleted = true, ceo_id = NULL WHERE corporation_id = $1", &[&corp]).await.map_err(db_err)?;
     }
     let school = school_corp(db, char_id).await?;
-    set_corp(db, world, char_id, school, 0).await
+    set_corp(db, outbox, char_id, school, 0, now).await
+}
+
+async fn leave(db: &Db, world: &World, char_id: i64) -> Result<(), CallError> {
+    let now = filetime_now();
+    db.transaction(
+        |tx, outbox| Box::pin(async move { leave_inner(tx, outbox, char_id, now).await }),
+        |value, outbox| async move { dispatch_world(value, outbox, world) },
+    ).await
 }
 
 fn application_row(r: &tokio_postgres::Row) -> Value {
@@ -285,7 +277,6 @@ const APPLICATION_SELECT: &str =
 /// Open applications grouped by `key` (corporation or character): {id: [application]}.
 async fn applications(db: &Db, where_sql: &str, arg: i64, by_corp: bool) -> CallResult {
     let rows = db
-        .client
         .query(&format!("{APPLICATION_SELECT} WHERE {where_sql} AND status = ANY($2) ORDER BY application_id"), &[&arg, &OPEN_APPLICATION.to_vec()])
         .await
         .map_err(db_err)?;
@@ -307,7 +298,7 @@ async fn update_application(c: &Client, call: &Call<'_>) -> CallResult {
     let int = |i: usize| call.args.get(i).and_then(|v| v.as_int()).unwrap_or(0);
     let (app_id, status) = (int(0), int(4) as i32);
     let message = call.args.get(5).and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
-    let Some(r) = db.client.query_opt(&format!("{APPLICATION_SELECT} WHERE application_id = $1"), &[&app_id]).await.map_err(db_err)? else {
+    let Some(r) = db.query_opt(&format!("{APPLICATION_SELECT} WHERE application_id = $1"), &[&app_id]).await.map_err(db_err)? else {
         return Err(notify_error("该申请已不存在。"));
     };
     let (corp, applicant, current): (i64, i64, i32) = (r.get(1), r.get(2), r.get(4));
@@ -324,24 +315,32 @@ async fn update_application(c: &Client, call: &Call<'_>) -> CallResult {
             return Err(notify_error("只有军团的人事经理才能处理申请。"));
         }
     }
-    db.client
-        .execute("UPDATE game.corp_applications SET status = $2, custom_message = $3 WHERE application_id = $1", &[&app_id, &status, &message])
-        .await
-        .map_err(db_err)?;
-    // An application the corporation accepts, or an invitation the character accepts, is a new member.
     let joins = (status == APP_ACCEPTED_BY_CORPORATION && current != APP_INVITED_BY_CORPORATION)
         || (status == APP_ACCEPTED_BY_CHARACTER && current == APP_INVITED_BY_CORPORATION);
-    if joins {
-        let (old, _) = membership(db, applicant).await?;
-        if is_player_corp(old) && ceo_of(db, old).await? == Some(applicant) {
-            return Err(notify_error("CEO 必须先离开自己的军团才能加入其他军团。"));
-        }
-        set_corp(db, world, applicant, corp, 0).await?;
-        db.client
-            .execute("UPDATE game.corp_applications SET status = $3 WHERE character_id = $1 AND application_id <> $2 AND status = ANY($4)", &[&applicant, &app_id, &APP_WITHDRAWN_BY_CHARACTER, &OPEN_APPLICATION.to_vec()])
-            .await
-            .map_err(db_err)?;
-    }
+    let now = filetime_now();
+    db.transaction(
+        |tx, outbox| {
+            let message = message.clone();
+            Box::pin(async move {
+                let affected = tx.execute("UPDATE game.corp_applications SET status = $2, custom_message = $3 WHERE application_id = $1 AND status = $4", &[&app_id, &status, &message, &current])
+                    .await.map_err(db_err)?;
+                if affected == 0 {
+                    return Err(notify_error("该申请已处理完毕。"));
+                }
+                if joins {
+                    let (old, _) = membership(tx, applicant).await?;
+                    if is_player_corp(old) && ceo_of(tx, old).await? == Some(applicant) {
+                        return Err(notify_error("CEO 必须先离开自己的军团才能加入其他军团。"));
+                    }
+                    set_corp(tx, outbox, applicant, corp, 0, now).await?;
+                    tx.execute("UPDATE game.corp_applications SET status = $3 WHERE character_id = $1 AND application_id <> $2 AND status = ANY($4)", &[&applicant, &app_id, &APP_WITHDRAWN_BY_CHARACTER, &OPEN_APPLICATION.to_vec()])
+                        .await.map_err(db_err)?;
+                }
+                Ok(())
+            })
+        },
+        |value, outbox| async move { dispatch_world(value, outbox, world) },
+    ).await?;
     Ok(Value::None)
 }
 
@@ -378,7 +377,7 @@ const MEMBER_SELECT: &str = "SELECT ch.character_id, ch.corp_roles,
     FROM game.characters ch";
 
 async fn members(db: &Db, corp: i64, extra: &str, ids: &[i64]) -> Result<Vec<tokio_postgres::Row>, CallError> {
-    db.client
+    db
         .query(&format!("{MEMBER_SELECT} WHERE ch.corporation_id = $1 AND NOT ch.deleted {extra} ORDER BY ch.character_id"), &[&corp, &ids.to_vec(), &FILETIME_SECOND, &FILETIME_UNIX_EPOCH])
         .await
         .map_err(db_err)
@@ -392,7 +391,6 @@ fn bound_corp(c: &Client, call: &Call<'_>) -> i64 {
 /// Employment history rows for the character info window: (corporationID, deleted, startDate).
 pub async fn employment_rows(db: &Db, char_id: i64) -> Result<Vec<Value>, CallError> {
     let rows = db
-        .client
         .query(
             "SELECT corporation_id, start_date FROM game.employment_history WHERE char_id = $1
              UNION ALL
@@ -415,7 +413,6 @@ pub async fn employment_rows(db: &Db, char_id: i64) -> Result<Vec<Value>, CallEr
 /// The CORP_HEADER line of a player corporation (universe::corporation).
 pub async fn corporation_line(db: &Db, corp: i64) -> Result<Option<Vec<Value>>, CallError> {
     let Some(r) = db
-        .client
         .query_opt(
             "SELECT name, description, ticker, url, tax_rate, lp_tax_rate, creator_id, ceo_id, station_id, is_recruiting, friendly_fire,
                     shape1::bigint, shape2::bigint, shape3::bigint, color1::bigint, color2::bigint, color3::bigint, typeface::bigint, created, deleted,
@@ -498,7 +495,7 @@ async fn update_member(db: &Db, world: &World, me: i64, args: &[Value]) -> Resul
     }
     // A CEO keeps every role.
     let roles = if ceo == Some(target) { Some(CEO_ROLES) } else { roles };
-    db.client
+    db
         .execute(
             "UPDATE game.characters SET corp_roles = COALESCE($2, corp_roles), corp_grantable_roles = COALESCE($3, corp_grantable_roles),
                     corp_title = COALESCE($4, corp_title), corp_title_mask = COALESCE($5, corp_title_mask)
@@ -540,7 +537,7 @@ async fn execute_actions(db: &Db, world: &World, me: i64, call: &Call<'_>) -> Re
                 Some(CTV_SET) => "$2".to_string(),
                 _ => continue,
             };
-            db.client
+            db
                 .execute(&format!("UPDATE game.characters SET {column} = {expr} WHERE character_id = $1"), &[&target, &value])
                 .await
                 .map_err(db_err)?;
@@ -566,7 +563,6 @@ const TITLE_HEADER: &[&str] = &[
 /// {titleID: Row} for all 16 title bits; unnamed ones the client calls "Untitled n".
 async fn titles(db: &Db, corp: i64) -> CallResult {
     let rows = db
-        .client
         .query(
             "SELECT title_id, name, roles, grantable_roles, roles_hq, grantable_hq, roles_base, grantable_base, roles_other, grantable_other
              FROM game.corp_titles WHERE corporation_id = $1",
@@ -595,7 +591,6 @@ async fn titles(db: &Db, corp: i64) -> CallResult {
 /// Online members holding any of `title_mask`'s titles get their roles again.
 async fn refresh_title_holders(db: &Db, world: &World, corp: i64, title_mask: i64) -> Result<(), CallError> {
     let rows = db
-        .client
         .query("SELECT character_id FROM game.characters WHERE corporation_id = $1 AND corp_title_mask & $2 <> 0 AND NOT deleted", &[&corp, &title_mask])
         .await
         .map_err(db_err)?;
@@ -620,7 +615,7 @@ async fn update_titles(db: &Db, world: &World, me: i64, corp: i64, lines: Vec<Ve
             continue;
         }
         let name = line.get(1).and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
-        db.client
+        db
             .execute(
                 "INSERT INTO game.corp_titles (corporation_id, title_id, name, roles, grantable_roles, roles_hq, grantable_hq, roles_base, grantable_base, roles_other, grantable_other)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
@@ -641,12 +636,11 @@ async fn delete_title(db: &Db, world: &World, me: i64, corp: i64, title: i64) ->
         return Err(notify_error("只有董事才能删除头衔。"));
     }
     let holders = db
-        .client
         .query("SELECT character_id FROM game.characters WHERE corporation_id = $1 AND corp_title_mask & $2 <> 0", &[&corp, &title])
         .await
         .map_err(db_err)?;
-    db.client.execute("DELETE FROM game.corp_titles WHERE corporation_id = $1 AND title_id = $2", &[&corp, &title]).await.map_err(db_err)?;
-    db.client
+    db.execute("DELETE FROM game.corp_titles WHERE corporation_id = $1 AND title_id = $2", &[&corp, &title]).await.map_err(db_err)?;
+    db
         .execute("UPDATE game.characters SET corp_title_mask = corp_title_mask & ~$2 WHERE corporation_id = $1", &[&corp, &title])
         .await
         .map_err(db_err)?;
@@ -659,7 +653,6 @@ async fn delete_title(db: &Db, world: &World, me: i64, corp: i64, title: i64) ->
 /// Members other than the CEO with Corporation Management, who could take over.
 async fn potential_ceos(db: &Db, corp: i64, ceo: i64) -> Result<Vec<i64>, CallError> {
     let rows = db
-        .client
         .query(
             "SELECT ch.character_id FROM game.characters ch JOIN game.skills s ON s.character_id = ch.character_id AND s.type_id = $3 AND s.level >= $4
              WHERE ch.corporation_id = $1 AND ch.character_id <> $2 AND NOT ch.deleted ORDER BY ch.character_id",
@@ -683,11 +676,23 @@ async fn resign_ceo(db: &Db, world: &World, me: i64, successor: Option<i64>) -> 
             if !potential_ceos(db, corp, me).await?.contains(&next) {
                 return Err(notify_error("该成员无法成为 CEO。"));
             }
-            db.client.execute("UPDATE game.corporations SET ceo_id = $2 WHERE corporation_id = $1", &[&corp, &next]).await.map_err(db_err)?;
-            db.client.execute("UPDATE game.characters SET corp_roles = $2 WHERE character_id = $1", &[&next, &CEO_ROLES]).await.map_err(db_err)?;
-            db.client.execute("UPDATE game.characters SET corp_roles = $2 WHERE character_id = $1", &[&me, &ROLE_DIRECTOR]).await.map_err(db_err)?;
-            refresh_roles(db, world, next).await?;
-            refresh_roles(db, world, me).await?;
+            db.transaction(
+                |tx, outbox: &mut Outbox| Box::pin(async move {
+                    tx.execute("UPDATE game.corporations SET ceo_id = $2 WHERE corporation_id = $1", &[&corp, &next]).await.map_err(db_err)?;
+                    let mut role_writes = [(next, CEO_ROLES), (me, ROLE_DIRECTOR)];
+                    role_writes.sort_by_key(|(char_id, _)| *char_id);
+                    for (char_id, roles) in role_writes {
+                        tx.execute("UPDATE game.characters SET corp_roles = $2 WHERE character_id = $1", &[&char_id, &roles]).await.map_err(db_err)?;
+                    }
+                    for char_id in [next, me] {
+                        let (_, roles) = membership(tx, char_id).await?;
+                        let pair = |k: &str| Value::tuple([Value::str(k), Value::Int(roles)]);
+                        outbox.notify_pilot(char_id, "__session", vec![pair("corprole"), pair("rolesAtAll"), pair("rolesAtBase"), pair("rolesAtHQ"), pair("rolesAtOther")]);
+                    }
+                    Ok(())
+                }),
+                |value, outbox| async move { dispatch_world(value, outbox, world) },
+            ).await?;
             info!("corporations: {me} handed {corp} to {next}");
             Ok(Value::None)
         }
@@ -701,11 +706,20 @@ async fn resign_ceo(db: &Db, world: &World, me: i64, successor: Option<i64>) -> 
             if !candidates.is_empty() {
                 return Ok(Value::list(candidates.into_iter().map(Value::Int)));
             }
-            for other in others {
-                let school = school_corp(db, other).await?;
-                set_corp(db, world, other, school, 0).await?;
-            }
-            leave(db, world, me).await?;
+            let now = filetime_now();
+            db.transaction(
+                |tx, outbox| {
+                    let others = others.clone();
+                    Box::pin(async move {
+                        for other in others {
+                            let school = school_corp(tx, other).await?;
+                            set_corp(tx, outbox, other, school, 0, now).await?;
+                        }
+                        leave_inner(tx, outbox, me, now).await
+                    })
+                },
+                |value, outbox| async move { dispatch_world(value, outbox, world) },
+            ).await?;
             Ok(Value::None)
         }
     }
@@ -715,7 +729,6 @@ async fn resign_ceo(db: &Db, world: &World, me: i64, successor: Option<i64>) -> 
 /// they hold (None for the others).
 async fn info_window_data(db: &Db, char_id: i64) -> CallResult {
     let Some(r) = db
-        .client
         .query_opt(
             "SELECT ch.corporation_id, co.alliance_id, ch.corp_title, ch.corp_title_mask FROM game.characters ch
              LEFT JOIN game.corporations co ON co.corporation_id = ch.corporation_id WHERE ch.character_id = $1",
@@ -727,7 +740,7 @@ async fn info_window_data(db: &Db, char_id: i64) -> CallResult {
         return Ok(Value::None);
     };
     let (corp, mask): (i64, i64) = (r.get(0), r.get(3));
-    let names = db.client.query("SELECT title_id, name FROM game.corp_titles WHERE corporation_id = $1", &[&corp]).await.map_err(db_err)?;
+    let names = db.query("SELECT title_id, name FROM game.corp_titles WHERE corporation_id = $1", &[&corp]).await.map_err(db_err)?;
     let mut fields: Vec<(String, Value)> = vec![
         ("corpID".into(), Value::Int(corp)),
         ("allianceID".into(), r.get::<_, Option<i64>>(1).map(Value::Int).unwrap_or(Value::None)),
@@ -815,14 +828,14 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             if !is_player_corp(target) {
                 return Some(Err(notify_error("NPC 军团不接受申请。")));
             }
-            let recruiting: Option<bool> = match db.client.query_opt("SELECT is_recruiting FROM game.corporations WHERE corporation_id = $1 AND NOT deleted", &[&target]).await {
+            let recruiting: Option<bool> = match db.query_opt("SELECT is_recruiting FROM game.corporations WHERE corporation_id = $1 AND NOT deleted", &[&target]).await {
                 Ok(r) => r.map(|r| r.get(0)),
                 Err(e) => return Some(Err(db_err(e))),
             };
             if recruiting != Some(true) {
                 return Some(Err(notify_error("该军团目前不接受申请。")));
             }
-            db.client
+            db
                 .query_one(
                     "INSERT INTO game.corp_applications (corporation_id, character_id, application_text, status, created) VALUES ($1, $2, $3, $4, $5) RETURNING application_id",
                     &[&target, &me, &text, &APP_APPLIED, &filetime_now()],
@@ -836,7 +849,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             let target = int(0).unwrap_or(0);
             match membership(db, me).await {
                 Ok((my_corp, roles)) if is_player_corp(my_corp) && roles & (ROLE_PERSONNEL_MANAGER | ROLE_DIRECTOR) != 0 => db
-                    .client
                     .execute(
                         "INSERT INTO game.corp_applications (corporation_id, character_id, application_text, status, created) VALUES ($1, $2, '', $3, $4)",
                         &[&my_corp, &target, &APP_INVITED_BY_CORPORATION, &filetime_now()],
@@ -851,7 +863,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "GetMyApplications" => applications(db, "character_id = $1", me, true).await,
         "GetApplications" => applications(db, "corporation_id = $1", corp, false).await,
         "GetMyOldApplications" => match db
-            .client
             .query(&format!("{APPLICATION_SELECT} WHERE character_id = $1 AND NOT (status = ANY($2)) ORDER BY application_id DESC LIMIT $3"), &[&me, &OPEN_APPLICATION.to_vec(), &OLD_APPLICATION_LIMIT])
             .await
         {
@@ -861,7 +872,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "UpdateApplicationOffer" => update_application(c, call).await,
         // [row(ownerID, ownerName, typeID, gender)] of the members.
         "GetEveOwners" => match db
-            .client
             .query("SELECT character_id, name, gender_id::bigint FROM game.characters WHERE corporation_id = $1 AND NOT deleted", &[&corp])
             .await
         {
@@ -934,7 +944,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             let names: Vec<Option<String>> = (0..CORP_DIVISION_NAME_COUNT).map(|i| call.args.get(i).and_then(|v| v.as_text()).map(|t| t.into_owned())).collect();
             match membership(db, me).await {
                 Ok((my_corp, roles)) if my_corp == corp && roles & ROLE_DIRECTOR != 0 => db
-                    .client
                     .execute("UPDATE game.corporations SET division_names = $2 WHERE corporation_id = $1", &[&corp, &names])
                     .await
                     .map(|_| Value::None)
@@ -958,7 +967,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             let lp_tax = call.args.get(4).and_then(|v| v.as_float()).unwrap_or(0.0).clamp(0.0, 1.0);
             match membership(db, me).await {
                 Ok((my_corp, roles)) if my_corp == corp && roles & ROLE_DIRECTOR != 0 => db
-                    .client
                     .execute(
                         "UPDATE game.corporations SET description = $2, url = $3, tax_rate = $4, is_recruiting = $5, lp_tax_rate = $6 WHERE corporation_id = $1",
                         &[&corp, &text(0), &text(1), &tax, &recruiting, &lp_tax],
@@ -972,7 +980,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         }
         "UpdateLogo" => {
             let s = |i: usize| call.args.get(i).and_then(|v| v.as_int()).map(|v| v as i32);
-            db.client
+            db
                 .execute(
                     "UPDATE game.corporations SET shape1 = $2, shape2 = $3, shape3 = $4, color1 = $5, color2 = $6, color3 = $7, typeface = $8
                      WHERE corporation_id = $1 AND ceo_id = $9",
@@ -982,13 +990,13 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                 .map(|_| Value::None)
                 .map_err(db_err)
         }
-        "GetCorpWelcomeMail" => match db.client.query_opt("SELECT welcome_mail FROM game.corporations WHERE corporation_id = $1", &[&corp]).await {
+        "GetCorpWelcomeMail" => match db.query_opt("SELECT welcome_mail FROM game.corporations WHERE corporation_id = $1", &[&corp]).await {
             Ok(r) => Ok(Value::unicode(r.map(|r| r.get::<_, String>(0)).unwrap_or_default())),
             Err(e) => Err(db_err(e)),
         },
         "SetCorpWelcomeMail" => {
             let text = call.args.first().and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
-            db.client
+            db
                 .execute("UPDATE game.corporations SET welcome_mail = $2 WHERE corporation_id = $1 AND ceo_id = $3", &[&corp, &text, &me])
                 .await
                 .map(|_| Value::None)

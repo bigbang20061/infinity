@@ -20,9 +20,11 @@ use super::{db_err, keyval, notify_error, rand01, user_error, value_id_list, Cal
 use crate::client::{filetime_now, Client};
 use crate::consts::{BLUEPRINT_COPY_QUANTITY, BLUEPRINT_INFINITE_RUNS, FILETIME_DAY, FILETIME_SECOND, FLAG_HANGAR, INDUSTRY_JOB_STATUS_INSTALLED, IX_LOCATION_ID, LOCATION_JUNKYARD};
 use crate::db::Db;
-use crate::space::World;
+use crate::db::executor::Executor;
+use crate::db::outbox::{dispatch_world, Outbox};
 use marshal::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tracing::info;
 
 /// Existing server policy for completed industry job history, in days.
@@ -108,11 +110,10 @@ struct Activity {
     max_production_limit: i32,
 }
 
-async fn activity(db: &Db, bp_type: i32, activity: i32) -> Result<Option<Activity>, CallError> {
+async fn activity(db: &(impl Executor + ?Sized), bp_type: i32, activity: i32) -> Result<Option<Activity>, CallError> {
     let Some(name) = activity_name(activity) else { return Ok(None) };
     let key = bp_type.to_string();
     let Some(head) = db
-        .client
         .query_opt(
             "SELECT (data->'activities'->$2->>'time')::float8, COALESCE((data->>'maxProductionLimit')::int, 1)
              FROM sde_native.blueprints WHERE key = $1 AND data->'activities' ? $2",
@@ -129,9 +130,9 @@ async fn activity(db: &Db, bp_type: i32, activity: i32) -> Result<Option<Activit
              FROM sde_native.blueprints b, jsonb_array_elements(COALESCE(b.data->'activities'->$2->'{part}', '[]')) e WHERE b.key = $1"
         )
     };
-    let materials = db.client.query(&list("materials"), &[&key, &name]).await.map_err(db_err)?;
-    let products = db.client.query(&list("products"), &[&key, &name]).await.map_err(db_err)?;
-    let skills = db.client.query(&list("skills"), &[&key, &name]).await.map_err(db_err)?;
+    let materials = db.query(&list("materials"), &[&key, &name]).await.map_err(db_err)?;
+    let products = db.query(&list("products"), &[&key, &name]).await.map_err(db_err)?;
+    let skills = db.query(&list("skills"), &[&key, &name]).await.map_err(db_err)?;
     Ok(Some(Activity {
         time: head.get::<_, Option<f64>>(0).unwrap_or(0.0),
         materials: materials.iter().map(|r| (r.get(0), r.get(1))).collect(),
@@ -143,10 +144,10 @@ async fn activity(db: &Db, bp_type: i32, activity: i32) -> Result<Option<Activit
 
 /// industryCommon.GetBlueprintPrice: the adjusted value of what the blueprint's manufacturing
 /// takes, at base quantities (the estimated item value of one run).
-async fn blueprint_price(db: &Db, bp_type: i32) -> Result<f64, CallError> {
+async fn blueprint_price(db: &(impl Executor + ?Sized), bp_type: i32) -> Result<f64, CallError> {
     let Some(m) = activity(db, bp_type, MANUFACTURING).await? else { return Ok(0.0) };
     let ids: Vec<i32> = m.materials.iter().map(|(t, _)| *t).collect();
-    let rows = db.client.query("SELECT type_id, adjusted FROM game.retail_prices WHERE type_id = ANY($1)", &[&ids]).await.map_err(db_err)?;
+    let rows = db.query("SELECT type_id, adjusted FROM game.retail_prices WHERE type_id = ANY($1)", &[&ids]).await.map_err(db_err)?;
     let price: HashMap<i32, f64> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
     Ok(m.materials.iter().map(|(t, q)| price.get(t).copied().unwrap_or(0.0) * *q as f64).sum())
 }
@@ -166,9 +167,8 @@ struct Blueprint {
     runs: i32,
 }
 
-async fn blueprint(db: &Db, item_id: i64) -> Result<Blueprint, CallError> {
+async fn blueprint(db: &(impl Executor + ?Sized), item_id: i64) -> Result<Blueprint, CallError> {
     let r = db
-        .client
         .query_opt(
             "SELECT i.item_id, i.type_id, i.owner_id, st.station_id::bigint, i.singleton, i.quantity,
                     COALESCE(b.material_efficiency, 0), COALESCE(b.time_efficiency, 0), COALESCE(b.runs, $2)
@@ -197,8 +197,8 @@ async fn blueprint(db: &Db, item_id: i64) -> Result<Blueprint, CallError> {
     })
 }
 
-async fn set_blueprint(db: &Db, item_id: i64, me: i32, te: i32, runs: i32) -> Result<(), CallError> {
-    db.client
+async fn set_blueprint(db: &(impl Executor + ?Sized), item_id: i64, me: i32, te: i32, runs: i32) -> Result<(), CallError> {
+    db
         .execute(
             "INSERT INTO game.blueprints (item_id, material_efficiency, time_efficiency, runs) VALUES ($1, $2, $3, $4)
              ON CONFLICT (item_id) DO UPDATE SET material_efficiency = $2, time_efficiency = $3, runs = $4",
@@ -282,8 +282,8 @@ const FACILITY_SELECT: &str = "SELECT s.station_id::bigint, s.type_id::bigint, C
         COALESCE(o.data->'services' @> to_jsonb($2::int), false)
     FROM sde.sta_stations s LEFT JOIN sde_native.stationoperations o ON o.key = s.operation_id::text";
 
-async fn facilities(db: &Db, where_sql: &str, arg: i64) -> Result<Vec<Facility>, CallError> {
-    let rows = db.client.query(&format!("{FACILITY_SELECT} WHERE {where_sql}"), &[&STATION_SERVICE_FACTORY, &STATION_SERVICE_LABORATORY, &arg]).await.map_err(db_err)?;
+async fn facilities(db: &(impl Executor + ?Sized), where_sql: &str, arg: i64) -> Result<Vec<Facility>, CallError> {
+    let rows = db.query(&format!("{FACILITY_SELECT} WHERE {where_sql}"), &[&STATION_SERVICE_FACTORY, &STATION_SERVICE_LABORATORY, &arg]).await.map_err(db_err)?;
     Ok(rows
         .iter()
         .map(|r| Facility { id: r.get(0), type_id: r.get(1), owner: r.get(2), system: r.get(3), security: r.get(4), factory: r.get(5), laboratory: r.get(6) })
@@ -291,14 +291,13 @@ async fn facilities(db: &Db, where_sql: &str, arg: i64) -> Result<Vec<Facility>,
         .collect())
 }
 
-async fn facility(db: &Db, id: i64) -> Result<Facility, CallError> {
+async fn facility(db: &(impl Executor + ?Sized), id: i64) -> Result<Facility, CallError> {
     facilities(db, "s.station_id = $3::bigint", id).await?.pop().ok_or_else(|| notify_error("该空间站没有工业服务。"))
 }
 
 /// The owner's materials in their item hangar at a facility: typeID -> quantity.
-async fn available(db: &Db, owner: i64, station: i64) -> Result<HashMap<i32, i64>, CallError> {
+async fn available(db: &(impl Executor + ?Sized), owner: i64, station: i64) -> Result<HashMap<i32, i64>, CallError> {
     let rows = db
-        .client
         .query(
             "SELECT type_id, sum(quantity)::bigint FROM game.items
              WHERE owner_id = $1 AND location_id = $2 AND flag_id = $3 AND NOT singleton GROUP BY type_id",
@@ -309,6 +308,7 @@ async fn available(db: &Db, owner: i64, station: i64) -> Result<HashMap<i32, i64
     Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
 }
 
+#[derive(Clone)]
 struct Job {
     id: i64,
     installer: i64,
@@ -405,7 +405,7 @@ impl Job {
 }
 
 async fn job(db: &Db, id: i64) -> Result<Job, CallError> {
-    db.client
+    db
         .query_opt(&format!("{JOB_SELECT} WHERE job_id = $1"), &[&id])
         .await
         .map_err(db_err)?
@@ -413,17 +413,16 @@ async fn job(db: &Db, id: i64) -> Result<Job, CallError> {
         .ok_or_else(|| user_error("IndustryJobNotFound", vec![]))
 }
 
-fn tell_job(world: &World, j: &Job) {
+fn tell_job<X>(outbox: &mut Outbox<X>, j: &Job) {
     let successful = j.successful_runs.map(|v| Value::Int(v as i64)).unwrap_or(Value::None);
     let args = vec![Value::Int(j.id), Value::Int(j.owner), Value::Int(j.blueprint_id), Value::Int(j.installer), Value::Int(j.status as i64), successful];
-    world.notify_pilot(j.installer, "OnIndustryJob", args);
-    world.notify_pilot(j.owner, "OnBlueprintsUpdated", vec![Value::Int(j.owner)]);
+    outbox.notify_pilot(j.installer, "OnIndustryJob", args);
+    outbox.notify_pilot(j.owner, "OnBlueprintsUpdated", vec![Value::Int(j.owner)]);
 }
 
 /// Decryptor bonuses (inventionPropabilityMultiplier, ME, TE, max runs) of an invention input.
-async fn decryptor(db: &Db, type_id: i32) -> Result<(f64, i32, i32, i32), CallError> {
+async fn decryptor(db: &(impl Executor + ?Sized), type_id: i32) -> Result<(f64, i32, i32, i32), CallError> {
     let rows = db
-        .client
         .query(
             "SELECT attribute_id, value FROM sde.type_attributes WHERE type_id = $1 AND attribute_id = ANY($2)",
             &[&type_id, &vec![ATTR_INVENTION_PROBABILITY_MULTIPLIER, ATTR_INVENTION_ME_MODIFIER, ATTR_INVENTION_TE_MODIFIER, ATTR_INVENTION_MAX_RUN_MODIFIER]],
@@ -450,7 +449,7 @@ struct Plan {
 
 #[allow(clippy::too_many_arguments)]
 async fn plan(
-    db: &Db,
+    db: &(impl Executor + ?Sized),
     fit: &Fit,
     skills: &HashMap<i32, i32>,
     bp: &Blueprint,
@@ -515,7 +514,6 @@ async fn plan(
             seconds *= char_attr(ATTR_MANUFACTURE_TIME_MULTIPLIER);
             for (skill, _) in &act.skills {
                 let per_level: Option<f64> = db
-                    .client
                     .query_opt("SELECT value FROM sde.type_attributes WHERE type_id = $1 AND attribute_id = $2", &[skill, &ATTR_MANUFACTURE_TIME_PER_LEVEL])
                     .await
                     .map_err(db_err)?
@@ -561,9 +559,8 @@ async fn plan(
 }
 
 /// Active jobs per activity of an installer (GetJobCounts).
-async fn job_counts(db: &Db, installer: i64) -> Result<HashMap<i32, i64>, CallError> {
+async fn job_counts(db: &(impl Executor + ?Sized), installer: i64) -> Result<HashMap<i32, i64>, CallError> {
     let rows = db
-        .client
         .query("SELECT activity_id, count(*) FROM game.industry_jobs WHERE installer_id = $1 AND status = $2 GROUP BY 1", &[&installer, &INDUSTRY_JOB_STATUS_INSTALLED])
         .await
         .map_err(db_err)?;
@@ -587,216 +584,224 @@ async fn install(c: &Client, request: &Value) -> CallResult {
         _ => HashMap::new(),
     };
     let _trading = lock().await;
-    let mut bp = blueprint(db, int("blueprintID").unwrap_or(0)).await?;
-    if bp.owner != me {
-        return Err(user_error("IndustryBlueprintAccessDenied", vec![]));
-    }
-    let busy: bool = db
-        .client
-        .query_one("SELECT EXISTS (SELECT 1 FROM game.industry_jobs WHERE blueprint_id = $1 AND status = $2)", &[&bp.item_id, &INDUSTRY_JOB_STATUS_INSTALLED])
-        .await
-        .map_err(db_err)?
-        .get(0);
-    if busy {
-        return Err(notify_error("该蓝图正在被一个项目使用。"));
-    }
-    let fac = facility(db, int("facilityID").unwrap_or(0)).await?;
-    if !fac.activities().contains(&activity_id) {
-        return Err(notify_error("该空间站不提供这项活动。"));
-    }
-    if bp.station != Some(fac.id) {
-        return Err(notify_error("蓝图必须位于该设施中。"));
-    }
-    let Some(act) = activity(db, bp.type_id, activity_id).await? else {
-        return Err(notify_error("该蓝图不能用于这项活动。"));
-    };
-    // Originals research and copy; only copies are invented from.
-    let needs_original = matches!(activity_id, RESEARCH_TIME | RESEARCH_MATERIAL | COPYING);
-    if needs_original && bp.copy || activity_id == INVENTION && !bp.copy {
-        return Err(notify_error("该蓝图不能用于这项活动。"));
-    }
-    let max_runs = match activity_id {
-        RESEARCH_TIME => (MAX_TIME_EFFICIENCY - bp.te) / 2,
-        RESEARCH_MATERIAL => MAX_MATERIAL_EFFICIENCY - bp.me,
-        MANUFACTURING | INVENTION if bp.copy => bp.runs,
-        _ => MAX_RUNS_HARD_CAP,
-    };
-    if runs > max_runs || (activity_id == COPYING && licensed_runs > act.max_production_limit) {
-        return Err(notify_error("流程数超出了蓝图允许的范围。"));
-    }
-    let skill_rows = db.client.query("SELECT type_id, level FROM game.skills WHERE character_id = $1", &[&me]).await.map_err(db_err)?;
-    let skills: HashMap<i32, i32> = skill_rows.iter().map(|r| (r.get(0), r.get(1))).collect();
-    if let Some((skill, level)) = act.skills.iter().find(|(s, l)| skills.get(s).copied().unwrap_or(0) < *l) {
-        return Err(notify_error(&format!("该项目需要技能 {skill} 达到 {level} 级。")));
-    }
-    // Remote jobs need Supply Chain Management / Scientific Networking.
-    let here = c.session.int("solarsystemid2").unwrap_or(0);
-    let reach_skill = if activity_id == MANUFACTURING { SKILL_SUPPLY_CHAIN_MANAGEMENT } else { SKILL_SCIENTIFIC_NETWORKING };
-    let reach = DISTANCE_PER_LEVEL[skills.get(&reach_skill).copied().unwrap_or(0).clamp(0, 5) as usize];
-    if jumps(graph(db).await?, here, fac.system, reach).is_none() {
-        return Err(notify_error("该设施超出了你的远程工业范围。"));
-    }
-    let ship = c.session.int("shipid").unwrap_or(0);
-    let fit = Fit::load(db, me, ship).await?;
-    let slots = if activity_id == MANUFACTURING {
-        fit.value(Key::Char, ATTR_MANUFACTURE_SLOT_LIMIT)
-    } else {
-        fit.value(Key::Char, ATTR_MAX_LABORATORY_SLOTS)
-    }
-    .max(1.0) as i64;
-    let counts = job_counts(db, me).await?;
-    let used: i64 = if activity_id == MANUFACTURING {
-        counts.get(&MANUFACTURING).copied().unwrap_or(0)
-    } else {
-        [RESEARCH_TIME, RESEARCH_MATERIAL, COPYING, INVENTION].iter().map(|a| counts.get(a).copied().unwrap_or(0)).sum()
-    };
-    if used >= slots {
-        return Err(notify_error(&format!("你在这项活动上的全部 {slots} 个工作槽位都已占用。")));
-    }
-    let optional = if activity_id == INVENTION {
-        let mut decryptor = None;
-        for t in requested.keys() {
-            let group: Option<i32> = db
-                .client
-                .query_opt("SELECT group_id FROM sde.inv_types WHERE type_id = $1", &[t])
-                .await
-                .map_err(db_err)?
-                .and_then(|r| r.get(0));
-            if group == Some(GROUP_DECRYPTORS) {
-                decryptor = Some(*t);
-            }
-        }
-        decryptor
-    } else {
-        None
-    };
+    let blueprint_id = int("blueprintID").unwrap_or(0);
+    let facility_id = int("facilityID").unwrap_or(0);
     let product_request = int("productTypeID").map(|p| p as i32);
-    let p = plan(db, &fit, &skills, &bp, &act, activity_id, runs, licensed_runs, product_request, optional, &fac).await?;
-
-    let have = available(db, me, fac.id).await?;
-    if let Some((t, q)) = p.materials.iter().find(|(t, q)| have.get(t).copied().unwrap_or(0) < *q) {
-        return Err(notify_error(&format!("你需要在此处物品机库中准备 {q} 个类型 {t}。")));
-    }
-    debit(db, world, me, p.total_cost).await?;
-    for (type_id, quantity) in &p.materials {
-        let mut left = *quantity;
-        let stacks = load_items_db(
-            db,
-            "i.owner_id = $1 AND i.location_id = $2 AND i.flag_id = $3 AND i.type_id = $4 AND NOT i.singleton ORDER BY i.quantity, i.item_id",
-            &[&me, &fac.id, &FLAG_HANGAR, type_id],
-        )
-        .await?;
-        for s in stacks {
-            if left == 0 {
-                break;
-            }
-            let n = (s.quantity as i64).min(left);
-            take_items(db, world, s, n as i32).await?;
-            left -= n;
-        }
-    }
-    // A blueprint in a stack is split off as its own item for the job.
-    if !bp.singleton {
-        let location: i64 =
-            db.client.query_one("SELECT location_id FROM game.items WHERE item_id = $1", &[&bp.item_id]).await.map_err(db_err)?.get(0);
-        if bp.quantity > 1 {
-            let stack = load_items_db(db, "i.item_id = $1", &[&bp.item_id]).await?.pop().ok_or_else(|| user_error("BlueprintNotFound", vec![]))?;
-            take_items(db, world, stack, 1).await?;
-            bp.item_id = db
-                .client
-                .query_one(
-                    "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton) VALUES ($1, $2, $3, $4, 1, true) RETURNING item_id",
-                    &[&bp.type_id, &me, &location, &FLAG_HANGAR],
-                )
-                .await
-                .map_err(db_err)?
-                .get(0);
-            show_items(db, world, me, location, &[bp.item_id], LOCATION_JUNKYARD).await?;
-        } else {
-            db.client.execute("UPDATE game.items SET singleton = true WHERE item_id = $1", &[&bp.item_id]).await.map_err(db_err)?;
-        }
-    }
+    let here = c.session.int("solarsystemid2").unwrap_or(0);
+    let ship = c.session.int("shipid").unwrap_or(0);
+    let system_graph = graph(db).await?;
+    let fit = Arc::new(Fit::load(db, me, ship).await?);
     let now = filetime_now();
-    let mut j = Job {
-        id: 0,
-        installer: me,
-        owner: me,
-        activity: activity_id,
-        blueprint_id: bp.item_id,
-        blueprint_type: bp.type_id,
-        blueprint_copy: bp.copy,
-        facility: fac.id,
-        system: fac.system,
-        runs,
-        licensed_runs,
-        successful_runs: None,
-        product_type: p.product,
-        optional_type: optional,
-        cost: p.total_cost,
-        probability: p.probability,
-        time: p.seconds,
-        start: now,
-        end: now + p.seconds * FILETIME_SECOND,
-        completed: None,
-        completed_by: None,
-        status: INDUSTRY_JOB_STATUS_INSTALLED,
-    };
-    j.id = db
-        .client
-        .query_one(
-            "INSERT INTO game.industry_jobs (installer_id, owner_id, activity_id, blueprint_id, blueprint_type_id, blueprint_copy, facility_id,
-                                             solar_system_id, runs, licensed_runs, product_type_id, optional_type_id, cost, probability,
-                                             time_seconds, start_date, end_date, status)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) RETURNING job_id",
-            &[
-                &j.installer,
-                &j.owner,
-                &j.activity,
-                &j.blueprint_id,
-                &j.blueprint_type,
-                &j.blueprint_copy,
-                &j.facility,
-                &j.system,
-                &j.runs,
-                &j.licensed_runs,
-                &j.product_type,
-                &j.optional_type,
-                &j.cost,
-                &j.probability,
-                &j.time,
-                &j.start,
-                &j.end,
-                &j.status,
-            ],
-        )
-        .await
-        .map_err(db_err)?
-        .get(0);
-    info!("industry: {me} installed job {} (activity {activity_id}, {runs} runs of {}) at {} for {} ISK, {}s", j.id, bp.type_id, fac.id, p.total_cost, p.seconds);
-    tell_job(world, &j);
+    let j = db.transaction(
+        |tx, outbox: &mut Outbox| {
+            let requested = requested.clone();
+            let fit = Arc::clone(&fit);
+            Box::pin(async move {
+                let mut bp = blueprint(tx, blueprint_id).await?;
+                if bp.owner != me {
+                    return Err(user_error("IndustryBlueprintAccessDenied", vec![]));
+                }
+                let busy: bool = tx
+                    .query_one("SELECT EXISTS (SELECT 1 FROM game.industry_jobs WHERE blueprint_id = $1 AND status = $2)", &[&bp.item_id, &INDUSTRY_JOB_STATUS_INSTALLED])
+                    .await
+                    .map_err(db_err)?
+                    .get(0);
+                if busy {
+                    return Err(notify_error("该蓝图正在被一个项目使用。"));
+                }
+                let fac = facility(tx, facility_id).await?;
+                if !fac.activities().contains(&activity_id) {
+                    return Err(notify_error("该空间站不提供这项活动。"));
+                }
+                if bp.station != Some(fac.id) {
+                    return Err(notify_error("蓝图必须位于该设施中。"));
+                }
+                let Some(act) = activity(tx, bp.type_id, activity_id).await? else {
+                    return Err(notify_error("该蓝图不能用于这项活动。"));
+                };
+                // Originals research and copy; only copies are invented from.
+                let needs_original = matches!(activity_id, RESEARCH_TIME | RESEARCH_MATERIAL | COPYING);
+                if needs_original && bp.copy || activity_id == INVENTION && !bp.copy {
+                    return Err(notify_error("该蓝图不能用于这项活动。"));
+                }
+                let max_runs = match activity_id {
+                    RESEARCH_TIME => (MAX_TIME_EFFICIENCY - bp.te) / 2,
+                    RESEARCH_MATERIAL => MAX_MATERIAL_EFFICIENCY - bp.me,
+                    MANUFACTURING | INVENTION if bp.copy => bp.runs,
+                    _ => MAX_RUNS_HARD_CAP,
+                };
+                if runs > max_runs || (activity_id == COPYING && licensed_runs > act.max_production_limit) {
+                    return Err(notify_error("流程数超出了蓝图允许的范围。"));
+                }
+                let skill_rows = tx.query("SELECT type_id, level FROM game.skills WHERE character_id = $1", &[&me]).await.map_err(db_err)?;
+                let skills: HashMap<i32, i32> = skill_rows.iter().map(|r| (r.get(0), r.get(1))).collect();
+                if let Some((skill, level)) = act.skills.iter().find(|(s, l)| skills.get(s).copied().unwrap_or(0) < *l) {
+                    return Err(notify_error(&format!("该项目需要技能 {skill} 达到 {level} 级。")));
+                }
+                // Remote jobs need Supply Chain Management / Scientific Networking.
+                let reach_skill = if activity_id == MANUFACTURING { SKILL_SUPPLY_CHAIN_MANAGEMENT } else { SKILL_SCIENTIFIC_NETWORKING };
+                let reach = DISTANCE_PER_LEVEL[skills.get(&reach_skill).copied().unwrap_or(0).clamp(0, 5) as usize];
+                if jumps(system_graph, here, fac.system, reach).is_none() {
+                    return Err(notify_error("该设施超出了你的远程工业范围。"));
+                }
+                let slots = if activity_id == MANUFACTURING {
+                    fit.value(Key::Char, ATTR_MANUFACTURE_SLOT_LIMIT)
+                } else {
+                    fit.value(Key::Char, ATTR_MAX_LABORATORY_SLOTS)
+                }
+                .max(1.0) as i64;
+                let counts = job_counts(tx, me).await?;
+                let used: i64 = if activity_id == MANUFACTURING {
+                    counts.get(&MANUFACTURING).copied().unwrap_or(0)
+                } else {
+                    [RESEARCH_TIME, RESEARCH_MATERIAL, COPYING, INVENTION].iter().map(|a| counts.get(a).copied().unwrap_or(0)).sum()
+                };
+                if used >= slots {
+                    return Err(notify_error(&format!("你在这项活动上的全部 {slots} 个工作槽位都已占用。")));
+                }
+                let optional = if activity_id == INVENTION {
+                    let mut decryptor = None;
+                    for t in requested.keys() {
+                        let group: Option<i32> = tx
+                            .query_opt("SELECT group_id FROM sde.inv_types WHERE type_id = $1", &[t])
+                            .await
+                            .map_err(db_err)?
+                            .and_then(|r| r.get(0));
+                        if group == Some(GROUP_DECRYPTORS) {
+                            decryptor = Some(*t);
+                        }
+                    }
+                    decryptor
+                } else {
+                    None
+                };
+                let p = plan(tx, &fit, &skills, &bp, &act, activity_id, runs, licensed_runs, product_request, optional, &fac).await?;
+
+                let have = available(tx, me, fac.id).await?;
+                if let Some((t, q)) = p.materials.iter().find(|(t, q)| have.get(t).copied().unwrap_or(0) < *q) {
+                    return Err(notify_error(&format!("你需要在此处物品机库中准备 {q} 个类型 {t}。")));
+                }
+                debit(tx, outbox, me, p.total_cost).await?;
+                for (type_id, quantity) in &p.materials {
+                    let mut left = *quantity;
+                    let stacks = load_items_db(
+                        tx,
+                        "i.owner_id = $1 AND i.location_id = $2 AND i.flag_id = $3 AND i.type_id = $4 AND NOT i.singleton ORDER BY i.quantity, i.item_id",
+                        &[&me, &fac.id, &FLAG_HANGAR, type_id],
+                    )
+                    .await?;
+                    for s in stacks {
+                        if left == 0 {
+                            break;
+                        }
+                        let n = (s.quantity as i64).min(left);
+                        take_items(tx, outbox, s, n as i32).await?;
+                        left -= n;
+                    }
+                }
+                // A blueprint in a stack is split off as its own item for the job.
+                if !bp.singleton {
+                    let location: i64 =
+                        tx.query_one("SELECT location_id FROM game.items WHERE item_id = $1", &[&bp.item_id]).await.map_err(db_err)?.get(0);
+                    if bp.quantity > 1 {
+                        let stack = load_items_db(tx, "i.item_id = $1", &[&bp.item_id]).await?.pop().ok_or_else(|| user_error("BlueprintNotFound", vec![]))?;
+                        take_items(tx, outbox, stack, 1).await?;
+                        bp.item_id = tx
+                            .query_one(
+                                "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton) VALUES ($1, $2, $3, $4, 1, true) RETURNING item_id",
+                                &[&bp.type_id, &me, &location, &FLAG_HANGAR],
+                            )
+                            .await
+                            .map_err(db_err)?
+                            .get(0);
+                        show_items(tx, outbox, me, location, &[bp.item_id], LOCATION_JUNKYARD).await?;
+                    } else {
+                        tx.execute("UPDATE game.items SET singleton = true WHERE item_id = $1", &[&bp.item_id]).await.map_err(db_err)?;
+                    }
+                }
+                let mut j = Job {
+                    id: 0,
+                    installer: me,
+                    owner: me,
+                    activity: activity_id,
+                    blueprint_id: bp.item_id,
+                    blueprint_type: bp.type_id,
+                    blueprint_copy: bp.copy,
+                    facility: fac.id,
+                    system: fac.system,
+                    runs,
+                    licensed_runs,
+                    successful_runs: None,
+                    product_type: p.product,
+                    optional_type: optional,
+                    cost: p.total_cost,
+                    probability: p.probability,
+                    time: p.seconds,
+                    start: now,
+                    end: now + p.seconds * FILETIME_SECOND,
+                    completed: None,
+                    completed_by: None,
+                    status: INDUSTRY_JOB_STATUS_INSTALLED,
+                };
+                j.id = tx
+                    .query_one(
+                        "INSERT INTO game.industry_jobs (installer_id, owner_id, activity_id, blueprint_id, blueprint_type_id, blueprint_copy, facility_id,
+                                                         solar_system_id, runs, licensed_runs, product_type_id, optional_type_id, cost, probability,
+                                                         time_seconds, start_date, end_date, status)
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) RETURNING job_id",
+                        &[
+                            &j.installer,
+                            &j.owner,
+                            &j.activity,
+                            &j.blueprint_id,
+                            &j.blueprint_type,
+                            &j.blueprint_copy,
+                            &j.facility,
+                            &j.system,
+                            &j.runs,
+                            &j.licensed_runs,
+                            &j.product_type,
+                            &j.optional_type,
+                            &j.cost,
+                            &j.probability,
+                            &j.time,
+                            &j.start,
+                            &j.end,
+                            &j.status,
+                        ],
+                    )
+                    .await
+                    .map_err(db_err)?
+                    .get(0);
+                tell_job(outbox, &j);
+                Ok(j)
+            })
+        },
+        |j, outbox| async move { dispatch_world(j, outbox, world) },
+    ).await?;
+    info!("industry: {me} installed job {} (activity {activity_id}, {runs} runs of {}) at {} for {} ISK, {}s", j.id, j.blueprint_type, j.facility, j.cost, j.time);
     Ok(Value::Int(j.id))
 }
 
 /// Remove a used-up blueprint copy.
-async fn destroy_blueprint(db: &Db, world: &World, item_id: i64) -> Result<(), CallError> {
+async fn destroy_blueprint<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, item_id: i64) -> Result<(), CallError> {
     if let Some(item) = load_items_db(db, "i.item_id = $1", &[&item_id]).await?.pop() {
         let owner = item.owner_id;
-        db.client.execute("DELETE FROM game.items WHERE item_id = $1", &[&item_id]).await.map_err(db_err)?;
-        db.client.execute("DELETE FROM game.blueprints WHERE item_id = $1", &[&item_id]).await.map_err(db_err)?;
+        db.execute("DELETE FROM game.items WHERE item_id = $1", &[&item_id]).await.map_err(db_err)?;
+        db.execute("DELETE FROM game.blueprints WHERE item_id = $1", &[&item_id]).await.map_err(db_err)?;
         let old = item.location_id;
         let gone = super::dogma::Item { location_id: LOCATION_JUNKYARD, ..item };
-        world.notify_pilot(owner, "OnItemChange", vec![gone.row(), Value::Dict(vec![(Value::Int(IX_LOCATION_ID), Value::Int(old))]), Value::None]);
+        outbox.notify_pilot(owner, "OnItemChange", vec![gone.row(), Value::Dict(vec![(Value::Int(IX_LOCATION_ID), Value::Int(old))]), Value::None]);
     }
     Ok(())
 }
 
 /// New blueprint copies in `owner`'s hangar at `station`.
 #[allow(clippy::too_many_arguments)]
-async fn make_copies(db: &Db, world: &World, owner: i64, station: i64, type_id: i32, count: i32, me: i32, te: i32, runs: i32) -> Result<(), CallError> {
+async fn make_copies<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, owner: i64, station: i64, type_id: i32, count: i32, me: i32, te: i32, runs: i32) -> Result<(), CallError> {
     let mut ids = vec![];
     for _ in 0..count {
         let id: i64 = db
-            .client
             .query_one(
                 "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton) VALUES ($1, $2, $3, $4, $5::bigint::integer, true) RETURNING item_id",
                 &[&type_id, &owner, &station, &FLAG_HANGAR, &BLUEPRINT_COPY_QUANTITY],
@@ -807,24 +812,28 @@ async fn make_copies(db: &Db, world: &World, owner: i64, station: i64, type_id: 
         set_blueprint(db, id, me, te, runs).await?;
         ids.push(id);
     }
-    show_items(db, world, owner, station, &ids, LOCATION_JUNKYARD).await
+    show_items(db, outbox, owner, station, &ids, LOCATION_JUNKYARD).await
 }
 
 /// Deliver a finished job's output to the owner's hangar at the facility.
-async fn deliver_job(db: &Db, world: &World, j: &mut Job, by: i64) -> Result<(), CallError> {
-    let bp = blueprint(db, j.blueprint_id).await.ok();
+async fn deliver_job<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, j: &mut Job, by: i64, invention_successful: i32, completed: i64) -> Result<(), CallError> {
+    let bp = match blueprint(db, j.blueprint_id).await {
+        Ok(bp) => Some(bp),
+        Err(CallError::User { .. }) => None,
+        Err(error) => return Err(error),
+    };
     let act = activity(db, j.blueprint_type, j.activity).await?;
     let mut successful = j.runs;
     match (j.activity, &act) {
         (MANUFACTURING, Some(act)) => {
             if let Some(&(product, per_run, _)) = act.products.iter().find(|p| Some(p.0) == j.product_type).or(act.products.first()) {
                 let quantity = (per_run * j.runs as i64).min(i32::MAX as i64) as i32;
-                deliver(db, world, j.owner, j.facility, product, quantity).await?;
+                deliver(db, outbox, j.owner, j.facility, product, quantity).await?;
             }
             if let Some(bp) = bp.filter(|b| b.copy) {
                 let left = bp.runs - j.runs;
                 if left <= 0 {
-                    destroy_blueprint(db, world, bp.item_id).await?;
+                    destroy_blueprint(db, outbox, bp.item_id).await?;
                 } else {
                     set_blueprint(db, bp.item_id, bp.me, bp.te, left).await?;
                 }
@@ -842,10 +851,10 @@ async fn deliver_job(db: &Db, world: &World, j: &mut Job, by: i64) -> Result<(),
         }
         (COPYING, _) => {
             let (me, te) = bp.as_ref().map(|b| (b.me, b.te)).unwrap_or((0, 0));
-            make_copies(db, world, j.owner, j.facility, j.blueprint_type, j.runs, me, te, j.licensed_runs).await?;
+            make_copies(db, outbox, j.owner, j.facility, j.blueprint_type, j.runs, me, te, j.licensed_runs).await?;
         }
         (INVENTION, Some(act)) => {
-            successful = (0..j.runs).filter(|_| rand01() < j.probability).count() as i32;
+            successful = invention_successful;
             let (_, d_me, d_te, d_runs) = match j.optional_type {
                 Some(d) => decryptor(db, d).await?,
                 None => (1.0, 0, 0, 0),
@@ -853,13 +862,13 @@ async fn deliver_job(db: &Db, world: &World, j: &mut Job, by: i64) -> Result<(),
             if let Some(&(product, per_run, _)) = act.products.iter().find(|p| Some(p.0) == j.product_type).or(act.products.first()) {
                 if successful > 0 {
                     let runs = (per_run as i32 + d_runs).max(1);
-                    make_copies(db, world, j.owner, j.facility, product, successful, INVENTION_MATERIAL_EFFICIENCY + d_me, INVENTION_TIME_EFFICIENCY + d_te, runs).await?;
+                    make_copies(db, outbox, j.owner, j.facility, product, successful, INVENTION_MATERIAL_EFFICIENCY + d_me, INVENTION_TIME_EFFICIENCY + d_te, runs).await?;
                 }
             }
             if let Some(bp) = bp {
                 let left = bp.runs - j.runs;
                 if left <= 0 {
-                    destroy_blueprint(db, world, bp.item_id).await?;
+                    destroy_blueprint(db, outbox, bp.item_id).await?;
                 } else {
                     set_blueprint(db, bp.item_id, bp.me, bp.te, left).await?;
                 }
@@ -869,17 +878,19 @@ async fn deliver_job(db: &Db, world: &World, j: &mut Job, by: i64) -> Result<(),
     }
     j.status = STATUS_DELIVERED;
     j.successful_runs = Some(successful);
-    j.completed = Some(filetime_now());
+    j.completed = Some(completed);
     j.completed_by = Some(by);
-    db.client
+    let affected = db
         .execute(
-            "UPDATE game.industry_jobs SET status = $2, successful_runs = $3, completed_date = $4, completed_by = $5 WHERE job_id = $1",
-            &[&j.id, &j.status, &j.successful_runs, &j.completed, &j.completed_by],
+            "UPDATE game.industry_jobs SET status = $2, successful_runs = $3, completed_date = $4, completed_by = $5 WHERE job_id = $1 AND status = $6",
+            &[&j.id, &j.status, &j.successful_runs, &j.completed, &j.completed_by, &INDUSTRY_JOB_STATUS_INSTALLED],
         )
         .await
         .map_err(db_err)?;
-    info!("industry: job {} delivered ({successful}/{} runs)", j.id, j.runs);
-    tell_job(world, j);
+    if affected == 0 {
+        return Err(notify_error("该项目已经交付。"));
+    }
+    tell_job(outbox, j);
     Ok(())
 }
 
@@ -887,7 +898,7 @@ async fn complete(c: &Client, id: i64) -> Result<(), CallError> {
     let (db, world) = (&c.db, &*c.world);
     let me = c.session.int("charid").unwrap_or(0);
     let _trading = lock().await;
-    let mut j = job(db, id).await?;
+    let j = job(db, id).await?;
     if j.owner != me && j.installer != me {
         return Err(user_error("IndustryJobAccessDenied", vec![]));
     }
@@ -897,7 +908,20 @@ async fn complete(c: &Client, id: i64) -> Result<(), CallError> {
     if j.end > filetime_now() {
         return Err(notify_error("该项目尚未完成。"));
     }
-    deliver_job(db, world, &mut j, me).await
+    let successful = if j.activity == INVENTION { (0..j.runs).filter(|_| rand01() < j.probability).count() as i32 } else { j.runs };
+    let completed = filetime_now();
+    let delivered = db.transaction(
+        |tx, outbox: &mut Outbox| {
+            let mut j = j.clone();
+            Box::pin(async move {
+                deliver_job(tx, outbox, &mut j, me, successful, completed).await?;
+                Ok(j)
+            })
+        },
+        |j, outbox| async move { dispatch_world(j, outbox, world) },
+    ).await?;
+    info!("industry: job {} delivered ({}/{} runs)", delivered.id, delivered.successful_runs.unwrap_or(0), delivered.runs);
+    Ok(())
 }
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
@@ -960,11 +984,11 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             let owner = int(0);
             let completed = call.args.get(1).is_some_and(|v| matches!(v, Value::Bool(true)) || v.as_int().is_some_and(|i| i != 0));
             let rows = if completed {
-                c.db.client
+                c.db
                     .query(&format!("{JOB_SELECT} WHERE owner_id = $1 AND (status = $2 OR completed_date >= $3) ORDER BY job_id"), &[&owner, &INDUSTRY_JOB_STATUS_INSTALLED, &(filetime_now() - COMPLETED_JOB_HISTORY_DAYS * FILETIME_DAY)])
                     .await
             } else {
-                c.db.client.query(&format!("{JOB_SELECT} WHERE owner_id = $1 AND status = $2 ORDER BY job_id"), &[&owner, &INDUSTRY_JOB_STATUS_INSTALLED]).await
+                c.db.query(&format!("{JOB_SELECT} WHERE owner_id = $1 AND status = $2 ORDER BY job_id"), &[&owner, &INDUSTRY_JOB_STATUS_INSTALLED]).await
             };
             match rows {
                 Ok(rows) => Ok(Value::list(rows.iter().map(|r| job_from_row(r).keyval()))),
@@ -1005,14 +1029,14 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                     j.completed_by = Some(me);
                     match c
                         .db
-                        .client
                         .execute("UPDATE game.industry_jobs SET status = $2, completed_date = $3, completed_by = $4 WHERE job_id = $1", &[&j.id, &j.status, &j.completed, &me])
                         .await
                     {
                         Ok(_) => {
                             info!("industry: {me} cancelled job {}", j.id);
-                            tell_job(&c.world, &j);
-                            Ok(Value::None)
+                            let mut outbox = Outbox::default();
+                            tell_job(&mut outbox, &j);
+                            dispatch_world(Value::None, outbox, &c.world)
                         }
                         Err(e) => Err(db_err(e)),
                     }

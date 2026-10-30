@@ -81,7 +81,7 @@ const TYPE_INFO_JOINS: &str = "
 const TYPE_INFO_COLUMNS: &str = "t.type_id, COALESCE(ln.data->>'text', t.name), COALESCE(ic.data->>'iconFile', '')";
 
 async fn build_catalogue(c: &Client) -> Result<Catalogue, CallError> {
-    let db = &c.db.client;
+    let db = &c.db;
     let plex_isk: f64 = db
         .query_opt("SELECT average FROM game.retail_prices WHERE type_id = $1", &[&TYPE_PLEX])
         .await
@@ -297,7 +297,6 @@ fn offer_json(o: &Offer, can_purchase: bool) -> Value {
 
 async fn claimed_daily_gift(c: &Client) -> Result<bool, CallError> {
     Ok(c.db
-        .client
         .query_one(
             &format!(
                 "SELECT EXISTS (SELECT 1 FROM game.store_purchases WHERE user_id = $1 AND offer_id = $2
@@ -314,7 +313,7 @@ async fn claimed_daily_gift(c: &Client) -> Result<bool, CallError> {
 
 /// Queue `quantity` x `type_id` on `user_id`'s redeeming queue.
 async fn grant_token(c: &Client, user_id: i64, type_id: i32, quantity: i64, label: &str) -> Result<(), CallError> {
-    c.db.client
+    c.db
         .execute(
             "INSERT INTO game.redeem_tokens (user_id, type_id, quantity, label, created) VALUES ($1, $2, $3, $4, $5)",
             &[&user_id, &type_id, &(quantity as i32), &label, &filetime_now()],
@@ -327,7 +326,6 @@ async fn grant_token(c: &Client, user_id: i64, type_id: i32, quantity: i64, labe
 async fn redeem_tokens(c: &Client) -> CallResult {
     let rows = c
         .db
-        .client
         .query(
             "SELECT token_id, type_id, quantity, label, description, created FROM game.redeem_tokens WHERE user_id = $1 ORDER BY token_id",
             &[&c.login.user_id],
@@ -376,7 +374,6 @@ async fn claim_tokens(c: &mut Client, call: &Call<'_>) -> CallResult {
     let home = call.kwargs.get("useHomeStation").or_else(|| call.args.get(2)).and_then(|v| v.as_int()).unwrap_or(0) != 0;
     let row = c
         .db
-        .client
         .query_opt("SELECT home_station_id, station_id FROM game.characters WHERE character_id = $1 AND user_id = $2", &[&char_id, &c.login.user_id])
         .await
         .map_err(db_err)?
@@ -385,7 +382,6 @@ async fn claim_tokens(c: &mut Client, call: &Call<'_>) -> CallResult {
     let station: Option<i64> = if home { row.get(0) } else { docked.or(row.get(0)) };
     let tokens = c
         .db
-        .client
         .query("DELETE FROM game.redeem_tokens WHERE user_id = $1 AND token_id = ANY($2) RETURNING type_id, quantity", &[&c.login.user_id, &ids])
         .await
         .map_err(db_err)?;
@@ -400,7 +396,6 @@ async fn claim_tokens(c: &mut Client, call: &Call<'_>) -> CallResult {
         let Some(station) = station else { continue };
         let item_id: i64 = c
             .db
-            .client
             .query_one(
                 "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity) VALUES ($1, $2, $3, $4, $5) RETURNING item_id",
                 &[&type_id, &char_id, &station, &FLAG_HANGAR, &quantity],
@@ -413,7 +408,6 @@ async fn claim_tokens(c: &mut Client, call: &Call<'_>) -> CallResult {
     if skill_points > 0 {
         let free: i64 = c
             .db
-            .client
             .query_one(
                 "UPDATE game.characters SET free_skill_points = free_skill_points + $2 WHERE character_id = $1 RETURNING free_skill_points",
                 &[&char_id, &skill_points],
@@ -458,7 +452,7 @@ async fn buy_offer(c: &mut Client, call: &Call<'_>) -> CallResult {
     let Some(offer) = cat.offers.iter().find(|o| o.id == offer_id && !o.daily) else { return Ok(Value::Bool(false)) };
     let cost = offer.price * qty;
     let recipient = match gift_to {
-        Some(ch) => match c.db.client.query_opt("SELECT user_id FROM game.characters WHERE character_id = $1", &[&ch]).await.map_err(db_err)? {
+        Some(ch) => match c.db.query_opt("SELECT user_id FROM game.characters WHERE character_id = $1", &[&ch]).await.map_err(db_err)? {
             Some(r) => r.get(0),
             None => return Ok(Value::Bool(false)),
         },
@@ -466,7 +460,6 @@ async fn buy_offer(c: &mut Client, call: &Call<'_>) -> CallResult {
     };
     let Some(row) = c
         .db
-        .client
         .query_opt(
             "UPDATE game.accounts SET plex_balance = plex_balance - $2 WHERE user_id = $1 AND plex_balance >= $2 RETURNING plex_balance",
             &[&c.login.user_id, &cost],
@@ -478,7 +471,7 @@ async fn buy_offer(c: &mut Client, call: &Call<'_>) -> CallResult {
         return Ok(Value::Bool(false));
     };
     let balance: i64 = row.get(0);
-    c.db.client
+    c.db
         .execute(
             "INSERT INTO game.store_purchases (user_id, offer_id, quantity, price) VALUES ($1, $2, $3, $4)",
             &[&c.login.user_id, &(offer_id as i32), &(qty as i32), &cost],
@@ -502,7 +495,7 @@ async fn free_to_get(c: &mut Client, call: &Call<'_>) -> CallResult {
     if claimed_daily_gift(c).await? {
         return Ok(Value::Bool(false));
     }
-    c.db.client
+    c.db
         .execute(
             "INSERT INTO game.store_purchases (user_id, offer_id, quantity, price) VALUES ($1, $2, 1, 0)",
             &[&c.login.user_id, &(offer_id as i32)],
@@ -527,7 +520,6 @@ async fn seasonal_campaign(c: &Client) -> Result<Option<(i32, Vec<(i32, i64)>, V
     };
     let row = c
         .db
-        .client
         .query_opt(
             &format!(
                 "SELECT key::int, {}, {} FROM sde_native.seasonalcampaignsloginrewards
@@ -557,7 +549,6 @@ fn parse_rewards(s: &str) -> Vec<(i32, i64)> {
 async fn seasonal_claims(c: &Client, campaign: i32) -> Result<(i64, bool), CallError> {
     let r = c
         .db
-        .client
         .query_one(
             &format!("SELECT count(*), count(*) FILTER (WHERE day = {REWARD_DAY_SQL}) > 0 FROM game.login_reward_claims WHERE user_id = $1 AND campaign_id = $2"),
             &[&c.login.user_id, &campaign],
@@ -583,7 +574,7 @@ async fn seasonal(c: &mut Client, call: &Call<'_>) -> CallResult {
         "get_active_campaign" => {
             let remaining = total - claimed;
             let today_ordinal: i32 =
-                c.db.client.query_one(&format!("SELECT ({REWARD_DAY_SQL} - date '0001-01-01') + 1"), &[]).await.map_err(db_err)?.get(0);
+                c.db.query_one(&format!("SELECT ({REWARD_DAY_SQL} - date '0001-01-01') + 1"), &[]).await.map_err(db_err)?.get(0);
             let end = today_ordinal as i64 + remaining + 1;
             Ok(Value::tuple([Value::Int(campaign as i64), Value::Int(end), Value::str(TURNOVER), Value::Int(remaining)]))
         }
@@ -591,7 +582,6 @@ async fn seasonal(c: &mut Client, call: &Call<'_>) -> CallResult {
         "get_claim_history" => {
             let rows = c
                 .db
-                .client
                 .query(
                     "SELECT (day - date '0001-01-01') + 1, clone_grade FROM game.login_reward_claims WHERE user_id = $1 AND campaign_id = $2",
                     &[&c.login.user_id, &campaign],
@@ -605,7 +595,7 @@ async fn seasonal(c: &mut Client, call: &Call<'_>) -> CallResult {
             if today || claimed >= total {
                 return Ok(Value::Bool(false));
             }
-            c.db.client
+            c.db
                 .execute(
                     &format!("INSERT INTO game.login_reward_claims (user_id, campaign_id, day, clone_grade) VALUES ($1, $2, {REWARD_DAY_SQL}, 1)"),
                     &[&c.login.user_id, &campaign],
@@ -653,7 +643,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         // get_account_balance(currency): PLEX in the vault; no other currencies.
         ("vaultManager", "get_account_balance") => {
             if call.args.first().and_then(|v| v.as_text()).as_deref() == Some(PLX) {
-                crate::db::Db::plex_balance(&c.db.client, c.login.user_id).await.map_err(db_err).map(Value::Int)
+                c.db.plex_balance(c.login.user_id).await.map_err(db_err).map(Value::Int)
             } else {
                 Ok(Value::Int(0))
             }
@@ -663,7 +653,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         ("userSvc", "ClaimRedeemTokens") => claim_tokens(c, call).await,
         ("userSvc", "TrashRedeemTokens") => {
             let ids = token_ids(call.args.first());
-            match c.db.client.execute("DELETE FROM game.redeem_tokens WHERE user_id = $1 AND token_id = ANY($2)", &[&c.login.user_id, &ids]).await {
+            match c.db.execute("DELETE FROM game.redeem_tokens WHERE user_id = $1 AND token_id = ANY($2)", &[&c.login.user_id, &ids]).await {
                 Ok(_) => Ok(Value::None),
                 Err(e) => Err(db_err(e)),
             }

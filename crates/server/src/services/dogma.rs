@@ -32,6 +32,7 @@ pub(super) fn wire_quantity(singleton: bool, quantity: i64) -> i64 {
 }
 
 /// An inventory item as the client's item DBRow expects it.
+#[derive(Clone)]
 pub struct Item {
     pub item_id: i64,
     pub type_id: i32,
@@ -68,9 +69,8 @@ pub async fn load_items(c: &Client, where_sql: &str, params: &[&(dyn tokio_postg
 }
 
 /// load_items for tasks without a client.
-pub async fn load_items_db(db: &crate::db::Db, where_sql: &str, params: &[&(dyn tokio_postgres::types::ToSql + Sync)]) -> Result<Vec<Item>, CallError> {
+pub async fn load_items_db(db: &(impl crate::db::executor::Executor + ?Sized), where_sql: &str, params: &[&(dyn tokio_postgres::types::ToSql + Sync)]) -> Result<Vec<Item>, CallError> {
     let rows = db
-        .client
         .query(
             &format!(
                 "SELECT i.item_id, i.type_id, i.owner_id, i.location_id, i.flag_id, i.quantity, i.singleton,
@@ -101,7 +101,6 @@ pub async fn load_items_db(db: &crate::db::Db, where_sql: &str, params: &[&(dyn 
 async fn type_attributes(c: &Client, type_id: i32) -> Result<BTreeMap<i64, f64>, CallError> {
     let rows = c
         .db
-        .client
         .query("SELECT attribute_id, value FROM sde.type_attributes WHERE type_id = $1", &[&type_id])
         .await
         .map_err(db_err)?;
@@ -109,7 +108,6 @@ async fn type_attributes(c: &Client, type_id: i32) -> Result<BTreeMap<i64, f64>,
     // mass, capacity, volume and radius are type columns, not dogma attribute rows.
     let columns = c
         .db
-        .client
         .query_opt("SELECT mass::float8, capacity::float8, volume::float8, radius::float8 FROM sde.inv_types WHERE type_id = $1", &[&type_id])
         .await
         .map_err(db_err)?;
@@ -184,7 +182,6 @@ async fn character_info(c: &Client) -> Result<Value, CallError> {
 /// Fitted modules of `ship_id` that are online (game.items.online).
 async fn online_modules(c: &Client, ship_id: i64) -> Result<Vec<i64>, CallError> {
     Ok(c.db
-        .client
         .query("SELECT item_id FROM game.items WHERE location_id = $1 AND online", &[&ship_id])
         .await
         .map_err(db_err)?
@@ -272,7 +269,6 @@ async fn ship_info(c: &Client) -> Result<Vec<(Value, Value)>, CallError> {
     // the HUD reads a launcher's charge from there.
     let charges = c
         .db
-        .client
         .query("SELECT flag_id, type_id, quantity FROM game.module_charges WHERE ship_id = $1 AND quantity > 0", &[&ship_id])
         .await
         .map_err(db_err)?;
@@ -348,7 +344,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
             let ship = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
             let module = call.args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
             let online = call.method == "SetModuleOnline";
-            c.db.client
+            c.db
                 .execute("UPDATE game.items SET online = $3 WHERE item_id = $1 AND location_id = $2", &[&module, &ship, &online])
                 .await
                 .map_err(db_err)?;

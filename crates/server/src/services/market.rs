@@ -17,6 +17,8 @@ use super::{crowset, db_err, keyval, notify_error, user_error, value_field, Call
 use crate::client::{filetime_now, Client};
 use crate::consts::{ACCOUNT_CASH, FILETIME_DAY, FLAG_HANGAR, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD};
 use crate::db::Db;
+use crate::db::executor::Executor;
+use crate::db::outbox::{Effect, Outbox};
 use crate::space::World;
 use marshal::{DbRowDescriptor, DbType, Value};
 use std::collections::{HashMap, HashSet};
@@ -61,6 +63,35 @@ const SKILL_WHOLESALE: i32 = 16596;
 const SKILL_MARGIN_TRADING: i32 = 16597;
 const SKILL_ACCOUNTING: i32 = 16622;
 const SKILL_TYCOON: i32 = 18580;
+
+enum MarketEffect {
+    Bought { buyer: i64, quantity: i32, type_id: i32, station: i64, value: f64, order: i64 },
+    Sold { seller: i64, quantity: i32, type_id: i32, station: i64, value: f64, order: i64 },
+    Placed { buyer: bool, owner: i64, order: i64, quantity: i32, type_id: i32, price: f64 },
+    Repriced { owner: i64, order: i64, price: f64 },
+    Cancelled { owner: i64, order: i64 },
+    Expired { owner: Option<i64>, order: i64 },
+}
+
+fn dispatch_market<T>(value: T, outbox: Outbox<MarketEffect>, world: &World) -> Result<T, CallError> {
+    for effect in outbox.into_entries() {
+        match effect {
+            Effect::Notification(notification) => notification.dispatch(world, None)?,
+            Effect::Operation(MarketEffect::Bought { buyer, quantity, type_id, station, value, order }) =>
+                info!("market: {buyer} bought {quantity} x {type_id} at {station} for {value} ISK (order {order})"),
+            Effect::Operation(MarketEffect::Sold { seller, quantity, type_id, station, value, order }) =>
+                info!("market: {seller} sold {quantity} x {type_id} at {station} for {value} ISK (order {order})"),
+            Effect::Operation(MarketEffect::Placed { buyer, owner, order, quantity, type_id, price }) => {
+                let side = if buyer { "buy" } else { "sell" };
+                info!("market: {owner} placed {side} order {order} for {quantity} x {type_id} at {price} ISK");
+            }
+            Effect::Operation(MarketEffect::Repriced { owner, order, price }) => info!("market: {owner} repriced order {order} to {price} ISK"),
+            Effect::Operation(MarketEffect::Cancelled { owner, order }) => info!("market: {owner} cancelled order {order}"),
+            Effect::Operation(MarketEffect::Expired { owner, order }) => info!("market: order {order} of {owner:?} expired"),
+        }
+    }
+    Ok(value)
+}
 
 pub(super) fn round2(x: f64) -> f64 {
     (x * 100.0).round() / 100.0
@@ -107,7 +138,6 @@ async fn orders(c: &Client, type_id: i64) -> CallResult {
     let region = c.session.int("regionid").unwrap_or(0);
     let rows = c
         .db
-        .client
         .query(
             &format!("SELECT {ORDER_COLUMNS} FROM game.market_orders WHERE type_id = $2 AND region_id = $3 AND vol_remaining > 0 ORDER BY price"),
             &[&today(), &(type_id as i32), &region],
@@ -136,7 +166,6 @@ async fn orders(c: &Client, type_id: i64) -> CallResult {
 async fn best_asks(c: &Client, column: &str, id: i64, as_rows: bool) -> CallResult {
     let rows = c
         .db
-        .client
         .query(
             &format!(
                 "SELECT DISTINCT ON (type_id) type_id::bigint, price, vol_remaining::bigint, station_id
@@ -176,9 +205,8 @@ pub(super) struct Station {
     pub(super) owner: i64,
 }
 
-pub(super) async fn station(db: &Db, id: i64) -> Result<Station, CallError> {
+pub(super) async fn station(db: &(impl Executor + ?Sized), id: i64) -> Result<Station, CallError> {
     let r = db
-        .client
         .query_opt(
             "SELECT station_id::bigint, solar_system_id::bigint, constellation_id::bigint, region_id::bigint, COALESCE(owner_id, 0)::bigint
              FROM sde.sta_stations WHERE station_id = $1::bigint",
@@ -196,7 +224,7 @@ pub(super) async fn graph(db: &Db) -> Result<&'static HashMap<i64, Vec<i64>>, Ca
     if let Some(g) = GRAPH.get() {
         return Ok(g);
     }
-    let rows = db.client.query("SELECT from_solar_system_id::bigint, to_solar_system_id::bigint FROM sde.map_jumps", &[]).await.map_err(db_err)?;
+    let rows = db.query("SELECT from_solar_system_id::bigint, to_solar_system_id::bigint FROM sde.map_jumps", &[]).await.map_err(db_err)?;
     let mut g: HashMap<i64, Vec<i64>> = HashMap::new();
     for r in &rows {
         g.entry(r.get(0)).or_default().push(r.get(1));
@@ -249,10 +277,9 @@ struct Skills {
     modification_discount: f64,
 }
 
-async fn skills(db: &Db, char_id: i64) -> Result<Skills, CallError> {
+async fn skills(db: &(impl Executor + ?Sized), char_id: i64) -> Result<Skills, CallError> {
     let wanted = vec![SKILL_TRADE, SKILL_RETAIL, SKILL_BROKER_RELATIONS, SKILL_WHOLESALE, SKILL_MARGIN_TRADING, SKILL_ACCOUNTING, SKILL_TYCOON];
     let rows = db
-        .client
         .query("SELECT type_id, level FROM game.skills WHERE character_id = $1 AND type_id = ANY($2)", &[&char_id, &wanted])
         .await
         .map_err(db_err)?;
@@ -270,23 +297,23 @@ fn broker_fee(rate: f64, amount: f64) -> f64 {
     round2((rate * amount).max(MIN_BROKER_FEE))
 }
 
-async fn check_order_slots(db: &Db, char_id: i64, skills: &Skills) -> Result<(), CallError> {
-    let open: i64 = db.client.query_one("SELECT count(*) FROM game.market_orders WHERE char_id = $1", &[&char_id]).await.map_err(db_err)?.get(0);
+async fn check_order_slots(db: &(impl Executor + ?Sized), char_id: i64, skills: &Skills) -> Result<(), CallError> {
+    let open: i64 = db.query_one("SELECT count(*) FROM game.market_orders WHERE char_id = $1", &[&char_id]).await.map_err(db_err)?.get(0);
     if open >= skills.order_cap {
         return Err(notify_error(&format!("你已有 {open} 个未完成的市场订单，达到了交易技能允许的上限。")));
     }
     Ok(())
 }
 
-async fn balance(db: &Db, char_id: i64) -> Result<f64, CallError> {
-    Ok(db.client.query_one("SELECT balance::float8 FROM game.characters WHERE character_id = $1", &[&char_id]).await.map_err(db_err)?.get(0))
+async fn balance(db: &(impl Executor + ?Sized), char_id: i64) -> Result<f64, CallError> {
+    Ok(db.query_one("SELECT balance::float8 FROM game.characters WHERE character_id = $1", &[&char_id]).await.map_err(db_err)?.get(0))
 }
 
 fn not_enough_money(have: f64, amount: f64) -> CallError {
     user_error("NotEnoughMoney", vec![("balance".into(), Value::Float(have)), ("amount".into(), Value::Float(amount))])
 }
 
-async fn require_balance(db: &Db, char_id: i64, amount: f64) -> Result<(), CallError> {
+async fn require_balance(db: &(impl Executor + ?Sized), char_id: i64, amount: f64) -> Result<(), CallError> {
     let have = balance(db, char_id).await?;
     if have < amount {
         return Err(not_enough_money(have, amount));
@@ -294,12 +321,11 @@ async fn require_balance(db: &Db, char_id: i64, amount: f64) -> Result<(), CallE
     Ok(())
 }
 
-pub(super) async fn credit(db: &Db, world: &World, char_id: i64, amount: f64) -> Result<(), CallError> {
+pub(super) async fn credit<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, char_id: i64, amount: f64) -> Result<(), CallError> {
     if amount <= 0.0 {
         return Ok(());
     }
     let balance: f64 = db
-        .client
         .query_one(
             "UPDATE game.characters SET balance = balance + $2::float8::numeric WHERE character_id = $1 RETURNING balance::float8",
             &[&char_id, &amount],
@@ -307,16 +333,15 @@ pub(super) async fn credit(db: &Db, world: &World, char_id: i64, amount: f64) ->
         .await
         .map_err(db_err)?
         .get(0);
-    world.notify_pilot(char_id, "OnAccountChange", vec![Value::str("cash"), Value::Int(char_id), Value::Float(balance)]);
+    outbox.notify_pilot(char_id, "OnAccountChange", vec![Value::str("cash"), Value::Int(char_id), Value::Float(balance)]);
     Ok(())
 }
 
-pub(super) async fn debit(db: &Db, world: &World, char_id: i64, amount: f64) -> Result<(), CallError> {
+pub(super) async fn debit<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, char_id: i64, amount: f64) -> Result<(), CallError> {
     if amount <= 0.0 {
         return Ok(());
     }
     let row = db
-        .client
         .query_opt(
             "UPDATE game.characters SET balance = balance - $2::float8::numeric
              WHERE character_id = $1 AND balance >= $2::float8::numeric RETURNING balance::float8",
@@ -326,7 +351,7 @@ pub(super) async fn debit(db: &Db, world: &World, char_id: i64, amount: f64) -> 
         .map_err(db_err)?;
     match row {
         Some(r) => {
-            world.notify_pilot(char_id, "OnAccountChange", vec![Value::str("cash"), Value::Int(char_id), Value::Float(r.get(0))]);
+            outbox.notify_pilot(char_id, "OnAccountChange", vec![Value::str("cash"), Value::Int(char_id), Value::Float(r.get(0))]);
             Ok(())
         }
         None => Err(not_enough_money(balance(db, char_id).await?, amount)),
@@ -334,26 +359,25 @@ pub(super) async fn debit(db: &Db, world: &World, char_id: i64, amount: f64) -> 
 }
 
 /// Take `quantity` off a stack, deleting it when all of it goes, and tell its owner.
-pub(super) async fn take_items(db: &Db, world: &World, item: Item, quantity: i32) -> Result<(), CallError> {
+pub(super) async fn take_items<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, item: Item, quantity: i32) -> Result<(), CallError> {
     let owner = item.owner_id;
     if quantity >= item.quantity {
-        db.client.execute("DELETE FROM game.items WHERE item_id = $1", &[&item.item_id]).await.map_err(db_err)?;
+        db.execute("DELETE FROM game.items WHERE item_id = $1", &[&item.item_id]).await.map_err(db_err)?;
         let old = item.location_id;
         let gone = Item { location_id: LOCATION_JUNKYARD, ..item };
-        world.notify_pilot(owner, "OnItemChange", vec![gone.row(), Value::Dict(vec![(Value::Int(IX_LOCATION_ID), Value::Int(old))]), Value::None]);
+        outbox.notify_pilot(owner, "OnItemChange", vec![gone.row(), Value::Dict(vec![(Value::Int(IX_LOCATION_ID), Value::Int(old))]), Value::None]);
     } else {
-        db.client.execute("UPDATE game.items SET quantity = quantity - $2 WHERE item_id = $1", &[&item.item_id, &quantity]).await.map_err(db_err)?;
+        db.execute("UPDATE game.items SET quantity = quantity - $2 WHERE item_id = $1", &[&item.item_id, &quantity]).await.map_err(db_err)?;
         let left = Item { quantity: item.quantity - quantity, ..item };
         let change = Value::Dict(vec![(Value::Int(IX_STACK_SIZE), Value::Int((left.quantity + quantity) as i64))]);
-        world.notify_pilot(owner, "OnItemChange", vec![left.row(), change, Value::None]);
+        outbox.notify_pilot(owner, "OnItemChange", vec![left.row(), change, Value::None]);
     }
     Ok(())
 }
 
 /// Put `quantity` x `type_id` in `owner`'s hangar at `station`, onto a stack there if there is one.
-pub(super) async fn deliver(db: &Db, world: &World, owner: i64, station: i64, type_id: i32, quantity: i32) -> Result<(), CallError> {
+pub(super) async fn deliver<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, owner: i64, station: i64, type_id: i32, quantity: i32) -> Result<(), CallError> {
     let stack = db
-        .client
         .query_opt(
             "SELECT item_id, quantity FROM game.items WHERE location_id = $1 AND flag_id = $2 AND type_id = $3 AND owner_id = $4 AND NOT singleton LIMIT 1",
             &[&station, &FLAG_HANGAR, &type_id, &owner],
@@ -363,12 +387,11 @@ pub(super) async fn deliver(db: &Db, world: &World, owner: i64, station: i64, ty
     let (item_id, change) = match stack {
         Some(r) => {
             let (id, old): (i64, i32) = (r.get(0), r.get(1));
-            db.client.execute("UPDATE game.items SET quantity = quantity + $2 WHERE item_id = $1", &[&id, &quantity]).await.map_err(db_err)?;
+            db.execute("UPDATE game.items SET quantity = quantity + $2 WHERE item_id = $1", &[&id, &quantity]).await.map_err(db_err)?;
             (id, (IX_STACK_SIZE, old as i64))
         }
         None => {
             let id: i64 = db
-                .client
                 .query_one(
                     "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity) VALUES ($1, $2, $3, $4, $5) RETURNING item_id",
                     &[&type_id, &owner, &station, &FLAG_HANGAR, &quantity],
@@ -381,22 +404,22 @@ pub(super) async fn deliver(db: &Db, world: &World, owner: i64, station: i64, ty
     };
     // Only a pilot docked there has that hangar loaded.
     let docked: Option<i64> =
-        db.client.query_opt("SELECT station_id FROM game.characters WHERE character_id = $1", &[&owner]).await.map_err(db_err)?.and_then(|r| r.get(0));
+        db.query_opt("SELECT station_id FROM game.characters WHERE character_id = $1", &[&owner]).await.map_err(db_err)?.and_then(|r| r.get(0));
     if docked == Some(station) {
         if let Some(item) = load_items_db(db, "i.item_id = $1", &[&item_id]).await?.pop() {
             let change = Value::Dict(vec![(Value::Int(change.0), Value::Int(change.1))]);
-            world.notify_pilot(owner, "OnItemChange", vec![item.row(), change, Value::None]);
+            outbox.notify_pilot(owner, "OnItemChange", vec![item.row(), change, Value::None]);
         }
     }
     Ok(())
 }
 
-async fn record(db: &Db, type_id: i32, quantity: i32, price: f64, buyer: i64, seller: i64, at: &Station) -> Result<(), CallError> {
-    db.client
+async fn record(db: &(impl Executor + ?Sized), type_id: i32, quantity: i32, price: f64, buyer: i64, seller: i64, at: &Station, now: i64) -> Result<(), CallError> {
+    db
         .execute(
             "INSERT INTO game.market_transactions (type_id, quantity, price, buyer_id, seller_id, station_id, region_id, date)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-            &[&type_id, &quantity, &price, &buyer, &seller, &at.id, &at.region, &filetime_now()],
+            &[&type_id, &quantity, &price, &buyer, &seller, &at.id, &at.region, &now],
         )
         .await
         .map_err(db_err)?;
@@ -444,18 +467,17 @@ fn order_from_row(r: &tokio_postgres::Row) -> Order {
     }
 }
 
-async fn my_order(db: &Db, char_id: i64, order_id: i64) -> Result<Order, CallError> {
-    db.client
-        .query_opt(&format!("{ORDER_SELECT} WHERE o.order_id = $2 AND o.char_id = $3"), &[&today(), &order_id, &char_id])
+async fn my_order(db: &(impl Executor + ?Sized), char_id: i64, order_id: i64, now: i64) -> Result<Order, CallError> {
+    db
+        .query_opt(&format!("{ORDER_SELECT} WHERE o.order_id = $2 AND o.char_id = $3"), &[&now, &order_id, &char_id])
         .await
         .map_err(db_err)?
         .map(|r| order_from_row(&r))
         .ok_or_else(|| notify_error("该订单已关闭。"))
 }
 
-async fn insert_order(db: &Db, o: &mut Order) -> Result<(), CallError> {
+async fn insert_order(db: &(impl Executor + ?Sized), o: &mut Order) -> Result<(), CallError> {
     o.id = db
-        .client
         .query_one(
             "INSERT INTO game.market_orders (type_id, char_id, station_id, solar_system_id, constellation_id, region_id, price,
                                              vol_entered, vol_remaining, min_volume, bid, range, duration, issued, escrow)
@@ -485,8 +507,8 @@ async fn insert_order(db: &Db, o: &mut Order) -> Result<(), CallError> {
 }
 
 /// Move a player's order to the history.
-async fn close(db: &Db, o: &Order, state: i32) -> Result<(), CallError> {
-    db.client
+async fn close(db: &(impl Executor + ?Sized), o: &Order, state: i32, now: i64) -> Result<(), CallError> {
+    db
         .execute(
             "WITH gone AS (DELETE FROM game.market_orders WHERE order_id = $1 RETURNING *)
              INSERT INTO game.market_order_history (order_id, type_id, char_id, station_id, region_id, price, vol_entered, vol_remaining,
@@ -494,7 +516,7 @@ async fn close(db: &Db, o: &Order, state: i32) -> Result<(), CallError> {
              SELECT order_id, type_id, char_id, station_id, region_id, price, vol_entered, $2::int, min_volume, bid, range, duration,
                     COALESCE(issued, $4::bigint), $3::int, $4::bigint
              FROM gone",
-            &[&o.id, &o.vol_remaining, &state, &filetime_now()],
+            &[&o.id, &o.vol_remaining, &state, &now],
         )
         .await
         .map_err(db_err)?;
@@ -502,12 +524,12 @@ async fn close(db: &Db, o: &Order, state: i32) -> Result<(), CallError> {
 }
 
 /// Give a closed order's escrow back: a sell order's items, a buy order's ISK.
-async fn refund(db: &Db, world: &World, o: &Order) -> Result<(), CallError> {
+async fn refund<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, o: &Order) -> Result<(), CallError> {
     let Some(owner) = o.char_id else { return Ok(()) };
     if o.bid {
-        credit(db, world, owner, round2(o.escrow)).await
+        credit(db, outbox, owner, round2(o.escrow)).await
     } else if o.vol_remaining > 0 {
-        deliver(db, world, owner, o.at.id, o.type_id, o.vol_remaining).await
+        deliver(db, outbox, owner, o.at.id, o.type_id, o.vol_remaining).await
     } else {
         Ok(())
     }
@@ -533,14 +555,14 @@ fn order_keyval(o: &Order) -> Value {
     ])
 }
 
-fn tell_owner(world: &World, o: &Order, reason: &str) {
+fn tell_owner<X>(outbox: &mut Outbox<X>, o: &Order, reason: &str) {
     if let Some(owner) = o.char_id {
-        world.notify_pilot(owner, "OnOwnOrdersChanged", vec![Value::list([order_keyval(o)]), Value::str(reason), Value::Bool(false)]);
+        outbox.notify_pilot(owner, "OnOwnOrdersChanged", vec![Value::list([order_keyval(o)]), Value::str(reason), Value::Bool(false)]);
     }
 }
 
 /// `quantity` of a resting order traded: a player's order shrinks, and closes once filled.
-async fn consume(db: &Db, world: &World, o: &mut Order, quantity: i32) -> Result<(), CallError> {
+async fn consume<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, o: &mut Order, quantity: i32, now: i64) -> Result<(), CallError> {
     let Some(owner) = o.char_id else { return Ok(()) };
     o.vol_remaining -= quantity;
     if o.bid {
@@ -548,31 +570,29 @@ async fn consume(db: &Db, world: &World, o: &mut Order, quantity: i32) -> Result
     }
     if o.vol_remaining <= 0 {
         if o.bid {
-            credit(db, world, owner, o.escrow).await?; // rounding left over
+            credit(db, outbox, owner, o.escrow).await?;
         }
-        close(db, o, STATE_CLOSED).await?;
+        close(db, o, STATE_CLOSED, now).await?;
     } else {
-        db.client
+        db
             .execute("UPDATE game.market_orders SET vol_remaining = $2, escrow = $3 WHERE order_id = $1", &[&o.id, &o.vol_remaining, &o.escrow])
             .await
             .map_err(db_err)?;
     }
-    tell_owner(world, o, "Modify");
+    tell_owner(outbox, o, "Modify");
     Ok(())
 }
 
 /// Sell up to `quantity` x `type_id` at `at` to the best bids paying at least `floor`.
 /// Returns how many sold.
-async fn hit_bids(db: &Db, world: &World, seller: i64, at: &Station, type_id: i32, floor: f64, quantity: i32) -> Result<i32, CallError> {
-    let g = graph(db).await?;
+async fn hit_bids(db: &(impl Executor + ?Sized), outbox: &mut Outbox<MarketEffect>, g: &HashMap<i64, Vec<i64>>, seller: i64, at: &Station, type_id: i32, floor: f64, quantity: i32, now: i64) -> Result<i32, CallError> {
     let rows = db
-        .client
         .query(
             &format!(
                 "{ORDER_SELECT} WHERE o.type_id = $2 AND o.region_id = $3 AND o.bid AND o.vol_remaining > 0 AND o.price >= $4::float8 - 0.005
                  ORDER BY o.price DESC, o.issued NULLS FIRST, o.order_id"
             ),
-            &[&today(), &type_id, &at.region, &floor],
+            &[&(now / FILETIME_DAY * FILETIME_DAY), &type_id, &at.region, &floor],
         )
         .await
         .map_err(db_err)?;
@@ -592,13 +612,13 @@ async fn hit_bids(db: &Db, world: &World, seller: i64, at: &Station, type_id: i3
             continue;
         }
         let value = round2(bid.price * q as f64);
-        credit(db, world, seller, round2(value * (1.0 - tax))).await?;
+        credit(db, outbox, seller, round2(value * (1.0 - tax))).await?;
         if let Some(buyer) = bid.char_id {
-            deliver(db, world, buyer, at.id, type_id, q).await?;
+            deliver(db, outbox, buyer, at.id, type_id, q).await?;
         }
-        record(db, type_id, q, bid.price, bid.char_id.unwrap_or(bid.at.owner), seller, at).await?;
-        consume(db, world, &mut bid, q).await?;
-        info!("market: {seller} sold {q} x {type_id} at {} for {value} ISK (order {})", at.id, bid.id);
+        record(db, type_id, q, bid.price, bid.char_id.unwrap_or(bid.at.owner), seller, at, now).await?;
+        consume(db, outbox, &mut bid, q, now).await?;
+        outbox.operation(MarketEffect::Sold { seller, quantity: q, type_id, station: at.id, value, order: bid.id });
         left -= q;
     }
     Ok(quantity - left)
@@ -608,16 +628,14 @@ async fn hit_bids(db: &Db, world: &World, seller: i64, at: &Station, type_id: i3
 /// than `cap`, paying from the wallet unless an order's escrow covers it.
 /// Returns (bought, spent).
 #[allow(clippy::too_many_arguments)]
-async fn lift_asks(db: &Db, world: &World, buyer: i64, at: &Station, range: i64, type_id: i32, cap: f64, quantity: i32, from_wallet: bool) -> Result<(i32, f64), CallError> {
-    let g = graph(db).await?;
+async fn lift_asks(db: &(impl Executor + ?Sized), outbox: &mut Outbox<MarketEffect>, g: &HashMap<i64, Vec<i64>>, buyer: i64, at: &Station, range: i64, type_id: i32, cap: f64, quantity: i32, from_wallet: bool, now: i64) -> Result<(i32, f64), CallError> {
     let rows = db
-        .client
         .query(
             &format!(
                 "{ORDER_SELECT} WHERE o.type_id = $2 AND o.region_id = $3 AND NOT o.bid AND o.vol_remaining > 0 AND o.price <= $4::float8 + 0.005
                  ORDER BY o.price, o.issued NULLS FIRST, o.order_id"
             ),
-            &[&today(), &type_id, &at.region, &cap],
+            &[&(now / FILETIME_DAY * FILETIME_DAY), &type_id, &at.region, &cap],
         )
         .await
         .map_err(db_err)?;
@@ -634,7 +652,7 @@ async fn lift_asks(db: &Db, world: &World, buyer: i64, at: &Station, range: i64,
         let q = left.min(available);
         let value = round2(ask.price * q as f64);
         if from_wallet {
-            match debit(db, world, buyer, value).await {
+            match debit(db, outbox, buyer, value).await {
                 Ok(()) => {}
                 Err(CallError::User { .. }) if left < quantity => break,
                 Err(e) => return Err(e),
@@ -642,12 +660,12 @@ async fn lift_asks(db: &Db, world: &World, buyer: i64, at: &Station, range: i64,
         }
         if let Some(seller) = ask.char_id {
             let tax = skills(db, seller).await?.sales_tax;
-            credit(db, world, seller, round2(value * (1.0 - tax))).await?;
+            credit(db, outbox, seller, round2(value * (1.0 - tax))).await?;
         }
-        deliver(db, world, buyer, ask.at.id, type_id, q).await?;
-        record(db, type_id, q, ask.price, buyer, ask.char_id.unwrap_or(ask.at.owner), &ask.at).await?;
-        consume(db, world, &mut ask, q).await?;
-        info!("market: {buyer} bought {q} x {type_id} at {} for {value} ISK (order {})", ask.at.id, ask.id);
+        deliver(db, outbox, buyer, ask.at.id, type_id, q).await?;
+        record(db, type_id, q, ask.price, buyer, ask.char_id.unwrap_or(ask.at.owner), &ask.at, now).await?;
+        consume(db, outbox, &mut ask, q, now).await?;
+        outbox.operation(MarketEffect::Bought { buyer, quantity: q, type_id, station: ask.at.id, value, order: ask.id });
         left -= q;
         spent += value;
     }
@@ -668,13 +686,16 @@ async fn place_buy(c: &Client, station_id: i64, type_id: i64, price: f64, quanti
     let min_volume = (min_volume.clamp(1, quantity as i64)) as i32;
     let _trading = lock().await;
     let at = station(db, station_id).await?;
+    let g = graph(db).await?;
+    let now = filetime_now();
+    db.transaction(|db, outbox: &mut Outbox<MarketEffect>| Box::pin(async move {
     let skills = skills(db, me).await?;
     if duration > 0 {
         check_order_slots(db, me, &skills).await?;
         let escrow = round2(price * quantity as f64);
         require_balance(db, me, escrow + broker_fee(skills.broker_fee, escrow)).await?;
     }
-    let (bought, _) = lift_asks(db, world, me, &at, range, type_id, price, quantity, true).await?;
+    let (bought, _) = lift_asks(db, outbox, g, me, &at, range, type_id, price, quantity, true, now).await?;
     let mut order = Order {
         id: 0,
         type_id,
@@ -687,7 +708,7 @@ async fn place_buy(c: &Client, station_id: i64, type_id: i64, price: f64, quanti
         bid: true,
         range,
         duration,
-        issued: filetime_now(),
+        issued: now,
         escrow: 0.0,
     };
     if duration == 0 || order.vol_remaining == 0 {
@@ -696,15 +717,16 @@ async fn place_buy(c: &Client, station_id: i64, type_id: i64, price: f64, quanti
         }
         order.duration = 0;
         order.vol_remaining = 0;
-        world.notify_pilot(me, "OnOwnOrdersChanged", vec![Value::list([order_keyval(&order)]), Value::str("Expiry"), Value::Bool(false)]);
+        outbox.notify_pilot(me, "OnOwnOrdersChanged", vec![Value::list([order_keyval(&order)]), Value::str("Expiry"), Value::Bool(false)]);
         return Ok(order_keyval(&order));
     }
     order.escrow = round2(price * order.vol_remaining as f64);
-    debit(db, world, me, order.escrow + broker_fee(skills.broker_fee, order.escrow)).await?;
+    debit(db, outbox, me, order.escrow + broker_fee(skills.broker_fee, order.escrow)).await?;
     insert_order(db, &mut order).await?;
-    info!("market: {me} placed buy order {} for {} x {type_id} at {price} ISK", order.id, order.vol_remaining);
-    tell_owner(world, &order, "Add");
+    outbox.operation(MarketEffect::Placed { buyer: true, owner: me, order: order.id, quantity: order.vol_remaining, type_id, price });
+    tell_owner(outbox, &order, "Add");
     Ok(order_keyval(&order))
+    }), |value, outbox| async move { dispatch_market(value, outbox, world) }).await
 }
 
 /// One item of `PlaceMultiSellOrder`: sell to the bids now, and with a duration list the
@@ -717,6 +739,9 @@ async fn place_sell(c: &Client, item_id: i64, station_id: i64, type_id: i64, pri
         return Err(user_error("MktOrderDidNotMatch", vec![]));
     }
     let _trading = lock().await;
+    let g = graph(db).await?;
+    let now = filetime_now();
+    db.transaction(|db, outbox: &mut Outbox<MarketEffect>| Box::pin(async move {
     let item = load_items_db(db, "i.item_id = $1", &[&item_id]).await?.pop().ok_or_else(|| notify_error("该物品已不在原处。"))?;
     if item.owner_id != me || item.location_id != station_id || item.flag_id != FLAG_HANGAR || item.type_id as i64 != type_id {
         return Err(notify_error("只能在物品所在空间站出售你物品机库中的物品。"));
@@ -728,11 +753,11 @@ async fn place_sell(c: &Client, item_id: i64, station_id: i64, type_id: i64, pri
     let at = station(db, station_id).await?;
     let skills = skills(db, me).await?;
     if duration == 0 {
-        let sold = hit_bids(db, world, me, &at, type_id, price, quantity).await?;
+        let sold = hit_bids(db, outbox, g, me, &at, type_id, price, quantity, now).await?;
         if sold == 0 {
             return Err(user_error("MktOrderDidNotMatch", vec![]));
         }
-        take_items(db, world, item, sold).await?;
+        take_items(db, outbox, item, sold).await?;
         let done = Order {
             id: 0,
             type_id,
@@ -745,17 +770,17 @@ async fn place_sell(c: &Client, item_id: i64, station_id: i64, type_id: i64, pri
             bid: false,
             range: RANGE_STATION,
             duration: 0,
-            issued: filetime_now(),
+            issued: now,
             escrow: 0.0,
         };
-        world.notify_pilot(me, "OnOwnOrdersChanged", vec![Value::list([order_keyval(&done)]), Value::str("Expiry"), Value::Bool(false)]);
+        outbox.notify_pilot(me, "OnOwnOrdersChanged", vec![Value::list([order_keyval(&done)]), Value::str("Expiry"), Value::Bool(false)]);
         return Ok(true);
     }
     check_order_slots(db, me, &skills).await?;
     require_balance(db, me, broker_fee(skills.broker_fee, price * quantity as f64)).await?;
     // The items go into escrow first; what the bids don't take stays listed.
-    take_items(db, world, item, quantity).await?;
-    let sold = hit_bids(db, world, me, &at, type_id, price, quantity).await?;
+    take_items(db, outbox, item, quantity).await?;
+    let sold = hit_bids(db, outbox, g, me, &at, type_id, price, quantity, now).await?;
     let mut order = Order {
         id: 0,
         type_id,
@@ -768,20 +793,18 @@ async fn place_sell(c: &Client, item_id: i64, station_id: i64, type_id: i64, pri
         bid: false,
         range: RANGE_STATION,
         duration,
-        issued: filetime_now(),
+        issued: now,
         escrow: 0.0,
     };
     if order.vol_remaining == 0 {
         return Ok(true);
     }
-    if let Err(e) = debit(db, world, me, broker_fee(skills.broker_fee, price * order.vol_remaining as f64)).await {
-        deliver(db, world, me, at.id, type_id, order.vol_remaining).await?;
-        return Err(e);
-    }
+    debit(db, outbox, me, broker_fee(skills.broker_fee, price * order.vol_remaining as f64)).await?;
     insert_order(db, &mut order).await?;
-    info!("market: {me} placed sell order {} for {} x {type_id} at {price} ISK", order.id, order.vol_remaining);
-    tell_owner(world, &order, "Add");
+    outbox.operation(MarketEffect::Placed { buyer: false, owner: me, order: order.id, quantity: order.vol_remaining, type_id, price });
+    tell_owner(outbox, &order, "Add");
     Ok(true)
+    }), |value, outbox| async move { dispatch_market(value, outbox, world) }).await
 }
 
 /// `ModifyCharOrder`: reprice an open order, paying the modification fee (and topping up or
@@ -791,7 +814,10 @@ async fn modify(c: &Client, order_id: i64, new_price: f64) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
     let new_price = valid_price(new_price)?;
     let _trading = lock().await;
-    let mut o = my_order(db, me, order_id).await?;
+    let g = graph(db).await?;
+    let now = filetime_now();
+    db.transaction(|db, outbox: &mut Outbox<MarketEffect>| Box::pin(async move {
+    let mut o = my_order(db, me, order_id, now / FILETIME_DAY * FILETIME_DAY).await?;
     let skills = skills(db, me).await?;
     let volume = o.vol_remaining as f64;
     let (old_amount, new_amount) = (o.price * volume, new_price * volume);
@@ -800,30 +826,31 @@ async fn modify(c: &Client, order_id: i64, new_price: f64) -> CallResult {
     );
     let escrow = if o.bid { round2(new_amount) } else { 0.0 };
     let top_up = escrow - o.escrow;
-    debit(db, world, me, fee + top_up.max(0.0)).await?;
-    credit(db, world, me, round2(-top_up)).await?;
+    debit(db, outbox, me, fee + top_up.max(0.0)).await?;
+    credit(db, outbox, me, round2(-top_up)).await?;
     o.price = new_price;
     o.escrow = escrow;
-    o.issued = filetime_now();
-    db.client
+    o.issued = now;
+    db
         .execute("UPDATE game.market_orders SET price = $2, escrow = $3, issued = $4 WHERE order_id = $1", &[&o.id, &o.price, &o.escrow, &o.issued])
         .await
         .map_err(db_err)?;
-    info!("market: {me} repriced order {} to {new_price} ISK", o.id);
+    outbox.operation(MarketEffect::Repriced { owner: me, order: o.id, price: new_price });
     let traded = if o.bid {
-        let (bought, spent) = lift_asks(db, world, me, &o.at, o.range, o.type_id, o.price, o.vol_remaining, false).await?;
+        let (bought, spent) = lift_asks(db, outbox, g, me, &o.at, o.range, o.type_id, o.price, o.vol_remaining, false, now).await?;
         // The escrow paid this order's price; cheaper asks leave change.
-        credit(db, world, me, round2(o.price * bought as f64 - spent)).await?;
+        credit(db, outbox, me, round2(o.price * bought as f64 - spent)).await?;
         bought
     } else {
-        hit_bids(db, world, me, &o.at, o.type_id, o.price, o.vol_remaining).await?
+        hit_bids(db, outbox, g, me, &o.at, o.type_id, o.price, o.vol_remaining, now).await?
     };
     if traded > 0 {
-        consume(db, world, &mut o, traded).await?;
+        consume(db, outbox, &mut o, traded, now).await?;
     } else {
-        tell_owner(world, &o, "Modify");
+        tell_owner(outbox, &o, "Modify");
     }
     Ok(Value::None)
+    }), |value, outbox| async move { dispatch_market(value, outbox, world) }).await
 }
 
 /// `CancelCharOrder`: close an open order and hand back its escrow (the broker's fee stays paid).
@@ -831,12 +858,15 @@ async fn cancel(c: &Client, order_id: i64) -> CallResult {
     let (db, world) = (&c.db, &*c.world);
     let me = c.session.int("charid").unwrap_or(0);
     let _trading = lock().await;
-    let o = my_order(db, me, order_id).await?;
-    close(db, &o, STATE_CANCELLED).await?;
-    refund(db, world, &o).await?;
-    info!("market: {me} cancelled order {}", o.id);
-    tell_owner(world, &o, "Cancel");
-    Ok(Value::None)
+    let now = filetime_now();
+    db.transaction(|db, outbox: &mut Outbox<MarketEffect>| Box::pin(async move {
+        let o = my_order(db, me, order_id, now / FILETIME_DAY * FILETIME_DAY).await?;
+        close(db, &o, STATE_CANCELLED, now).await?;
+        refund(db, outbox, &o).await?;
+        outbox.operation(MarketEffect::Cancelled { owner: me, order: o.id });
+        tell_owner(outbox, &o, "Cancel");
+        Ok(Value::None)
+    }), |value, outbox| async move { dispatch_market(value, outbox, world) }).await
 }
 
 /// Close players' orders past their duration, once a minute.
@@ -851,18 +881,21 @@ pub async fn expire_orders(db: Db, world: Arc<World>) {
 
 async fn expire(db: &Db, world: &World) -> Result<(), CallError> {
     let _trading = lock().await;
-    let rows = db
-        .client
-        .query(&format!("{ORDER_SELECT} WHERE o.char_id IS NOT NULL AND o.issued + o.duration::bigint * $2 <= $3"), &[&today(), &FILETIME_DAY, &filetime_now()])
-        .await
-        .map_err(db_err)?;
-    for r in &rows {
-        let o = order_from_row(r);
-        close(db, &o, STATE_CLOSED).await?;
-        refund(db, world, &o).await?;
-        info!("market: order {} of {:?} expired", o.id, o.char_id);
-        tell_owner(world, &o, "Expiry");
-    }
+    let now = filetime_now();
+    db.transaction(|db, outbox: &mut Outbox<MarketEffect>| Box::pin(async move {
+        let rows = db
+            .query(&format!("{ORDER_SELECT} WHERE o.char_id IS NOT NULL AND o.issued + o.duration::bigint * $2 <= $3"), &[&(now / FILETIME_DAY * FILETIME_DAY), &FILETIME_DAY, &now])
+            .await
+            .map_err(db_err)?;
+        for r in &rows {
+            let o = order_from_row(r);
+            close(db, &o, STATE_CLOSED, now).await?;
+            refund(db, outbox, &o).await?;
+            outbox.operation(MarketEffect::Expired { owner: o.char_id, order: o.id });
+            tell_owner(outbox, &o, "Expiry");
+        }
+        Ok(())
+    }), |value, outbox| async move { dispatch_market(value, outbox, world) }).await?;
     Ok(())
 }
 
@@ -873,7 +906,7 @@ async fn my_orders(c: &Client) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
     let here = c.session.int("solarsystemid2").unwrap_or(0);
     let g = graph(&c.db).await?;
-    let rows = c.db.client.query(&format!("{ORDER_SELECT} WHERE o.char_id = $2 ORDER BY o.order_id"), &[&today(), &me]).await.map_err(db_err)?;
+    let rows = c.db.query(&format!("{ORDER_SELECT} WHERE o.char_id = $2 ORDER BY o.order_id"), &[&today(), &me]).await.map_err(db_err)?;
     let header = DbRowDescriptor::new([
         ("orderID", DbType::I8),
         ("typeID", DbType::I4),
@@ -930,7 +963,6 @@ async fn order_history(c: &Client) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
     let rows = c
         .db
-        .client
         .query(
             "SELECT order_id, type_id::bigint, region_id, station_id, range::bigint, bid, price, vol_entered::bigint, vol_remaining::bigint,
                     issued, min_volume::bigint, duration::bigint, state::bigint, closed
@@ -991,7 +1023,6 @@ async fn transactions(c: &Client, from: Option<i64>) -> CallResult {
     let from = from.unwrap_or(filetime_now() - DEFAULT_TRANSACTION_HISTORY_DAYS * FILETIME_DAY);
     let rows = c
         .db
-        .client
         .query(
             "SELECT transaction_id, date, type_id::bigint, quantity::bigint, price, station_id, buyer_id, seller_id
              FROM game.market_transactions WHERE (buyer_id = $1 OR seller_id = $1) AND date >= $2 ORDER BY date DESC LIMIT 2500",
@@ -1038,7 +1069,6 @@ async fn escrow(c: &Client) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
     let r = c
         .db
-        .client
         .query_one(
             "SELECT COALESCE(sum(escrow) FILTER (WHERE bid), 0)::float8, COALESCE(sum(price * vol_remaining) FILTER (WHERE NOT bid), 0)::float8
              FROM game.market_orders WHERE char_id = $1",
@@ -1067,7 +1097,6 @@ async fn price_history(c: &Client, type_ids: &[i32]) -> Result<HashMap<i32, (Val
     let today = today();
     let rows = c
         .db
-        .client
         .query(
             "SELECT type_id, date / $3 * $3 AS day, min(price), max(price), sum(price * quantity) / sum(quantity), sum(quantity)::bigint, count(*)
              FROM game.market_transactions WHERE region_id = $1 AND type_id = ANY($2) AND date >= $4

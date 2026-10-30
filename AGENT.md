@@ -75,7 +75,7 @@ Any other tag starts nothing.
 | Chat | `chat.rs` |
 | Image server and content CDN | `images.rs`, `cdn.rs` |
 | Captured retail data | `retail.rs` and `crates/server/retail/` |
-| Database access and schema | `db.rs`, `crates/server/sql/game_schema.sql` |
+| Database access and schema | `db/mod.rs` (`Db`: pool, statement methods, startup), `db/transaction.rs` (`Db::transaction`), `db/executor.rs` (`Executor`), `db/outbox.rs` (`Outbox`), `crates/server/sql/game_schema.sql` |
 | Wire format | `crates/marshal` |
 
 ## 4. Conventions
@@ -171,6 +171,22 @@ Helpers and constants used by more than one module, each defined once:
 
 ### Database
 
+- `Db` owns a pool of connections and is the only way to reach the database.
+  - For a single statement, call `db.query`, `db.query_one`, `db.query_opt` or `db.execute`. Each borrows one pooled connection for that statement.
+  - Never hold a connection outside `Db`.
+- **One business operation, one transaction.** An operation that writes more than one row, or more than one table, runs in `db.transaction(operation, dispatch)`.
+  - `operation` gets the transaction and an `Outbox`. The runner commits, or rolls back on error.
+  - The runner reruns `operation` once on a deadlock or serialization failure, so `operation` must be safe to repeat: capture inputs before the call and rebuild any mutable state inside it.
+  - `dispatch` runs after COMMIT and receives the outbox.
+  - Shared helpers take `&impl Executor` and the outbox, so the same helper works inside a transaction and on its own. Helpers never open a transaction themselves.
+- **Notify after commit.** Inside `operation`:
+  - Never notify a client, call `World`, or change memory state directly. Queue the effect in the outbox; a rolled-back operation sends nothing.
+  - Never `.await` on `World` or on a client. Read what the operation needs from `World` before the transaction starts.
+- **Guarded writes.** A write that depends on a value read earlier checks it in SQL, for example `UPDATE ... SET quantity = quantity - $2 WHERE item_id = $1 AND quantity >= $2`. The same applies to a status transition (`AND status = $old`) and a balance (`AND balance >= $2`).
+  - Zero affected rows refuses the operation with the player-visible message and rolls the transaction back.
+  - Quantity changes to existing item rows go through the shared plan in `services/item_quantities.rs`.
+- **Lock order.** An operation that writes several rows of one table writes them in ascending primary key order.
+- **Economy operations** (wallets, market, contracts, industry, corporation and alliance fees, bills, offices, the LP store) take `market::lock()` before opening the transaction and hold it until `dispatch` has run. Do not add row locks on orders or wallets.
 - `game_schema.sql` runs on every server start (`Db::connect`), so every statement must be idempotent and safe on an existing database:
   - `CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`, `CREATE SEQUENCE IF NOT EXISTS`
   - `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`

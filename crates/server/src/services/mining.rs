@@ -17,15 +17,16 @@
 //! Reprocessing (the station's bound reprocessingSvc) turns items into their
 //! sde.inv_type_materials per portion: a station yield of 50%, raised by Reprocessing,
 //! Reprocessing Efficiency and the item's own processing skill, less a 5% tax in ISK.
+//! Output that exceeds a single stack's capacity is refused without consuming inputs.
 
 use super::fit::{Fit, Key};
 use super::{db_err, keyval, notify_error, rand01, rand_dir, value_id_list, Call, CallError, CallResult};
 use crate::client::{filetime_now, unix_ms_from_filetime_ceil, Client};
-use crate::consts::{ATTR_CAPACITY, ATTR_MAX_RANGE, FILETIME_SECOND, FLAG_CARGO, FLAG_HANGAR, GROUP_ASTEROID_BELT, IX_LOCATION_ID, IX_STACK_SIZE};
+use crate::consts::{ATTR_CAPACITY, ATTR_MAX_RANGE, FILETIME_SECOND, FLAG_CARGO, FLAG_HANGAR, GROUP_ASTEROID_BELT, IX_FLAG, IX_LOCATION_ID, IX_STACK_SIZE};
 use crate::db::Db;
 use crate::space::{dist, now_ms, Ball, NotifyTx, World, MODE_RIGID, V3};
 use marshal::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use tracing::{info, warn};
 
@@ -102,7 +103,7 @@ async fn field_types(db: &Db, field: Field, security: f64, jspace: bool) -> Resu
     let (names, groups) = field_groups(field, security, jspace);
     let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
     let rows = if groups {
-        db.client
+        db
             .query(
                 "SELECT t.type_id, t.volume::float8 FROM sde.inv_types t JOIN sde.inv_groups g ON g.group_id = t.group_id
                  WHERE g.category_id = 25 AND g.name = ANY($1) AND t.published
@@ -111,7 +112,7 @@ async fn field_types(db: &Db, field: Field, security: f64, jspace: bool) -> Resu
             )
             .await
     } else {
-        db.client.query("SELECT type_id, volume::float8 FROM sde.inv_types WHERE name = ANY($1) AND published", &[&names]).await
+        db.query("SELECT type_id, volume::float8 FROM sde.inv_types WHERE name = ANY($1) AND published", &[&names]).await
     }
     .map_err(db_err)?;
     Ok(rows.iter().map(|r| (r.get(0), r.get::<_, Option<f64>>(1).unwrap_or(1.0).max(0.01))).collect())
@@ -187,7 +188,6 @@ pub async fn grow_field(db: &Db, world: &World, system: i64, field_id: i64, cent
         let d = 3_000.0 + rand01() * spread;
         let pos = [center[0] + v[0] * d, center[1] + v[1] * d * 0.3, center[2] + v[2] * d];
         let id: i64 = db
-            .client
             .query_one(
                 "INSERT INTO game.asteroids (system_id, field_id, type_id, quantity, original_quantity, radius, x, y, z)
                  VALUES ($1, $2, $3, $4, $4, $5, $6, $7, $8) RETURNING asteroid_id",
@@ -206,7 +206,6 @@ pub async fn grow_field(db: &Db, world: &World, system: i64, field_id: i64, cent
 /// (security, wormhole space) of a system.
 async fn system_band(db: &Db, system: i64) -> Result<(f64, bool), CallError> {
     let r = db
-        .client
         .query_one("SELECT COALESCE(security, 0)::float8 FROM sde.map_solar_systems WHERE solar_system_id = $1", &[&(system as i32)])
         .await
         .map_err(db_err)?;
@@ -220,7 +219,6 @@ pub async fn ensure_fields(db: &Db, world: &Arc<World>, system: i64) -> Result<(
         return Ok(());
     }
     let rows = db
-        .client
         .query("SELECT asteroid_id, field_id, type_id, quantity, radius, x, y, z FROM game.asteroids WHERE system_id = $1", &[&system])
         .await
         .map_err(db_err)?;
@@ -233,7 +231,6 @@ pub async fn ensure_fields(db: &Db, world: &Arc<World>, system: i64) -> Result<(
         world.add_ship(system, ball).await.map_err(CallError::Internal)?;
     }
     let belts = db
-        .client
         .query("SELECT item_id::bigint, x, y, z FROM sde.map_celestials WHERE solar_system_id = $1 AND group_id = $2", &[&(system as i32), &GROUP_ASTEROID_BELT])
         .await
         .map_err(db_err)?;
@@ -248,7 +245,6 @@ pub async fn ensure_fields(db: &Db, world: &Arc<World>, system: i64) -> Result<(
             continue;
         }
         let depleted: Option<Option<i64>> = db
-            .client
             .query_opt("SELECT depleted_at FROM game.asteroid_fields WHERE field_id = $1", &[&belt])
             .await
             .map_err(db_err)?
@@ -266,7 +262,7 @@ pub async fn ensure_fields(db: &Db, world: &Arc<World>, system: i64) -> Result<(
 
 async fn grow_belt(db: &Db, world: &World, system: i64, belt: i64, center: V3, security: f64, jspace: bool) -> Result<(), CallError> {
     let ids = grow_field(db, world, system, belt, center, Field::Ore, security, jspace).await?;
-    db.client
+    db
         .execute(
             "INSERT INTO game.asteroid_fields (field_id, system_id, grown_at) VALUES ($1, $2, $3)
              ON CONFLICT (field_id) DO UPDATE SET grown_at = EXCLUDED.grown_at, depleted_at = NULL",
@@ -304,19 +300,18 @@ fn schedule_regrow(db: Db, world: Arc<World>, system: i64, belt: i64, center: V3
 async fn exhaust(db: &Db, world: &Arc<World>, id: i64) -> Result<(), CallError> {
     let Some(rock) = state().rocks.remove(&id) else { return Ok(()) };
     world.remove_ball(rock.system, id).await;
-    db.client.execute("DELETE FROM game.asteroids WHERE asteroid_id = $1", &[&id]).await.map_err(db_err)?;
+    db.execute("DELETE FROM game.asteroids WHERE asteroid_id = $1", &[&id]).await.map_err(db_err)?;
     let field_empty = !state().rocks.values().any(|r| r.field == rock.field);
     if !field_empty {
         return Ok(());
     }
     let belt = db
-        .client
         .query_opt("SELECT x, y, z FROM sde.map_celestials WHERE item_id = $1 AND group_id = $2", &[&rock.field, &GROUP_ASTEROID_BELT])
         .await
         .map_err(db_err)?;
     if let Some(b) = belt {
         let now = filetime_now();
-        db.client.execute("UPDATE game.asteroid_fields SET depleted_at = $2 WHERE field_id = $1", &[&rock.field, &now]).await.map_err(db_err)?;
+        db.execute("UPDATE game.asteroid_fields SET depleted_at = $2 WHERE field_id = $1", &[&rock.field, &now]).await.map_err(db_err)?;
         schedule_regrow(db.clone(), world.clone(), rock.system, rock.field, [b.get(0), b.get(1), b.get(2)], now + BELT_REGROW_SECS * FILETIME_SECOND);
         info!("mining: belt {} in {} mined out", rock.field, rock.system);
     }
@@ -334,7 +329,6 @@ pub fn is_rock(id: i64) -> bool {
 /// pilot (OnItemChange).
 async fn store(db: &Db, notify: &NotifyTx, owner: i64, ship: i64, flag: i32, type_id: i32, quantity: i32) -> Result<(), CallError> {
     let stack = db
-        .client
         .query_opt(
             "SELECT item_id, quantity FROM game.items WHERE location_id = $1 AND flag_id = $2 AND type_id = $3 AND owner_id = $4 AND NOT singleton LIMIT 1",
             &[&ship, &flag, &type_id, &owner],
@@ -344,12 +338,11 @@ async fn store(db: &Db, notify: &NotifyTx, owner: i64, ship: i64, flag: i32, typ
     let (item_id, total, change) = match stack {
         Some(r) => {
             let (id, old): (i64, i32) = (r.get(0), r.get(1));
-            db.client.execute("UPDATE game.items SET quantity = quantity + $2 WHERE item_id = $1", &[&id, &quantity]).await.map_err(db_err)?;
+            db.execute("UPDATE game.items SET quantity = quantity + $2 WHERE item_id = $1", &[&id, &quantity]).await.map_err(db_err)?;
             (id, old + quantity, (IX_STACK_SIZE, Value::Int(old as i64)))
         }
         None => {
             let id: i64 = db
-                .client
                 .query_one(
                     "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity) VALUES ($1, $2, $3, $4, $5) RETURNING item_id",
                     &[&type_id, &owner, &ship, &flag, &quantity],
@@ -361,7 +354,6 @@ async fn store(db: &Db, notify: &NotifyTx, owner: i64, ship: i64, flag: i32, typ
         }
     };
     let t = db
-        .client
         .query_one("SELECT COALESCE(group_id, 0)::bigint, COALESCE(category_id, 0)::bigint FROM sde.inv_types WHERE type_id = $1", &[&type_id])
         .await
         .map_err(db_err)?;
@@ -401,7 +393,6 @@ pub async fn extract(db: &Db, world: &Arc<World>, notify: &NotifyTx, char_id: i6
         return Ok(false);
     }
     let unit_volume: f64 = db
-        .client
         .query_one("SELECT COALESCE(volume, 1)::float8 FROM sde.inv_types WHERE type_id = $1", &[&rock.type_id])
         .await
         .map_err(db_err)?
@@ -420,7 +411,6 @@ pub async fn extract(db: &Db, world: &Arc<World>, notify: &NotifyTx, char_id: i6
     let hold = fit.value(Key::Ship, ATTR_MINING_HOLD);
     let (flag, capacity) = if hold > 0.0 { (FLAG_MINING_HOLD, hold) } else { (FLAG_CARGO, fit.value(Key::Ship, ATTR_CAPACITY)) };
     let used: f64 = db
-        .client
         .query_one(
             "SELECT COALESCE(sum(i.quantity * COALESCE(t.volume, 0)), 0)::float8 FROM game.items i JOIN sde.inv_types t USING (type_id)
              WHERE i.location_id = $1 AND i.flag_id = $2",
@@ -438,7 +428,7 @@ pub async fn extract(db: &Db, world: &Arc<World>, notify: &NotifyTx, char_id: i6
     if let Some(r) = state().rocks.get_mut(&target) {
         r.quantity = left;
     }
-    db.client.execute("UPDATE game.asteroids SET quantity = $2 WHERE asteroid_id = $1", &[&target, &left]).await.map_err(db_err)?;
+    db.execute("UPDATE game.asteroids SET quantity = $2 WHERE asteroid_id = $1", &[&target, &left]).await.map_err(db_err)?;
     let crit_units = ((crit_bonus / unit_volume).floor() as i64).min(taken);
     let _ = notify.send((
         "OnOreMined".into(),
@@ -492,14 +482,12 @@ async fn perform_scan(c: &Client) -> Value {
 async fn skill_multiplier(c: &Client, char_id: i64, type_id: i32) -> Result<f64, CallError> {
     let own_skill: Option<f64> = c
         .db
-        .client
         .query_opt("SELECT value FROM sde.type_attributes WHERE type_id = $1 AND attribute_id = $2", &[&type_id, &ATTR_PROCESSING_SKILL])
         .await
         .map_err(db_err)?
         .map(|r| r.get(0));
     let skills = c
         .db
-        .client
         .query("SELECT type_id, level FROM game.skills WHERE character_id = $1", &[&char_id])
         .await
         .map_err(db_err)?;
@@ -518,10 +506,22 @@ struct Quote {
     materials: Vec<(i32, i64, i64, f64)>,
 }
 
+fn output_overflow() -> CallError {
+    notify_error("精炼产物数量超过物品堆叠容量。")
+}
+
+fn add_output(total: i64, amount: i64) -> Result<i64, CallError> {
+    total.checked_add(amount).ok_or_else(output_overflow)
+}
+
+fn output_stack_quantity(current: Option<i32>, amount: i64) -> Result<i32, CallError> {
+    let amount = i32::try_from(amount).map_err(|_| output_overflow())?;
+    current.unwrap_or(0).checked_add(amount).ok_or_else(output_overflow)
+}
+
 async fn quote(c: &Client, char_id: i64, item: &super::dogma::Item) -> Result<Option<Quote>, CallError> {
     let portion: i32 = c
         .db
-        .client
         .query_one("SELECT GREATEST(COALESCE(portion_size, 1), 1) FROM sde.inv_types WHERE type_id = $1", &[&item.type_id])
         .await
         .map_err(db_err)?
@@ -533,7 +533,6 @@ async fn quote(c: &Client, char_id: i64, item: &super::dogma::Item) -> Result<Op
     }
     let materials = c
         .db
-        .client
         .query(
             "SELECT m.material_type_id, m.quantity, COALESCE(p.average, 0)::float8 FROM sde.inv_type_materials m
              LEFT JOIN game.retail_prices p ON p.type_id = m.material_type_id WHERE m.type_id = $1",
@@ -545,15 +544,15 @@ async fn quote(c: &Client, char_id: i64, item: &super::dogma::Item) -> Result<Op
         return Ok(None);
     }
     let efficiency = (STATION_EFFICIENCY * skill_multiplier(c, char_id, item.type_id).await?).min(1.0);
-    let materials = materials
-        .iter()
-        .map(|r| {
-            let total = r.get::<_, Option<i64>>(1).unwrap_or(0) * batches as i64;
-            let received = (total as f64 * efficiency).floor() as i64;
-            (r.get::<_, i32>(0), received, total - received, received as f64 * r.get::<_, f64>(2) * STATION_TAX)
-        })
-        .filter(|m| m.1 + m.2 > 0)
-        .collect();
+    let mut result = Vec::new();
+    for r in &materials {
+        let total = r.get::<_, Option<i64>>(1).unwrap_or(0).checked_mul(batches as i64).ok_or_else(output_overflow)?;
+        let received = (total as f64 * efficiency).floor() as i64;
+        if total > 0 {
+            result.push((r.get::<_, i32>(0), received, total - received, received as f64 * r.get::<_, f64>(2) * STATION_TAX));
+        }
+    }
+    let materials = result;
     Ok(Some(Quote { type_id: item.type_id, leftover: quantity % portion, materials }))
 }
 
@@ -607,41 +606,77 @@ async fn reprocessing(c: &mut Client, call: &Call<'_>) -> CallResult {
             let out_location = call.args.get(3).and_then(|v| v.as_int()).unwrap_or(station);
             let out_flag = call.args.get(4).and_then(|v| v.as_int()).map(|f| f as i32).unwrap_or(FLAG_HANGAR);
             let items = reprocessable(c, &value_id_list(call.args.first())).await?;
-            let mut done = vec![];
-            let mut output: HashMap<i32, i64> = HashMap::new();
+            let mut sources = Vec::new();
+            let mut output = BTreeMap::<i32, i64>::new();
             let mut tax = 0.0;
             for item in items {
                 let Some(q) = quote(c, char_id, &item).await? else { continue };
-                let (id, quantity) = (item.item_id, item.quantity);
-                if q.leftover > 0 {
-                    c.db.client.execute("UPDATE game.items SET quantity = $2 WHERE item_id = $1", &[&id, &q.leftover]).await.map_err(db_err)?;
-                    super::inventory::notify_item_change(c, id, vec![(IX_STACK_SIZE, Value::Int(quantity as i64))]).await?;
-                } else {
-                    super::combat::remove_stack(c, item).await?;
-                }
-                for (t, received, _, isk) in &q.materials {
-                    *output.entry(*t).or_default() += received;
+                for (type_id, received, _, isk) in &q.materials {
+                    let total = output.entry(*type_id).or_default();
+                    *total = add_output(*total, *received)?;
                     tax += isk;
                 }
-                done.push(Value::Int(id));
+                sources.push((item, q.leftover));
             }
-            for (t, qty) in &output {
-                if *qty > 0 {
-                    super::combat::deposit(c, char_id, out_location, out_flag, *t, (*qty).min(i32::MAX as i64) as i32, 0).await?;
-                }
-            }
-            if tax > 0.0 {
-                let balance: f64 = c
-                    .db
-                    .client
-                    .query_one("UPDATE game.characters SET balance = balance - $2::float8::numeric WHERE character_id = $1 RETURNING balance::float8", &[&char_id, &tax])
-                    .await
-                    .map_err(db_err)?
-                    .get(0);
-                c.notify("OnAccountChange", vec![Value::str("cash"), Value::Int(char_id), Value::Float(balance)]);
-            }
-            info!(user = c.login.user_id, "reprocessed {} items into {} material types ({tax:.0} ISK tax)", done.len(), output.len());
-            Ok(Value::tuple([Value::List(done), Value::Dict(output.into_iter().map(|(t, q)| (Value::Int(t as i64), Value::Int(q))).collect())]))
+            let plan = Arc::new((sources, output));
+            let db = c.db.clone();
+            let plan = db.transaction(
+                |tx, outbox| {
+                    let plan = Arc::clone(&plan);
+                    Box::pin(async move {
+                    use super::item_quantities::{apply, QuantityChange};
+                    let mut changes = BTreeMap::new();
+                    for (item, leftover) in &plan.0 {
+                        changes.insert(item.item_id, QuantityChange::new(item, (*leftover > 0).then_some(*leftover)));
+                    }
+                    let mut inserts = BTreeMap::new();
+                    for (&type_id, &amount) in &plan.1 {
+                        if amount <= 0 { continue; }
+                        let quantity = output_stack_quantity(None, amount)?;
+                        let candidates = super::dogma::load_items_db(tx,
+                            "i.location_id = $1 AND i.flag_id = $2 AND i.type_id = $3 AND i.owner_id = $4 AND NOT i.singleton",
+                            &[&out_location, &out_flag, &type_id, &char_id]).await?;
+                        let stack = candidates.into_iter().next();
+                        if let Some(item) = stack {
+                            let current = changes.get(&item.item_id).map_or(Some(item.quantity), |change| change.quantity);
+                            let final_quantity = output_stack_quantity(current, amount)?;
+                            changes.entry(item.item_id).and_modify(|change| change.quantity = Some(final_quantity))
+                                .or_insert_with(|| QuantityChange::new(&item, Some(final_quantity)));
+                        } else {
+                            inserts.insert(type_id, quantity);
+                        }
+                    }
+                    apply(tx, &changes, "该物品的数量不足。").await?;
+                    for (&id, change) in &changes {
+                        if change.quantity.is_some() {
+                            super::inventory::notify_item_change(tx, outbox, id, vec![(IX_STACK_SIZE, Value::Int(change.expected_quantity as i64))]).await?;
+                        } else {
+                            let item = plan.0.iter().find(|(item, _)| item.item_id == id).expect("removed item is a source");
+                            super::inventory::notify_item_removed(outbox, item.0.clone());
+                        }
+                    }
+                    for (type_id, quantity) in inserts {
+                        let id: i64 = tx.query_one(
+                            "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity) VALUES ($1, $2, $3, $4, $5) RETURNING item_id",
+                            &[&type_id, &char_id, &out_location, &out_flag, &quantity],
+                        ).await.map_err(db_err)?.get(0);
+                        super::inventory::notify_item_change(tx, outbox, id, vec![(IX_LOCATION_ID, Value::Int(0)), (IX_FLAG, Value::Int(out_flag as i64))]).await?;
+                    }
+                    if tax > 0.0 {
+                        let row = tx.query_opt(
+                            "UPDATE game.characters SET balance = balance - $2::float8::numeric WHERE character_id = $1 AND balance >= $2::float8::numeric RETURNING balance::float8",
+                            &[&char_id, &tax],
+                        ).await.map_err(db_err)?.ok_or_else(|| notify_error("你的 ISK 余额不足以支付精炼税。"))?;
+                        outbox.notify_client("OnAccountChange", vec![Value::str("cash"), Value::Int(char_id), Value::Float(row.get(0))]);
+                    }
+                    Ok::<_, CallError>(Arc::clone(&plan))
+                })
+                },
+                |value, outbox| async { crate::db::outbox::dispatch_client(value, outbox, c) },
+            ).await?;
+            let done: Vec<_> = plan.0.iter().map(|(item, _)| Value::Int(item.item_id)).collect();
+            info!(user = c.login.user_id, "reprocessed {} items into {} material types ({tax:.0} ISK tax)", done.len(), plan.1.len());
+            Ok(Value::tuple([Value::List(done), Value::Dict(plan.1.iter().map(|(&t, &q)| (Value::Int(t as i64), Value::Int(q))).collect())]))
         }
         _ => Ok(Value::None),
     }
@@ -655,23 +690,4 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn regrowth_deadline_rounds_up_to_milliseconds() {
-        let whole = crate::client::filetime_from_unix_ms(42);
-        assert_eq!(unix_ms_from_filetime_ceil(whole), 42);
-        assert_eq!(unix_ms_from_filetime_ceil(whole + 1), 43);
-    }
-
-    #[test]
-    fn ore_bands_follow_security() {
-        assert!(field_groups(Field::Ore, 0.9, false).0.contains(&"Veldspar"));
-        assert!(field_groups(Field::Ore, 0.3, false).0.contains(&"Jaspet"));
-        assert!(field_groups(Field::Ore, -0.4, false).0.contains(&"Arkonor"));
-        assert!(field_groups(Field::Gas, -1.0, true).0.iter().all(|g| g.starts_with("Fullerite")));
-        assert!(rock_radius(Field::Ore, 25_000.0) < 10_000.0);
-    }
-}
+#[cfg(test)] mod tests;

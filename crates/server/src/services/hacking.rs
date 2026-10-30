@@ -440,7 +440,6 @@ pub async fn start(c: &mut Client, module: i64, target: Option<i64>) -> CallResu
     }
     let r = c
         .db
-        .client
         .query_opt(
             "SELECT i.type_id,
                     COALESCE((SELECT value FROM sde.type_attributes WHERE type_id = i.type_id AND attribute_id = $3), 0)::int,
@@ -471,7 +470,6 @@ pub async fn start(c: &mut Client, module: i64, target: Option<i64>) -> CallResu
     }
     let level: f64 = c
         .db
-        .client
         .query_opt("SELECT level FROM game.skills WHERE character_id = $1 AND type_id = $2", &[&char_id, &needed])
         .await
         .map_err(db_err)?

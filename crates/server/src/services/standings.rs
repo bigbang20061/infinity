@@ -17,6 +17,8 @@
 use super::{db_err, keyval, notify_error, rowset, Call, CallError, CallResult};
 use crate::client::Client;
 use crate::db::Db;
+use crate::db::executor::Executor;
+use crate::db::outbox::{dispatch_world, Outbox};
 use crate::space::World;
 use marshal::Value;
 use tracing::info;
@@ -56,7 +58,6 @@ const AGENT_LEVEL_FOUR: i64 = 4;
 
 pub async fn standing(db: &Db, char_id: i64, from: i64) -> Result<f64, CallError> {
     Ok(db
-        .client
         .query_opt("SELECT standing FROM game.standings WHERE char_id = $1 AND from_id = $2", &[&char_id, &from])
         .await
         .map_err(db_err)?
@@ -71,7 +72,7 @@ pub async fn modify(db: &Db, world: &World, char_id: i64, from: i64, change: f64
     }
     let old = standing(db, char_id, from).await?;
     let new = if change > 0.0 { old + (STANDING_LIMIT - old) * change } else { old + (STANDING_LIMIT + old) * change }.clamp(-STANDING_LIMIT, STANDING_LIMIT);
-    db.client
+    db
         .execute(
             "INSERT INTO game.standings (char_id, from_id, standing) VALUES ($1, $2, $3)
              ON CONFLICT (char_id, from_id) DO UPDATE SET standing = $3",
@@ -118,9 +119,8 @@ pub async fn mission_declined(db: &Db, world: &World, char_id: i64, agent: i64, 
 
 // ---------------------------------------------------------------- loyalty points
 
-pub async fn lp_balance(db: &Db, char_id: i64, corp: i64) -> Result<i64, CallError> {
+pub async fn lp_balance(db: &(impl Executor + ?Sized), char_id: i64, corp: i64) -> Result<i64, CallError> {
     Ok(db
-        .client
         .query_opt("SELECT amount FROM game.lp_balances WHERE char_id = $1 AND corp_id = $2", &[&char_id, &corp])
         .await
         .map_err(db_err)?
@@ -129,7 +129,7 @@ pub async fn lp_balance(db: &Db, char_id: i64, corp: i64) -> Result<i64, CallErr
 }
 
 /// Add (or, negative, take) loyalty points with `corp`; taking more than there is fails.
-pub async fn add_lp(db: &Db, world: &World, char_id: i64, corp: i64, amount: i64) -> Result<(), CallError> {
+pub async fn add_lp<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, char_id: i64, corp: i64, amount: i64) -> Result<(), CallError> {
     if amount == 0 || corp == 0 {
         return Ok(());
     }
@@ -137,7 +137,7 @@ pub async fn add_lp(db: &Db, world: &World, char_id: i64, corp: i64, amount: i64
     if before + amount < 0 {
         return Err(notify_error(&format!("你在该军团只有 {before} 忠诚点。")));
     }
-    db.client
+    db
         .execute(
             "INSERT INTO game.lp_balances (char_id, corp_id, amount) VALUES ($1, $2, $3)
              ON CONFLICT (char_id, corp_id) DO UPDATE SET amount = game.lp_balances.amount + $3",
@@ -145,14 +145,13 @@ pub async fn add_lp(db: &Db, world: &World, char_id: i64, corp: i64, amount: i64
         )
         .await
         .map_err(db_err)?;
-    world.notify_pilot(char_id, "OnLPChange", vec![Value::str("lp"), Value::Int(corp), Value::Int(before), Value::Int(before + amount)]);
+    outbox.notify_pilot(char_id, "OnLPChange", vec![Value::str("lp"), Value::Int(corp), Value::Int(before), Value::Int(before + amount)]);
     Ok(())
 }
 
 /// A corporation's LP store: (offerID = typeID, typeID, LP, ISK).
 async fn offers(db: &Db, corp: i64) -> Result<Vec<(i32, i64, i64)>, CallError> {
     let rows = db
-        .client
         .query(
             "SELECT t.type_id, r.average
              FROM sde_native.npccorporations c
@@ -188,12 +187,18 @@ async fn take_offer(c: &Client, corp: i64, offer: i64, count: i64) -> CallResult
         return Err(notify_error("该兑换项已不可用。"));
     };
     let _trading = super::market::lock().await;
-    if lp_balance(db, me, corp).await? < lp * count {
-        return Err(notify_error("你的忠诚点不足。"));
-    }
-    super::market::debit(db, world, me, (isk * count) as f64).await?;
-    add_lp(db, world, me, corp, -lp * count).await?;
-    super::market::deliver(db, world, me, station, type_id, count as i32).await?;
+    db.transaction(
+        |tx, outbox| Box::pin(async move {
+            if lp_balance(tx, me, corp).await? < lp * count {
+                return Err(notify_error("你的忠诚点不足。"));
+            }
+            super::market::debit(tx, outbox, me, (isk * count) as f64).await?;
+            add_lp(tx, outbox, me, corp, -lp * count).await?;
+            super::market::deliver(tx, outbox, me, station, type_id, count as i32).await?;
+            Ok(())
+        }),
+        |value, outbox| async move { dispatch_world(value, outbox, world) },
+    ).await?;
     info!("lp store: {me} bought {count} x {type_id} from {corp} for {} LP and {} ISK", lp * count, isk * count);
     Ok(Value::Bool(true))
 }
@@ -203,7 +208,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     let int = |i: usize| call.args.get(i).and_then(|v| v.as_int()).unwrap_or(0);
     let db = &c.db;
     Some(match (call.service, call.method) {
-        ("standingMgr", "GetCharStandings") => match db.client.query("SELECT from_id, standing FROM game.standings WHERE char_id = $1", &[&me]).await {
+        ("standingMgr", "GetCharStandings") => match db.query("SELECT from_id, standing FROM game.standings WHERE char_id = $1", &[&me]).await {
             Ok(rows) => Ok(rowset(&["fromID", "standing"], rows.iter().map(|r| vec![Value::Int(r.get(0)), Value::Float(r.get(1))]).collect())),
             Err(e) => Err(db_err(e)),
         },
@@ -211,7 +216,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         ("standingMgr", "GetStandingTransactions") | ("standingMgr", "GetStandingCompositions") => Ok(Value::list([])),
 
         // [(issuerCorpID, amount)]
-        ("LPSvc", "GetAllMyCharacterWalletLPBalances") => match db.client.query("SELECT corp_id, amount FROM game.lp_balances WHERE char_id = $1 AND amount > 0", &[&me]).await {
+        ("LPSvc", "GetAllMyCharacterWalletLPBalances") => match db.query("SELECT corp_id, amount FROM game.lp_balances WHERE char_id = $1 AND amount > 0", &[&me]).await {
             Ok(rows) => Ok(Value::list(rows.iter().map(|r| Value::tuple([Value::Int(r.get(0)), Value::Int(r.get(1))])))),
             Err(e) => Err(db_err(e)),
         },

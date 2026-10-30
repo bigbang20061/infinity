@@ -29,12 +29,15 @@ const FIRST_CLIENT_ID: i64 = 1_000_000_000_000;
 const ONLINE_JOIN_DELTA: i64 = 1;
 /// Server online population counter delta when a session leaves.
 const ONLINE_LEAVE_DELTA: i64 = -1;
+/// Server policy: leave capacity for administrators and tools under PostgreSQL's default 100 connections.
+const DATABASE_POOL_SIZE_DEFAULT: usize = 16;
 
 /// Values the client checks during the handshake; defaults match the
 /// Infinity build 3653293 start.ini and eveMachoNetVersion.machoVersion.
 pub struct Config {
     pub bind: String,
     pub database_url: String,
+    pub database_pool_size: usize,
     pub macho_version: i64,
     pub boot_version: f64,
     pub boot_build: i64,
@@ -69,6 +72,7 @@ impl Config {
         Ok(Config {
             bind: env_or("BIND", "0.0.0.0:26000".to_string()),
             database_url: std::env::var("DATABASE_URL").context("DATABASE_URL is not set")?,
+            database_pool_size: env_or("DATABASE_POOL_SIZE", DATABASE_POOL_SIZE_DEFAULT),
             macho_version: env_or("MACHO_VERSION", 496),
             boot_version: env_or("BOOT_VERSION", 24.01),
             boot_build: env_or("BOOT_BUILD", 3653293),
@@ -110,7 +114,7 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,infinity_server=debug".into()))
         .init();
     let cfg = Arc::new(Config::from_env()?);
-    let db = db::Db::connect(&cfg.database_url).await?;
+    let db = db::Db::connect(&cfg.database_url, cfg.database_pool_size).await?;
     if let Err(services::CallError::Internal(e)) = services::unbury_sites(&db).await {
         tracing::warn!("moving sites out of planets failed: {e:#}");
     }

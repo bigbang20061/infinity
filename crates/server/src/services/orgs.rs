@@ -37,7 +37,7 @@ fn owner(c: &Client, call: &Call<'_>) -> Option<i64> {
 async fn may(db: &Db, me: i64, owner: i64, roles: i64) -> Result<bool, CallError> {
     let (corp, my_roles) = membership(db, me).await?;
     let acting_corp = if owner >= FIRST_PLAYER_ALLIANCE {
-        db.client
+        db
             .query_opt("SELECT executor_corp_id FROM game.alliances WHERE alliance_id = $1 AND NOT deleted", &[&owner])
             .await
             .map_err(db_err)?
@@ -62,7 +62,6 @@ fn bulletin_header() -> DbRowDescriptor {
 
 async fn bulletins(db: &Db, owner: i64) -> CallResult {
     let rows = db
-        .client
         .query(
             "SELECT bulletin_id, title, body, edit_char_id, edit_date, sort_order FROM game.org_bulletins WHERE owner_id = $1 ORDER BY sort_order, edit_date DESC",
             &[&owner],
@@ -98,7 +97,6 @@ async fn add_bulletin(db: &Db, me: i64, owner: i64, call: &Call<'_>) -> CallResu
     match edit_of {
         Some(id) => {
             let current: Option<i64> = db
-                .client
                 .query_opt("SELECT edit_date FROM game.org_bulletins WHERE bulletin_id = $1 AND owner_id = $2", &[&id, &owner])
                 .await
                 .map_err(db_err)?
@@ -108,7 +106,7 @@ async fn add_bulletin(db: &Db, me: i64, owner: i64, call: &Call<'_>) -> CallResu
                 Some(t) if seen.is_some_and(|s| s < t) => return Err(CallError::User { msg: "CorpBulletinHasBeenEdited".into(), dict: vec![] }),
                 Some(_) => {}
             }
-            db.client
+            db
                 .execute(
                     "UPDATE game.org_bulletins SET title = $2, body = $3, edit_char_id = $4, edit_date = $5 WHERE bulletin_id = $1",
                     &[&id, &title, &body, &me, &now],
@@ -117,11 +115,11 @@ async fn add_bulletin(db: &Db, me: i64, owner: i64, call: &Call<'_>) -> CallResu
                 .map_err(db_err)?;
         }
         None => {
-            let count: i64 = db.client.query_one("SELECT count(*) FROM game.org_bulletins WHERE owner_id = $1", &[&owner]).await.map_err(db_err)?.get(0);
+            let count: i64 = db.query_one("SELECT count(*) FROM game.org_bulletins WHERE owner_id = $1", &[&owner]).await.map_err(db_err)?.get(0);
             if count >= MAX_BULLETINS {
                 return Err(CallError::User { msg: "CorpTooManyBulletins".into(), dict: vec![] });
             }
-            db.client
+            db
                 .execute(
                     "INSERT INTO game.org_bulletins (owner_id, title, body, edit_char_id, edit_date, sort_order)
                      VALUES ($1, $2, $3, $4, $5, (SELECT COALESCE(max(sort_order) + 1, 0) FROM game.org_bulletins WHERE owner_id = $1))",
@@ -137,7 +135,6 @@ async fn add_bulletin(db: &Db, me: i64, owner: i64, call: &Call<'_>) -> CallResu
 /// {contactID: KeyVal(contactID, relationshipID, labelMask)}
 async fn contacts(db: &Db, owner: i64) -> CallResult {
     let rows = db
-        .client
         .query("SELECT contact_id, relationship_id, label_mask FROM game.org_contacts WHERE owner_id = $1", &[&owner])
         .await
         .map_err(db_err)?;
@@ -157,7 +154,7 @@ async fn contacts(db: &Db, owner: i64) -> CallResult {
 
 /// {labelID: KeyVal(labelID, name, color)}
 async fn labels(db: &Db, owner: i64) -> CallResult {
-    let rows = db.client.query("SELECT label_id, name, color FROM game.org_labels WHERE owner_id = $1", &[&owner]).await.map_err(db_err)?;
+    let rows = db.query("SELECT label_id, name, color FROM game.org_labels WHERE owner_id = $1", &[&owner]).await.map_err(db_err)?;
     Ok(Value::Dict(
         rows.iter()
             .map(|r| {
@@ -195,15 +192,15 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             Err(e) => return Some(Err(e)),
         }
     }
-    let done = |r: Result<u64, tokio_postgres::Error>| r.map(|_| Value::None).map_err(db_err);
+    let done = |r: Result<u64, crate::db::Error>| r.map(|_| Value::None).map_err(db_err);
     Some(match call.method {
         "GetBulletins" => bulletins(db, owner).await,
         "AddBulletin" => add_bulletin(db, me, owner, call).await,
-        "DeleteBulletin" => done(db.client.execute("DELETE FROM game.org_bulletins WHERE bulletin_id = $1 AND owner_id = $2", &[&int(0).unwrap_or(0), &owner]).await),
+        "DeleteBulletin" => done(db.execute("DELETE FROM game.org_bulletins WHERE bulletin_id = $1 AND owner_id = $2", &[&int(0).unwrap_or(0), &owner]).await),
         // UpdateBulletinOrder([bulletinID, ...])
         "UpdateBulletinOrder" => {
             for (i, id) in value_ids(call.args.first()).iter().enumerate() {
-                if let Err(e) = db.client.execute("UPDATE game.org_bulletins SET sort_order = $3 WHERE bulletin_id = $1 AND owner_id = $2", &[id, &owner, &(i as i32)]).await {
+                if let Err(e) = db.execute("UPDATE game.org_bulletins SET sort_order = $3 WHERE bulletin_id = $1 AND owner_id = $2", &[id, &owner, &(i as i32)]).await {
                     return Some(Err(db_err(e)));
                 }
             }
@@ -212,7 +209,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "GetCorporateContacts" | "GetAllianceContacts" => contacts(db, owner).await,
         // Add/Edit*Contact(contactID, relationshipID)
         "AddCorporateContact" | "AddAllianceContact" | "EditCorporateContact" | "EditAllianceContact" => done(
-            db.client
+            db
                 .execute(
                     "INSERT INTO game.org_contacts (owner_id, contact_id, relationship_id) VALUES ($1, $2, $3)
                      ON CONFLICT (owner_id, contact_id) DO UPDATE SET relationship_id = $3",
@@ -221,11 +218,11 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                 .await,
         ),
         "RemoveCorporateContacts" | "RemoveAllianceContacts" => {
-            done(db.client.execute("DELETE FROM game.org_contacts WHERE owner_id = $1 AND contact_id = ANY($2)", &[&owner, &value_ids(call.args.first())]).await)
+            done(db.execute("DELETE FROM game.org_contacts WHERE owner_id = $1 AND contact_id = ANY($2)", &[&owner, &value_ids(call.args.first())]).await)
         }
         // EditContactsRelationshipID(contactIDs, relationshipID)
         "EditContactsRelationshipID" => done(
-            db.client
+            db
                 .execute(
                     "UPDATE game.org_contacts SET relationship_id = $3 WHERE owner_id = $1 AND contact_id = ANY($2)",
                     &[&owner, &value_ids(call.args.first()), &relationship(1).unwrap_or(0.0)],
@@ -241,14 +238,14 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                 return Some(Err(CallError::User { msg: "MailLabelMustProvideName".into(), dict: vec![] }));
             }
             // A label's ID is its bit in the contacts' labelMask: the lowest free one.
-            let used: Vec<i64> = match db.client.query("SELECT label_id FROM game.org_labels WHERE owner_id = $1", &[&owner]).await {
+            let used: Vec<i64> = match db.query("SELECT label_id FROM game.org_labels WHERE owner_id = $1", &[&owner]).await {
                 Ok(rows) => rows.iter().map(|r| r.get(0)).collect(),
                 Err(e) => return Some(Err(db_err(e))),
             };
             let Some(id) = (0..LABEL_BIT_END).map(|b| 1i64 << b).find(|b| !used.contains(b)) else {
                 return Some(Err(notify_error("标签数量已达上限。")));
             };
-            db.client
+            db
                 .execute("INSERT INTO game.org_labels (owner_id, label_id, name, color) VALUES ($1, $2, $3, $4)", &[&owner, &id, &name, &color])
                 .await
                 .map(|_| Value::Int(id))
@@ -256,17 +253,17 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         }
         "DeleteLabel" => {
             let id = int(0).unwrap_or(0);
-            if let Err(e) = db.client.execute("UPDATE game.org_contacts SET label_mask = label_mask & ~$2 WHERE owner_id = $1", &[&owner, &id]).await {
+            if let Err(e) = db.execute("UPDATE game.org_contacts SET label_mask = label_mask & ~$2 WHERE owner_id = $1", &[&owner, &id]).await {
                 return Some(Err(db_err(e)));
             }
-            done(db.client.execute("DELETE FROM game.org_labels WHERE label_id = $1 AND owner_id = $2", &[&id, &owner]).await)
+            done(db.execute("DELETE FROM game.org_labels WHERE label_id = $1 AND owner_id = $2", &[&id, &owner]).await)
         }
         // EditLabel(labelID, name, color): None keeps the current value.
         "EditLabel" => {
             let name = call.args.get(1).and_then(|v| v.as_text()).map(|t| t.trim().to_string());
             let color = int(2).map(|c| c as i32);
             done(
-                db.client
+                db
                     .execute(
                         "UPDATE game.org_labels SET name = COALESCE($3, name), color = COALESCE($4, color) WHERE label_id = $1 AND owner_id = $2",
                         &[&int(0).unwrap_or(0), &owner, &name, &color],
@@ -281,7 +278,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             } else {
                 "UPDATE game.org_contacts SET label_mask = label_mask & ~$3 WHERE owner_id = $1 AND contact_id = ANY($2)"
             };
-            done(db.client.execute(sql, &[&owner, &value_ids(call.args.first()), &int(1).unwrap_or(0)]).await)
+            done(db.execute(sql, &[&owner, &value_ids(call.args.first()), &int(1).unwrap_or(0)]).await)
         }
         _ => return None,
     })

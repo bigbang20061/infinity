@@ -27,7 +27,6 @@ fn header(cols: &[&str]) -> Value {
 pub async fn owners(c: &Client, ids: &[i64]) -> Result<Value, CallError> {
     let rows = c
         .db
-        .client
         .query(
             "SELECT character_id, name, $2::bigint, gender_id, NULL::bigint FROM game.characters WHERE character_id = ANY($1::bigint[])
              UNION ALL SELECT corporation_id, name, $3::bigint, 0, NULL FROM sde.crp_npc_corporations WHERE corporation_id = ANY($1::bigint[])
@@ -60,7 +59,6 @@ async fn locations(c: &Client, ids: &[i64]) -> Result<Value, CallError> {
     // anything else it knows (stations by name, player items such as ships).
     let rows = c
         .db
-        .client
         .query(
             "SELECT item_id, COALESCE(i.name, t.name), NULL::bigint, 0::float8, 0::float8, 0::float8 FROM game.items i
                  LEFT JOIN sde.inv_types t USING (type_id) WHERE item_id = ANY($1::bigint[])
@@ -91,7 +89,6 @@ async fn locations(c: &Client, ids: &[i64]) -> Result<Value, CallError> {
 async fn tickers(c: &Client, ids: &[i64]) -> Result<Value, CallError> {
     let rows = c
         .db
-        .client
         .query(
             "SELECT corporation_id::bigint, ticker FROM sde.crp_npc_corporations WHERE corporation_id = ANY($1::bigint[])
              UNION ALL SELECT corporation_id, ticker FROM game.corporations WHERE corporation_id = ANY($1::bigint[])",
@@ -124,7 +121,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
             let owner = keys.first().copied().unwrap_or(0);
             let rows = c
                 .db
-                .client
                 .query("SELECT DISTINCT solar_system_id::bigint FROM sde.sta_stations WHERE owner_id::bigint = $1", &[&owner])
                 .await
                 .map_err(db_err)?;
@@ -133,7 +129,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
         "GetMultiAllianceShortNamesEx" | "GetAllianceShortNamesEx" => {
             let rows = c
                 .db
-                .client
                 .query("SELECT alliance_id, short_name FROM game.alliances WHERE alliance_id = ANY($1::bigint[])", &[&keys])
                 .await
                 .map_err(db_err)?;

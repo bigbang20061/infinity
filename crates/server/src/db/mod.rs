@@ -1,15 +1,23 @@
-//! PostgreSQL access. One pipelined connection shared by all tasks.
+//! PostgreSQL access for server services using game and SDE tables.
+//! The bounded NoTls pool uses Verified recycling to reject terminated backends
+//! before a statement; Fast can race the connection task and return a termination error.
+//! Failed statements are not retried.
 //! The shared account PLEX query returns whole PLEX; wire-unit conversion is the caller's policy.
+
+pub mod executor;
+pub mod outbox;
+pub mod transaction;
 
 use crate::consts::{NPC_BID_RATIO, ROLE_PLAYER_LOGIN};
 use anyhow::{Context, Result};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
-use tokio_postgres::{Client, NoTls};
-use tracing::{error, info};
+use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
+use tokio_postgres::{types::ToSql, Client, NoTls, Row, ToStatement};
+use tracing::info;
 
-const GAME_SCHEMA: &str = include_str!("../sql/game_schema.sql");
-const MARKET_SEED: &str = include_str!("../sql/market_seed.sql");
+const GAME_SCHEMA: &str = include_str!("../../sql/game_schema.sql");
+const MARKET_SEED: &str = include_str!("../../sql/market_seed.sql");
 
 /// Existing server policy for the first database reconnect delay.
 const RECONNECT_INITIAL_DELAY_SECONDS: u64 = 1;
@@ -18,9 +26,41 @@ const RECONNECT_MAX_RETRY_DELAY_SECONDS: u64 = 16;
 /// Existing server policy for exponential database reconnect backoff.
 const RECONNECT_BACKOFF_FACTOR: u64 = 2;
 
+#[derive(Debug)]
+pub enum Error {
+    Pool(deadpool_postgres::PoolError),
+    Postgres(tokio_postgres::Error),
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pool(e) => write!(f, "database pool: {e}"),
+            Self::Postgres(e) => write!(f, "PostgreSQL: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Pool(e) => Some(e),
+            Self::Postgres(e) => Some(e),
+        }
+    }
+}
+
+impl From<deadpool_postgres::PoolError> for Error {
+    fn from(error: deadpool_postgres::PoolError) -> Self { Self::Pool(error) }
+}
+
+impl From<tokio_postgres::Error> for Error {
+    fn from(error: tokio_postgres::Error) -> Self { Self::Postgres(error) }
+}
+
 #[derive(Clone)]
 pub struct Db {
-    pub client: Arc<Client>,
+    pool: Pool,
     online: Arc<AtomicI64>,
 }
 
@@ -31,15 +71,35 @@ pub struct Account {
 }
 
 impl Db {
-    /// Account vault balance in whole PLEX, shared by the store and public gateway.
-    pub async fn plex_balance(client: &Client, user_id: i64) -> Result<i64, tokio_postgres::Error> {
-        Ok(client.query_one("SELECT plex_balance FROM game.accounts WHERE user_id = $1", &[&user_id]).await?.get(0))
+    pub async fn query<T: ?Sized + ToStatement + Sync>(&self, statement: &T, params: &[&(dyn ToSql + Sync)]) -> std::result::Result<Vec<Row>, Error> {
+        Ok(self.pool.get().await?.query(statement, params).await?)
     }
 
-    pub async fn connect(url: &str) -> Result<Db> {
+    pub async fn query_one<T: ?Sized + ToStatement + Sync>(&self, statement: &T, params: &[&(dyn ToSql + Sync)]) -> std::result::Result<Row, Error> {
+        Ok(self.pool.get().await?.query_one(statement, params).await?)
+    }
+
+    pub async fn query_opt<T: ?Sized + ToStatement + Sync>(&self, statement: &T, params: &[&(dyn ToSql + Sync)]) -> std::result::Result<Option<Row>, Error> {
+        Ok(self.pool.get().await?.query_opt(statement, params).await?)
+    }
+
+    pub async fn execute<T: ?Sized + ToStatement + Sync>(&self, statement: &T, params: &[&(dyn ToSql + Sync)]) -> std::result::Result<u64, Error> {
+        Ok(self.pool.get().await?.execute(statement, params).await?)
+    }
+
+    /// Account vault balance in whole PLEX, shared by the store and public gateway.
+    pub async fn plex_balance(&self, user_id: i64) -> std::result::Result<i64, Error> {
+        Ok(self.query_one("SELECT plex_balance FROM game.accounts WHERE user_id = $1", &[&user_id]).await?.get(0))
+    }
+
+    pub async fn connect(url: &str, pool_size: usize) -> Result<Db> {
+        anyhow::ensure!(pool_size > 0, "DATABASE_POOL_SIZE must be greater than zero");
+        let config = url.parse::<tokio_postgres::Config>().context("parsing PostgreSQL URL")?;
+        let manager = Manager::from_config(config, NoTls, ManagerConfig { recycling_method: RecyclingMethod::Verified });
+        let pool = Pool::builder(manager).max_size(pool_size).build().context("building PostgreSQL pool")?;
         let mut delay = RECONNECT_INITIAL_DELAY_SECONDS;
-        let (client, conn) = loop {
-            match tokio_postgres::connect(url, NoTls).await {
+        let client = loop {
+            match pool.get().await {
                 Ok(c) => break c,
                 Err(e) if delay <= RECONNECT_MAX_RETRY_DELAY_SECONDS => {
                     info!("database not ready ({e}); retrying in {delay}s");
@@ -49,11 +109,7 @@ impl Db {
                 Err(e) => return Err(e).context("connecting to PostgreSQL"),
             }
         };
-        tokio::spawn(async move {
-            if let Err(e) = conn.await {
-                error!("database connection lost: {e}");
-            }
-        });
+        // The initial checkout is retained for schema setup, then returned to the pool.
         client.batch_execute(GAME_SCHEMA).await.context("applying game schema")?;
         let types: i64 = client.query_one("SELECT count(*) FROM sde.inv_types", &[]).await.context("SDE not imported? run sde-import")?.get(0);
         load_retail_prices(&client).await.context("loading retail prices")?;
@@ -94,7 +150,8 @@ impl Db {
             info!("repriced {n} NPC market orders from retail prices");
         }
         info!("database ready ({types} types in SDE)");
-        Ok(Db { client: Arc::new(client), online: Arc::new(AtomicI64::new(0)) })
+        drop(client);
+        Ok(Db { pool, online: Arc::new(AtomicI64::new(0)) })
     }
 
     pub fn online_count(&self) -> i64 {
@@ -107,7 +164,6 @@ impl Db {
     /// Verify credentials. Unknown user names are registered on first login.
     pub async fn login(&self, user_name: &str, password_hash: &[u8]) -> Result<Option<Account>> {
         let row = self
-            .client
             .query_opt("SELECT user_id, password_hash, role, user_type FROM game.accounts WHERE lower(user_name) = lower($1)", &[&user_name])
             .await?;
         let (user_id, role, user_type) = match row {
@@ -120,7 +176,6 @@ impl Db {
             }
             None => {
                 let r = self
-                    .client
                     .query_one(
                         "INSERT INTO game.accounts (user_name, password_hash, role) VALUES ($1, $2, $3) RETURNING user_id, user_type",
                         &[&user_name, &password_hash, &ROLE_PLAYER_LOGIN],
@@ -130,7 +185,7 @@ impl Db {
                 (r.get(0), ROLE_PLAYER_LOGIN, r.get::<_, i32>(1))
             }
         };
-        self.client.execute("UPDATE game.accounts SET last_login = now() WHERE user_id = $1", &[&user_id]).await?;
+        self.execute("UPDATE game.accounts SET last_login = now() WHERE user_id = $1", &[&user_id]).await?;
         Ok(Some(Account { user_id, role, user_type: user_type as i64 }))
     }
 }

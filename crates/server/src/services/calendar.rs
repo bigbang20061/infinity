@@ -9,6 +9,8 @@
 use super::{db_err, keyval, notify_error, value_id_list, value_text, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
 use crate::consts::{FILETIME_SECOND, FILETIME_UNIX_EPOCH, ROLE_DIRECTOR};
+use crate::db::executor::Executor;
+use crate::db::outbox::{dispatch_world, Outbox};
 use marshal::{DbRowDescriptor, DbType, Value};
 
 /// Client appConst.eventResponseDeleted.
@@ -31,7 +33,6 @@ async fn event_list(c: &Client, month: i64, year: i64) -> CallResult {
     let corp = c.session.int("corpid").unwrap_or(0);
     let rows = c
         .db
-        .client
         .query(
             "SELECT e.event_id, e.owner_id, e.event_date, e.modified, e.duration::bigint, e.importance::bigint, e.title, e.deleted
              FROM game.calendar_events e
@@ -73,7 +74,7 @@ async fn event_list(c: &Client, month: i64, year: i64) -> CallResult {
 
 /// Invitees of an event, but its owner.
 async fn invitees(c: &Client, event: i64) -> Result<Vec<i64>, CallError> {
-    let rows = c.db.client.query("SELECT char_id FROM game.calendar_responses WHERE event_id = $1 AND status <> $2", &[&event, &RESPONSE_DELETED]).await.map_err(db_err)?;
+    let rows = c.db.query("SELECT char_id FROM game.calendar_responses WHERE event_id = $1 AND status <> $2", &[&event, &RESPONSE_DELETED]).await.map_err(db_err)?;
     Ok(rows.iter().map(|r| r.get(0)).collect())
 }
 
@@ -85,26 +86,39 @@ async fn create(c: &Client, call: &Call<'_>, owner: i64) -> CallResult {
     let (title, description) = (value_text(call.args.get(2), MAX_TITLE_LENGTH), value_text(call.args.get(3), MAX_DESCRIPTION_LENGTH));
     let important = call.args.get(4).and_then(|v| v.as_int()).unwrap_or(0) as i32;
     let now = filetime_now();
-    let id: i64 = c
-        .db
-        .client
-        .query_one(
-            "INSERT INTO game.calendar_events (owner_id, creator_id, event_date, duration, title, description, importance, modified)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING event_id",
-            &[&owner, &me, &when, &duration, &title, &description, &important, &now],
-        )
-        .await
-        .map_err(db_err)?
-        .get(0);
-    if owner == me {
-        let guests: Vec<i64> = call.args.get(5).and_then(|v| v.items()).unwrap_or(&[]).iter().filter_map(|v| v.as_int()).filter(|g| *g != me).take(MAX_INVITEES).collect();
-        c.db.client.execute("INSERT INTO game.calendar_responses (event_id, char_id, status) VALUES ($1, $2, $3)", &[&id, &me, &RESPONSE_ACCEPTED]).await.map_err(db_err)?;
-        for g in &guests {
-            c.db.client.execute("INSERT INTO game.calendar_responses (event_id, char_id, status) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING", &[&id, g, &RESPONSE_UNDECIDED]).await.map_err(db_err)?;
-            c.world.notify_pilot(*g, "OnNewCalendarEvent", vec![Value::Int(id), Value::Int(owner), Value::Int(when), Value::Int(duration as i64), Value::unicode(title.as_str()), Value::Int(important as i64)]);
-        }
-    }
-    Ok(Value::Int(id))
+    let guests: Vec<i64> = call.args.get(5).and_then(|v| v.items()).unwrap_or(&[]).iter().filter_map(|v| v.as_int()).filter(|g| *g != me).take(MAX_INVITEES).collect();
+    let world = c.world.clone();
+    c.db.transaction(
+        |tx, outbox: &mut Outbox| {
+            let title = title.clone();
+            let description = description.clone();
+            let guests = guests.clone();
+            Box::pin(async move {
+                let id: i64 = Executor::query_one(tx,
+                    "INSERT INTO game.calendar_events (owner_id, creator_id, event_date, duration, title, description, importance, modified)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING event_id",
+                    &[&owner, &me, &when, &duration, &title, &description, &important, &now],
+                ).await.map_err(db_err)?.get(0);
+                if owner == me {
+                    let mut responses: Vec<_> = guests.iter().map(|&g| (g, RESPONSE_UNDECIDED)).collect();
+                    responses.push((me, RESPONSE_ACCEPTED));
+                    responses.sort_unstable_by_key(|&(char_id, _)| char_id);
+                    for (char_id, status) in responses {
+                        if char_id == me {
+                            Executor::execute(tx, "INSERT INTO game.calendar_responses (event_id, char_id, status) VALUES ($1, $2, $3)", &[&id, &char_id, &status]).await.map_err(db_err)?;
+                        } else {
+                            Executor::execute(tx, "INSERT INTO game.calendar_responses (event_id, char_id, status) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING", &[&id, &char_id, &status]).await.map_err(db_err)?;
+                        }
+                    }
+                    for g in guests {
+                        outbox.notify_pilot(g, "OnNewCalendarEvent", vec![Value::Int(id), Value::Int(owner), Value::Int(when), Value::Int(duration as i64), Value::unicode(title.as_str()), Value::Int(important as i64)]);
+                    }
+                }
+                Ok(Value::Int(id))
+            })
+        },
+        |value, outbox| async move { dispatch_world(value, outbox, &world) },
+    ).await
 }
 
 /// The character may change `owner`'s events: their own, or their corporation's as a director.
@@ -116,7 +130,7 @@ fn may_manage(c: &Client, owner: i64) -> bool {
 /// `Edit*Event(eventID, oldDateTime, dateTime, duration, title, description, important)`.
 async fn edit(c: &Client, call: &Call<'_>) -> CallResult {
     let event = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
-    let Some(owner) = c.db.client.query_opt("SELECT owner_id FROM game.calendar_events WHERE event_id = $1", &[&event]).await.map_err(db_err)?.map(|r| r.get::<_, i64>(0)) else {
+    let Some(owner) = c.db.query_opt("SELECT owner_id FROM game.calendar_events WHERE event_id = $1", &[&event]).await.map_err(db_err)?.map(|r| r.get::<_, i64>(0)) else {
         return Err(notify_error("该活动已不存在。"));
     };
     if !may_manage(c, owner) {
@@ -127,7 +141,7 @@ async fn edit(c: &Client, call: &Call<'_>) -> CallResult {
     let duration = call.args.get(3).and_then(|v| v.as_int()).unwrap_or(0) as i32;
     let title = value_text(call.args.get(4), MAX_TITLE_LENGTH);
     let important = call.args.get(6).and_then(|v| v.as_int()).unwrap_or(0) as i32;
-    c.db.client
+    c.db
         .execute(
             "UPDATE game.calendar_events SET event_date = $2, duration = $3, title = $4, description = $5, importance = $6, modified = $7 WHERE event_id = $1",
             &[&event, &when, &duration, &title, &value_text(call.args.get(5), MAX_DESCRIPTION_LENGTH), &important, &filetime_now()],
@@ -152,7 +166,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         ("calendarProxy", "GetEventList") => event_list(c, int(0), int(1)).await,
         // GetEventDetails(eventID, ownerID)
         ("calendarProxy", "GetEventDetails") => {
-            match c.db.client.query_opt("SELECT description, creator_id, owner_id FROM game.calendar_events WHERE event_id = $1", &[&int(0)]).await {
+            match c.db.query_opt("SELECT description, creator_id, owner_id FROM game.calendar_events WHERE event_id = $1", &[&int(0)]).await {
                 Ok(Some(r)) => Ok(keyval([
                     ("eventID", Value::Int(int(0))),
                     ("eventText", Value::unicode(r.get::<_, String>(0))),
@@ -177,7 +191,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         // DeleteEvent(eventID, ownerID): the owner cancels it; an invitee drops it.
         ("calendarMgr", "DeleteEvent") => {
             let event = int(0);
-            let found = match c.db.client.query_opt("SELECT owner_id, event_date FROM game.calendar_events WHERE event_id = $1", &[&event]).await {
+            let found = match c.db.query_opt("SELECT owner_id, event_date FROM game.calendar_events WHERE event_id = $1", &[&event]).await {
                 Ok(r) => r.map(|r| (r.get::<_, i64>(0), r.get::<_, i64>(1))),
                 Err(e) => return Some(Err(db_err(e))),
             };
@@ -187,7 +201,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                     Ok(g) => g,
                     Err(e) => return Some(Err(e)),
                 };
-                if let Err(e) = c.db.client.execute("UPDATE game.calendar_events SET deleted = true, modified = $2 WHERE event_id = $1", &[&event, &filetime_now()]).await {
+                if let Err(e) = c.db.execute("UPDATE game.calendar_events SET deleted = true, modified = $2 WHERE event_id = $1", &[&event, &filetime_now()]).await {
                     return Some(Err(db_err(e)));
                 }
                 for g in guests {
@@ -195,7 +209,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                 }
                 Ok(Value::None)
             } else {
-                c.db.client
+                c.db
                     .execute("UPDATE game.calendar_responses SET status = $3 WHERE event_id = $1 AND char_id = $2", &[&event, &me, &RESPONSE_DELETED])
                     .await
                     .map(|_| Value::None)
@@ -205,7 +219,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         // SendEventResponse(eventID, ownerID, response)
         ("calendarMgr", "SendEventResponse") => c
             .db
-            .client
             .execute(
                 "INSERT INTO game.calendar_responses (event_id, char_id, status) VALUES ($1, $2, $3) ON CONFLICT (event_id, char_id) DO UPDATE SET status = $3",
                 &[&int(0), &me, &(int(2) as i32)],
@@ -214,19 +227,19 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             .map(|_| Value::None)
             .map_err(db_err),
         // [row(eventID, status)]
-        ("calendarMgr", "GetResponsesForCharacter") => match c.db.client.query("SELECT event_id, status::bigint FROM game.calendar_responses WHERE char_id = $1", &[&me]).await {
+        ("calendarMgr", "GetResponsesForCharacter") => match c.db.query("SELECT event_id, status::bigint FROM game.calendar_responses WHERE char_id = $1", &[&me]).await {
             Ok(rows) => Ok(Value::list(rows.iter().map(|r| keyval([("eventID", Value::Int(r.get(0))), ("status", Value::Int(r.get(1)))])))),
             Err(e) => Err(db_err(e)),
         },
         // GetResponsesToEvent(eventID, ownerID) -> [row(characterID, status)]
-        ("calendarMgr", "GetResponsesToEvent") => match c.db.client.query("SELECT char_id, status::bigint FROM game.calendar_responses WHERE event_id = $1", &[&int(0)]).await {
+        ("calendarMgr", "GetResponsesToEvent") => match c.db.query("SELECT char_id, status::bigint FROM game.calendar_responses WHERE event_id = $1", &[&int(0)]).await {
             Ok(rows) => Ok(Value::list(rows.iter().map(|r| keyval([("characterID", Value::Int(r.get(0))), ("status", Value::Int(r.get(1)))])))),
             Err(e) => Err(db_err(e)),
         },
         // UpdateEventParticipants(eventID, charsToAdd, charsToRemove)
         ("calendarMgr", "UpdateEventParticipants") => {
             let event = int(0);
-            let owner = match c.db.client.query_opt("SELECT owner_id FROM game.calendar_events WHERE event_id = $1", &[&event]).await {
+            let owner = match c.db.query_opt("SELECT owner_id FROM game.calendar_events WHERE event_id = $1", &[&event]).await {
                 Ok(r) => r.map(|r| r.get::<_, i64>(0)),
                 Err(e) => return Some(Err(db_err(e))),
             };
@@ -234,12 +247,12 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                 return Some(Err(notify_error("你无法修改该活动。")));
             }
             for g in value_id_list(call.args.get(1)) {
-                if let Err(e) = c.db.client.execute("INSERT INTO game.calendar_responses (event_id, char_id, status) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING", &[&event, &g, &RESPONSE_UNDECIDED]).await {
+                if let Err(e) = c.db.execute("INSERT INTO game.calendar_responses (event_id, char_id, status) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING", &[&event, &g, &RESPONSE_UNDECIDED]).await {
                     return Some(Err(db_err(e)));
                 }
             }
             let gone = value_id_list(call.args.get(2));
-            c.db.client
+            c.db
                 .execute("DELETE FROM game.calendar_responses WHERE event_id = $1 AND char_id = ANY($2) AND char_id <> $3", &[&event, &gone, &me])
                 .await
                 .map(|_| Value::None)

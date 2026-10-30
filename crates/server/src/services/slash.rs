@@ -38,9 +38,9 @@ fn help() -> String {
 /// A type by ID or (partial) name.
 async fn resolve_type(c: &Client, arg: &str) -> Result<(i32, String), CallError> {
     let row = match arg.parse::<i32>() {
-        Ok(id) => c.db.client.query_opt("SELECT type_id, name FROM sde.inv_types WHERE type_id = $1", &[&id]).await,
+        Ok(id) => c.db.query_opt("SELECT type_id, name FROM sde.inv_types WHERE type_id = $1", &[&id]).await,
         Err(_) => {
-            c.db.client
+            c.db
                 .query_opt(
                     "SELECT type_id, name FROM sde.inv_types WHERE published AND name ILIKE '%' || $1 || '%'
                      ORDER BY lower(name) = lower($1) DESC, length(name) LIMIT 1",
@@ -75,7 +75,6 @@ async fn tr(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
     if (30_000_000..33_000_000).contains(&id) {
         let p = c
             .db
-            .client
             .query_opt(
                 "SELECT x, y, z, COALESCE(radius, 10000)::float8 FROM sde.map_celestials WHERE solar_system_id = $1
                  ORDER BY group_id = 7 DESC, random() LIMIT 1",
@@ -91,7 +90,6 @@ async fn tr(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
     // A station, planet, moon, gate...
     if let Some(p) = c
         .db
-        .client
         .query_opt("SELECT solar_system_id::bigint, x, y, z, COALESCE(radius, 5000)::float8 FROM sde.map_celestials WHERE item_id = $1", &[&id])
         .await
         .map_err(db_err)?
@@ -103,7 +101,6 @@ async fn tr(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
     // A character in space, or an item floating somewhere.
     let at = c
         .db
-        .client
         .query_opt(
             "SELECT i.location_id, i.x, i.y, i.z FROM game.items i
              WHERE i.item_id = COALESCE((SELECT ship_id FROM game.characters WHERE character_id = $1), $1)
@@ -133,7 +130,9 @@ async fn create(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
         (None, Some(ship)) => (ship, FLAG_CARGO),
         _ => return Err(slash_error("nowhere to put it".into())),
     };
-    super::combat::deposit(c, char_id, location, flag, type_id, qty, 0).await?;
+    let mut outbox = crate::db::outbox::Outbox::default();
+    super::combat::deposit(&c.db, &mut outbox, char_id, location, flag, type_id, qty, 0).await?;
+    crate::db::outbox::dispatch_client((), outbox, c)?;
     Ok(format!("created {qty} x {name} ({type_id})"))
 }
 
@@ -142,7 +141,6 @@ async fn isk(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
     let char_id = c.session.int("charid").unwrap_or(0);
     let balance: f64 = c
         .db
-        .client
         .query_one("UPDATE game.characters SET balance = balance + $2::float8::numeric WHERE character_id = $1 RETURNING balance::float8", &[&char_id, &amount])
         .await
         .map_err(db_err)?

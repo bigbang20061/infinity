@@ -225,7 +225,6 @@ async fn missions_of(c: &Client, agent_id: Option<i64>) -> Result<Vec<Mission>, 
     let me = c.session.int("charid").unwrap_or(0);
     let rows = c
         .db
-        .client
         .query(
             &format!(
                 "SELECT {MISSION_COLUMNS} FROM game.agent_missions am JOIN sde_native.missions m ON m.key = am.mission_id::text
@@ -245,7 +244,6 @@ async fn mission_with(c: &Client, agent_id: i64) -> Result<Option<Mission>, Call
 /// A mission message ID of this mission (`messages.mission.accepted.agentsays`...).
 async fn message(c: &Client, mission_id: i32, key: &str) -> Result<Option<i64>, CallError> {
     Ok(c.db
-        .client
         .query_one("SELECT (data->'messages'->>$2)::bigint FROM sde_native.missions WHERE key = $1::int::text", &[&mission_id, &key])
         .await
         .map_err(db_err)?
@@ -264,7 +262,6 @@ async fn offer(c: &Client, agent: &Agent) -> Result<(), CallError> {
     let level = agent.level.clamp(1, 5) as i32;
     let pick = c
         .db
-        .client
         .query_opt(
             "SELECT m.key::int, (m.data->'killMission'->>'dungeonID')::int, COALESCE((d.data->>'factionID')::bigint, 0)
              FROM sde_native.missions m JOIN sde_native.dungeons d ON d.key = m.data->'killMission'->>'dungeonID'
@@ -278,7 +275,7 @@ async fn offer(c: &Client, agent: &Agent) -> Result<(), CallError> {
         .ok_or_else(|| CallError::Internal(anyhow::anyhow!("no level {level} kill missions")))?;
     let pos = mission_site_position(c, agent.system_id).await?;
     let (isk, lp) = rewards(agent.level);
-    c.db.client
+    c.db
         .execute(
             "INSERT INTO game.agent_missions (character_id, agent_id, mission_id, dungeon_id, faction_id, state, system_id, x, y, z, reward_isk, reward_lp, offered_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
@@ -325,7 +322,6 @@ async fn arcs(c: &Client) -> Result<&'static HashMap<i32, ArcStep>, CallError> {
     }
     let rows = c
         .db
-        .client
         .query(
             "SELECT e.key::bigint, m.key::int, (m.value->>'agentID')::bigint, COALESCE(m.value->'nextMissions', '[]'::jsonb)::text,
                     (m.value->>'failMissionID')::int
@@ -356,7 +352,6 @@ async fn next_arc_step(c: &Client, agent_id: i64) -> Result<Option<i32>, CallErr
     let me = c.session.int("charid").unwrap_or(0);
     let rows = c
         .db
-        .client
         .query("SELECT arc_id, mission_id, state FROM game.epic_arc_missions WHERE character_id = $1", &[&me])
         .await
         .map_err(db_err)?;
@@ -376,7 +371,7 @@ async fn set_arc_state(c: &Client, arc: i64, mission: i32, state: &str) -> Resul
         _ => "accepted_at",
     };
     let stamp = if state == "unlocked" { None } else { Some(filetime_now()) };
-    c.db.client
+    c.db
         .execute(
             &format!(
                 "INSERT INTO game.epic_arc_missions (character_id, arc_id, mission_id, state, {column}) VALUES ($1, $2, $3, $4, $5)
@@ -397,7 +392,6 @@ async fn offer_arc(c: &Client, agent: &Agent, mission_id: i32) -> Result<(), Cal
     let Some(step) = steps.get(&mission_id) else { return Ok(()) };
     let r = c
         .db
-        .client
         .query_one(
             "SELECT m.data->>'contentTemplate', COALESCE((m.data->'killMission'->>'dungeonID')::int, 0),
                     COALESCE((d.data->>'factionID')::bigint, (m.data->>'factionID')::bigint, 0),
@@ -420,7 +414,7 @@ async fn offer_arc(c: &Client, agent: &Agent, mission_id: i32) -> Result<(), Cal
     let cargo_type: Option<i32> = r.get(3);
     let cargo_qty: Option<i32> = cargo_type.map(|_| r.get::<_, Option<i32>>(4).unwrap_or(1).max(1));
     let pos = mission_site_position(c, agent.system_id).await?;
-    c.db.client
+    c.db
         .execute(
             "INSERT INTO game.agent_missions (character_id, agent_id, mission_id, dungeon_id, faction_id, state, system_id, x, y, z,
                  reward_isk, reward_lp, offered_at, kind, arc_id, dest_agent, cargo_type, cargo_qty)
@@ -459,7 +453,6 @@ async fn epic_arc_status(c: &Client) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
     let rows = c
         .db
-        .client
         .query(
             "SELECT e.arc_id, e.mission_id, e.accepted_at, e.completed_at, e.quit_at, (m.data->>'nameID')::bigint
              FROM game.epic_arc_missions e JOIN sde_native.missions m ON m.key = e.mission_id::text
@@ -503,18 +496,20 @@ async fn has_goods(c: &Client, station: i64, (type_id, qty): (i32, i32)) -> Resu
 /// Take `qty` of the goods from the hangar and cargo at `station`.
 async fn take_goods(c: &mut Client, station: i64, (type_id, qty): (i32, i32)) -> Result<(), CallError> {
     let mut left = qty;
+    let mut outbox = crate::db::outbox::Outbox::default();
     for item in goods_at(c, station, type_id).await? {
         if left <= 0 {
             break;
         }
         if item.quantity <= left {
             left -= item.quantity;
-            super::combat::remove_stack(c, item).await?;
+            super::combat::remove_stack(&c.db, &mut outbox, item).await?;
         } else {
-            c.db.client.execute("UPDATE game.items SET quantity = quantity - $2 WHERE item_id = $1", &[&item.item_id, &left]).await.map_err(db_err)?;
-            super::inventory::notify_item_change(c, item.item_id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
+            c.db.execute("UPDATE game.items SET quantity = quantity - $2 WHERE item_id = $1", &[&item.item_id, &left]).await.map_err(db_err)?;
+            super::inventory::notify_item_change(&c.db, &mut outbox, item.item_id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
             left = 0;
         }
+        crate::db::outbox::dispatch_client((), std::mem::take(&mut outbox), c)?;
     }
     Ok(())
 }
@@ -549,7 +544,6 @@ async fn finish(c: &mut Client, m: &Mission, agent: &Agent, choice: Option<usize
     if m.reward_isk > 0 {
         let balance: f64 = c
             .db
-            .client
             .query_one("UPDATE game.characters SET balance = balance + $2::bigint WHERE character_id = $1 RETURNING balance::float8", &[&me, &m.reward_isk])
             .await
             .map_err(db_err)?
@@ -557,12 +551,13 @@ async fn finish(c: &mut Client, m: &Mission, agent: &Agent, choice: Option<usize
         c.notify("OnAccountChange", vec![Value::str("cash"), Value::Int(me), Value::Float(balance)]);
     }
     // Loyalty points with the agent's corporation, and standings with agent, corporation and faction.
-    super::standings::add_lp(&c.db, &c.world, me, agent.corp_id, m.reward_lp).await?;
+    let mut outbox = crate::db::outbox::Outbox::default();
+    super::standings::add_lp(&c.db, &mut outbox, me, agent.corp_id, m.reward_lp).await?;
+    crate::db::outbox::dispatch_client((), outbox, c)?;
     super::standings::mission_completed(&c.db, &c.world, me, agent.id, agent.corp_id, agent.faction_id, agent.level).await?;
     if let Some(arc) = m.arc_id {
         let item = c
             .db
-            .client
             .query_opt(
                 "SELECT (data->'missionRewards'->'reward'->>'rewardTypeID')::int, (data->'missionRewards'->'reward'->>'rewardQuantity')::int
                  FROM sde_native.missions WHERE key = $1::text AND (data->'missionRewards'->'reward'->>'rewardTypeID')::int <> $2",
@@ -573,7 +568,9 @@ async fn finish(c: &mut Client, m: &Mission, agent: &Agent, choice: Option<usize
         if let Some(r) = item {
             let (type_id, qty): (Option<i32>, Option<i32>) = (r.get(0), r.get(1));
             if let (Some(type_id), Some(qty)) = (type_id, qty) {
-                super::combat::deposit(c, me, agent.station_id, FLAG_HANGAR, type_id, qty.max(1), 0).await?;
+                let mut outbox = crate::db::outbox::Outbox::default();
+                super::combat::deposit(&c.db, &mut outbox, me, agent.station_id, FLAG_HANGAR, type_id, qty.max(1), 0).await?;
+                crate::db::outbox::dispatch_client((), outbox, c)?;
             }
         }
         set_arc_state(c, arc, m.mission_id, "completed").await?;
@@ -605,7 +602,7 @@ async fn options(c: &Client, mission_id: i32) -> Result<Vec<i64>, CallError> {
 
 async fn set_state(c: &Client, agent_id: i64, state: i32) -> Result<(), CallError> {
     let me = c.session.int("charid").unwrap_or(0);
-    c.db.client
+    c.db
         .execute(
             "UPDATE game.agent_missions SET state = $3, accepted_at = CASE WHEN $3 = 2 THEN $4 ELSE accepted_at END
              WHERE character_id = $1 AND agent_id = $2",
@@ -618,7 +615,7 @@ async fn set_state(c: &Client, agent_id: i64, state: i32) -> Result<(), CallErro
 
 async fn remove(c: &Client, agent_id: i64) -> Result<(), CallError> {
     let me = c.session.int("charid").unwrap_or(0);
-    c.db.client.execute("DELETE FROM game.agent_missions WHERE character_id = $1 AND agent_id = $2", &[&me, &agent_id]).await.map_err(db_err)?;
+    c.db.execute("DELETE FROM game.agent_missions WHERE character_id = $1 AND agent_id = $2", &[&me, &agent_id]).await.map_err(db_err)?;
     despawn(c, me, agent_id);
     Ok(())
 }
@@ -669,7 +666,6 @@ async fn ensure_site(c: &mut Client, m: &Mission) -> Result<(), CallError> {
     // The dungeon faction's mission/deadspace rats, else the generic mission rats.
     let rows = c
         .db
-        .client
         .query(
             "SELECT t.type_id, g.name, COALESCE(t.radius, 50)::float8, COALESCE(t.mass, 1000000)::float8,
                     (SELECT value FROM sde.type_attributes WHERE type_id = t.type_id AND attribute_id = 37),
@@ -689,7 +685,6 @@ async fn ensure_site(c: &mut Client, m: &Mission) -> Result<(), CallError> {
     // as corporations (tickers, standings), and a faction ID there breaks target locking.
     let corp: i64 = c
         .db
-        .client
         .query_opt("SELECT corporation_id::bigint FROM sde.chr_factions WHERE faction_id::bigint = $1", &[&m.faction_id])
         .await
         .map_err(db_err)?
@@ -792,7 +787,6 @@ fn site_location(m: &Mission) -> Value {
 async fn agent_station(c: &Client, agent: &Agent) -> Result<(i64, i64, i64, V3), CallError> {
     let r = c
         .db
-        .client
         .query_opt(
             "SELECT s.type_id::bigint, s.solar_system_id::bigint, COALESCE(s.x, 0), COALESCE(s.y, 0), COALESCE(s.z, 0)
              FROM sde.sta_stations s WHERE s.station_id = $1::int",
@@ -832,7 +826,7 @@ async fn objective_info(c: &Client, m: &Mission) -> Result<Value, CallError> {
     let volume = |c: &Client, type_id: i32| {
         let db = c.db.clone();
         async move {
-            db.client
+            db
                 .query_opt("SELECT COALESCE(volume, 0)::float8 FROM sde.inv_types WHERE type_id = $1", &[&type_id])
                 .await
                 .ok()
@@ -1131,7 +1125,9 @@ async fn do_action(c: &mut Client, agent: &Agent, action: Option<i64>) -> CallRe
             // Courier cargo waits in the pilot's hangar at the agent's station.
             if let (Kind::Courier, Some((type_id, qty))) = (m.kind, m.cargo) {
                 let me = c.session.int("charid").unwrap_or(0);
-                super::combat::deposit(c, me, agent.station_id, FLAG_HANGAR, type_id, qty, 0).await?;
+                let mut outbox = crate::db::outbox::Outbox::default();
+                super::combat::deposit(&c.db, &mut outbox, me, agent.station_id, FLAG_HANGAR, type_id, qty, 0).await?;
+                crate::db::outbox::dispatch_client((), outbox, c)?;
             }
             info!(user = c.login.user_id, "agent {}: mission {} accepted", agent.id, m.mission_id);
             c.notify("OnAgentMissionChange", vec![Value::str("accepted"), Value::Int(agent.id)]);

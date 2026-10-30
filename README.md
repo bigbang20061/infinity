@@ -120,6 +120,7 @@ The server reads its configuration from environment variables. `docker-compose.y
 | Variable | Default | Meaning |
 |---|---|---|
 | `DATABASE_URL` | (required) | PostgreSQL connection string |
+| `DATABASE_POOL_SIZE` | `16` | Maximum number of PostgreSQL connections the server opens. Keep it below the server's `max_connections` (PostgreSQL's default is 100), leaving room for tools. |
 | `PUBLIC_HOST` | `127.0.0.1` | Address clients use to reach this host (image server and CDN URLs). Set it when clients are not local. |
 | `SYSTEM_CAPACITY` | `0` | Pilots in space per solar system before stargate jumps queue (`0` = no limit) |
 | `BIND` | `0.0.0.0:26000` | machoNet listener |

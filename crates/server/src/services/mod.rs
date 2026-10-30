@@ -27,6 +27,7 @@ mod hacking;
 mod industry;
 mod insurance;
 mod inventory;
+pub(super) mod item_quantities;
 mod mail;
 mod market;
 mod npe;
@@ -99,9 +100,28 @@ impl From<anyhow::Error> for CallError {
     }
 }
 
+impl From<crate::db::Error> for CallError {
+    fn from(error: crate::db::Error) -> Self {
+        Self::Internal(error.into())
+    }
+}
+
+impl crate::db::transaction::TransactionError for CallError {
+    fn is_retryable_transaction(&self) -> bool {
+        use crate::db::transaction::{retryable_postgres, TransactionError};
+        match self {
+            Self::User { .. } => false,
+            Self::Internal(error) => error.chain().any(|cause| {
+                cause.downcast_ref::<crate::db::Error>().is_some_and(TransactionError::is_retryable_transaction)
+                    || cause.downcast_ref::<tokio_postgres::Error>().is_some_and(retryable_postgres)
+            }),
+        }
+    }
+}
+
 pub type CallResult = Result<Value, CallError>;
 
-pub fn db_err(e: tokio_postgres::Error) -> CallError {
+pub fn db_err(e: impl Into<anyhow::Error>) -> CallError {
     CallError::Internal(e.into())
 }
 
@@ -166,14 +186,14 @@ pub(super) async fn has_role_or_is_ceo(db: &Db, char_id: i64, corp_id: i64, role
 }
 
 /// Iterate character IDs for all non-deleted members of `corp_id`; database errors propagate.
-pub(super) async fn active_corporation_member_ids(db: &Db, corp_id: i64) -> Result<impl Iterator<Item = i64>, CallError> {
-    let rows = db.client.query("SELECT character_id FROM game.characters WHERE corporation_id = $1 AND NOT deleted", &[&corp_id]).await.map_err(db_err)?;
+pub(super) async fn active_corporation_member_ids(db: &(impl crate::db::executor::Executor + ?Sized), corp_id: i64) -> Result<impl Iterator<Item = i64>, CallError> {
+    let rows = db.query("SELECT character_id FROM game.characters WHERE corporation_id = $1 AND NOT deleted", &[&corp_id]).await.map_err(db_err)?;
     Ok(rows.into_iter().map(|r| r.get(0)))
 }
 
 /// Choose a planet and its radius; callers retain their fallback and offset policy.
 pub async fn site_position(db: &Db, system: i64) -> Result<Option<(V3, f64)>, CallError> {
-    let planet = db.client.query_opt(
+    let planet = db.query_opt(
         "SELECT x, y, z, COALESCE(radius, 0)::float8 FROM sde.map_celestials WHERE solar_system_id = $1 AND group_id = $2 ORDER BY random() LIMIT 1",
         &[&(system as i32), &GROUP_PLANET],
     ).await.map_err(db_err)?;
@@ -437,18 +457,4 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn surface_offset_includes_radius() {
-        let center = [1.0e9, -2.0e9, 3.0e9];
-        for radius in [0.0, 6_000_000.0, 1.0e12] {
-            let clearance = 1_000_000.0;
-            let actual = crate::space::dist(center, off_surface(center, radius, clearance));
-            let expected = radius + clearance;
-            assert!((actual - expected).abs() < expected * 1e-12, "{actual} != {expected}");
-        }
-    }
-}
+#[cfg(test)] mod tests;

@@ -19,20 +19,25 @@
 //! pays the NPC's bounty and leaves a wreck with loot.
 //! Target locks, reloads, module cycles, pulses and missile impacts use system
 //! actor timers. Database-backed effects run on deferred workers outside the actor.
+//! Reload reservations and delayed completion are separate atomic database phases; a
+//! server interruption between them can leave reserved ammunition uncompleted.
 //! Dropped cycle owners release their own in-memory activation markers without notifications.
 //! Reset clears a pilot's targets and pending locks and stops only that pilot's modules.
 //! Missiles in flight use a temporary, nonpersistent ID namespace.
 
 use super::dogma::load_items;
-use super::inventory::notify_item_change;
+use super::inventory::{notify_item_change, notify_item_removed};
+use super::item_quantities::{self, QuantityChange};
 use super::fit::{Fit, Key};
-use super::{db_err, rand01, user_error, value_id_list, Call, CallError, CallResult};
+use super::{db_err, notify_error, rand01, user_error, value_id_list, Call, CallError, CallResult};
 use crate::client::{filetime_now, filetime_ticks_from_ms, Client};
-use crate::consts::{ACCOUNT_CASH, ATTR_ARMOR_DAMAGE, ATTR_CAPACITOR_CAPACITY, ATTR_CAPACITY, ATTR_CHARGE, ATTR_EXPLOSION_DELAY, ATTR_HULL_DAMAGE, ATTR_IS_ONLINE, ATTR_MASS, ATTR_MAX_RANGE, ATTR_MAX_VELOCITY, ATTR_QUANTITY, ATTR_SHIELD_CAPACITY, ATTR_SHIELD_CHARGE, ATTR_SIGNATURE_RADIUS, ATTR_STRUCTURE_HP, CATEGORY_CHARGE, DAMAGE_TYPE_COUNT, EFFECT_AFTERBURNER, EFFECT_MICROWARPDRIVE, EFFECT_ONLINE, FILETIME_SECOND, FLAG_CARGO, FLAG_HANGAR, IX_FLAG, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD};
+use crate::consts::{ACCOUNT_CASH, ATTR_ARMOR_DAMAGE, ATTR_CAPACITOR_CAPACITY, ATTR_CAPACITY, ATTR_CHARGE, ATTR_EXPLOSION_DELAY, ATTR_HULL_DAMAGE, ATTR_IS_ONLINE, ATTR_MASS, ATTR_MAX_RANGE, ATTR_MAX_VELOCITY, ATTR_QUANTITY, ATTR_SHIELD_CAPACITY, ATTR_SHIELD_CHARGE, ATTR_SIGNATURE_RADIUS, ATTR_STRUCTURE_HP, CATEGORY_CHARGE, DAMAGE_TYPE_COUNT, EFFECT_AFTERBURNER, EFFECT_MICROWARPDRIVE, EFFECT_ONLINE, FILETIME_SECOND, FLAG_CARGO, FLAG_HANGAR, IX_FLAG, IX_LOCATION_ID, IX_STACK_SIZE};
 use crate::db::Db;
+use crate::db::executor::Executor;
+use crate::db::outbox::{Outbox, dispatch_client, dispatch_world};
 use crate::space::{dist, event, lock_time_ms, metres_to_km, ms_to_seconds, seconds_to_ms, now_ms, now_tick, Ball, NotifyTx, NpcAction, NpcBrain, NpcConfig, NpcEffects, NpcFuture, System, World, MODE_MISSILE, MODE_WARP};
 use marshal::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use tracing::{debug, info, warn};
@@ -209,7 +214,7 @@ fn ctx(c: &Client) -> Option<Ctx> {
 }
 
 async fn attributes(db: &Db, type_id: i32) -> Result<HashMap<i32, f64>, CallError> {
-    let rows = db.client.query("SELECT attribute_id, value FROM sde.type_attributes WHERE type_id = $1", &[&type_id]).await.map_err(db_err)?;
+    let rows = db.query("SELECT attribute_id, value FROM sde.type_attributes WHERE type_id = $1", &[&type_id]).await.map_err(db_err)?;
     Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
 }
 
@@ -329,7 +334,6 @@ pub(super) fn quantity_change(owner: i64, ship: i64, flag: i32, type_id: i32, ne
 pub async fn flag_quantities(c: &Client, ship: i64) -> Result<(Value, Vec<Value>), CallError> {
     let rows = c
         .db
-        .client
         .query("SELECT flag_id, type_id, quantity FROM game.module_charges WHERE ship_id = $1", &[&ship])
         .await
         .map_err(db_err)?;
@@ -353,9 +357,8 @@ pub async fn flag_quantities(c: &Client, ship: i64) -> Result<(Value, Vec<Value>
     Ok((cache, keys))
 }
 
-async fn loaded(db: &Db, ship: i64, flag: i32) -> Result<Option<(i32, i32)>, CallError> {
+async fn loaded(db: &(impl Executor + ?Sized), ship: i64, flag: i32) -> Result<Option<(i32, i32)>, CallError> {
     Ok(db
-        .client
         .query_opt("SELECT type_id, quantity FROM game.module_charges WHERE ship_id = $1 AND flag_id = $2", &[&ship, &flag])
         .await
         .map_err(db_err)?
@@ -363,19 +366,15 @@ async fn loaded(db: &Db, ship: i64, flag: i32) -> Result<Option<(i32, i32)>, Cal
 }
 
 /// Tell the client a stack is gone, then delete it.
-pub(super) async fn remove_stack(c: &mut Client, item: super::dogma::Item) -> Result<(), CallError> {
-    c.db.client.execute("DELETE FROM game.items WHERE item_id = $1", &[&item.item_id]).await.map_err(db_err)?;
-    let old = item.location_id;
-    let gone = super::dogma::Item { location_id: LOCATION_JUNKYARD, ..item };
-    c.notify("OnItemChange", vec![gone.row(), Value::Dict(vec![(Value::Int(IX_LOCATION_ID), Value::Int(old))]), Value::None]);
+pub(super) async fn remove_stack<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, item: super::dogma::Item) -> Result<(), CallError> {
+    db.execute("DELETE FROM game.items WHERE item_id = $1", &[&item.item_id]).await.map_err(db_err)?;
+    notify_item_removed(outbox, item);
     Ok(())
 }
 
 /// Put `quantity` x `type_id` into `location`/`flag`, onto an existing stack if there is one.
-pub(super) async fn deposit(c: &mut Client, owner: i64, location: i64, flag: i32, type_id: i32, quantity: i32, from: i64) -> Result<(), CallError> {
-    let stack = c
-        .db
-        .client
+pub(super) async fn deposit<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, owner: i64, location: i64, flag: i32, type_id: i32, quantity: i32, from: i64) -> Result<(), CallError> {
+    let stack = db
         .query_opt(
             "SELECT item_id, quantity FROM game.items WHERE location_id = $1 AND flag_id = $2 AND type_id = $3 AND owner_id = $4 AND NOT singleton LIMIT 1",
             &[&location, &flag, &type_id, &owner],
@@ -385,13 +384,11 @@ pub(super) async fn deposit(c: &mut Client, owner: i64, location: i64, flag: i32
     match stack {
         Some(r) => {
             let (id, old): (i64, i32) = (r.get(0), r.get(1));
-            c.db.client.execute("UPDATE game.items SET quantity = quantity + $2 WHERE item_id = $1", &[&id, &quantity]).await.map_err(db_err)?;
-            notify_item_change(c, id, vec![(IX_STACK_SIZE, Value::Int(old as i64))]).await
+            db.execute("UPDATE game.items SET quantity = quantity + $2 WHERE item_id = $1", &[&id, &quantity]).await.map_err(db_err)?;
+            notify_item_change(db, outbox, id, vec![(IX_STACK_SIZE, Value::Int(old as i64))]).await
         }
         None => {
-            let id: i64 = c
-                .db
-                .client
+            let id: i64 = db
                 .query_one(
                     "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity) VALUES ($1, $2, $3, $4, $5) RETURNING item_id",
                     &[&type_id, &owner, &location, &flag, &quantity],
@@ -399,24 +396,23 @@ pub(super) async fn deposit(c: &mut Client, owner: i64, location: i64, flag: i32
                 .await
                 .map_err(db_err)?
                 .get(0);
-            notify_item_change(c, id, vec![(IX_LOCATION_ID, Value::Int(from)), (IX_FLAG, Value::Int(flag as i64))]).await
+            notify_item_change(db, outbox, id, vec![(IX_LOCATION_ID, Value::Int(from)), (IX_FLAG, Value::Int(flag as i64))]).await
         }
     }
 }
 
 /// Modules of a weapon group, master first.
-async fn bank(db: &Db, ship: i64, master: i64) -> Result<Vec<i64>, CallError> {
-    let rows = db.client.query("SELECT slave_id FROM game.weapon_banks WHERE ship_id = $1 AND master_id = $2", &[&ship, &master]).await.map_err(db_err)?;
+async fn bank(db: &(impl Executor + ?Sized), ship: i64, master: i64) -> Result<Vec<i64>, CallError> {
+    let rows = db.query("SELECT slave_id FROM game.weapon_banks WHERE ship_id = $1 AND master_id = $2", &[&ship, &master]).await.map_err(db_err)?;
     Ok(std::iter::once(master).chain(rows.iter().map(|r| r.get(0))).collect())
 }
 
 /// Empty a module's charges into `location`/`flag` (cargo by default).
-async fn unload(c: &mut Client, ship: i64, module: &super::dogma::Item, location: i64, flag: i32) -> Result<(), CallError> {
-    let Some((type_id, qty)) = loaded(&c.db, ship, module.flag_id).await? else { return Ok(()) };
-    c.db.client.execute("DELETE FROM game.module_charges WHERE ship_id = $1 AND flag_id = $2", &[&ship, &module.flag_id]).await.map_err(db_err)?;
-    let owner = c.session.int("charid").unwrap_or(module.owner_id);
-    c.notify("OnModuleAttributeChanges", vec![quantity_change(owner, ship, module.flag_id, type_id, 0, qty as i64)]);
-    deposit(c, owner, location, flag, type_id, qty, ship).await
+async fn unload<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, owner: i64, ship: i64, module: &super::dogma::Item, location: i64, flag: i32) -> Result<(), CallError> {
+    let Some((type_id, qty)) = loaded(db, ship, module.flag_id).await? else { return Ok(()) };
+    db.execute("DELETE FROM game.module_charges WHERE ship_id = $1 AND flag_id = $2", &[&ship, &module.flag_id]).await.map_err(db_err)?;
+    outbox.notify_client("OnModuleAttributeChanges", vec![quantity_change(owner, ship, module.flag_id, type_id, 0, qty as i64)]);
+    deposit(db, outbox, owner, location, flag, type_id, qty, ship).await
 }
 
 // Unlike value_ids, scalar module IDs accept Bool through as_int; lists take precedence.
@@ -434,79 +430,89 @@ fn module_ids(v: Option<&Value>) -> Vec<i64> {
 /// and nextActivationTime drive the client's reload animation); docked it is immediate.
 async fn load_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
     let ship = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
-    let mut modules = module_ids(call.args.get(1));
+    let modules = module_ids(call.args.get(1));
     let charge_ids = value_id_list(call.args.get(2));
-    let mut all = vec![];
-    for m in modules.drain(..) {
-        for id in bank(&c.db, ship, m).await? {
-            if !all.contains(&id) {
-                all.push(id);
-            }
-        }
-    }
-    let owner = c.session.int("charid").unwrap_or(0);
-    // (module, flag, charge type, quantity after, quantity before)
-    let mut loads: Vec<(i64, i32, i32, i32, i32)> = vec![];
-    for module_id in all {
-        let Some(module) = load_items(c, "i.item_id = $1 AND i.location_id = $2", &[&module_id, &ship]).await?.into_iter().next() else { continue };
-        let stacks = load_items(c, "i.item_id = ANY($1) AND i.quantity > 0", &[&charge_ids]).await?;
-        let Some(first) = stacks.first() else { break };
-        let type_id = first.type_id;
-        // Capacity is the type's own column (the dogma attribute only exists on some types).
-        let capacity: f64 = c
-            .db
-            .client
-            .query_one(
-                "SELECT GREATEST(COALESCE(t.capacity, 0), COALESCE((SELECT value FROM sde.type_attributes WHERE type_id = t.type_id AND attribute_id = $2), 0))::float8
-                 FROM sde.inv_types t WHERE t.type_id = $1",
-                &[&module.type_id, &ATTR_CAPACITY],
-            )
-            .await
-            .map_err(db_err)?
-            .get(0);
-        let volume: f64 = c
-            .db
-            .client
-            .query_one("SELECT COALESCE(volume, 0.01)::float8 FROM sde.inv_types WHERE type_id = $1", &[&type_id])
-            .await
-            .map_err(db_err)?
-            .get(0);
-        let max = (capacity / volume.max(1e-6) + 1e-6).floor() as i32;
-        if max <= 0 {
-            continue;
-        }
-        let current = loaded(&c.db, ship, module.flag_id).await?;
-        let have = match current {
-            Some((t, q)) if t == type_id => q,
-            Some(_) => {
-                unload(c, ship, &module, ship, FLAG_CARGO).await?;
-                0
-            }
-            None => 0,
-        };
-        let mut need = max - have;
-        for stack in stacks.into_iter().filter(|s| s.type_id == type_id) {
-            if need <= 0 {
-                break;
-            }
-            let take = need.min(stack.quantity);
-            need -= take;
-            if take == stack.quantity {
-                remove_stack(c, stack).await?;
-            } else {
-                c.db.client.execute("UPDATE game.items SET quantity = quantity - $2 WHERE item_id = $1", &[&stack.item_id, &take]).await.map_err(db_err)?;
-                notify_item_change(c, stack.item_id, vec![(IX_STACK_SIZE, Value::Int(stack.quantity as i64))]).await?;
-            }
-        }
-        let now = max - need;
-        if now > have {
-            loads.push((module_id, module.flag_id, type_id, now, have));
-        }
-    }
+    let session_owner = c.session.int("charid");
+    let owner = session_owner.unwrap_or(0);
+    let db = c.db.clone();
+    let client = &mut *c;
+    let loads = db.transaction(
+        |tx, outbox: &mut Outbox| {
+            let modules = modules.clone();
+            let charge_ids = charge_ids.clone();
+            Box::pin(async move {
+                let mut all = Vec::new();
+                for m in modules {
+                    for id in bank(tx, ship, m).await? {
+                        if !all.contains(&id) { all.push(id); }
+                    }
+                }
+                let stacks = super::dogma::load_items_db(tx, "i.item_id = ANY($1) AND i.quantity > 0", &[&charge_ids]).await?;
+                let selected: Vec<i64> = stacks.iter().map(|item| item.item_id).collect();
+                let mut items: BTreeMap<i64, (super::dogma::Item, i32)> = stacks.into_iter().map(|item| (item.item_id, { let quantity = item.quantity; (item, quantity) })).collect();
+                let mut inserts: BTreeMap<(i64, i32), i32> = BTreeMap::new();
+                let mut unloads = BTreeMap::new();
+                let mut loads = Vec::new();
+                let mut flags = HashSet::new();
+                for module_id in all {
+                    let Some(module) = super::dogma::load_items_db(tx, "i.item_id = $1 AND i.location_id = $2", &[&module_id, &ship]).await?.into_iter().next() else { continue };
+                    if !flags.insert(module.flag_id) { continue; }
+                    let Some(type_id) = selected.iter().find_map(|id| items.get(id).filter(|(_, q)| *q > 0).map(|(item, _)| item.type_id)) else { break };
+                    let capacity: f64 = tx.query_one(
+                        "SELECT GREATEST(COALESCE(t.capacity, 0), COALESCE((SELECT value FROM sde.type_attributes WHERE type_id = t.type_id AND attribute_id = $2), 0))::float8 FROM sde.inv_types t WHERE t.type_id = $1",
+                        &[&module.type_id, &ATTR_CAPACITY],
+                    ).await.map_err(db_err)?.get(0);
+                    let volume: f64 = tx.query_one("SELECT COALESCE(volume, 0.01)::float8 FROM sde.inv_types WHERE type_id = $1", &[&type_id]).await.map_err(db_err)?.get(0);
+                    let max = (capacity / volume.max(1e-6) + 1e-6).floor() as i32;
+                    if max <= 0 { continue; }
+                    let have = match loaded(tx, ship, module.flag_id).await? {
+                        Some((t, q)) if t == type_id => q,
+                        Some((t, q)) => {
+                            let unload_owner = session_owner.unwrap_or(module.owner_id);
+                            unloads.insert(module.flag_id, (t, q, unload_owner));
+                            let destination = super::dogma::load_items_db(tx, "i.location_id = $1 AND i.flag_id = $2 AND i.type_id = $3 AND i.owner_id = $4 AND NOT i.singleton", &[&ship, &FLAG_CARGO, &t, &unload_owner]).await?.into_iter().next();
+                            if let Some(item) = destination {
+                                let entry = items.entry(item.item_id).or_insert_with(|| { let quantity = item.quantity; (item, quantity) });
+                                entry.1 = entry.1.checked_add(q).ok_or_else(|| notify_error("弹药数量不足。"))?;
+                            } else {
+                                let entry = inserts.entry((unload_owner, t)).or_default();
+                                *entry = entry.checked_add(q).ok_or_else(|| notify_error("弹药数量不足。"))?;
+                            }
+                            0
+                        }
+                        None => 0,
+                    };
+                    let need = reserve_quantities(&mut items, &selected, type_id, max.saturating_sub(have));
+                    let now = max - need;
+                    if now > have { loads.push((module_id, module.flag_id, type_id, now, have)); }
+                }
+                let changes = items.iter().filter_map(|(&id, (item, quantity))| {
+                    (*quantity != item.quantity).then(|| (id, QuantityChange::new(item, (*quantity > 0).then_some(*quantity))))
+                }).collect();
+                item_quantities::apply(tx, &changes, "弹药数量不足。").await?;
+                for (&flag, &(type_id, quantity, unload_owner)) in &unloads {
+                    let affected = tx.execute("DELETE FROM game.module_charges WHERE ship_id = $1 AND flag_id = $2 AND type_id = $3 AND quantity = $4", &[&ship, &flag, &type_id, &quantity]).await.map_err(db_err)?;
+                    if affected == 0 { return Err(notify_error("弹药数量不足。")); }
+                    outbox.notify_client("OnModuleAttributeChanges", vec![quantity_change(unload_owner, ship, flag, type_id, 0, quantity as i64)]);
+                }
+                for (id, (item, quantity)) in items {
+                    if quantity == item.quantity { continue; }
+                    if quantity == 0 { notify_item_removed(outbox, item); }
+                    else { notify_item_change(tx, outbox, id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?; }
+                }
+                for ((insert_owner, type_id), quantity) in inserts {
+                    let id: i64 = tx.query_one("INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity) VALUES ($1, $2, $3, $4, $5) RETURNING item_id", &[&type_id, &insert_owner, &ship, &FLAG_CARGO, &quantity]).await.map_err(db_err)?.get(0);
+                    notify_item_change(tx, outbox, id, vec![(IX_LOCATION_ID, Value::Int(ship)), (IX_FLAG, Value::Int(FLAG_CARGO as i64))]).await?;
+                }
+                Ok(loads)
+            })
+        },
+        |value, outbox| async move { dispatch_client(value, outbox, client) },
+    ).await?;
     let Some(&(first, _, type_id, _, _)) = loads.first() else { return Ok(Value::None) };
-    let (db, notify) = (c.db.clone(), c.notify_tx.clone());
+    let notify = c.notify_tx.clone();
     if c.session.int("solarsystemid").is_none() {
-        apply_loads(&db, &notify, owner, ship, &loads).await?;
+        apply_loads(&db, &c.world, &notify, owner, ship, loads).await?;
         return Ok(Value::None);
     }
     let reload_ms = match Fit::load(&c.db, owner, ship).await?.value(Key::Module(first), ATTR_RELOAD_TIME) {
@@ -528,18 +534,35 @@ async fn load_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
     c.notify("OnModuleAttributeChanges", vec![Value::List(timers)]);
     info!(user = c.login.user_id, "reloading {} module(s) with {type_id} in {reload_ms:.0} ms", ids.len());
     let system = c.session.int("solarsystemid").unwrap();
+    let world = c.world.clone();
     c.world.schedule(system, seconds_to_ms(ms_to_seconds(reload_ms)), move |s| {
         let (loads, rejected) = partition_reload(loads, &state().reloading, until);
         s.defer(async move {
+            let mut returns = BTreeMap::<i32, i64>::new();
             for &(_, _, type_id, now, have) in &rejected {
-                if let Err(e) = db.client.execute(
-                    "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity) VALUES ($1, $2, $3, $4, $5)",
-                    &[&type_id, &owner, &ship, &FLAG_CARGO, &(now - have)],
-                ).await {
-                    warn!("returning superseded reload to cargo failed: {e}");
-                }
+                *returns.entry(type_id).or_default() += i64::from(now) - i64::from(have);
             }
-            if let Err(e) = apply_loads(&db, &notify, owner, ship, &loads).await {
+            let world_ref = &world;
+            let result: Result<(), CallError> = db.transaction(
+                |tx, _: &mut Outbox| {
+                    let returns = returns.clone();
+                    Box::pin(async move {
+                        for (type_id, quantity) in returns {
+                            let quantity = i32::try_from(quantity).map_err(|_| notify_error("弹药数量不足。"))?;
+                            tx.execute("INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity) VALUES ($1, $2, $3, $4, $5)", &[&type_id, &owner, &ship, &FLAG_CARGO, &quantity]).await.map_err(db_err)?;
+                        }
+                        Ok(())
+                    })
+                },
+                |value, outbox| async move { dispatch_world(value, outbox, world_ref) },
+            ).await;
+            if let Err(e) = result {
+                warn!("returning superseded reload to cargo failed: {}", match e {
+                    CallError::Internal(e) => format!("{e:#}"),
+                    CallError::User { msg, .. } => msg,
+                });
+            }
+            if let Err(e) = apply_loads(&db, &world, &notify, owner, ship, loads).await {
                 warn!("reload of {ids:?} failed: {}", match e {
                     CallError::Internal(e) => format!("{e:#}"),
                     CallError::User { msg, .. } => msg,
@@ -550,6 +573,17 @@ async fn load_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
         });
     });
     Ok(Value::None)
+}
+
+fn reserve_quantities(items: &mut BTreeMap<i64, (super::dogma::Item, i32)>, selected: &[i64], type_id: i32, mut need: i32) -> i32 {
+    for id in selected {
+        let (item, remaining) = items.get_mut(id).unwrap();
+        if item.type_id != type_id || need <= 0 { continue; }
+        let take = need.min((*remaining).max(0));
+        *remaining -= take;
+        need -= take;
+    }
+    need
 }
 type ReservedLoad = (i64, i32, i32, i32, i32);
 
@@ -565,20 +599,27 @@ fn clear_reload_markers(reloading: &mut HashMap<i64, i64>, ids: &[i64], until: i
 
 
 /// Put loaded charges in their modules and tell the client.
-async fn apply_loads(db: &Db, notify: &NotifyTx, owner: i64, ship: i64, loads: &[(i64, i32, i32, i32, i32)]) -> Result<(), CallError> {
-    for &(module, flag, type_id, now, have) in loads {
-        db.client
-            .execute(
-                "INSERT INTO game.module_charges (ship_id, flag_id, type_id, quantity) VALUES ($1, $2, $3, $4)
-                 ON CONFLICT (ship_id, flag_id) DO UPDATE SET type_id = EXCLUDED.type_id, quantity = EXCLUDED.quantity",
-                &[&ship, &flag, &type_id, &now],
-            )
-            .await
-            .map_err(db_err)?;
-        let _ = notify.send(("OnModuleAttributeChanges".into(), vec![quantity_change(owner, ship, flag, type_id, now as i64, have as i64)]));
-        debug!("loaded {now} x {type_id} into module {module}");
-    }
-    Ok(())
+async fn apply_loads(db: &Db, world: &World, notify: &NotifyTx, owner: i64, ship: i64, mut loads: Vec<ReservedLoad>) -> Result<(), CallError> {
+    loads.sort_by_key(|load| load.1);
+    db.transaction(
+        |tx, outbox: &mut Outbox| {
+            let loads = loads.clone();
+            let notify = notify.clone();
+            Box::pin(async move {
+                for (module, flag, type_id, now, have) in loads {
+                    tx.execute(
+                        "INSERT INTO game.module_charges (ship_id, flag_id, type_id, quantity) VALUES ($1, $2, $3, $4)
+                         ON CONFLICT (ship_id, flag_id) DO UPDATE SET type_id = EXCLUDED.type_id, quantity = EXCLUDED.quantity",
+                        &[&ship, &flag, &type_id, &now],
+                    ).await.map_err(db_err)?;
+                    outbox.notify_sender(notify.clone(), "OnModuleAttributeChanges", vec![quantity_change(owner, ship, flag, type_id, now as i64, have as i64)]);
+                    debug!("loaded {now} x {type_id} into module {module}");
+                }
+                Ok(())
+            })
+        },
+        |value, outbox| async move { dispatch_world(value, outbox, world) },
+    ).await
 }
 
 /// UnloadAmmo(shipID, moduleID | [moduleIDs], destination[, quantity]); destination is a
@@ -595,21 +636,31 @@ async fn unload_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
         None => (ship, None),
     };
     let flag = flag.unwrap_or(if location == ship { FLAG_CARGO } else { FLAG_HANGAR });
-    for m in modules {
-        for id in bank(&c.db, ship, m).await? {
-            if let Some(module) = load_items(c, "i.item_id = $1 AND i.location_id = $2", &[&id, &ship]).await?.into_iter().next() {
-                unload(c, ship, &module, location, flag).await?;
-            }
-        }
-    }
-    Ok(Value::None)
+    let owner = c.session.int("charid");
+    let db = c.db.clone();
+    db.transaction(
+        |tx, outbox: &mut Outbox| {
+            let modules = modules.clone();
+            Box::pin(async move {
+                for m in modules {
+                    for id in bank(tx, ship, m).await? {
+                        if let Some(module) = super::dogma::load_items_db(tx, "i.item_id = $1 AND i.location_id = $2", &[&id, &ship]).await?.into_iter().next() {
+                            unload(tx, outbox, owner.unwrap_or(module.owner_id), ship, &module, location, flag).await?;
+                        }
+                    }
+                }
+                Ok(Value::None)
+            })
+        },
+        |value, outbox| async move { dispatch_client(value, outbox, c) },
+    ).await
 }
 
 // ---------------------------------------------------------------- weapon groups
 
 /// `{masterID: [slaveIDs]}` for a ship.
-pub async fn banks(db: &Db, ship: i64) -> Result<Value, CallError> {
-    let rows = db.client.query("SELECT master_id, slave_id FROM game.weapon_banks WHERE ship_id = $1 ORDER BY slave_id", &[&ship]).await.map_err(db_err)?;
+pub async fn banks(db: &(impl Executor + ?Sized), ship: i64) -> Result<Value, CallError> {
+    let rows = db.query("SELECT master_id, slave_id FROM game.weapon_banks WHERE ship_id = $1 ORDER BY slave_id", &[&ship]).await.map_err(db_err)?;
     let mut by_master: Vec<(i64, Vec<Value>)> = Vec::new();
     for r in rows {
         let (master, slave): (i64, i64) = (r.get(0), r.get(1));
@@ -621,13 +672,13 @@ pub async fn banks(db: &Db, ship: i64) -> Result<Value, CallError> {
     Ok(Value::Dict(by_master.into_iter().map(|(m, s)| (Value::Int(m), Value::List(s))).collect()))
 }
 
-async fn link(db: &Db, ship: i64, master: i64, slave: i64) -> Result<(), CallError> {
+async fn link(db: &(impl Executor + ?Sized), ship: i64, master: i64, slave: i64) -> Result<(), CallError> {
     if master == slave {
         return Ok(());
     }
     // A master joining another group brings its own slaves along.
-    db.client.execute("UPDATE game.weapon_banks SET master_id = $2 WHERE ship_id = $1 AND master_id = $3", &[&ship, &master, &slave]).await.map_err(db_err)?;
-    db.client
+    db.execute("UPDATE game.weapon_banks SET master_id = $2 WHERE ship_id = $1 AND master_id = $3", &[&ship, &master, &slave]).await.map_err(db_err)?;
+    db
         .execute(
             "INSERT INTO game.weapon_banks (ship_id, master_id, slave_id) VALUES ($1, $2, $3) ON CONFLICT (slave_id) DO UPDATE SET master_id = EXCLUDED.master_id",
             &[&ship, &master, &slave],
@@ -641,25 +692,36 @@ async fn weapon_groups(c: &mut Client, call: &Call<'_>) -> CallResult {
     let int = |i: usize| call.args.get(i).and_then(|v| v.as_int()).unwrap_or(0);
     let ship = int(0);
     let db = c.db.clone();
-    match call.method {
+    let method = match call.method {
+        "LinkWeapons" => "LinkWeapons",
+        "MergeModuleGroups" => "MergeModuleGroups",
+        "PeelAndLink" => "PeelAndLink",
+        "LinkAllWeapons" => "LinkAllWeapons",
+        "UnlinkModule" => "UnlinkModule",
+        "UnlinkAllModules" => "UnlinkAllModules",
+        _ => "",
+    };
+    let (master, other) = (int(1), int(2));
+    let fallback_ship = if ship != 0 { ship } else { c.session.int("shipid").unwrap_or(0) };
+    db.transaction(
+        |db, _outbox: &mut Outbox| Box::pin(async move {
+    match method {
         "LinkWeapons" | "MergeModuleGroups" | "PeelAndLink" => {
-            let (master, other) = (int(1), int(2));
-            if call.method == "PeelAndLink" {
-                db.client.execute("DELETE FROM game.weapon_banks WHERE ship_id = $1 AND slave_id = $2", &[&ship, &other]).await.map_err(db_err)?;
-                db.client
+            if method == "PeelAndLink" {
+                db.execute("DELETE FROM game.weapon_banks WHERE ship_id = $1 AND slave_id = $2", &[&ship, &other]).await.map_err(db_err)?;
+                db
                     .execute("INSERT INTO game.weapon_banks (ship_id, master_id, slave_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING", &[&ship, &master, &other])
                     .await
                     .map_err(db_err)?;
             } else {
-                link(&db, ship, master, other).await?;
+                link(db, ship, master, other).await?;
             }
-            banks(&db, ship).await
+            banks(db, ship).await
         }
         // Group every online high-slot module with the others of its type.
         "LinkAllWeapons" => {
-            db.client.execute("DELETE FROM game.weapon_banks WHERE ship_id = $1", &[&ship]).await.map_err(db_err)?;
+            db.execute("DELETE FROM game.weapon_banks WHERE ship_id = $1", &[&ship]).await.map_err(db_err)?;
             let rows = db
-                .client
                 .query(
                     "SELECT item_id, type_id FROM game.items WHERE location_id = $1 AND flag_id BETWEEN $2 AND $3 AND online ORDER BY flag_id",
                     &[&ship, &HI_SLOTS.start(), &HI_SLOTS.end()],
@@ -670,19 +732,17 @@ async fn weapon_groups(c: &mut Client, call: &Call<'_>) -> CallResult {
             for r in rows {
                 let (id, type_id): (i64, i32) = (r.get(0), r.get(1));
                 match masters.get(&type_id) {
-                    Some(&m) => link(&db, ship, m, id).await?,
+                    Some(&m) => link(db, ship, m, id).await?,
                     None => {
                         masters.insert(type_id, id);
                     }
                 }
             }
-            banks(&db, ship).await
+            banks(db, ship).await
         }
         // Takes the last module off a group; returns it.
         "UnlinkModule" => {
-            let master = int(1);
             let slave: Option<i64> = db
-                .client
                 .query_opt(
                     "DELETE FROM game.weapon_banks WHERE slave_id = (SELECT max(slave_id) FROM game.weapon_banks WHERE ship_id = $1 AND master_id = $2) RETURNING slave_id",
                     &[&ship, &master],
@@ -693,11 +753,14 @@ async fn weapon_groups(c: &mut Client, call: &Call<'_>) -> CallResult {
             Ok(slave.map(Value::Int).unwrap_or(Value::None))
         }
         "UnlinkAllModules" => {
-            db.client.execute("DELETE FROM game.weapon_banks WHERE ship_id = $1", &[&ship]).await.map_err(db_err)?;
+            db.execute("DELETE FROM game.weapon_banks WHERE ship_id = $1", &[&ship]).await.map_err(db_err)?;
             Ok(Value::None)
         }
-        _ => banks(&db, if ship != 0 { ship } else { c.session.int("shipid").unwrap_or(0) }).await,
+        _ => banks(db, fallback_ship).await,
     }
+        }),
+        |value, outbox| async move { dispatch_client(value, outbox, c) },
+    ).await
 }
 
 // ---------------------------------------------------------------- capacitor and hit points
@@ -952,7 +1015,6 @@ async fn reward_kill(db: &Db, world: &World, system: i64, npc: &Ball, killer: Op
     if let Some(pilot) = killer.filter(|_| bounty > 0.0) {
         // A player corporation takes its tax rate of the bounty into its master wallet.
         let corp_tax = db
-            .client
             .query_opt(
                 "SELECT co.corporation_id, co.tax_rate FROM game.characters ch JOIN game.corporations co ON co.corporation_id = ch.corporation_id
                  WHERE ch.character_id = $1 AND NOT co.deleted",
@@ -963,7 +1025,6 @@ async fn reward_kill(db: &Db, world: &World, system: i64, npc: &Ball, killer: Op
             .map(|r| (r.get::<_, i64>(0), r.get::<_, f64>(1).clamp(0.0, 1.0)));
         let tax = corp_tax.map(|(_, rate)| super::market::round2(bounty * rate)).unwrap_or(0.0);
         let balance: f64 = db
-            .client
             .query_one(
                 "UPDATE game.characters SET balance = balance + $2::float8::numeric WHERE character_id = $1 RETURNING balance::float8",
                 &[&pilot, &(bounty - tax)],
@@ -973,13 +1034,14 @@ async fn reward_kill(db: &Db, world: &World, system: i64, npc: &Ball, killer: Op
             .get(0);
         world.notify_pilot(pilot, "OnAccountChange", vec![Value::str("cash"), Value::Int(pilot), Value::Float(balance)]);
         if let Some((corp, _)) = corp_tax.filter(|_| tax > 0.0) {
-            super::corpwallet::corp_credit(db, world, corp, ACCOUNT_CASH, tax).await?;
+            let mut outbox = Outbox::default();
+            super::corpwallet::corp_credit(db, &mut outbox, corp, ACCOUNT_CASH, tax).await?;
+            dispatch_world((), outbox, world)?;
         }
         info!("{pilot} earned {bounty:.0} ISK bounty for {} ({tax:.0} corporation tax)", npc.type_id);
         super::crimewatch::npc_killed(db, world, pilot).await?;
     }
     let wreck = db
-        .client
         .query_opt(
             "SELECT COALESCE(w.data->'raceIdToWreckTypeId'->>(COALESCE(t.race_id, 0)::text), w.data->'raceIdToWreckTypeId'->>'0')::int,
                     COALESCE(wt.radius, 100)::float8
@@ -994,7 +1056,6 @@ async fn reward_kill(db: &Db, world: &World, system: i64, npc: &Ball, killer: Op
     let Some(wreck_type) = wreck.get::<_, Option<i32>>(0) else { return Ok(()) };
     let owner = killer.unwrap_or(npc.owner_id);
     let wreck_id: i64 = db
-        .client
         .query_one(
             "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton, x, y, z)
              VALUES ($1, $2, $3, 0, 1, true, $4, $5, $6) RETURNING item_id",
@@ -1006,7 +1067,6 @@ async fn reward_kill(db: &Db, world: &World, system: i64, npc: &Ball, killer: Op
     // Loot: one or two modules or ammo stacks that traded on Serenity, worth up to the bounty.
     let picks = 1 + (rand01() * 2.0) as i64;
     let loot = db
-        .client
         .query(
             "SELECT t.type_id, t.category_id FROM sde.inv_types t JOIN game.retail_prices r USING (type_id)
              WHERE t.published AND t.category_id IN (7, $3) AND r.average BETWEEN 1000 AND GREATEST($1::float8, 50000)
@@ -1018,7 +1078,7 @@ async fn reward_kill(db: &Db, world: &World, system: i64, npc: &Ball, killer: Op
     for r in &loot {
         let (type_id, category): (i32, i32) = (r.get(0), r.get(1));
         let quantity: i32 = if category == CATEGORY_CHARGE { 20 + (rand01() * 100.0) as i32 } else { 1 };
-        db.client
+        db
             .execute(
                 "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity) VALUES ($1, $2, $3, 0, $4)",
                 &[&type_id, &owner, &wreck_id, &quantity],
@@ -1203,7 +1263,6 @@ fn weapon_fx(cx: &Ctx, modules: &[Module], effect: &Effect, target: Option<i64>,
 async fn consume_charge(cx: &Ctx, module: &Module) -> Result<Option<i32>, CallError> {
     let row = cx
         .db
-        .client
         .query_opt(
             "UPDATE game.module_charges SET quantity = quantity - 1 WHERE ship_id = $1 AND flag_id = $2 AND quantity > 0 RETURNING type_id, quantity",
             &[&cx.ship_id, &module.flag],
@@ -1213,7 +1272,7 @@ async fn consume_charge(cx: &Ctx, module: &Module) -> Result<Option<i32>, CallEr
     let Some(r) = row else { return Ok(None) };
     let (type_id, left): (i32, i32) = (r.get(0), r.get(1));
     if left == 0 {
-        cx.db.client.execute("DELETE FROM game.module_charges WHERE ship_id = $1 AND flag_id = $2", &[&cx.ship_id, &module.flag]).await.map_err(db_err)?;
+        cx.db.execute("DELETE FROM game.module_charges WHERE ship_id = $1 AND flag_id = $2", &[&cx.ship_id, &module.flag]).await.map_err(db_err)?;
     }
     cx.notify("OnModuleAttributeChanges", vec![quantity_change(cx.char_id, cx.ship_id, module.flag, type_id, left as i64, left as i64 + 1)]);
     Ok(Some(type_id))
@@ -1302,7 +1361,6 @@ struct Missile {
 /// explodes and deals damage scaled by explosion radius vs. the target's signature.
 async fn launch_missile(db: Db, world: Arc<World>, system: i64, from: Ball, target: Ball, owner: i64, module: Option<i64>, m: Missile) -> Result<(), CallError> {
     let size = db
-        .client
         .query_one("SELECT COALESCE(radius, 1)::float8, COALESCE(mass, 1)::float8 FROM sde.inv_types WHERE type_id = $1", &[&m.charge])
         .await
         .map_err(db_err)?;
@@ -1616,7 +1674,6 @@ async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
     };
     let row = cx
         .db
-        .client
         .query_opt("SELECT effect_id, guid, duration_attribute_id FROM sde.dogma_effects WHERE name = $1", &[&effect_name])
         .await
         .map_err(db_err)?
@@ -1717,7 +1774,6 @@ async fn set_online(c: &mut Client, item_id: i64, online: bool) -> CallResult {
     let Some(cx) = ctx(c) else { return Ok(Value::None) };
     let changed = cx
         .db
-        .client
         .execute("UPDATE game.items SET online = $3 WHERE item_id = $1 AND location_id = $2 AND online <> $3", &[&item_id, &cx.ship_id, &online])
         .await
         .map_err(db_err)?;
@@ -1779,7 +1835,6 @@ async fn npc_stats(db: &Db, type_id: i32) -> Result<NpcStats, CallError> {
     let a = attributes(db, type_id).await?;
     let multiplier = attr(&a, ATTR_DAMAGE_MULTIPLIER, 1.0);
     let fx: Option<String> = db
-        .client
         .query_opt(
             "SELECT e.guid FROM sde.type_effects te JOIN sde.dogma_effects e USING (effect_id)
              WHERE te.type_id = $1 AND e.effect_category = 2 AND e.guid LIKE 'effects.%' AND e.name <> 'missileLaunching' LIMIT 1",
@@ -1956,243 +2011,4 @@ fn npc_repair(world: &World, system: i64, id: i64, stats: &NpcStats) {
     world.set_health(system, id, health);
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn module_ids_preserve_scalar_and_list_shapes() {
-        assert_eq!(module_ids(None), Vec::<i64>::new());
-        assert_eq!(module_ids(Some(&Value::Int(42))), vec![42]);
-        assert_eq!(module_ids(Some(&Value::Bool(true))), vec![1]);
-        assert_eq!(module_ids(Some(&Value::Bool(false))), vec![0]);
-        assert_eq!(module_ids(Some(&Value::list([Value::Int(7), Value::Bool(true), Value::None]))), vec![7, 1]);
-        assert_eq!(module_ids(Some(&Value::list([]))), Vec::<i64>::new());
-        assert_eq!(module_ids(Some(&Value::None)), Vec::<i64>::new());
-    }
-
-    #[test]
-    fn missile_lifecycle_preserves_exploration_site() {
-        let mut system = System::default();
-        let site = Ball {
-            id: 9_500_000_000_000, type_id: 1, owner_id: 1, corp_id: 1, alliance_id: -1,
-            char_id: None, signature_radius: None, mode: crate::space::MODE_STOP, radius: 1.0, mass: 1.0,
-            max_vel: 1.0, agility: 1.0, speed_fraction: 0.0,
-            pos: [1.0, 2.0, 3.0], vel: [0.0; 3], goto: [0.0; 3],
-            follow_id: 0, follow_range: 0.0, free: true, global: false,
-            massive: true, warp: None, warp_factor: 0, last_ms: 0,
-            cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new(),
-        };
-        let (site_id, site_type, site_pos) = (site.id, site.type_id, site.pos);
-        let missile_id = NEXT_MISSILE_ID.fetch_add(1, Ordering::Relaxed);
-        let missile = Ball {
-            id: missile_id, type_id: 2, mode: MODE_MISSILE, pos: [4.0, 5.0, 6.0],
-            ..site.clone()
-        };
-        system.insert(site);
-        system.insert(missile);
-
-        let retained_site = system.ball(site_id).unwrap();
-        assert_eq!((retained_site.id, retained_site.type_id, retained_site.pos), (site_id, site_type, site_pos));
-        let retained_missile = system.ball(missile_id).unwrap();
-        assert_eq!((retained_missile.id, retained_missile.type_id, retained_missile.pos), (missile_id, 2, [4.0, 5.0, 6.0]));
-        let second_id = NEXT_MISSILE_ID.fetch_add(1, Ordering::Relaxed);
-        assert_ne!(missile_id, second_id);
-        assert_eq!(second_id, missile_id + 1);
-
-        system.destroy_ball(missile_id).unwrap();
-        assert!(!system.contains(missile_id));
-        let retained_site = system.ball(site_id).unwrap();
-        assert_eq!((retained_site.id, retained_site.type_id, retained_site.pos), (site_id, site_type, site_pos));
-    }
-
-    #[test]
-    fn reset_only_stops_owning_pilots_modules() {
-        let mut st = State::default();
-        let a = 1;
-        let b = 2;
-        let flags: Vec<_> = (0..3).map(|_| Arc::new(AtomicBool::new(false))).collect();
-        for (master, owner, flag) in [(10, a, &flags[0]), (11, a, &flags[1]), (12, b, &flags[2])] {
-            st.active.insert(master, ActiveModule { char_id: owner, stop: flag.clone() });
-            st.activation_generation.insert(master, flag.clone());
-        }
-        st.targets.insert(a, HashSet::from([20]));
-        st.targets.insert(b, HashSet::from([a, 21]));
-        st.locking.insert((a, 20), 1);
-        st.locking.insert((b, a), 2);
-        st.locking.insert((b, 21), 3);
-
-        st.reset_character(a);
-        assert!(flags[0].load(Ordering::Relaxed));
-        assert!(flags[1].load(Ordering::Relaxed));
-        assert!(!flags[2].load(Ordering::Relaxed));
-        assert!(!st.targets.contains_key(&a));
-        assert_eq!(st.targets.get(&b), Some(&HashSet::from([a, 21])));
-        assert_eq!(st.locking, HashMap::from([((b, a), 2), ((b, 21), 3)]));
-        assert_eq!(st.active.len(), 3);
-        assert_eq!(st.activation_generation.len(), 3);
-        for (master, flag) in [(10, &flags[0]), (11, &flags[1]), (12, &flags[2])] {
-            assert!(Arc::ptr_eq(&st.active[&master].stop, flag));
-            assert!(Arc::ptr_eq(&st.activation_generation[&master], flag));
-        }
-        st.reset_character(3);
-        st.reset_character(a);
-        assert!(!flags[2].load(Ordering::Relaxed));
-        assert_eq!(st.targets.get(&b), Some(&HashSet::from([a, 21])));
-        assert_eq!(st.locking, HashMap::from([((b, a), 2), ((b, 21), 3)]));
-        assert_eq!(st.active.len(), 3);
-        assert_eq!(st.activation_generation.len(), 3);
-    }
-
-    #[test]
-    fn discarded_cycle_owners_release_only_their_generation() {
-        let master = -9011;
-        let generation = Arc::new(AtomicBool::new(false));
-        {
-            let mut st = state();
-            assert!(!st.active.contains_key(&master));
-            st.active.insert(master, ActiveModule { char_id: 1, stop: generation.clone() });
-            st.activation_generation.insert(master, generation.clone());
-        }
-        let owner = ActivationOwner { master, generation: generation.clone(), armed: true };
-        let mut system = System::default();
-        schedule_cycle_end(&mut system, 0, 1000.0, move |_, _| drop(owner));
-        drop(system);
-        {
-            let mut st = state();
-            assert!(!st.active.contains_key(&master));
-            assert!(!st.activation_generation.contains_key(&master));
-            st.active.insert(master, ActiveModule { char_id: 1, stop: generation.clone() });
-            st.activation_generation.insert(master, generation.clone());
-        }
-        let owner = ActivationOwner { master, generation: generation.clone(), armed: true };
-        let system = System::default();
-        system.defer(async move { drop(owner); });
-        {
-            let st = state();
-            assert!(!st.active.contains_key(&master));
-            assert!(!st.activation_generation.contains_key(&master));
-        }
-        {
-            let mut st = state();
-            st.active.insert(master, ActiveModule { char_id: 1, stop: generation.clone() });
-            st.activation_generation.insert(master, generation.clone());
-        }
-        let owner = ActivationOwner { master, generation: generation.clone(), armed: true };
-        let rejected_post = move |_: &mut System| drop(owner);
-        drop(rejected_post);
-        {
-            let st = state();
-            assert!(!st.active.contains_key(&master));
-            assert!(!st.activation_generation.contains_key(&master));
-        }
-
-        let replacement = Arc::new(AtomicBool::new(false));
-        {
-            let mut st = state();
-            st.active.insert(master, ActiveModule { char_id: 1, stop: replacement.clone() });
-            st.activation_generation.insert(master, replacement.clone());
-        }
-        let owner = ActivationOwner { master, generation, armed: true };
-        let mut system = System::default();
-        schedule_cycle_end(&mut system, 0, 1000.0, move |_, _| drop(owner));
-        drop(system);
-        let mut st = state();
-        assert!(Arc::ptr_eq(&st.active[&master].stop, &replacement));
-        assert!(Arc::ptr_eq(&st.activation_generation[&master], &replacement));
-        st.active.remove(&master);
-        st.activation_generation.remove(&master);
-    }
-
-
-    #[test]
-    fn cycle_deadlines_and_deactivation() {
-        let mut s = System::default();
-        let completed = Arc::new(Mutex::new(Vec::new()));
-        let stop = Arc::new(AtomicBool::new(false));
-        let seen = completed.clone();
-        let flag = stop.clone();
-        schedule_cycle_end(&mut s, 1000, 500.0, move |s, end| {
-            seen.lock().unwrap().push((1, s.now_ms(), end));
-            assert!(!cycle_is_final(flag.load(Ordering::Relaxed), 3, 1));
-            // Model a continuation returning late from the worker.
-            s.schedule_at(1700, move |s| {
-                assert!(!cycle_should_stop(false, &flag));
-                schedule_cycle_end(s, end, 500.0, move |s, end| {
-                    seen.lock().unwrap().push((2, s.now_ms(), end));
-                    assert!(cycle_is_final(flag.load(Ordering::Relaxed), 3, 2));
-                    assert!(cycle_should_stop(false, &flag));
-                });
-            });
-        });
-        s.tick(1499);
-        assert!(completed.lock().unwrap().is_empty());
-        s.tick(1500);
-        s.tick(1700);
-        stop.store(true, Ordering::Relaxed);
-        s.tick(1999);
-        assert_eq!(*completed.lock().unwrap(), [(1, 1500, 1500)]);
-        s.tick(2000);
-        s.tick(3000);
-        assert_eq!(*completed.lock().unwrap(), [(1, 1500, 1500), (2, 2000, 2000)]);
-
-        let old = Arc::new(AtomicBool::new(false));
-        let replacement = Arc::new(AtomicBool::new(false));
-        let mut active = HashMap::from([(1, ActiveModule { char_id: 1, stop: replacement.clone() })]);
-        let mut published = false;
-        assert!(!retire_activation(&mut active, 1, &old, || published = true));
-        assert!(!published);
-        assert!(Arc::ptr_eq(&active[&1].stop, &replacement));
-        assert!(retire_activation(&mut active, 1, &replacement, || published = true));
-        assert!(published);
-        assert!(active.is_empty());
-    }
-
-    #[test]
-    fn reload_reservation_survives_departure_and_preserves_new_marker() {
-        let mut s = System::default();
-        s.insert(Ball {
-            id: 42, type_id: 1, owner_id: 1, corp_id: 1, alliance_id: -1,
-            char_id: Some(1), signature_radius: Some(1.0), mode: crate::space::MODE_STOP, radius: 1.0, mass: 1.0,
-            max_vel: 1.0, agility: 1.0, speed_fraction: 0.0,
-            pos: [0.0; 3], vel: [0.0; 3], goto: [0.0; 3],
-            follow_id: 0, follow_range: 0.0, free: true, global: false,
-            massive: true, warp: None, warp_factor: 0, last_ms: 0,
-            cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new(),
-        });
-        let result = Arc::new(Mutex::new(None));
-        let captured = result.clone();
-        s.schedule_at(100, move |s| {
-            assert!(!s.contains(42));
-            let load = (7, 27, 8, 10, 2);
-            let mut markers = HashMap::from([(7, 100)]);
-            let (accepted, rejected) = partition_reload(vec![load], &markers, 100);
-            markers.insert(7, 200);
-            clear_reload_markers(&mut markers, &[7], 100);
-            *captured.lock().unwrap() = Some((accepted, rejected, markers));
-        });
-        s.remove_ball(42).unwrap();
-        s.tick(99);
-        assert!(result.lock().unwrap().is_none());
-        s.tick(100);
-        let result = result.lock().unwrap();
-        let (accepted, rejected, markers) = result.as_ref().unwrap();
-        assert_eq!(accepted, &vec![(7, 27, 8, 10, 2)]);
-        assert!(rejected.is_empty());
-        assert_eq!(markers.get(&7), Some(&200));
-    }
-
-    #[test]
-    fn hit_quality_bands() {
-        assert_eq!(hit_quality(0.0), 0);
-        assert_eq!(hit_quality(0.5), 1);
-        assert_eq!(hit_quality(1.1), 4);
-        assert_eq!(hit_quality(3.0), 6);
-    }
-
-    #[test]
-    fn weapon_effects() {
-        assert!(weapon_kind("projectileFired") == Some(Weapon::Turret));
-        assert!(weapon_kind("useMissiles") == Some(Weapon::Missile));
-        assert!(weapon_kind("online").is_none());
-    }
-}
+#[cfg(test)] mod tests;

@@ -28,7 +28,6 @@ fn char_id(c: &Client) -> i64 {
 async fn public_info(c: &Client, id: i64) -> Result<Value, CallError> {
     let r = c
         .db
-        .client
         .query_opt(
             "SELECT name, corporation_id, race_id, bloodline_id, ancestry_id, school_id, gender_id,
                     (extract(epoch FROM created_at) * $2::bigint)::bigint + $3::bigint
@@ -61,7 +60,6 @@ async fn public_info(c: &Client, id: i64) -> Result<Value, CallError> {
 async fn balance(c: &Client) -> Result<f64, CallError> {
     Ok(c
         .db
-        .client
         .query_one("SELECT balance::float8 FROM game.characters WHERE character_id = $1", &[&char_id(c)])
         .await
         .map_err(db_err)?
@@ -72,7 +70,6 @@ async fn balance(c: &Client) -> Result<f64, CallError> {
 async fn doll_blob(c: &Client, id: i64, column: &str) -> Result<Value, CallError> {
     let row = c
         .db
-        .client
         .query_opt(&format!("SELECT {column} FROM game.characters WHERE character_id = $1"), &[&id])
         .await
         .map_err(db_err)?;
@@ -109,7 +106,6 @@ fn zero_doll_nulls(v: &mut Value) {
 async fn asset_worth(c: &Client) -> CallResult {
     let r = c
         .db
-        .client
         .query_one(
             "SELECT COALESCE(sum(GREATEST(i.quantity, 1) *
                     (SELECT min(o.price) FROM game.market_orders o WHERE o.type_id = i.type_id AND NOT o.bid)), 0)::float8
@@ -126,7 +122,7 @@ async fn store_doll(c: &Client, call: &Call<'_>) -> CallResult {
     let id = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
     let appearance = marshal::dumps(call.args.get(1).unwrap_or(&Value::None));
     let portrait = marshal::dumps(call.args.get(2).unwrap_or(&Value::None));
-    c.db.client
+    c.db
         .execute(
             "UPDATE game.characters SET appearance = $3, portrait = $4 WHERE character_id = $1 AND user_id = $2",
             &[&id, &c.login.user_id, &appearance, &portrait],
@@ -141,7 +137,6 @@ async fn store_doll(c: &Client, call: &Call<'_>) -> CallResult {
 async fn home_station_row(c: &Client, me: i64) -> CallResult {
     let r = c
         .db
-        .client
         .query_opt(
             "SELECT s.station_id::bigint, s.solar_system_id::bigint, s.type_id::bigint FROM game.characters ch
              JOIN sde.sta_stations s ON s.station_id = ch.home_station_id WHERE ch.character_id = $1",
@@ -214,7 +209,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         // Assets window (invCache global inventory): stations holding the character's items...
         ("charMgr", "ListStations") => match c
             .db
-            .client
             .query(
                 "SELECT i.location_id, count(*), st.type_id::bigint, st.solar_system_id::bigint FROM game.items i
                  JOIN sde.sta_stations st ON st.station_id = i.location_id
@@ -245,7 +239,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             let ids = value_id_list(call.args.first());
             match c
                 .db
-                .client
                 .query(
                     "SELECT i.item_id, i.type_id::bigint, COALESCE((SELECT value FROM sde.type_attributes a WHERE a.type_id = i.type_id AND a.attribute_id = $3), 0)::float8
                      FROM game.items i WHERE i.item_id = ANY($1) AND i.owner_id = $2",
@@ -275,7 +268,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         // The info window's private notes: GetNote(itemID) -> text or None, SetNote(itemID, text).
         ("charMgr", "GetNote") => {
             let item = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
-            match c.db.client.query_opt("SELECT note FROM game.char_notes WHERE char_id = $1 AND item_id = $2", &[&me, &item]).await {
+            match c.db.query_opt("SELECT note FROM game.char_notes WHERE char_id = $1 AND item_id = $2", &[&me, &item]).await {
                 Ok(r) => Ok(r.map(|r| Value::unicode(r.get::<_, String>(0))).unwrap_or(Value::None)),
                 Err(e) => Err(db_err(e)),
             }
@@ -284,9 +277,9 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             let item = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
             let note = call.args.get(1).and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
             let r = if note.trim().is_empty() {
-                c.db.client.execute("DELETE FROM game.char_notes WHERE char_id = $1 AND item_id = $2", &[&me, &item]).await
+                c.db.execute("DELETE FROM game.char_notes WHERE char_id = $1 AND item_id = $2", &[&me, &item]).await
             } else {
-                c.db.client
+                c.db
                     .execute(
                         "INSERT INTO game.char_notes (char_id, item_id, note) VALUES ($1, $2, $3)
                          ON CONFLICT (char_id, item_id) DO UPDATE SET note = $3",
@@ -304,7 +297,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         ("home_station", "get_home_station") => {
             let r = c
                 .db
-                .client
                 .query_opt(
                     "SELECT s.station_id::bigint, s.type_id::bigint, s.solar_system_id::bigint FROM game.characters ch
                      JOIN sde.sta_stations s ON s.station_id = ch.home_station_id WHERE ch.character_id = $1",
