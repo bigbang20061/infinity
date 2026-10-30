@@ -13,4 +13,5 @@ pub(crate) mod contracts;
 pub(crate) mod items;
 pub(crate) mod market;
 pub(crate) mod skills;
+pub(crate) mod store;
 pub(crate) mod wallets;
