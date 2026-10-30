@@ -302,7 +302,7 @@ fn tell<X: Send>(outbox: &mut Outbox<X>, char_id: i64, event: &str, contract_id:
 }
 
 async fn max_outstanding(db: &(impl Executor + ?Sized), char_id: i64) -> Result<i64, CallError> {
-    let rows = crate::dao::skills::market::levels(db, char_id, &[SKILL_CONTRACTING, SKILL_ADVANCED_CONTRACTING]).await.map_err(db_err)?;
+    let rows = crate::dao::skills::levels::levels_of(db, char_id, &[SKILL_CONTRACTING, SKILL_ADVANCED_CONTRACTING]).await.map_err(db_err)?;
     let level = |skill: i32| rows.iter().find(|r| r.type_id == skill).map(|r| r.level.clamp(0, 5) as usize).unwrap_or(0);
     Ok(NUM_CONTRACTS_BY_SKILL[level(SKILL_CONTRACTING)] + NUM_CONTRACTS_BY_ADVSKILL[level(SKILL_ADVANCED_CONTRACTING)])
 }

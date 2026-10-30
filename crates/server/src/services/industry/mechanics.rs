@@ -327,7 +327,7 @@ pub(super) async fn install(c: &Client, request: &Value) -> CallResult {
                 if runs > max_runs || (activity_id == COPYING && licensed_runs > act.max_production_limit) {
                     return Err(notify_error(messages::BLUEPRINT_RUN_COUNT_EXCEEDED));
                 }
-                let skills = industry_dao::skills(tx, me).await.map_err(db_err)?;
+                let skills: HashMap<i32, i32> = crate::dao::skills::levels::levels(tx, me).await.map_err(db_err)?.into_iter().map(|r| (r.type_id, r.level)).collect();
                 if let Some((skill, level)) = act.skills.iter().find(|(s, l)| skills.get(s).copied().unwrap_or(0) < *l) {
                     return Err(notify_error(&messages::required_skill_message(skill, level)));
                 }

@@ -73,9 +73,6 @@ pub(crate) async fn set_state(ex: &(impl Executor + ?Sized), character_id: i64, 
 pub(crate) async fn remove(ex: &(impl Executor + ?Sized), character_id: i64, agent_id: i64) -> Result<u64, db::Error> {
     ex.execute("DELETE FROM game.agent_missions WHERE character_id = $1 AND agent_id = $2", &[&character_id, &agent_id]).await
 }
-pub(crate) async fn subtract_goods(ex: &(impl Executor + ?Sized), item_id: i64, quantity: i32) -> Result<u64, db::Error> {
-    ex.execute("UPDATE game.items SET quantity = quantity - $2 WHERE item_id = $1", &[&item_id, &quantity]).await
-}
 pub(crate) struct Balance { pub balance: f64 }
 impl Balance { fn from_row(r: &Row) -> Self { Self { balance: r.get("balance") } } }
 pub(crate) async fn pay(ex: &(impl Executor + ?Sized), character_id: i64, amount: i64) -> Result<Balance, db::Error> {

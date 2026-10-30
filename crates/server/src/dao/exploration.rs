@@ -80,9 +80,6 @@ pub(crate) async fn next_site_id(ex: &(impl Executor + ?Sized)) -> Result<i64, E
 pub(crate) async fn delete_expired(ex: &(impl Executor + ?Sized), now: i64) -> Result<(), Error> { ex.execute("DELETE FROM game.exploration_sites WHERE wh_born IS NOT NULL AND wh_born + (wh_life_minutes * 60 * 10000000)::bigint < $1", &[&now]).await?; Ok(()) }
 pub(crate) async fn is_generated(ex: &(impl Executor + ?Sized), system: i64) -> Result<bool, Error> { Ok(ex.query_opt("SELECT 1 FROM game.exploration_systems WHERE system_id = $1", &[&system]).await?.is_some()) }
 pub(crate) async fn mark_generated(ex: &(impl Executor + ?Sized), system: i64, now: i64) -> Result<(), Error> { ex.execute("INSERT INTO game.exploration_systems (system_id, generated_at) VALUES ($1, $2) ON CONFLICT DO NOTHING", &[&system, &now]).await?; Ok(()) }
-pub(crate) struct Skill { pub(crate) type_id: i32, pub(crate) level: i32 }
-impl Skill { fn from_row(r: &Row) -> Self { Self { type_id: r.get("type_id"), level: r.get("level") } } }
-pub(crate) async fn probe_skills(ex: &(impl Executor + ?Sized), char_id: i64, skills: &[i32]) -> Result<Vec<Skill>, Error> { Ok(ex.query("SELECT type_id, level FROM game.skills WHERE character_id = $1 AND type_id = ANY($2)", &[&char_id, &skills]).await?.iter().map(Skill::from_row).collect()) }
 pub(crate) async fn module_flag(ex: &(impl Executor + ?Sized), module: i64, ship: i64) -> Result<Option<i32>, Error> { Ok(ex.query_opt("SELECT flag_id FROM game.items WHERE item_id = $1 AND location_id = $2", &[&module, &ship]).await?.as_ref().map(|r| ModuleFlag::from_row(r).flag_id)) }
 pub(crate) async fn consume_probes(ex: &(impl Executor + ?Sized), ship: i64, flag: i32, type_id: i32, have: i32, take: i32) -> Result<Option<i32>, Error> {
     if take == have { Ok(ex.query_opt("DELETE FROM game.module_charges WHERE ship_id = $1 AND flag_id = $2 AND type_id = $3 AND quantity = $4 RETURNING quantity", &[&ship, &flag, &type_id, &have]).await?.map(|_| 0)) }

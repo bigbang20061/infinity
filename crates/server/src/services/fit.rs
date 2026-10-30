@@ -275,7 +275,7 @@ impl Fit {
     pub async fn load(db: &Db, char_id: i64, ship: i64) -> Result<Fit, CallError> {
         let char_type: i32 = TYPE_CHARACTER;
         let ship_type = crate::dao::items::inventory::type_id(db, ship).await.map_err(db_err)?.unwrap_or(0);
-        let skills = crate::dao::skills::ships::levels(db, char_id).await.map_err(db_err)?;
+        let skills = crate::dao::skills::levels::levels(db, char_id).await.map_err(db_err)?;
         let modules = fit_dao::modules(db, ship).await.map_err(db_err)?;
         let charges = fit_dao::charges(db, ship).await.map_err(db_err)?;
         let mut all: Vec<i32> = vec![char_type, ship_type];

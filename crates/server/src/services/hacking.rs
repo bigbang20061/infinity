@@ -455,7 +455,7 @@ pub async fn start(c: &mut Client, module: i64, target: Option<i64>) -> CallResu
     if gap > range {
         return Err(notify_error(&messages::analyzer_range(metres_to_km(gap), metres_to_km(range))));
     }
-    let level = crate::dao::skills::ships::level(&c.db, char_id, needed).await.map_err(db_err)?.map(|level| level as f64).unwrap_or(0.0);
+    let level = crate::dao::skills::levels::level(&c.db, char_id, needed).await.map_err(db_err)?.map(|level| level as f64).unwrap_or(0.0);
     let coherence = (r.coherence + COHERENCE_PER_SKILL_LEVEL * level).round() as i64;
     let strength = r.strength.round() as i64;
     let slots = r.slots.round().clamp(1.0, 6.0) as usize;

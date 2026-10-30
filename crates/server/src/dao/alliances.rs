@@ -205,9 +205,6 @@ impl BillAmount { fn from_row(r: &Row) -> Self { Self { amount: r.get("amount") 
 pub(crate) async fn bill_amount(ex: &(impl Executor + ?Sized), bill: i64, alliance: i64) -> Result<Option<f64>, Error> {
     Ok(ex.query_opt("SELECT amount::float8 AS amount FROM game.bills WHERE bill_id = $1 AND debtor_id = $2", &[&bill, &alliance]).await?.map(|r| BillAmount::from_row(&r).amount))
 }
-pub(crate) async fn bill_exists(ex: &(impl Executor + ?Sized), bill: i64, alliance: i64) -> Result<bool, Error> {
-    Ok(ex.query_opt("SELECT 1 FROM game.bills WHERE bill_id = $1 AND debtor_id = $2", &[&bill, &alliance]).await?.is_some())
-}
 pub(crate) async fn is_executor(ex: &(impl Executor + ?Sized), alliance: i64, corp: i64) -> Result<bool, Error> {
     Ok(ex.query_opt("SELECT 1 FROM game.alliances WHERE alliance_id = $1 AND executor_corp_id = $2", &[&alliance, &corp]).await?.is_some())
 }

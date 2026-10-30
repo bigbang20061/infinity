@@ -249,7 +249,7 @@ async fn found(c: &Client, call: &Call<'_>) -> CallResult {
     if !(ORG_SHORT_NAME_MIN_LENGTH..=ORG_SHORT_NAME_MAX_LENGTH).contains(&ticker.chars().count()) || !ticker.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
         return Err(notify_error(messages::CORP_SHORT_NAME_INVALID));
     }
-    let skill = registry::management_skill(db, me, SKILL_CORPORATION_MANAGEMENT).await.map_err(db_err)?.unwrap_or(0);
+    let skill = crate::dao::skills::levels::level(db, me, SKILL_CORPORATION_MANAGEMENT).await.map_err(db_err)?.unwrap_or(0);
     if skill < MIN_CORPORATION_MANAGEMENT_LEVEL {
         return Err(notify_error(messages::CORPORATION_MANAGEMENT_SKILL_REQUIRED));
     }

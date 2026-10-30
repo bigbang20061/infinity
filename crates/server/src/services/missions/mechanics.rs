@@ -235,7 +235,7 @@ async fn take_goods(c: &mut Client, station: i64, (type_id, qty): (i32, i32)) ->
             left -= item.quantity;
             super::items::remove_stack(&c.db, &mut outbox, item).await?;
         } else {
-            crate::dao::missions::subtract_goods(&c.db, item.item_id, left).await.map_err(db_err)?;
+            crate::dao::items::transfers::take(&c.db, item.item_id, left).await.map_err(db_err)?;
             super::inventory::notify_item_change(&c.db, &mut outbox, item.item_id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
             left = 0;
         }

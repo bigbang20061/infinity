@@ -18,7 +18,7 @@ async fn skill_multiplier(c: &Client, char_id: i64, type_id: i32) -> Result<f64,
         .await
         .map_err(db_err)?
         .map(|r| Attribute::from_row(&r).value);
-    let skills = crate::dao::skills::ships::levels(&c.db, char_id).await.map_err(db_err)?;
+    let skills = crate::dao::skills::levels::levels(&c.db, char_id).await.map_err(db_err)?;
     let level = |skill: i32| skills.iter().find(|r| r.type_id == skill).map(|r| r.level as f64).unwrap_or(0.0);
     Ok(match own_skill {
         Some(s) => (1.0 + 0.03 * level(SKILL_REPROCESSING)) * (1.0 + 0.02 * level(SKILL_REPROCESSING_EFFICIENCY)) * (1.0 + 0.02 * level(s as i32)),

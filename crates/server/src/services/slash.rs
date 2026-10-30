@@ -140,7 +140,7 @@ async fn create(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
 async fn isk(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
     let amount: f64 = args.first().and_then(|a| a.replace(',', "").parse().ok()).ok_or_else(|| slash_error(messages::GM_ISK_USAGE.into()))?;
     let char_id = c.session.int("charid").unwrap_or(0);
-    let balance = crate::dao::wallets::social::add(&c.db, char_id, amount).await.map_err(db_err)?;
+    let balance = crate::dao::wallets::characters::credit(&c.db, char_id, amount).await.map_err(db_err)?;
     c.notify("OnAccountChange", vec![Value::str("cash"), Value::Int(char_id), Value::Float(balance)]);
     Ok(messages::gm_balance(balance))
 }

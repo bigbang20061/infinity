@@ -233,7 +233,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         "PayBill" => {
             let (bill, key) = (int(0), call.kwargs.get("fromAccountKey").and_then(|v| v.as_int()).unwrap_or(int(1)) as i32);
             let corp = c.session.int("corpid").unwrap_or(0);
-            let owed = match dao::bill_exists(db, bill, alliance).await {
+            let owed = match crate::dao::bills::owned(db, bill, alliance).await {
                 Ok(r) => r,
                 Err(e) => return Some(Err(db_err(e))),
             };

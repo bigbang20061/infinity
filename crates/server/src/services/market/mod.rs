@@ -202,7 +202,7 @@ struct Skills {
 
 async fn skills(db: &(impl Executor + ?Sized), char_id: i64) -> Result<Skills, CallError> {
     let wanted = vec![SKILL_TRADE, SKILL_RETAIL, SKILL_BROKER_RELATIONS, SKILL_WHOLESALE, SKILL_MARGIN_TRADING, SKILL_ACCOUNTING, SKILL_TYCOON];
-    let rows = crate::dao::skills::market::levels(db, char_id, &wanted).await.map_err(db_err)?;
+    let rows = crate::dao::skills::levels::levels_of(db, char_id, &wanted).await.map_err(db_err)?;
     let levels: HashMap<i32, i32> = rows.iter().map(|r| (r.type_id, r.level)).collect();
     let l = |skill: i32| levels.get(&skill).copied().unwrap_or(0) as f64;
     Ok(Skills {

@@ -1,4 +1,4 @@
-//! Corporation registry persistence in game corporations, characters, skills,
+//! Corporation registry persistence in game corporations, characters,
 //! employment history, applications and items, plus SDE school and NPC corp data.
 //! Client behavior is owned by corpRegistry (eve/client/script/ui/services/corporation);
 //! this module does not implement policy, notifications or transactions.
@@ -53,13 +53,6 @@ impl CountRow {
     }
 }
 
-struct SkillRow { level: i32 }
-impl SkillRow {
-    fn from_row(row: &tokio_postgres::Row) -> Self {
-        Self { level: row.get("level") }
-    }
-}
-
 struct TakenRow { taken: bool }
 impl TakenRow {
     fn from_row(row: &tokio_postgres::Row) -> Self {
@@ -111,10 +104,6 @@ pub(crate) async fn other_member_count(ex: &(impl Executor + ?Sized), corp: i64,
 pub(crate) async fn close_corp(ex: &(impl Executor + ?Sized), corp: i64) -> Result<(), db::Error> {
     ex.execute("UPDATE game.corporations SET deleted = true, ceo_id = NULL WHERE corporation_id = $1", &[&corp]).await?;
     Ok(())
-}
-
-pub(crate) async fn management_skill(ex: &(impl Executor + ?Sized), char_id: i64, skill: i32) -> Result<Option<i32>, db::Error> {
-    Ok(ex.query_opt("SELECT level FROM game.skills WHERE character_id = $1 AND type_id = $2", &[&char_id, &skill]).await?.as_ref().map(SkillRow::from_row).map(|row| row.level))
 }
 
 pub(crate) async fn name_taken(ex: &(impl Executor + ?Sized), name: &str, ticker: &str) -> Result<bool, db::Error> {

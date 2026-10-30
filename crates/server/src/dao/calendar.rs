@@ -127,10 +127,7 @@ pub(crate) async fn initial_responses(
                 &[&event, &char_id, &status],
             ).await?;
         } else {
-            ex.execute(
-                "INSERT INTO game.calendar_responses (event_id, char_id, status) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-                &[&event, &char_id, &status],
-            ).await?;
+            insert_response(ex, event, char_id, status).await?;
         }
     }
     Ok(())
@@ -183,6 +180,9 @@ pub(crate) async fn event_responses(ex: &impl Executor, event: i64) -> Result<Ve
     Ok(rows.iter().map(CharacterResponse::from_row).collect())
 }
 pub(crate) async fn add_response(ex: &impl Executor, event: i64, char_id: i64, status: i32) -> Result<u64, Error> {
+    insert_response(ex, event, char_id, status).await
+}
+async fn insert_response(ex: &impl Executor, event: i64, char_id: i64, status: i32) -> Result<u64, Error> {
     ex.execute(
         "INSERT INTO game.calendar_responses (event_id, char_id, status) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
         &[&event, &char_id, &status],

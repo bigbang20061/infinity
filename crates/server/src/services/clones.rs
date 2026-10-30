@@ -10,7 +10,7 @@
 use super::{crowset, db_err, notify_error, value_text, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
 use crate::consts::{FILETIME_HOUR, FLAG_HANGAR, TYPE_CAPSULE};
-use crate::dao::{characters::clones as clone_dao, items::{clones as item_dao, creation}, skills::ships as skill_dao};
+use crate::dao::{characters::clones as clone_dao, items::{clones as item_dao, creation}, skills::levels as skill_dao};
 use crate::db::outbox::{Effect, Outbox};
 use crate::messages;
 use marshal::{DbRowDescriptor, DbType, Value};
