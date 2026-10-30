@@ -4,13 +4,21 @@
 //! Exact GM writes use decimal strings; client projections are lossy and clamped.
 //! Non-GM overflowing credits remain database errors; no decimal dependency is used.
 
+use crate::consts::CLIENT_MAX_ISK;
 use crate::db::{executor::Executor, Error};
 use super::Balance;
 
 struct ExactBalance { exact: String, balance: f64 }
 impl ExactBalance {
     fn from_row(row: &tokio_postgres::Row) -> Self {
-        Self { exact: row.get("exact"), balance: Balance::from_row(row).0 }
+        Self { exact: row.get("exact"), balance: Balance::from_row(row, CLIENT_MAX_ISK).0 }
+    }
+}
+
+struct Coverage { covers: bool }
+impl Coverage {
+    fn from_row(row: &tokio_postgres::Row) -> Self {
+        Self { covers: row.get("covers") }
     }
 }
 
@@ -33,14 +41,21 @@ pub(crate) async fn credit_exact(ex: &(impl Executor + ?Sized), char_id: i64, am
 }
 
 pub(crate) async fn balance(ex: &(impl Executor + ?Sized), char_id: i64) -> Result<f64, Error> {
-    Ok(Balance::from_row(&ex.query_one("SELECT balance::float8 FROM game.characters WHERE character_id = $1", &[&char_id]).await?).0)
+    Ok(Balance::from_row(&ex.query_one("SELECT balance::float8 FROM game.characters WHERE character_id = $1", &[&char_id]).await?, CLIENT_MAX_ISK).0)
+}
+
+pub(crate) async fn covers(ex: &(impl Executor + ?Sized), char_id: i64, amount: f64) -> Result<bool, Error> {
+    Ok(Coverage::from_row(&ex.query_one(
+        "SELECT balance >= $2::float8::numeric AS covers FROM game.characters WHERE character_id = $1",
+        &[&char_id, &amount],
+    ).await?).covers)
 }
 
 pub(crate) async fn credit(ex: &(impl Executor + ?Sized), char_id: i64, amount: f64) -> Result<f64, Error> {
     Ok(Balance::from_row(&ex.query_one(
         "UPDATE game.characters SET balance = balance + $2::float8::numeric WHERE character_id = $1 RETURNING balance::float8",
         &[&char_id, &amount],
-    ).await?).0)
+    ).await?, CLIENT_MAX_ISK).0)
 }
 
 pub(crate) async fn debit(ex: &(impl Executor + ?Sized), char_id: i64, amount: f64) -> Result<Option<f64>, Error> {
@@ -48,7 +63,7 @@ pub(crate) async fn debit(ex: &(impl Executor + ?Sized), char_id: i64, amount: f
         "UPDATE game.characters SET balance = balance - $2::float8::numeric
              WHERE character_id = $1 AND balance >= $2::float8::numeric RETURNING balance::float8",
         &[&char_id, &amount],
-    ).await?.map(|row| Balance::from_row(&row).0))
+    ).await?.map(|row| Balance::from_row(&row, CLIENT_MAX_ISK).0))
 }
 
 pub(crate) async fn recipient_exists(ex: &(impl Executor + ?Sized), char_id: i64) -> Result<bool, Error> {

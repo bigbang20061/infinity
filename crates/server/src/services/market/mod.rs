@@ -227,9 +227,8 @@ async fn check_order_slots(db: &(impl Executor + ?Sized), char_id: i64, skills: 
 
 
 async fn require_balance(db: &(impl Executor + ?Sized), char_id: i64, amount: f64) -> Result<(), CallError> {
-    let have = balance(db, char_id).await?;
-    if have < amount {
-        return Err(not_enough_money(have, amount));
+    if !crate::dao::wallets::characters::covers(db, char_id, amount).await.map_err(db_err)? {
+        return Err(not_enough_money(balance(db, char_id).await?, amount));
     }
     Ok(())
 }
