@@ -3,7 +3,7 @@
 use super::{lp_balance, add_lp};
 use crate::services::{db_err, keyval, notify_error, Call, CallError, CallResult};
 use crate::client::Client;
-use crate::db::{Db, outbox::dispatch_world};
+use crate::db::outbox::dispatch_world;
 use crate::messages;
 use marshal::Value;
 use tracing::info;
@@ -21,40 +21,48 @@ const MIN_LP_PRICE: i64 = 100;
 const MAX_OFFER_COUNT: i64 = 1000;
 
 /// A corporation's LP store: (offerID = typeID, typeID, LP, ISK).
-async fn offers(db: &Db, corp: i64) -> Result<Vec<(i32, i64, i64)>, CallError> {
-    let rows = crate::dao::store::loyalty::offers(db, corp, META_GROUP_FACTION).await.map_err(db_err)?;
-    Ok(rows
-        .iter()
-        .map(|r| {
-            let lp = (((r.average / ISK_VALUE_PER_LP) / LP_PRICE_INCREMENT as f64).round() as i64 * LP_PRICE_INCREMENT).max(MIN_LP_PRICE);
-            (r.type_id, lp, lp * ISK_PER_LP)
-        })
-        .collect())
+async fn offers(c: &Client, corp: i64) -> Result<Vec<(i32, i64, i64)>, CallError> {
+    let Some(race) = c.sde.npc_corporations.get(corp).and_then(|c| c.race_id) else { return Ok(Vec::new()) };
+    let prices = crate::dao::store::catalogue::prices(&c.db).await.map_err(db_err)?;
+    let mut offers = Vec::new();
+    for t in c.sde.types.iter() {
+        if t.race_id.map(i64::from) != Some(race) || t.published != Some(true) || t.market_group_id.is_none() { continue; }
+        let Some(average) = prices.get(&t.type_id).copied().filter(|p| crate::dao::store::catalogue::positive_price(*p)) else { continue };
+        for attr in c.sde.dogma.attributes_by_name("metaGroupID") {
+            if t.attribute(attr.attribute_id) != Some(META_GROUP_FACTION) { continue; }
+            let lp = (((average / ISK_VALUE_PER_LP) / LP_PRICE_INCREMENT as f64).round() as i64 * LP_PRICE_INCREMENT).max(MIN_LP_PRICE);
+            offers.push((t.type_id, lp, lp * ISK_PER_LP));
+        }
+    }
+    Ok(offers)
 }
 
 /// `TakeOfferForCharacter(corpID, offerID, count)`: pay LP and ISK, get the items in the
 /// station hangar.
 async fn take_offer(c: &Client, corp: i64, offer: i64, count: i64) -> CallResult {
     let (db, world) = (&c.db, &*c.world);
+    let sde = &c.sde;
     let me = c.session.int("charid").unwrap_or(0);
     let Some(station) = c.session.int("stationid") else {
         return Err(notify_error(messages::STATION_DOCK_REQUIRED_FOR_LP_STORE));
     };
     let count = count.clamp(1, MAX_OFFER_COUNT);
-    let Some((type_id, lp, isk)) = offers(db, corp).await?.into_iter().find(|o| o.0 as i64 == offer) else {
+    let Some((type_id, lp, isk)) = offers(c, corp).await?.into_iter().find(|o| o.0 as i64 == offer) else {
         return Err(notify_error(messages::LP_OFFER_UNAVAILABLE));
     };
     let _trading = crate::services::market::lock().await;
     db.transaction(
-        |tx, outbox| Box::pin(async move {
+        |tx, outbox| {
+            let sde = sde.clone();
+            Box::pin(async move {
             if lp_balance(tx, me, corp).await? < lp * count {
                 return Err(notify_error(messages::INSUFFICIENT_LOYALTY_POINTS));
             }
             crate::services::wallets::debit(tx, outbox, me, (isk * count) as f64).await?;
             add_lp(tx, outbox, me, corp, -lp * count).await?;
-            crate::services::items::deliver(tx, outbox, me, station, type_id, count as i32).await?;
+            crate::services::items::deliver(tx, &sde, outbox, me, station, type_id, count as i32).await?;
             Ok(())
-        }),
+        })},
         |value, outbox| async move { dispatch_world(value, outbox, world) },
     ).await?;
     info!("lp store: {me} bought {count} x {type_id} from {corp} for {} LP and {} ISK", lp * count, isk * count);
@@ -63,11 +71,10 @@ async fn take_offer(c: &Client, corp: i64, offer: i64, count: i64) -> CallResult
 
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     let int = |i: usize| call.args.get(i).and_then(|v| v.as_int()).unwrap_or(0);
-    let db = &c.db;
     Some(match call.method {
         "GetAvailableOffersFromCorp" => {
             let corp = int(0);
-            offers(db, corp).await.map(|list| {
+            offers(c, corp).await.map(|list| {
                 Value::list(list.into_iter().map(|(type_id, lp, isk)| {
                     keyval([
                         ("offerID", Value::Int(type_id as i64)),
@@ -88,3 +95,4 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         _ => return None,
     })
 }
+

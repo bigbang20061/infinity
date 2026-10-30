@@ -1,5 +1,5 @@
 //! Corporation registry persistence in game corporations, characters,
-//! employment history, applications and items, plus SDE school and NPC corp data.
+//! employment history, applications and items.
 //! Client behavior is owned by corpRegistry (eve/client/script/ui/services/corporation);
 //! this module does not implement policy, notifications or transactions.
 
@@ -39,10 +39,10 @@ impl HeadquartersRow {
     }
 }
 
-struct SchoolRow { corporation_id: Option<i64> }
+pub(crate) struct SchoolRow { pub(crate) school_id: Option<i32>, pub(crate) race_id: i32 }
 impl SchoolRow {
     fn from_row(row: &tokio_postgres::Row) -> Self {
-        Self { corporation_id: row.get("corporation_id") }
+        Self { school_id: row.get("school_id"), race_id: row.get("race_id") }
     }
 }
 
@@ -53,10 +53,10 @@ impl CountRow {
     }
 }
 
-struct TakenRow { taken: bool }
+pub(crate) struct TakenRow { pub(crate) taken: bool, pub(crate) lower_name: String }
 impl TakenRow {
     fn from_row(row: &tokio_postgres::Row) -> Self {
-        Self { taken: row.get("taken") }
+        Self { taken: row.get("taken"), lower_name: row.get("lower_name") }
     }
 }
 
@@ -86,15 +86,9 @@ pub(crate) async fn set_corp(ex: &(impl Executor + ?Sized), char_id: i64, corp: 
     Ok(())
 }
 
-pub(crate) async fn school_corp(ex: &(impl Executor + ?Sized), char_id: i64) -> Result<Option<i64>, db::Error> {
-    let row = ex.query_one(
-        "SELECT COALESCE(
-                 (SELECT (s.data->>'corporationID')::bigint FROM sde_native.schools s WHERE s.key = ch.school_id::text),
-                 (SELECT (s.data->>'corporationID')::bigint FROM sde_native.schools s WHERE (s.data->>'raceID')::int = ch.race_id ORDER BY s.key::int LIMIT 1)) AS corporation_id
-             FROM game.characters ch WHERE ch.character_id = $1",
-        &[&char_id],
-    ).await?;
-    Ok(SchoolRow::from_row(&row).corporation_id)
+pub(crate) async fn school(ex: &(impl Executor + ?Sized), char_id: i64) -> Result<SchoolRow, db::Error> {
+    let row = ex.query_one("SELECT school_id, race_id FROM game.characters WHERE character_id = $1", &[&char_id]).await?;
+    Ok(SchoolRow::from_row(&row))
 }
 
 pub(crate) async fn other_member_count(ex: &(impl Executor + ?Sized), corp: i64, char_id: i64) -> Result<i64, db::Error> {
@@ -106,12 +100,11 @@ pub(crate) async fn close_corp(ex: &(impl Executor + ?Sized), corp: i64) -> Resu
     Ok(())
 }
 
-pub(crate) async fn name_taken(ex: &(impl Executor + ?Sized), name: &str, ticker: &str) -> Result<bool, db::Error> {
+pub(crate) async fn name_taken(ex: &(impl Executor + ?Sized), name: &str, ticker: &str) -> Result<TakenRow, db::Error> {
     Ok(TakenRow::from_row(&ex.query_one(
-        "SELECT EXISTS (SELECT 1 FROM game.corporations WHERE NOT deleted AND (lower(name) = lower($1) OR upper(ticker) = $2))
-                 OR EXISTS (SELECT 1 FROM sde.crp_npc_corporations WHERE lower(name) = lower($1) OR upper(ticker) = $2) AS taken",
+        "SELECT EXISTS (SELECT 1 FROM game.corporations WHERE NOT deleted AND (lower(name) = lower($1) OR upper(ticker) = $2)) AS taken, lower($1) AS lower_name",
         &[&name, &ticker],
-    ).await?).taken)
+    ).await?))
 }
 
 pub(crate) struct NewCorporation<'a> {

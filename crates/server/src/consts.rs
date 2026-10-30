@@ -51,6 +51,8 @@ pub const GROUP_ASTEROID_BELT: i32 = 9;
 pub const CATEGORY_SHIP: i32 = 6;
 /// SDE invCategories: Charge.
 pub const CATEGORY_CHARGE: i32 = 8;
+/// SDE invCategories: Entity.
+pub const CATEGORY_ENTITY: i32 = 11;
 /// SDE invTypes: Hacking skill.
 pub const SKILL_HACKING: i32 = 21718;
 /// SDE invTypes: Archaeology skill.
@@ -83,6 +85,8 @@ pub const ATTR_VOLUME: i32 = 161;
 pub const ATTR_RADIUS: i32 = 162;
 /// SDE dgmAttributeTypes: maxVelocity (also used for missiles).
 pub const ATTR_MAX_VELOCITY: i32 = 37;
+/// SDE dgmAttributeTypes: agility.
+pub const ATTR_AGILITY: i32 = 70;
 /// SDE dgmAttributeTypes: signatureRadius.
 pub const ATTR_SIGNATURE_RADIUS: i32 = 552;
 /// SDE dgmAttributeTypes: maxRange.

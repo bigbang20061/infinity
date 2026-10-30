@@ -2,7 +2,7 @@
 //! The owning services support `eve/client/script/parklife`; this DAO has no wire contract.
 //! Uses `game.exploration_sites`, `game.exploration_scanned`, `game.exploration_systems`,
 //! `game.agent_missions`, `game.asteroids`, `game.items`, `game.module_charges`
-//! and SDE data. Simulation, policy, transactions and notifications remain with callers.
+//! and `game.retail_prices`. Simulation, policy, transactions and notifications remain with callers.
 use crate::db::{executor::Executor, Error};
 use tokio_postgres::Row;
 
@@ -22,17 +22,16 @@ const SITE_COLUMNS: &str = "site_id, system_id, target, kind, strength_attr, eas
 pub(crate) const EXPLORATION_SITES_TABLE: &str = "game.exploration_sites";
 pub(crate) const AGENT_MISSIONS_TABLE: &str = "game.agent_missions";
 
-pub(crate) struct RepairRow { pub(crate) id: String, pub(crate) old: [f64; 3], pub(crate) planet: [f64; 3], pub(crate) radius: f64 }
-impl RepairRow { fn from_row(r: &Row) -> Self { Self { id: r.get("id"), old: [r.get("old_x"), r.get("old_y"), r.get("old_z")], planet: [r.get("planet_x"), r.get("planet_y"), r.get("planet_z")], radius: r.get("radius") } } }
-fn repair_sql(exploration: bool) -> String {
-    let (table, key) = if exploration { (EXPLORATION_SITES_TABLE, "site_id") } else { (AGENT_MISSIONS_TABLE, "(character_id, agent_id)") };
-    format!("SELECT {key}::text AS id, s.x AS old_x, s.y AS old_y, s.z AS old_z, p.x AS planet_x, p.y AS planet_y, p.z AS planet_z, COALESCE(p.radius, 0)::float8 AS radius FROM {table} s
-                     CROSS JOIN LATERAL (SELECT c.x, c.y, c.z, c.radius FROM sde.map_celestials c
-                                         WHERE c.solar_system_id = s.system_id AND c.group_id = $1
-                                         ORDER BY (c.x - s.x) ^ 2 + (c.y - s.y) ^ 2 + (c.z - s.z) ^ 2 LIMIT 1) p
-                     WHERE sqrt((p.x - s.x) ^ 2 + (p.y - s.y) ^ 2 + (p.z - s.z) ^ 2) < COALESCE(p.radius, 0) + $2")
+pub(crate) struct RepairRow { pub(crate) id: String, pub(crate) system: i64, pub(crate) old: [f64; 3] }
+impl RepairRow { fn from_row(r: &Row) -> Self { Self { id: r.get("id"), system: r.get("system_id"), old: [r.get("x"), r.get("y"), r.get("z")] } } }
+pub(crate) async fn repair_rows(ex: &(impl Executor + ?Sized), exploration: bool) -> Result<Vec<RepairRow>, Error> {
+    let sql = if exploration {
+        "SELECT site_id::text AS id, system_id, x, y, z FROM game.exploration_sites"
+    } else {
+        "SELECT (character_id, agent_id)::text AS id, system_id, x, y, z FROM game.agent_missions"
+    };
+    Ok(ex.query(sql, &[]).await?.iter().map(RepairRow::from_row).collect())
 }
-pub(crate) async fn repair_rows(ex: &(impl Executor + ?Sized), exploration: bool, planet_group: i32, clearance: f64) -> Result<Vec<RepairRow>, Error> { Ok(ex.query(&repair_sql(exploration), &[&planet_group, &clearance]).await?.iter().map(RepairRow::from_row).collect()) }
 pub(crate) async fn move_exploration(ex: &(impl Executor + ?Sized), site: i64, delta: [f64; 3]) -> Result<(), Error> {
     ex.execute("UPDATE game.exploration_sites SET x = x + $2, y = y + $3, z = z + $4,
                                 overlay_x = overlay_x + $2, overlay_y = overlay_y + $3, overlay_z = overlay_z + $4 WHERE site_id = $1", &[&site, &delta[0], &delta[1], &delta[2]]).await?;
@@ -93,14 +92,11 @@ pub(crate) async fn insert_container(ex: &(impl Executor + ?Sized), type_id: i32
                  VALUES ($1, 1, $2, 0, 1, true, $3, $4, $5) RETURNING item_id", &[&type_id, &system, &pos[0], &pos[1], &pos[2]]).await?).item_id) }
 pub(crate) struct Loot { pub(crate) type_id: i32, pub(crate) average: f64 }
 impl Loot { fn from_row(r: &Row) -> Self { Self { type_id: r.get("type_id"), average: r.get("average") } } }
-pub(crate) async fn loot(ex: &(impl Executor + ?Sized), groups: &[i32], value: f64, stacks: i64) -> Result<Vec<Loot>, Error> { Ok(ex.query("SELECT t.type_id, r.average FROM sde.inv_types t JOIN game.retail_prices r USING (type_id)
-                 WHERE t.published AND t.group_id = ANY($1) AND r.average BETWEEN 1000 AND $2
-                 ORDER BY random() LIMIT $3", &[&groups, &value, &stacks]).await?.iter().map(Loot::from_row).collect()) }
+pub(crate) async fn loot(ex: &(impl Executor + ?Sized), value: f64) -> Result<Vec<Loot>, Error> { Ok(ex.query("SELECT type_id, average FROM game.retail_prices WHERE average BETWEEN 1000 AND $1", &[&value]).await?.iter().map(Loot::from_row).collect()) }
 pub(crate) async fn insert_loot(ex: &(impl Executor + ?Sized), type_id: i32, id: i64, quantity: i32) -> Result<(), Error> { ex.execute("INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity) VALUES ($1, 1, $2, 0, $3)", &[&type_id, &id, &quantity]).await?; Ok(()) }
-pub(crate) struct Container { pub(crate) item_id: i64, pub(crate) type_id: i32, pub(crate) pos: [f64; 3], pub(crate) radius: f64 }
-impl Container { fn from_row(r: &Row) -> Self { Self { item_id: r.get("item_id"), type_id: r.get("type_id"), pos: [r.get("x"), r.get("y"), r.get("z")], radius: r.get("radius") } } }
-pub(crate) async fn containers(ex: &(impl Executor + ?Sized), ids: &[i64]) -> Result<Vec<Container>, Error> { Ok(ex.query("SELECT i.item_id, i.type_id, i.x, i.y, i.z, COALESCE(t.radius, 300)::float8 AS radius FROM game.items i JOIN sde.inv_types t USING (type_id)
-             WHERE i.item_id = ANY($1) AND i.x IS NOT NULL", &[&ids]).await?.iter().map(Container::from_row).collect()) }
+pub(crate) struct Container { pub(crate) item_id: i64, pub(crate) type_id: i32, pub(crate) pos: [f64; 3] }
+impl Container { fn from_row(r: &Row) -> Self { Self { item_id: r.get("item_id"), type_id: r.get("type_id"), pos: [r.get("x"), r.get("y"), r.get("z")] } } }
+pub(crate) async fn containers(ex: &(impl Executor + ?Sized), ids: &[i64]) -> Result<Vec<Container>, Error> { Ok(ex.query("SELECT item_id, type_id, x, y, z FROM game.items WHERE item_id = ANY($1) AND x IS NOT NULL", &[&ids]).await?.iter().map(Container::from_row).collect()) }
 pub(crate) async fn set_container_owner(ex: &(impl Executor + ?Sized), container: i64, char_id: i64) -> Result<(), Error> { ex.execute("UPDATE game.items SET owner_id = $2 WHERE location_id = $1", &[&container, &char_id]).await?; Ok(()) }
 pub(crate) struct WormholeLocation { pub(crate) site_id: i64, pub(crate) system_id: i64 }
 impl WormholeLocation { fn from_row(r: &Row) -> Self { Self { site_id: r.get("site_id"), system_id: r.get("system_id") } } }

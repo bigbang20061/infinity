@@ -3,7 +3,8 @@
 //! Structure access is unsupported.
 use crate::services::inventory::notify_item_change;
 use crate::services::{db_err, user_error, Call, CallError, CallResult};
-use crate::dao::items::loading::{load_items, ItemQuery};
+use crate::dao::items::loading::ItemQuery;
+use crate::services::items::load_items;
 use crate::dao::items::fitting as fitting_dao;
 use crate::client::Client;
 use crate::consts::{CATEGORY_SHIP, FLAG_HANGAR, IX_SINGLETON};
@@ -32,10 +33,10 @@ async fn repackage(c: &mut Client, call: &Call<'_>) -> CallResult {
         if Some(id) == active_ship {
             return Err(user_error(messages::MSG_CANT_REPACKAGE_ACTIVE_SHIP, vec![]));
         }
-        let item = load_items(&c.db, ItemQuery::Id(id)).await.map_err(db_err)?.into_iter().next()
+        let item = load_items(&c.db, &c.sde, ItemQuery::Id(id)).await.map_err(db_err)?.into_iter().next()
             .ok_or_else(|| crate::services::notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
         if item.owner_id != char_id || item.location_id != named_station || item.location_id != location || item.flag_id != FLAG_HANGAR
-            || c.db.query_opt("SELECT 1 FROM sde.sta_stations WHERE station_id = $1::bigint", &[&named_station]).await.map_err(db_err)?.is_none() {
+            || c.sde.map.station(named_station).is_none() {
             return Err(crate::services::notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
         }
         if planned.contains_key(&id) {
@@ -53,17 +54,19 @@ async fn repackage(c: &mut Client, call: &Call<'_>) -> CallResult {
         planned.insert(id, item.location_id);
     }
     let db = c.db.clone();
+    let sde = std::sync::Arc::clone(&c.sde);
     let planned = std::sync::Arc::new(planned);
     db.transaction(
         move |tx, outbox: &mut Outbox| {
             let planned = std::sync::Arc::clone(&planned);
+            let sde = std::sync::Arc::clone(&sde);
             Box::pin(async move {
                 for (&id, &station) in planned.iter() {
                     let changed = fitting_dao::repackage(tx, id, char_id, station).await.map_err(db_err)?;
                     if changed == 0 {
                         return Err(crate::services::notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
                     }
-                    notify_item_change(tx, outbox, id, vec![(IX_SINGLETON, Value::Bool(true))]).await?;
+                    notify_item_change(tx, &sde, outbox, id, vec![(IX_SINGLETON, Value::Bool(true))]).await?;
                 }
                 Ok(())
             })

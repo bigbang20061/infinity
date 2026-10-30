@@ -1,5 +1,5 @@
 //! Order storage for marketProxy (`eve/client/script/ui/services/marketsvc.py`),
-//! using game.market_orders and sde.sta_stations. Matching, transactions,
+//! using game.market_orders. Station owner enrichment, matching, transactions,
 //! notifications and refusals are handled by the caller.
 use crate::db::{self, executor::Executor};
 use tokio_postgres::Row;
@@ -17,14 +17,14 @@ pub(crate) struct Order {
 impl Order {
     fn from_row(r: &Row) -> Self {
         Self { id: r.get("order_id"), type_id: r.get("type_id"), char_id: r.get("char_id"),
-            at: Station { id: r.get("station_id"), system: r.get("solar_system_id"), constellation: r.get("constellation_id"), region: r.get("region_id"), owner: r.get("owner_id") },
+            at: Station { id: r.get("station_id"), system: r.get("solar_system_id"), constellation: r.get("constellation_id"), region: r.get("region_id"), owner: 0 },
             price: r.get("price"), vol_entered: r.get("vol_entered"), vol_remaining: r.get("vol_remaining"), min_volume: r.get("min_volume"), bid: r.get("bid"), range: r.get("range"), duration: r.get("duration"), issued: r.get("issued"), escrow: r.get("escrow") }
     }
 }
 const ORDER_SELECT: &str = "SELECT o.order_id, o.type_id, o.char_id, o.station_id, o.solar_system_id, o.constellation_id, o.region_id,
-        COALESCE(s.owner_id, 0)::bigint AS owner_id, o.price, o.vol_entered, o.vol_remaining, o.min_volume, o.bid,
+        o.price, o.vol_entered, o.vol_remaining, o.min_volume, o.bid,
         o.range::bigint, o.duration::bigint, COALESCE(o.issued, $1) AS issued, o.escrow
-    FROM game.market_orders o LEFT JOIN sde.sta_stations s ON s.station_id = o.station_id";
+    FROM game.market_orders o";
 
 pub(crate) async fn my_order(ex: &(impl Executor + ?Sized), char_id: i64, order_id: i64, now: i64) -> Result<Option<Order>, db::Error> {
     Ok(ex.query_opt(&format!("{ORDER_SELECT} WHERE o.order_id = $2 AND o.char_id = $3"), &[&now, &order_id, &char_id]).await?.as_ref().map(Order::from_row))

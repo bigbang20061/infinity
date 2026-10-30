@@ -3,7 +3,8 @@
 use crate::services::dogma::ship_state;
 use crate::services::inventory::notify_item_change;
 use crate::services::{db_err, user_error, value_ids, Call, CallResult};
-use crate::dao::items::loading::{load_items, ItemQuery};
+use crate::dao::items::loading::ItemQuery;
+use crate::services::items::load_items;
 use crate::dao::items::fitting as fitting_dao;
 use crate::client::Client;
 use crate::consts::{CATEGORY_SHIP, FLAG_CARGO, FLAG_HANGAR, IX_LOCATION_ID, IX_SINGLETON, IX_STACK_SIZE};
@@ -20,7 +21,7 @@ const GROUP_STRATEGIC_CRUISER: i64 = 963;
 async fn board(c: &mut Client, ship_id: i64) -> CallResult {
     let char_id = c.session.int("charid").unwrap_or(0);
     let Some(station) = c.session.int("stationid") else { return Err(user_error(messages::MSG_CANT_BOARD_SHIP_WHILE_IN_SPACE, vec![])) };
-    let ship = load_items(&c.db, ItemQuery::Id(ship_id)).await.map_err(db_err)?.into_iter().next().ok_or_else(|| user_error(messages::MSG_SHIP_NOT_FOUND, vec![]))?;
+    let ship = load_items(&c.db, &c.sde, ItemQuery::Id(ship_id)).await.map_err(db_err)?.into_iter().next().ok_or_else(|| user_error(messages::MSG_SHIP_NOT_FOUND, vec![]))?;
     if ship.category_id != CATEGORY_SHIP as i64 || ship.owner_id != char_id || ship.location_id != station {
         return Err(user_error(messages::MSG_CANT_BOARD_SHIP_NOT_IN_HANGAR, vec![]));
     }
@@ -60,9 +61,11 @@ async fn assemble(c: &mut Client, call: &Call<'_>) -> CallResult {
     let ids = value_ids(call.args.first());
     let name = call.kwargs.get("name").and_then(|v| v.as_text()).map(|t| t.into_owned());
     let db = c.db.clone();
+    let sde = std::sync::Arc::clone(&c.sde);
     let assembled = db.transaction(
         move |tx, outbox: &mut Outbox| {
             let (ids, name) = (ids.clone(), name.clone());
+            let sde = std::sync::Arc::clone(&sde);
             Box::pin(async move {
                 // Simulate requests in their original order, but write each source once
                 // in primary-key order before inserting any generated hulls.
@@ -70,12 +73,12 @@ async fn assemble(c: &mut Client, call: &Call<'_>) -> CallResult {
                 let mut actions = Vec::new();
                 for id in ids {
                     if !sources.contains_key(&id) {
-                        let item = load_items(tx, ItemQuery::Id(id)).await.map_err(db_err)?.into_iter().next()
+                        let item = load_items(tx, &sde, ItemQuery::Id(id)).await.map_err(db_err)?.into_iter().next()
                             .ok_or_else(|| crate::services::notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
                         let valid_source = if let Some(station) = station {
                             item.location_id == station && item.flag_id == FLAG_HANGAR
                         } else if Some(item.location_id) == active_ship && item.flag_id == FLAG_CARGO {
-                            let carrier = load_items(tx, ItemQuery::Id(item.location_id)).await.map_err(db_err)?.into_iter().next();
+                            let carrier = load_items(tx, &sde, ItemQuery::Id(item.location_id)).await.map_err(db_err)?.into_iter().next();
                             carrier.is_some_and(|carrier| carrier.owner_id == char_id && carrier.category_id == CATEGORY_SHIP as i64)
                         } else {
                             false
@@ -105,11 +108,11 @@ async fn assemble(c: &mut Client, call: &Call<'_>) -> CallResult {
                 for (id, split) in actions {
                     let (item, remaining) = &sources[&id];
                     if notified.insert(id) {
-                        notify_item_change(tx, outbox, id, assembly_source_change(item.quantity, remaining.unwrap())).await?;
+                        notify_item_change(tx, &sde, outbox, id, assembly_source_change(item.quantity, remaining.unwrap())).await?;
                     }
                     let ship_id = if split {
                         let new_id = fitting_dao::insert_assembled(tx, item, char_id, &name).await.map_err(db_err)?;
-                        notify_item_change(tx, outbox, new_id, vec![(IX_LOCATION_ID, Value::Int(0))]).await?;
+                        notify_item_change(tx, &sde, outbox, new_id, vec![(IX_LOCATION_ID, Value::Int(0))]).await?;
                         new_id
                     } else {
                         id

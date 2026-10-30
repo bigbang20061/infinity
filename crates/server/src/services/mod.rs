@@ -1,8 +1,11 @@
-//! Remote services the client calls (`sm.RemoteSvc(name).Method(...)`).
-//!
-//! Shared error builders, wire-field readers, randomness, corporation queries and surface-aware
-//! site placement live here. The site query reads `sde.map_celestials`; each service retains its
-//! own fallback and offset policy.
+//! Remote service routing and shared error builders, wire-field readers, randomness,
+//! corporation queries and site placement. Individual modules document their client
+//! contracts; scanning consumers include `eve/client/script/parklife/scanSvc.py:193-198`.
+//! Placement is server design, not a client-provided position generator: it uses
+//! celestials from the shared SDE, while each service retains its own fallback and
+//! offset policy. Runtime corporation data comes from the game database. Unsupported
+//! services fall through the dispatch chain; feature limitations are documented in
+//! their modules.
 
 mod agency;
 mod alliances;
@@ -40,6 +43,7 @@ mod ship;
 mod skills;
 mod standings;
 mod slash;
+mod sql_pattern;
 mod station;
 mod store;
 mod universe;
@@ -57,6 +61,7 @@ use crate::consts::GROUP_PLANET;
 use marshal::{DbRowDescriptor, DbType, Value};
 use crate::db::Db;
 use crate::messages;
+use crate::sde::Sde;
 use crate::space::V3;
 use tracing::warn;
 
@@ -188,23 +193,13 @@ pub(super) async fn has_role_or_is_ceo(db: &Db, char_id: i64, corp_id: i64, role
 }
 
 
-struct SitePositionRow { x: f64, y: f64, z: f64, radius: f64 }
-impl SitePositionRow {
-    fn from_row(row: &tokio_postgres::Row) -> Self {
-        Self { x: row.get("x"), y: row.get("y"), z: row.get("z"), radius: row.get("radius") }
-    }
-}
-
 /// Choose a planet and its radius; callers retain their fallback and offset policy.
-pub async fn site_position(db: &Db, system: i64) -> Result<Option<(V3, f64)>, CallError> {
-    let planet = db.query_opt(
-        "SELECT x, y, z, COALESCE(radius, 0)::float8 AS radius FROM sde.map_celestials WHERE solar_system_id = $1 AND group_id = $2 ORDER BY random() LIMIT 1",
-        &[&(system as i32), &GROUP_PLANET],
-    ).await.map_err(db_err)?;
-    Ok(planet.map(|p| {
-        let p = SitePositionRow::from_row(&p);
-        ([p.x, p.y, p.z], p.radius)
-    }))
+pub fn site_position(sde: &Sde, system: i64) -> Option<(V3, f64)> {
+    let planets = || sde.map.celestials(system).filter(|p| p.group_id == Some(i64::from(GROUP_PLANET)));
+    let count = planets().count();
+    if count == 0 { return None; }
+    let p = planets().nth((rand01() * count as f64) as usize)?;
+    Some(([p.x.expect("planet x"), p.y.expect("planet y"), p.z.expect("planet z")], p.radius.unwrap_or(0.0)))
 }
 
 /// A point `distance` above a body's surface, in a random direction near the system plane.

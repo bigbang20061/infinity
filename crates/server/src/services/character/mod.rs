@@ -10,7 +10,7 @@ mod char_mgr;
 mod paper_doll_server;
 mod corporation_svc;
 mod repair_svc;
-mod home_station;
+pub(super) mod home_station;
 mod account;
 mod station;
 

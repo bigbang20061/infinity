@@ -1,6 +1,6 @@
 //! Bound skillHandler calls; no specific client module path is established.
-//! Uses game.skills, game.skill_queue, game.characters, sde.chr_bloodlines and
-//! sde.type_attributes through the training and attribute helpers.
+//! Uses game.skills, game.skill_queue, game.characters and startup SDE data
+//! through the training and attribute helpers.
 //! History, boosters, implants, penalties and several other calls use fixed answers.
 use super::*;
 use super::attributes::character_attributes;

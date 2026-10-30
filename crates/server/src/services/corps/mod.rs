@@ -7,8 +7,8 @@
 //! kick them, back to their school's NPC corporation. Membership changes reach an online
 //! pilot as a session change (corpid, corprole...), which also moves them to the new corp
 //! chat channel. A member's roles are one mask (game.characters.corp_roles) used for all
-//! locations. Alliances are services/alliances; titles, wallet divisions and offices are
-//! supported. Shares aren't supported.
+//! locations. Static NPC corporations and schools come from the startup SDE. Alliances are
+//! services/alliances; titles, wallet divisions and offices are supported. Shares aren't supported.
 
 use super::{db_err, keyval, notify_error, row, rowset, trimmed_arg_text, value_id_list, Call, CallError, CallResult};
 use super::alliances;
@@ -19,8 +19,10 @@ use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::{dispatch_world, Outbox};
 use crate::messages;
+use crate::sde::Sde;
 use crate::space::World;
 use marshal::{DbRowDescriptor, DbType, Value};
+use std::sync::Arc;
 use tracing::info;
 
 /// appConst.corporationStartupCost
@@ -90,17 +92,12 @@ pub(super) async fn ceo_of(db: &(impl Executor + ?Sized), corp: i64) -> Result<O
 
 /// Move a character into `corp` with `roles`, recording the employment and updating their
 /// session if they're online.
-async fn set_corp<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, char_id: i64, corp: i64, roles: i64, now: i64) -> Result<(), CallError> {
+async fn set_corp<X: Send>(db: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<X>, char_id: i64, corp: i64, roles: i64, now: i64) -> Result<(), CallError> {
     let (hq, alliance): (Option<i64>, Option<i64>) = if is_player_corp(corp) {
         registry::headquarters(db, corp).await.map_err(db_err)?
             .map(|row| (row.station_id, row.alliance_id)).unwrap_or_default()
     } else {
-        let hq = db
-            .query_opt("SELECT station_id::bigint AS station_id FROM sde.crp_npc_corporations WHERE corporation_id = $1::bigint", &[&corp])
-            .await
-            .map_err(db_err)?
-            .and_then(|r| r.get("station_id"));
-        (hq, None)
+        (sde.npc_corporations.get(corp).and_then(|row| row.station_id), None)
     };
     registry::set_corp(db, char_id, corp, roles, now).await.map_err(db_err)?;
     let pair = |k: &str, v: Value| Value::tuple([Value::str(k), v]);
@@ -122,15 +119,17 @@ async fn set_corp<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>
 }
 
 /// The NPC corporation of the character's school.
-async fn school_corp(db: &(impl Executor + ?Sized), char_id: i64) -> Result<i64, CallError> {
-    registry::school_corp(db, char_id).await.map_err(db_err)?
+async fn school_corp(db: &(impl Executor + ?Sized), sde: &Sde, char_id: i64) -> Result<i64, CallError> {
+    let row = registry::school(db, char_id).await.map_err(db_err)?;
+    row.school_id.and_then(|id| sde.characters.school(i64::from(id))).and_then(|school| school.corporation_id)
+        .or_else(|| sde.characters.schools_for_race(row.race_id).next().and_then(|school| school.corporation_id))
         .ok_or_else(|| CallError::Internal(anyhow::anyhow!("no school corporation for {char_id}")))
 }
 
 
 /// Leave (or be kicked from) a player corporation, back to the school's NPC corporation.
 /// A CEO can only leave as the last member, which closes the corporation.
-async fn leave_inner<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, char_id: i64, now: i64) -> Result<(), CallError> {
+async fn leave_inner<X: Send>(db: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<X>, char_id: i64, now: i64) -> Result<(), CallError> {
     let (corp, _) = membership(db, char_id).await?;
     if !is_player_corp(corp) {
         return Err(notify_error(messages::CANNOT_LEAVE_NPC_CORP));
@@ -143,14 +142,18 @@ async fn leave_inner<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox
         super::alliances::leave_alliance(db, outbox, corp, now).await?;
         registry::close_corp(db, corp).await.map_err(db_err)?;
     }
-    let school = school_corp(db, char_id).await?;
-    set_corp(db, outbox, char_id, school, 0, now).await
+    let school = school_corp(db, sde, char_id).await?;
+    set_corp(db, sde, outbox, char_id, school, 0, now).await
 }
 
-async fn leave(db: &Db, world: &World, char_id: i64) -> Result<(), CallError> {
+async fn leave(db: &Db, sde: &Arc<Sde>, world: &World, char_id: i64) -> Result<(), CallError> {
     let now = filetime_now();
+    let sde = sde.clone();
     db.transaction(
-        |tx, outbox| Box::pin(async move { leave_inner(tx, outbox, char_id, now).await }),
+        |tx, outbox| {
+            let sde = sde.clone();
+            Box::pin(async move { leave_inner(tx, &sde, outbox, char_id, now).await })
+        },
         |value, outbox| async move { dispatch_world(value, outbox, world) },
     ).await
 }

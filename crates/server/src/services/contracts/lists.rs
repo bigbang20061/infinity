@@ -1,10 +1,21 @@
 //! Contract listing mechanics for contractProxy, mirroring eve/client/script/ui/shared/neocom/contracts.
-//! Uses game contracts and items through database access; corporation contracts are unsupported.
+//! Uses game contracts and items plus immutable SDE stations and types; corporation contracts are unsupported.
 
 use super::*;
 
 // ---------------------------------------------------------------- lists
 
+
+fn location_matches(location: Option<i64>, station: i64, ancestry: [Option<i64>; 3]) -> bool {
+    location.is_none_or(|id| id == station || ancestry.contains(&Some(id)))
+}
+
+fn type_matches(type_id: i32, group: Option<i32>, category: Option<i32>, types: Option<&[i32]>, wanted_group: Option<i32>, wanted_category: Option<i32>) -> bool {
+    if let Some(types) = types { types.contains(&type_id) }
+    else if let Some(wanted) = wanted_group { group == Some(wanted) }
+    else if let Some(wanted) = wanted_category { category == Some(wanted) }
+    else { true }
+}
 
 /// `SearchContracts(**filters)` -> KeyVal(contracts, numFound, searchTime, maxResults).
 pub(super) async fn search(c: &Client, kw: &Value) -> CallResult {
@@ -19,23 +30,42 @@ pub(super) async fn search(c: &Client, kw: &Value) -> CallResult {
     };
     let filters = query::Search {
         now: filetime_now(), assignee, kind: int("contractType").unwrap_or(CONTYPE_ALL),
-        start: int("locationID"), end: int("endLocationID"), issuer: int("issuerID"),
+        issuer: int("issuerID"),
         bounds: [float("minPrice"), float("maxPrice"), float("minReward"), float("maxReward"),
             float("minCollateral"), float("maxCollateral"), float("minVolume"), float("maxVolume")],
-        item_types: get("itemTypes").map(id_list), group: int("itemGroupID").map(|v| v as i32),
-        category: int("itemCategoryID").map(|v| v as i32),
         description: get("description").and_then(|v| v.as_text()).filter(|t| !t.trim().is_empty()).map(|t| t.into_owned()),
         exclude_multiple: truthy(get("excludeMultiple")), exclude_trade: truthy(get("excludeTrade")),
         exclude_no_buyout: truthy(get("excludeNoBuyout")), sort: int("sortBy").unwrap_or(0),
         descending: int("sortDir").unwrap_or(0) != 0, outstanding: STATUS_OUTSTANDING,
         all: CONTYPE_ALL, combined: CONTYPE_AUCTION_AND_ITEM_EXCHANGE, exchange: TYPE_ITEM_EXCHANGE,
-        auction: TYPE_AUCTION, limit: MAX_SEARCH_RESULTS,
+        auction: TYPE_AUCTION,
     };
-    let (found, started) = query::search(db, filters).await.map_err(db_err)?;
+    let (mut found, started) = query::search(db, filters).await.map_err(db_err)?;
+    let matches_location = |id: i64, location: Option<i64>| {
+        let station = c.sde.map.station(id);
+        location_matches(location, id, [
+            station.and_then(|s| s.solar_system_id),
+            station.and_then(|s| s.constellation_id),
+            station.and_then(|s| s.region_id),
+        ])
+    };
+    found.retain(|k| matches_location(k.start, int("locationID")) && matches_location(k.end, int("endLocationID")));
+    let item_types = get("itemTypes").map(id_list);
+    let group = int("itemGroupID").map(|v| v as i32);
+    let category = int("itemCategoryID").map(|v| v as i32);
+    if item_types.is_some() || group.is_some() || category.is_some() {
+        let ids: Vec<_> = found.iter().map(|k| k.id).collect();
+        let matching: std::collections::HashSet<i64> = shared::items(db, &ids).await.map_err(db_err)?.into_iter()
+            .filter(|item| item.in_crate && c.sde.types.get(item.type_id as i32).is_some_and(|t|
+                type_matches(item.type_id as i32, t.group_id, t.category_id, item_types.as_deref(), group, category)))
+            .map(|item| item.contract_id).collect();
+        found.retain(|k| matching.contains(&k.id));
+    }
+    found.truncate(MAX_SEARCH_RESULTS);
     let start = (int("startNum").unwrap_or(0).max(0) as usize).min(found.len());
     let page = &found[start..(start + CONTRACTS_PER_PAGE).min(found.len())];
     Ok(keyval([
-        ("contracts", Value::List(bundles(db, page).await?)),
+        ("contracts", Value::List(bundles(db, &c.sde, page).await?)),
         ("numFound", Value::Int(found.len() as i64)),
         ("searchTime", Value::Int(started.elapsed().as_millis() as i64)),
         ("maxResults", Value::Int(MAX_SEARCH_RESULTS as i64)),
@@ -47,7 +77,7 @@ pub(super) async fn list_for_owner(c: &Client, call: &Call<'_>) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
     let arg_int = |i: usize| call.args.get(i).and_then(|v| v.as_int());
     if arg_int(0) != Some(me) {
-        return listing(&c.db, &[]).await;
+        return listing(&c.db, &c.sde, &[]).await;
     }
     let filters = query::Owner {
         me, issued_by: match call.args.get(3) { Some(Value::Bool(v)) => Some(*v), _ => None },
@@ -58,7 +88,7 @@ pub(super) async fn list_for_owner(c: &Client, call: &Call<'_>) -> CallResult {
         all: CONTYPE_ALL, combined: CONTYPE_AUCTION_AND_ITEM_EXCHANGE, exchange: TYPE_ITEM_EXCHANGE, auction: TYPE_AUCTION,
     };
     let list = query::owner(&c.db, filters).await.map_err(db_err)?;
-    listing(&c.db, &list).await
+    listing(&c.db, &c.sde, &list).await
 }
 
 /// Contracts that need the character: their own expired or rejected ones, and courier
@@ -112,9 +142,9 @@ pub(super) async fn login_info(c: &Client) -> CallResult {
     let attention = DbRowDescriptor::new([("contractID", DbType::I8), ("forCorp", DbType::Bool)]);
     let needs: Vec<Value> = needing_attention(db, me).await?.iter().map(|k| attention.row(&[Value::Int(k.id), Value::Bool(false)])).collect();
     Ok(keyval([
-        ("assignedToMe", Value::list(assigned_to(db, me, corp).await?.iter().map(Contract::keyval))),
+        ("assignedToMe", Value::list(assigned_to(db, me, corp).await?.iter().map(|k| k.keyval(&c.sde)))),
         ("needsAttention", Value::List(needs)),
-        ("inProgress", Value::list(in_progress(db, me).await?.iter().filter(|k| k.kind == TYPE_COURIER).map(Contract::keyval))),
+        ("inProgress", Value::list(in_progress(db, me).await?.iter().filter(|k| k.kind == TYPE_COURIER).map(|k| k.keyval(&c.sde)))),
     ]))
 }
 
@@ -130,9 +160,9 @@ pub(super) async fn escrow(c: &Client) -> CallResult {
 pub(super) async fn items_in(c: &Client, location: i64, hangar_only: bool) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
     let items = if hangar_only {
-        load_items(&c.db, ItemQuery::OwnerLocationFlag(me, location, FLAG_HANGAR)).await.map_err(db_err)?
+        load_items(&c.db, &c.sde, ItemQuery::OwnerLocationFlag(me, location, FLAG_HANGAR)).await.map_err(db_err)?
     } else {
-        load_items(&c.db, ItemQuery::OwnerLocation(me, location)).await.map_err(db_err)?
+        load_items(&c.db, &c.sde, ItemQuery::OwnerLocation(me, location)).await.map_err(db_err)?
     };
     Ok(Value::list(items.iter().map(Item::row)))
 }
@@ -140,11 +170,15 @@ pub(super) async fn items_in(c: &Client, location: i64, hangar_only: bool) -> Ca
 /// `SplitStack(stationID, itemID, quantity, forCorp, flag)` -> the new stack's itemID.
 pub(super) async fn split_stack(c: &Client, station_id: i64, item_id: i64, quantity: i64) -> CallResult {
     let (db, world) = (&c.db, &*c.world);
+    let sde = &c.sde;
     let me = c.session.int("charid").unwrap_or(0);
     let _trading = lock().await;
     db.transaction(
-        |db, outbox: &mut Outbox| Box::pin(async move {
-            let item = load_items(db, ItemQuery::Id(item_id)).await.map_err(db_err)?.pop().ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
+        |db, outbox: &mut Outbox| {
+            let sde = sde.clone();
+            Box::pin(async move {
+            let sde = &*sde;
+            let item = load_items(db, sde, ItemQuery::Id(item_id)).await.map_err(db_err)?.pop().ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
             if item.owner_id != me || item.location_id != station_id || item.singleton || quantity < 1 || quantity >= item.quantity as i64 {
                 return Err(notify_error(messages::STACK_CANNOT_BE_SPLIT));
             }
@@ -153,9 +187,12 @@ pub(super) async fn split_stack(c: &Client, station_id: i64, item_id: i64, quant
             let old_quantity = item.quantity;
             let left = Item { quantity: old_quantity - quantity, ..item };
             outbox.notify_pilot(me, "OnItemChange", vec![left.row(), Value::Dict(vec![(Value::Int(IX_STACK_SIZE), Value::Int(old_quantity as i64))]), Value::None]);
-            show_items(db, outbox, me, station_id, &[id], LOCATION_JUNKYARD).await?;
+            show_items(db, sde, outbox, me, station_id, &[id], LOCATION_JUNKYARD).await?;
             Ok(Value::Int(id))
-        }),
+        })},
         |value, outbox| async move { dispatch_world(value, outbox, world) },
     ).await
 }
+
+#[cfg(test)] mod tests;
+

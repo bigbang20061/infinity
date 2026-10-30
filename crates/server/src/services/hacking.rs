@@ -81,6 +81,15 @@ const UE_TURNS: i64 = 3;
 const SUPPRESSION: i64 = 10;
 const RESTORATION_HEAL: i64 = 10;
 
+/// Match PostgreSQL's float-to-integer conversion for requiredSkill1.
+fn analyzer_skill(value: f64) -> Result<i32, CallError> {
+    let rounded = value.round_ties_even();
+    if !rounded.is_finite() || rounded < i32::MIN as f64 || rounded > i32::MAX as f64 {
+        return Err(CallError::Internal(anyhow::anyhow!("analyzer required skill is out of integer range: {value}")));
+    }
+    Ok(rounded as i32)
+}
+
 type Coord = (i64, i64);
 
 fn rand_below(n: usize) -> usize {
@@ -439,9 +448,11 @@ pub async fn start(c: &mut Client, module: i64, target: Option<i64>) -> CallResu
     if site.hacked {
         return Err(notify_error(messages::HACK_CONTAINER_ALREADY_HACKED));
     }
-    let r = crate::dao::items::hacking::analyzer(&c.db, module, ship, [ATTR_REQUIRED_SKILL_1, ATTR_MAX_RANGE, ATTR_DURATION, ATTR_VIRUS_COHERENCE, ATTR_VIRUS_STRENGTH, ATTR_VIRUS_SLOTS]).await.map_err(db_err)?;
-    let Some(r) = r else { return Ok(Value::None) };
-    let (module_type, skill, range, duration) = (r.type_id, r.skill, r.range, r.duration);
+    let Some(module_type) = crate::dao::items::hacking::analyzer(&c.db, module, ship).await.map_err(db_err)? else { return Ok(Value::None) };
+    let attr = |id, default| c.sde.types.attribute(module_type, id).unwrap_or(default);
+    let skill = analyzer_skill(attr(ATTR_REQUIRED_SKILL_1, 0.0))?;
+    let range = attr(ATTR_MAX_RANGE, 6000.0);
+    let duration = attr(ATTR_DURATION, 5000.0);
     let needed = if site.relic { SKILL_ARCHAEOLOGY } else { SKILL_HACKING };
     if skill != needed {
         return Err(notify_error(if site.relic { messages::RELIC_CONTAINER_REQUIRES_RELIC_ANALYZER } else { messages::DATA_CONTAINER_REQUIRES_DATA_ANALYZER }));
@@ -456,9 +467,9 @@ pub async fn start(c: &mut Client, module: i64, target: Option<i64>) -> CallResu
         return Err(notify_error(&messages::analyzer_range(metres_to_km(gap), metres_to_km(range))));
     }
     let level = crate::dao::skills::levels::level(&c.db, char_id, needed).await.map_err(db_err)?.map(|level| level as f64).unwrap_or(0.0);
-    let coherence = (r.coherence + COHERENCE_PER_SKILL_LEVEL * level).round() as i64;
-    let strength = r.strength.round() as i64;
-    let slots = r.slots.round().clamp(1.0, 6.0) as usize;
+    let coherence = (attr(ATTR_VIRUS_COHERENCE, 40.0) + COHERENCE_PER_SKILL_LEVEL * level).round() as i64;
+    let strength = attr(ATTR_VIRUS_STRENGTH, 20.0).round() as i64;
+    let slots = attr(ATTR_VIRUS_SLOTS, 3.0).round().clamp(1.0, 6.0) as usize;
 
     let mut next_id = 100;
     let (tiles, _) = board(site.tier, || {

@@ -1,5 +1,5 @@
-//! Contract list queries for contractProxy; reads game contracts and static station data.
-//! Filtering and SQL construction are persistence concerns; client policy stays in services.
+//! Contract list queries for contractProxy; reads game contracts and contract items.
+//! Static filtering and pagination of search candidates remain in the service.
 use super::{Contract, CONTRACT_SELECT};
 use crate::db::{executor::Executor, Error};
 use tokio_postgres::types::ToSql;
@@ -14,11 +14,11 @@ async fn run(ex: &(impl Executor + ?Sized), sql: &str, params: &[Box<dyn ToSql +
 }
 
 pub(crate) struct Search {
-    pub now: i64, pub assignee: i64, pub kind: i64, pub start: Option<i64>, pub end: Option<i64>, pub issuer: Option<i64>,
-    pub bounds: [Option<f64>; 8], pub item_types: Option<Vec<i32>>, pub group: Option<i32>, pub category: Option<i32>,
+    pub now: i64, pub assignee: i64, pub kind: i64, pub issuer: Option<i64>,
+    pub bounds: [Option<f64>; 8],
     pub description: Option<String>, pub exclude_multiple: bool, pub exclude_trade: bool, pub exclude_no_buyout: bool,
     pub sort: i64, pub descending: bool,
-    pub outstanding: i32, pub all: i64, pub combined: i64, pub exchange: i32, pub auction: i32, pub limit: usize,
+    pub outstanding: i32, pub all: i64, pub combined: i64, pub exchange: i32, pub auction: i32,
 }
 pub(crate) async fn search(ex: &(impl Executor + ?Sized), f: Search) -> Result<(Vec<Contract>, std::time::Instant), Error> {
     let mut params: Vec<Box<dyn ToSql + Sync + Send>> = vec![];
@@ -26,17 +26,10 @@ pub(crate) async fn search(ex: &(impl Executor + ?Sized), f: Search) -> Result<(
     sql += &format!(" AND c.assignee_id = {}", arg(&mut params, f.assignee));
     if f.kind == f.combined { sql += &format!(" AND c.type IN ({}, {})", f.exchange, f.auction); }
     else if f.kind != f.all { sql += &format!(" AND c.type = {}", arg(&mut params, f.kind as i32)); }
-    for (loc, alias, station) in [(f.start, "ss", "c.start_station_id"), (f.end, "es", "c.end_station_id")] {
-        if let Some(loc) = loc { let p = arg(&mut params, loc); sql += &format!(" AND ({station} = {p} OR {alias}.solar_system_id = {p} OR {alias}.constellation_id = {p} OR {alias}.region_id = {p})"); }
-    }
     if let Some(issuer) = f.issuer { sql += &format!(" AND c.issuer_id = {}", arg(&mut params, issuer)); }
     for (v, (column, op)) in f.bounds.into_iter().zip([("price", ">="), ("price", "<="), ("reward", ">="), ("reward", "<="), ("collateral", ">="), ("collateral", "<="), ("volume", ">="), ("volume", "<=")]) {
         if let Some(v) = v { sql += &format!(" AND c.{column} {op} {}", arg(&mut params, v)); }
     }
-    let crate_has = |cond: &str| format!(" AND EXISTS (SELECT 1 FROM game.contract_items ci JOIN sde.inv_types t USING (type_id) WHERE ci.contract_id = c.contract_id AND ci.in_crate AND {cond})");
-    if let Some(types) = f.item_types { sql += &crate_has(&format!("ci.type_id = ANY({})", arg(&mut params, types))); }
-    else if let Some(group) = f.group { sql += &crate_has(&format!("t.group_id = {}", arg(&mut params, group))); }
-    else if let Some(category) = f.category { sql += &crate_has(&format!("t.category_id = {}", arg(&mut params, category))); }
     if let Some(text) = f.description { sql += &format!(" AND (c.title ILIKE {p} OR c.description ILIKE {p})", p = arg(&mut params, format!("%{}%", text.trim()))); }
     if f.exclude_multiple { sql += " AND (SELECT count(*) FROM game.contract_items ci WHERE ci.contract_id = c.contract_id AND ci.in_crate) <= 1"; }
     if f.exclude_trade { sql += " AND NOT EXISTS (SELECT 1 FROM game.contract_items ci WHERE ci.contract_id = c.contract_id AND NOT ci.in_crate)"; }
@@ -45,7 +38,7 @@ pub(crate) async fn search(ex: &(impl Executor + ?Sized), f: Search) -> Result<(
     let dir = if f.descending { "DESC" } else { "ASC" };
     let refs: Vec<&(dyn ToSql + Sync)> = params.iter().map(|p| p.as_ref() as &(dyn ToSql + Sync)).collect();
     let started = std::time::Instant::now();
-    let order = format!("ORDER BY {column} {dir}, c.contract_id LIMIT {}", f.limit);
+    let order = format!("ORDER BY {column} {dir}, c.contract_id");
     let found = ex.query(&format!("{CONTRACT_SELECT} WHERE {sql} {order}"), &refs).await?.iter().map(Contract::from_row).collect();
     Ok((found, started))
 }

@@ -11,9 +11,9 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         ("corpmgr", "GetPublicInfo") => return Some(corporation(c, arg_int(0).unwrap_or(my_corp)).await),
         ("corpmgr", "GetCorporationIDForCharacter") => {
             let id = arg_int(0).unwrap_or(0);
-            let r = crate::dao::characters::routing::corporation_for_character(&c.db, id).await;
+            let r = crate::dao::characters::crimewatch::corporation(&c.db, id).await;
             match r {
-                Ok(r) => r.map(Value::Int).unwrap_or(Value::None),
+                Ok(r) => r.or_else(|| c.sde.characters.npc_character(id).and_then(|npc| npc.corporation_id)).map(Value::Int).unwrap_or(Value::None),
                 Err(e) => return Some(Err(db_err(e))),
             }
         }

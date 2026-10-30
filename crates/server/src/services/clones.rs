@@ -6,6 +6,7 @@
 //! pilot in a fresh capsule at the destination; it can be done once per 24 hours, an hour
 //! less per Infomorph Synchronizing level. Implants aren't modelled, so clones carry none
 //! and cost nothing. Ship-borne clone vat bays aren't supported.
+//! Clone destinations are resolved from the startup SDE after checking game ownership.
 
 use super::{crowset, db_err, notify_error, value_text, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
@@ -85,8 +86,11 @@ async fn jump(c: &mut Client, me: i64, dest: i64, clone_id: i64) -> CallResult {
     let now = filetime_now();
     let ship = c.session.int("shipid");
     let db = c.db.clone();
+    let sde = c.sde.clone();
     db.transaction(
-        |tx, outbox: &mut Outbox<JumpEffect>| Box::pin(async move {
+        |tx, outbox: &mut Outbox<JumpEffect>| {
+            let sde = sde.clone();
+            Box::pin(async move {
             let last = clone_dao::last_jump(tx, me).await.map_err(db_err)?;
             let level = skill_dao::level(tx, me, SKILL_INFOMORPH_SYNCHRONIZING).await.map_err(db_err)?.unwrap_or(0) as i64;
             let cooldown = (BASE_JUMP_COOLDOWN_HOURS - level) * FILETIME_HOUR;
@@ -94,8 +98,10 @@ async fn jump(c: &mut Client, me: i64, dest: i64, clone_id: i64) -> CallResult {
                 let hours = (ready - now) as f64 / FILETIME_HOUR as f64;
                 return Err(notify_error(&messages::jump_clone_cooldown(hours)));
             }
-            let target = clone_dao::target(tx, clone_id, me, dest).await.map_err(db_err)?.ok_or_else(|| notify_error(messages::JUMP_CLONE_NOT_FOUND))?;
-            let (to, system, constellation, region) = (target.station_id, target.solar_system_id, target.constellation_id, target.region_id);
+            let target = clone_dao::target(tx, clone_id, me, dest).await.map_err(db_err)?
+                .and_then(|id| sde.map.station(id)).ok_or_else(|| notify_error(messages::JUMP_CLONE_NOT_FOUND))?;
+            let required = |v: Option<i64>| v.ok_or_else(|| CallError::Internal(anyhow::anyhow!("jump clone station required field is null")));
+            let (to, system, constellation, region) = (target.station_id, required(target.solar_system_id)?, required(target.constellation_id)?, required(target.region_id)?);
             if to == station {
                 return Err(notify_error(messages::ALREADY_AT_JUMP_CLONE_DESTINATION));
             }
@@ -109,7 +115,8 @@ async fn jump(c: &mut Client, me: i64, dest: i64, clone_id: i64) -> CallResult {
             outbox.operation(JumpEffect::Session { station: to, system, constellation, region, capsule });
             outbox.notify_pilot(me, "OnJumpCloneCacheInvalidated", vec![]);
             Ok(to)
-        }),
+            })
+        },
         |to, outbox| async move {
             let world = c.world.clone();
             for effect in outbox.into_entries() {

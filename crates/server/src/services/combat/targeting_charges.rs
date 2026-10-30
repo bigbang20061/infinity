@@ -18,8 +18,7 @@ pub(super) async fn add_target(c: &mut Client, target: i64) -> CallResult {
     let Some((ship, t)) = cx.world.with(cx.system_id, move |s| Some((s.ball(ship_id)?.clone(), s.ball(target)?.clone()))).await.flatten() else {
         return Err(user_error(messages::MSG_TARGETING_ATTEMPT_CANCELLED, vec![]));
     };
-    let fit = Fit::load(&cx.db, cx.char_id, cx.ship_id).await?;
-    let target_attrs = attributes(&cx.db, t.type_id).await?;
+    let fit = Fit::load(&cx.db, cx.world.sde().clone(), cx.char_id, cx.ship_id).await?;
     let range = fit.value(Key::Ship, ATTR_MAX_TARGET_RANGE);
     let gap = dist(ship.pos, t.pos) - t.radius as f64;
     if gap > range {
@@ -33,7 +32,7 @@ pub(super) async fn add_target(c: &mut Client, target: i64) -> CallResult {
     if targets_of(cx.char_id).len() >= max_targets.max(1) {
         return Err(user_error(messages::MSG_CUSTOM_NOTIFY, vec![("notify".into(), Value::unicode(messages::target_limit(max_targets.max(1))))]));
     }
-    let delay = lock_time_ms(fit.value(Key::Ship, ATTR_SCAN_RESOLUTION), attr(&target_attrs, ATTR_SIGNATURE_RADIUS, t.radius as f64));
+    let delay = lock_time_ms(fit.value(Key::Ship, ATTR_SCAN_RESOLUTION), attr(cx.world.sde(), t.type_id, ATTR_SIGNATURE_RADIUS, t.radius as f64));
     let attempt = NEXT_LOCK.fetch_add(1, Ordering::Relaxed);
     state().locking.insert((cx.char_id, target), attempt);
     debug!(user = c.login.user_id, "locking {target} in {delay}ms");
@@ -113,11 +112,11 @@ pub(super) async fn bank(db: &(impl Executor + ?Sized), ship: i64, master: i64) 
 }
 
 /// Empty a module's charges into `location`/`flag` (cargo by default).
-pub(super) async fn unload<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, owner: i64, ship: i64, module: &Item, location: i64, flag: i32) -> Result<(), CallError> {
+pub(super) async fn unload<X: Send>(db: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<X>, owner: i64, ship: i64, module: &Item, location: i64, flag: i32) -> Result<(), CallError> {
     let Some((type_id, qty)) = loaded(db, ship, module.flag_id).await? else { return Ok(()) };
     crate::dao::items::combat::delete_charge(db, ship, module.flag_id).await.map_err(db_err)?;
     outbox.notify_client("OnModuleAttributeChanges", vec![quantity_change(owner, ship, module.flag_id, type_id, 0, qty as i64)]);
-    deposit(db, outbox, owner, location, flag, type_id, qty, ship).await
+    deposit(db, sde, outbox, owner, location, flag, type_id, qty, ship).await
 }
 
 // Unlike value_ids, scalar module IDs accept Bool through as_int; lists take precedence.
@@ -143,16 +142,18 @@ pub(super) async fn load_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
     let session_owner = c.session.int("charid");
     let owner = session_owner.unwrap_or(0);
     let db = c.db.clone();
+    let sde = c.sde.clone();
     let client = &mut *c;
     let loads = db.transaction(
         |tx, outbox: &mut Outbox| {
             let modules = modules.clone();
             let charge_ids = charge_ids.clone();
+            let sde = sde.clone();
             Box::pin(async move {
                 let refuse = || notify_error(messages::INSUFFICIENT_AMMUNITION);
                 if !crate::dao::items::ship::lock_reload_ship(tx, ship).await.map_err(db_err)? { return Err(refuse()); }
                 let owner = session_owner.ok_or_else(refuse)?;
-                let hull = load_items(tx, ItemQuery::Id(ship)).await.map_err(db_err)?
+                let hull = load_items(tx, &sde, ItemQuery::Id(ship)).await.map_err(db_err)?
                     .into_iter().next().ok_or_else(refuse)?;
                 if hull.owner_id != owner || hull.category_id != crate::consts::CATEGORY_SHIP as i64
                     || (active_ship != Some(ship) && !(hull.singleton && station == Some(hull.location_id) && hull.flag_id == FLAG_HANGAR)) {
@@ -162,7 +163,7 @@ pub(super) async fn load_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
                 let source_flags: &[i32] = if station == Some(source) {
                     &[FLAG_HANGAR]
                 } else {
-                    let container = load_items(tx, ItemQuery::Id(source)).await.map_err(db_err)?
+                    let container = load_items(tx, &sde, ItemQuery::Id(source)).await.map_err(db_err)?
                         .into_iter().next().ok_or_else(refuse)?;
                     if container.owner_id != owner || !container.singleton {
                         return Err(refuse());
@@ -183,7 +184,7 @@ pub(super) async fn load_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
                         if !all.contains(&id) { all.push(id); }
                     }
                 }
-                let fitted = load_items(tx, ItemQuery::Ids(&all)).await.map_err(db_err)?;
+                let fitted = load_items(tx, &sde, ItemQuery::Ids(&all)).await.map_err(db_err)?;
                 if all.iter().any(|id| !fitted.iter().any(|item| item.item_id == *id && item.owner_id == owner && item.location_id == ship && super::super::inventory::is_fitting_flag(item.flag_id))) {
                     return Err(refuse());
                 }
@@ -192,8 +193,8 @@ pub(super) async fn load_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
                 target_flags.dedup();
                 let older = crate::dao::items::pending_reloads::for_flags(tx, ship, &target_flags).await.map_err(db_err)?;
                 let older_ids: Vec<i64> = older.into_iter().map(|row| row.reload_id).collect();
-                super::reload_recovery::return_pending(tx, outbox, &older_ids, true).await?;
-                let stacks = load_items(tx, ItemQuery::Ids(&charge_ids)).await.map_err(db_err)?;
+                super::reload_recovery::return_pending(tx, &sde, outbox, &older_ids, true).await?;
+                let stacks = load_items(tx, &sde, ItemQuery::Ids(&charge_ids)).await.map_err(db_err)?;
                 if charge_ids.iter().any(|id| !stacks.iter().any(|item| item.item_id == *id && item.owner_id == owner && item.location_id == source && source_flags.contains(&item.flag_id) && item.quantity > 0)) {
                     return Err(refuse());
                 }
@@ -207,11 +208,9 @@ pub(super) async fn load_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
                     let module = fitted.iter().find(|item| item.item_id == module_id).ok_or_else(refuse)?;
                     if !flags.insert(module.flag_id) { continue; }
                     let Some(type_id) = selected.iter().find_map(|id| items.get(id).filter(|(_, q)| *q > 0).map(|(item, _)| item.type_id)) else { break };
-                    let capacity = ScalarRow::from_row(&tx.query_one(
-                        "SELECT GREATEST(COALESCE(t.capacity, 0), COALESCE((SELECT value FROM sde.type_attributes WHERE type_id = t.type_id AND attribute_id = $2), 0))::float8 AS value FROM sde.inv_types t WHERE t.type_id = $1",
-                        &[&module.type_id, &ATTR_CAPACITY],
-                    ).await.map_err(db_err)?).value;
-                    let volume = ScalarRow::from_row(&tx.query_one("SELECT COALESCE(volume, 0.01)::float8 AS value FROM sde.inv_types WHERE type_id = $1", &[&type_id]).await.map_err(db_err)?).value;
+                    let module_type = sde.types.get(module.type_id).ok_or_else(|| CallError::Internal(anyhow::anyhow!("unknown type {}", module.type_id)))?;
+                    let capacity = module_type.capacity.unwrap_or(0.0).max(module_type.attribute(ATTR_CAPACITY).unwrap_or(0.0));
+                    let volume = sde.types.get(type_id).ok_or_else(|| CallError::Internal(anyhow::anyhow!("unknown type {type_id}")))?.volume.unwrap_or(0.01);
                     let max = (capacity / volume.max(1e-6) + 1e-6).floor() as i32;
                     if max <= 0 { continue; }
                     let have = match loaded(tx, ship, module.flag_id).await? {
@@ -219,7 +218,7 @@ pub(super) async fn load_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
                         Some((t, q)) => {
                             let unload_owner = session_owner.unwrap_or(module.owner_id);
                             unloads.insert(module.flag_id, (t, q, unload_owner));
-                            let destination = load_items(tx, ItemQuery::LocationFlagTypeOwnerStack(ship, FLAG_CARGO, t, unload_owner)).await.map_err(db_err)?.into_iter().next();
+                            let destination = load_items(tx, &sde, ItemQuery::LocationFlagTypeOwnerStack(ship, FLAG_CARGO, t, unload_owner)).await.map_err(db_err)?.into_iter().next();
                             if let Some(item) = destination {
                                 let entry = items.entry(item.item_id).or_insert_with(|| { let quantity = item.quantity; (item, quantity) });
                                 entry.1 = entry.1.checked_add(q).ok_or_else(|| notify_error(messages::INSUFFICIENT_AMMUNITION))?;
@@ -246,11 +245,11 @@ pub(super) async fn load_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
                 for (id, (item, quantity)) in items {
                     if quantity == item.quantity { continue; }
                     if quantity == 0 { notify_item_removed(outbox, item); }
-                    else { notify_item_change(tx, outbox, id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?; }
+                    else { notify_item_change(tx, &sde, outbox, id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?; }
                 }
                 let ids = crate::dao::items::combat::insert_cargo(tx, ship, FLAG_CARGO, &inserts).await.map_err(db_err)?;
                 for id in ids {
-                    notify_item_change(tx, outbox, id, vec![(IX_LOCATION_ID, Value::Int(ship)), (IX_FLAG, Value::Int(FLAG_CARGO as i64))]).await?;
+                    notify_item_change(tx, &sde, outbox, id, vec![(IX_LOCATION_ID, Value::Int(ship)), (IX_FLAG, Value::Int(FLAG_CARGO as i64))]).await?;
                 }
                 let mut pending = Vec::with_capacity(loads.len());
                 for load in loads {
@@ -269,7 +268,7 @@ pub(super) async fn load_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
         apply_loads(&db, &c.world, &notify, ship, loads).await?;
         return Ok(Value::None);
     }
-    let reload_ms = match Fit::load(&c.db, owner, ship).await?.value(Key::Module(first), ATTR_RELOAD_TIME) {
+    let reload_ms = match Fit::load(&c.db, c.sde.clone(), owner, ship).await?.value(Key::Module(first), ATTR_RELOAD_TIME) {
         ms if ms > 0.0 => ms,
         _ => DEFAULT_RELOAD_MS,
     };
@@ -384,14 +383,16 @@ pub(super) async fn unload_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
     let flag = flag.unwrap_or(if location == ship { FLAG_CARGO } else { FLAG_HANGAR });
     let owner = c.session.int("charid");
     let db = c.db.clone();
+    let sde = c.sde.clone();
     db.transaction(
         |tx, outbox: &mut Outbox| {
             let modules = modules.clone();
+            let sde = sde.clone();
             Box::pin(async move {
                 for m in modules {
                     for id in bank(tx, ship, m).await? {
-                        if let Some(module) = load_items(tx, ItemQuery::IdAt(id, ship)).await.map_err(db_err)?.into_iter().next() {
-                            unload(tx, outbox, owner.unwrap_or(module.owner_id), ship, &module, location, flag).await?;
+                        if let Some(module) = load_items(tx, &sde, ItemQuery::IdAt(id, ship)).await.map_err(db_err)?.into_iter().next() {
+                            unload(tx, &sde, outbox, owner.unwrap_or(module.owner_id), ship, &module, location, flag).await?;
                         }
                     }
                 }
@@ -401,4 +402,5 @@ pub(super) async fn unload_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
         |value, outbox| async move { dispatch_client(value, outbox, c) },
     ).await
 }
+
 

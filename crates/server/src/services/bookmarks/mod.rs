@@ -2,7 +2,7 @@
 //! BookmarkScanResult; eve/client/script/ui/shared/bookmarks/bookmarkSvc.py).
 //!
 //! Each character has personal folders (game.bookmark_folders) with subfolders, holding
-//! bookmarks of static locations (regions, constellations, systems, stations), of things in
+//! bookmarks of startup SDE locations (regions, constellations, systems, stations), of things in
 //! space, of the pilot's own position, and of scan results. A bookmark keeps the solar system
 //! it is in and its coordinates. Deleting a subfolder only affects the specified owned folder;
 //! a missing or mismatched subfolder returns an empty list. Shared (access-group) folders aren't

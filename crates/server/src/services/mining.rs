@@ -15,7 +15,7 @@
 //! (OnOreMined -> notifications.oreMinedNotificationAdapter, OnItemChange).
 //!
 //! Reprocessing (the station's bound reprocessingSvc) turns items into their
-//! sde.inv_type_materials per portion: a station yield of 50%, raised by Reprocessing,
+//! canonical SDE type materials per portion: a station yield of 50%, raised by Reprocessing,
 //! Reprocessing Efficiency and the item's own processing skill, less a 5% tax in ISK.
 //! Output that exceeds a single stack's capacity is refused without consuming inputs.
 
@@ -43,6 +43,8 @@ const ATTR_PROCESSING_SKILL: i32 = 790; // reprocessingSkillType
 const FLAG_MINING_HOLD: i32 = 134; // flagGeneralMiningHold
 const SKILL_REPROCESSING: i32 = 3385;
 const SKILL_REPROCESSING_EFFICIENCY: i32 = 3389;
+/// SDE invCategories: asteroid resources.
+const CATEGORY_ASTEROID: i32 = 25;
 const SKILL_SCRAPMETAL: i32 = 12196;
 /// Server policy: an emptied belt grows back after two hours.
 const BELT_REGROW_SECS: i64 = 7200;
@@ -51,18 +53,6 @@ const STATION_EFFICIENCY: f64 = 0.5;
 const STATION_TAX: f64 = 0.05;
 /// The ship mining scanner reaches this far (m).
 const SCAN_RANGE: f64 = 500_000.0;
-struct FieldType { type_id: i32, volume: Option<f64> }
-impl FieldType { fn from_row(r: &tokio_postgres::Row) -> Self { Self { type_id: r.get("type_id"), volume: r.get("volume") } } }
-struct Security { security: f64 }
-impl Security { fn from_row(r: &tokio_postgres::Row) -> Self { Self { security: r.get("security") } } }
-struct Belt { item_id: i64, x: f64, y: f64, z: f64 }
-impl Belt { fn from_row(r: &tokio_postgres::Row) -> Self { Self { item_id: r.get("item_id"), x: r.get("x"), y: r.get("y"), z: r.get("z") } } }
-struct Position { x: f64, y: f64, z: f64 }
-impl Position { fn from_row(r: &tokio_postgres::Row) -> Self { Self { x: r.get("x"), y: r.get("y"), z: r.get("z") } } }
-struct TypeGroups { group_id: i64, category_id: i64 }
-impl TypeGroups { fn from_row(r: &tokio_postgres::Row) -> Self { Self { group_id: r.get("group_id"), category_id: r.get("category_id") } } }
-struct Volume { volume: f64 }
-impl Volume { fn from_row(r: &tokio_postgres::Row) -> Self { Self { volume: r.get("volume") } } }
 
 
 // ---------------------------------------------------------------- fields
@@ -113,25 +103,23 @@ fn field_groups(field: Field, security: f64, jspace: bool) -> (&'static [&'stati
         Field::Gas => (&["Amber Cytoserocin", "Golden Cytoserocin", "Viridian Cytoserocin", "Celadon Cytoserocin", "Lime Cytoserocin", "Vermillion Cytoserocin", "Azure Cytoserocin"], false),
     }
 }
+fn ore_candidate(name: &str, group: &str, category: Option<i32>, names: &[&str]) -> bool {
+    category == Some(CATEGORY_ASTEROID) && names.contains(&group)
+        && (name == group || name.strip_prefix(group).is_some_and(|suffix| suffix == " II-Grade" || suffix == " III-Grade"))
+}
+
 
 /// (typeID, volume) candidates of a field: ores with their +5% / +10% grades.
-async fn field_types(db: &Db, field: Field, security: f64, jspace: bool) -> Result<Vec<(i32, f64)>, CallError> {
+fn field_types(sde: &crate::sde::Sde, field: Field, security: f64, jspace: bool) -> Vec<(i32, f64)> {
     let (names, groups) = field_groups(field, security, jspace);
-    let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
-    let rows = if groups {
-        db
-            .query(
-                "SELECT t.type_id, t.volume::float8 FROM sde.inv_types t JOIN sde.inv_groups g ON g.group_id = t.group_id
-                 WHERE g.category_id = 25 AND g.name = ANY($1) AND t.published
-                   AND (t.name = g.name OR t.name = g.name || ' II-Grade' OR t.name = g.name || ' III-Grade')",
-                &[&names],
-            )
-            .await
-    } else {
-        db.query("SELECT type_id, volume::float8 FROM sde.inv_types WHERE name = ANY($1) AND published", &[&names]).await
-    }
-    .map_err(db_err)?;
-    Ok(rows.iter().map(|r| { let r = FieldType::from_row(r); (r.type_id, r.volume.unwrap_or(1.0).max(0.01)) }).collect())
+    sde.types.iter().filter(|t| {
+        if t.published != Some(true) { return false; }
+        let Some(name) = t.name.as_deref() else { return false };
+        if !groups { return names.contains(&name); }
+        let Some(group) = t.group_id.and_then(|id| sde.types.group(id)) else { return false };
+        let Some(group_name) = group.name.as_deref() else { return false };
+        ore_candidate(name, group_name, group.category_id, names)
+    }).map(|t| (t.type_id, t.volume.unwrap_or(1.0).max(0.01))).collect()
 }
 
 fn rock_ball(id: i64, type_id: i32, pos: V3, radius: f32) -> Ball {
@@ -180,7 +168,7 @@ fn rock_radius(field: Field, volume_m3: f64) -> f32 {
 
 /// Grow a field of rocks around `center` and put it in space. Returns the rock IDs.
 pub async fn grow_field(db: &Db, world: &World, system: i64, field_id: i64, center: V3, field: Field, security: f64, jspace: bool) -> Result<Vec<i64>, CallError> {
-    let types = field_types(db, field, security, jspace).await?;
+    let types = field_types(world.sde(), field, security, jspace);
     if types.is_empty() {
         return Ok(vec![]);
     }
@@ -212,12 +200,9 @@ pub async fn grow_field(db: &Db, world: &World, system: i64, field_id: i64, cent
 }
 
 /// (security, wormhole space) of a system.
-async fn system_band(db: &Db, system: i64) -> Result<(f64, bool), CallError> {
-    let r = db
-        .query_one("SELECT COALESCE(security, 0)::float8 AS security FROM sde.map_solar_systems WHERE solar_system_id = $1", &[&(system as i32)])
-        .await
-        .map_err(db_err)?;
-    Ok((Security::from_row(&r).security, (31_000_000..32_000_000).contains(&system)))
+fn system_band(sde: &crate::sde::Sde, system: i64) -> Result<(f64, bool), CallError> {
+    let row = sde.map.system(system as i32 as i64).ok_or_else(|| CallError::Internal(anyhow::anyhow!("missing solar system {system}")))?;
+    Ok((row.security.unwrap_or(0.0), (31_000_000..32_000_000).contains(&system)))
 }
 
 /// Bring a system's rocks into space (once per run): the stored ones, and fields for
@@ -235,17 +220,13 @@ pub async fn ensure_fields(db: &Db, world: &Arc<World>, system: i64) -> Result<(
         let ball = rock_ball(id, r.type_id, [r.x, r.y, r.z], r.radius.unwrap_or(2_000.0));
         world.add_ship(system, ball).await.map_err(CallError::Internal)?;
     }
-    let belts = db
-        .query("SELECT item_id::bigint, x, y, z FROM sde.map_celestials WHERE solar_system_id = $1 AND group_id = $2", &[&(system as i32), &GROUP_ASTEROID_BELT])
-        .await
-        .map_err(db_err)?;
+    let belts: Vec<_> = world.sde().map.celestials(system as i32 as i64).filter(|b| b.group_id == Some(GROUP_ASTEROID_BELT as i64)).collect();
     if belts.is_empty() {
         return Ok(());
     }
-    let (security, jspace) = system_band(db, system).await?;
+    let (security, jspace) = system_band(world.sde(), system)?;
     let now = filetime_now();
     for b in belts {
-        let b = Belt::from_row(&b);
         let belt = b.item_id;
         if fields_with_rocks.contains(&belt) {
             continue;
@@ -254,10 +235,10 @@ pub async fn ensure_fields(db: &Db, world: &Arc<World>, system: i64) -> Result<(
         let regrow_at = depleted.flatten().map(|t| t + BELT_REGROW_SECS * FILETIME_SECOND);
         if regrow_at.is_some_and(|t| t > now) {
             world.system(system).await.map_err(CallError::Internal)?;
-            schedule_regrow(db.clone(), world.clone(), system, belt, [b.x, b.y, b.z], regrow_at.unwrap_or(now));
+            schedule_regrow(db.clone(), world.clone(), system, belt, [b.x.expect("belt x"), b.y.expect("belt y"), b.z.expect("belt z")], regrow_at.unwrap_or(now));
             continue;
         }
-        grow_belt(db, world, system, belt, [b.x, b.y, b.z], security, jspace).await?;
+        grow_belt(db, world, system, belt, [b.x.expect("belt x"), b.y.expect("belt y"), b.z.expect("belt z")], security, jspace).await?;
     }
     Ok(())
 }
@@ -277,7 +258,7 @@ fn schedule_regrow(db: Db, world: Arc<World>, system: i64, belt: i64, center: V3
             s.defer(async move {
                 let Some(world) = world_ref.upgrade() else { return };
                 let result = async {
-                    let (security, jspace) = system_band(&db, system).await?;
+                    let (security, jspace) = system_band(world.sde(), system)?;
                     grow_belt(&db, &world, system, belt, center, security, jspace).await
                 };
                 if let Err(e) = result.await {
@@ -300,15 +281,11 @@ async fn exhaust(db: &Db, world: &Arc<World>, id: i64) -> Result<(), CallError> 
     if !field_empty {
         return Ok(());
     }
-    let belt = db
-        .query_opt("SELECT x, y, z FROM sde.map_celestials WHERE item_id = $1 AND group_id = $2", &[&rock.field, &GROUP_ASTEROID_BELT])
-        .await
-        .map_err(db_err)?;
+    let belt = world.sde().map.celestial(rock.field).filter(|b| b.group_id == Some(GROUP_ASTEROID_BELT as i64));
     if let Some(b) = belt {
-        let b = Position::from_row(&b);
         let now = filetime_now();
         crate::dao::asteroids::mark_depleted(db, rock.field, now).await.map_err(db_err)?;
-        schedule_regrow(db.clone(), world.clone(), rock.system, rock.field, [b.x, b.y, b.z], now + BELT_REGROW_SECS * FILETIME_SECOND);
+        schedule_regrow(db.clone(), world.clone(), rock.system, rock.field, [b.x.expect("belt x"), b.y.expect("belt y"), b.z.expect("belt z")], now + BELT_REGROW_SECS * FILETIME_SECOND);
         info!("mining: belt {} in {} mined out", rock.field, rock.system);
     }
     Ok(())
@@ -323,7 +300,7 @@ pub fn is_rock(id: i64) -> bool {
 
 /// Put mined ore in a hold, onto a stack of the same type if there is one, and tell the
 /// pilot (OnItemChange).
-async fn store(db: &Db, notify: &NotifyTx, owner: i64, ship: i64, flag: i32, type_id: i32, quantity: i32) -> Result<(), CallError> {
+async fn store(db: &Db, sde: &crate::sde::Sde, notify: &NotifyTx, owner: i64, ship: i64, flag: i32, type_id: i32, quantity: i32) -> Result<(), CallError> {
     let stack = crate::dao::items::transfers::stack(db, ship, flag, type_id, owner).await.map_err(db_err)?;
     let (item_id, total, change) = match stack {
         Some(r) => {
@@ -336,11 +313,7 @@ async fn store(db: &Db, notify: &NotifyTx, owner: i64, ship: i64, flag: i32, typ
             (id, quantity, (IX_LOCATION_ID, Value::Int(0)))
         }
     };
-    let t = db
-        .query_one("SELECT COALESCE(group_id, 0)::bigint AS group_id, COALESCE(category_id, 0)::bigint AS category_id FROM sde.inv_types WHERE type_id = $1", &[&type_id])
-        .await
-        .map_err(db_err)?;
-    let t = TypeGroups::from_row(&t);
+    let t = sde.types.get(type_id).ok_or_else(|| CallError::Internal(anyhow::anyhow!("missing type {type_id}")))?;
     let item = crate::dao::items::loading::Item {
         item_id,
         type_id,
@@ -349,8 +322,8 @@ async fn store(db: &Db, notify: &NotifyTx, owner: i64, ship: i64, flag: i32, typ
         flag_id: flag,
         quantity: total,
         singleton: false,
-        group_id: t.group_id,
-        category_id: t.category_id,
+        group_id: t.group_id.unwrap_or(0) as i64,
+        category_id: t.category_id.unwrap_or(0) as i64,
         custom_info: None,
     };
     let _ = notify.send(("OnItemChange".into(), vec![item.row(), Value::Dict(vec![(Value::Int(change.0), change.1)]), Value::None]));
@@ -376,10 +349,7 @@ pub async fn extract(db: &Db, world: &Arc<World>, notify: &NotifyTx, char_id: i6
         tell(notify, messages::TARGET_OUTSIDE_MINING_RANGE);
         return Ok(false);
     }
-    let unit_volume = Volume::from_row(&db
-        .query_one("SELECT COALESCE(volume, 1)::float8 AS volume FROM sde.inv_types WHERE type_id = $1", &[&rock.type_id])
-        .await
-        .map_err(db_err)?).volume.max(0.01);
+    let unit_volume = world.sde().types.get(rock.type_id).ok_or_else(|| CallError::Internal(anyhow::anyhow!("missing type {}", rock.type_id)))?.volume.unwrap_or(1.0).max(0.01);
     // Yield this cycle: miningAmount, doubled-up on a critical success, less any residue.
     let mut amount = fit.value(Key::Module(module), ATTR_MINING_AMOUNT);
     let crit_bonus = if rand01() < fit.value(Key::Module(module), ATTR_CRIT_CHANCE) { amount * fit.value(Key::Module(module), ATTR_CRIT_BONUS) } else { 0.0 };
@@ -392,11 +362,12 @@ pub async fn extract(db: &Db, world: &Arc<World>, notify: &NotifyTx, char_id: i6
     // Into the mining hold, or the cargo hold of ships without one.
     let hold = fit.value(Key::Ship, ATTR_MINING_HOLD);
     let (flag, capacity) = if hold > 0.0 { (FLAG_MINING_HOLD, hold) } else { (FLAG_CARGO, fit.value(Key::Ship, ATTR_CAPACITY)) };
-    let used = crate::dao::items::mining::used(db, ship, flag).await.map_err(db_err)?;
+    let used: f64 = crate::dao::items::mining::rows(db, ship, flag).await.map_err(db_err)?.iter()
+        .filter_map(|item| world.sde().types.get(item.type_id).map(|t| item.quantity as f64 * t.volume.unwrap_or(0.0))).fold(0.0, |total, v| total + v);
     let room = ((capacity - used) / unit_volume).floor().max(0.0) as i64;
     let taken = units.min(room);
     if taken > 0 {
-        store(db, notify, char_id, ship, flag, rock.type_id, taken as i32).await?;
+        store(db, world.sde(), notify, char_id, ship, flag, rock.type_id, taken as i32).await?;
     }
     let left = (rock.quantity - taken - wasted_units).max(0);
     if let Some(r) = state().rocks.get_mut(&target) {

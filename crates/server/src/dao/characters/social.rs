@@ -1,8 +1,8 @@
 //! Character identity, paperdolls, notes and cfg lookups for `charMgr`,
 //! `paperDollServer` and `eve/common/script/sys/eveCfg.py`.
-//! Uses `game.characters`, `game.char_notes`, `game.items`, `game.corporations`,
-//! `game.alliances` and SDE owner and map tables. Wire values and policy remain
-//! with services; transactions and notifications are not handled here.
+//! Uses `game.characters`, `game.char_notes`, `game.items`, `game.corporations`
+//! and `game.alliances`. Static enrichment and wire values remain with services;
+//! transactions and notifications are not handled here.
 use crate::db::{executor::Executor, Error};
 use tokio_postgres::Row;
 
@@ -70,33 +70,13 @@ pub(crate) async fn store_doll(ex: &impl Executor, id: i64, user: i64, appearanc
         &[&id, &user, &appearance, &portrait],
     ).await
 }
-pub(crate) struct HomeStation {
-    pub station_id: i64,
-    pub solar_system_id: i64,
-    pub type_id: i64,
+struct HomeStationId { home_station_id: Option<i64> }
+impl HomeStationId {
+    fn from_row(r: &Row) -> Self { Self { home_station_id: r.get("home_station_id") } }
 }
-impl HomeStation {
-    fn from_row(r: &Row) -> Self {
-        Self {
-            station_id: r.get("station_id"),
-            solar_system_id: r.get("solar_system_id"),
-            type_id: r.get("type_id"),
-        }
-    }
-}
-pub(crate) async fn home_station(ex: &impl Executor, id: i64) -> Result<Option<HomeStation>, Error> {
-    let row = ex.query_opt(
-        "SELECT s.station_id::bigint, s.solar_system_id::bigint, s.type_id::bigint FROM game.characters ch\n             JOIN sde.sta_stations s ON s.station_id = ch.home_station_id WHERE ch.character_id = $1",
-        &[&id],
-    ).await?;
-    Ok(row.as_ref().map(HomeStation::from_row))
-}
-pub(crate) async fn home_station_for_service(ex: &impl Executor, id: i64) -> Result<Option<HomeStation>, Error> {
-    let row = ex.query_opt(
-        "SELECT s.station_id::bigint, s.type_id::bigint, s.solar_system_id::bigint FROM game.characters ch\n                     JOIN sde.sta_stations s ON s.station_id = ch.home_station_id WHERE ch.character_id = $1",
-        &[&id],
-    ).await?;
-    Ok(row.as_ref().map(HomeStation::from_row))
+pub(crate) async fn home_station_id(ex: &impl Executor, id: i64) -> Result<Option<i64>, Error> {
+    let row = ex.query_opt("SELECT home_station_id FROM game.characters WHERE character_id = $1", &[&id]).await?;
+    Ok(row.as_ref().and_then(|r| HomeStationId::from_row(r).home_station_id))
 }
 struct Note { note: String }
 impl Note {
@@ -134,36 +114,30 @@ impl Owner {
         }
     }
 }
-pub(crate) async fn owners(ex: &impl Executor, ids: &[i64], character: i64, corporation: i64, faction: i64, alliance: i64) -> Result<Vec<Owner>, Error> {
+pub(crate) async fn owners(ex: &impl Executor, ids: &[i64], character: i64, corporation: i64, alliance: i64) -> Result<Vec<Owner>, Error> {
     let rows = ex.query(
-        "SELECT character_id, name, $2::bigint AS type_id, gender_id, NULL::bigint AS name_id FROM game.characters WHERE character_id = ANY($1::bigint[])\n             UNION ALL SELECT corporation_id, name, $3::bigint, 0, NULL FROM sde.crp_npc_corporations WHERE corporation_id = ANY($1::bigint[])\n             UNION ALL SELECT corporation_id, name, $3::bigint, 0, NULL FROM game.corporations WHERE corporation_id = ANY($1::bigint[])\n             UNION ALL SELECT character_id, data->'name'->>'en', $2::bigint, (data->>'gender')::boolean::int, (data->>'nameID')::bigint\n                       FROM sde.npc_characters WHERE character_id = ANY($1::bigint[])\n             UNION ALL SELECT faction_id, name, $4::bigint, 0, NULL FROM sde.chr_factions WHERE faction_id = ANY($1::bigint[])\n             UNION ALL SELECT alliance_id, name, $5::bigint, 0, NULL FROM game.alliances WHERE alliance_id = ANY($1::bigint[])",
-        &[&ids, &character, &corporation, &faction, &alliance],
+        "SELECT character_id, name, $2::bigint AS type_id, gender_id, NULL::bigint AS name_id FROM game.characters WHERE character_id = ANY($1::bigint[])\n             UNION ALL SELECT corporation_id, name, $3::bigint, 0, NULL FROM game.corporations WHERE corporation_id = ANY($1::bigint[])\n             UNION ALL SELECT alliance_id, name, $4::bigint, 0, NULL FROM game.alliances WHERE alliance_id = ANY($1::bigint[])",
+        &[&ids, &character, &corporation, &alliance],
     ).await?;
     Ok(rows.iter().map(Owner::from_row).collect())
 }
 pub(crate) struct Location {
     pub id: i64,
     pub name: Option<String>,
-    pub system: Option<i64>,
-    pub x: f64,
-    pub y: f64,
-    pub z: f64,
+    pub type_id: i32,
 }
 impl Location {
     fn from_row(r: &Row) -> Self {
         Self {
             id: r.get("item_id"),
             name: r.get("name"),
-            system: r.get("system"),
-            x: r.get("x"),
-            y: r.get("y"),
-            z: r.get("z"),
+            type_id: r.get("type_id"),
         }
     }
 }
 pub(crate) async fn locations(ex: &impl Executor, ids: &[i64]) -> Result<Vec<Location>, Error> {
     let rows = ex.query(
-        "SELECT item_id, COALESCE(i.name, t.name) AS name, NULL::bigint AS system, 0::float8 AS x, 0::float8 AS y, 0::float8 AS z FROM game.items i\n                 LEFT JOIN sde.inv_types t USING (type_id) WHERE item_id = ANY($1::bigint[])\n             UNION ALL SELECT solar_system_id::bigint, name, solar_system_id::bigint, x, y, z FROM sde.map_solar_systems WHERE solar_system_id = ANY($1::bigint[])",
+        "SELECT item_id, name, type_id FROM game.items WHERE item_id = ANY($1::bigint[])",
         &[&ids],
     ).await?;
     Ok(rows.iter().map(Location::from_row).collect())
@@ -179,7 +153,7 @@ impl Ticker {
 }
 pub(crate) async fn tickers(ex: &impl Executor, ids: &[i64]) -> Result<Vec<Ticker>, Error> {
     let rows = ex.query(
-        "SELECT corporation_id::bigint, ticker FROM sde.crp_npc_corporations WHERE corporation_id = ANY($1::bigint[])\n             UNION ALL SELECT corporation_id, ticker FROM game.corporations WHERE corporation_id = ANY($1::bigint[])",
+        "SELECT corporation_id, ticker FROM game.corporations WHERE corporation_id = ANY($1::bigint[])",
         &[&ids],
     ).await?;
     Ok(rows.iter().map(Ticker::from_row).collect())

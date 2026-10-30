@@ -1,6 +1,6 @@
 //! Contract lifecycle, list, report, item, bid and status persistence for contractProxy.
 //! The owning service supports `eve/client/script/ui/shared/neocom/contracts`.
-//! Sources include game contracts, contract items, bids and items, plus SDE station and type data.
+//! Sources include game contracts, contract items, bids and items; static enrichment belongs to services.
 //! Corporation contracts are unsupported; policy, transactions and notifications remain with callers.
 
 pub(crate) mod lifecycle;
@@ -16,11 +16,7 @@ pub(crate) struct Contract {
     pub(crate) assignee: i64,
     pub(crate) acceptor: i64,
     pub(crate) start: i64,
-    pub(crate) start_system: i64,
-    pub(crate) start_region: i64,
     pub(crate) end: i64,
-    pub(crate) end_system: i64,
-    pub(crate) end_region: i64,
     pub(crate) price: f64,
     pub(crate) reward: f64,
     pub(crate) collateral: f64,
@@ -37,21 +33,17 @@ pub(crate) struct Contract {
 }
 
 pub(super) const CONTRACT_SELECT: &str = "SELECT c.contract_id, c.type, c.issuer_id, c.issuer_corp_id, c.assignee_id, c.acceptor_id,
-        c.start_station_id, COALESCE(ss.solar_system_id, 0)::bigint AS start_system, COALESCE(ss.region_id, 0)::bigint AS start_region,
-        c.end_station_id, COALESCE(es.solar_system_id, 0)::bigint AS end_system, COALESCE(es.region_id, 0)::bigint AS end_region,
+        c.start_station_id, c.end_station_id,
         c.price, c.reward, c.collateral, c.title, c.description, c.volume, c.num_days, c.status,
         c.date_issued, c.date_expired, c.date_accepted, c.date_completed, c.package_id
-    FROM game.contracts c
-    LEFT JOIN sde.sta_stations ss ON ss.station_id = c.start_station_id
-    LEFT JOIN sde.sta_stations es ON es.station_id = c.end_station_id";
+    FROM game.contracts c";
 
 impl Contract {
     pub(super) fn from_row(r: &tokio_postgres::Row) -> Self {
         Self {
             id: r.get("contract_id"), kind: r.get("type"), issuer: r.get("issuer_id"),
             issuer_corp: r.get("issuer_corp_id"), assignee: r.get("assignee_id"), acceptor: r.get("acceptor_id"),
-            start: r.get("start_station_id"), start_system: r.get("start_system"), start_region: r.get("start_region"),
-            end: r.get("end_station_id"), end_system: r.get("end_system"), end_region: r.get("end_region"),
+            start: r.get("start_station_id"), end: r.get("end_station_id"),
             price: r.get("price"), reward: r.get("reward"), collateral: r.get("collateral"), title: r.get("title"),
             description: r.get("description"), volume: r.get("volume"), num_days: r.get("num_days"), status: r.get("status"),
             issued: r.get("date_issued"), expires: r.get("date_expired"), accepted: r.get("date_accepted"),

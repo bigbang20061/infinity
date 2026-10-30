@@ -43,7 +43,7 @@ pub(super) fn repair_kind(effect: &str) -> Option<(usize, i32)> {
 
 /// The ship's speed and mass as fitted now (propulsion running or not), for everyone's destiny.
 pub(super) async fn apply_propulsion(cx: &Ctx, master: i64, generation: Arc<AtomicBool>, active: bool) {
-    let Ok(fit) = Fit::load(&cx.db, cx.char_id, cx.ship_id).await else { return };
+    let Ok(fit) = Fit::load(&cx.db, cx.world.sde().clone(), cx.char_id, cx.ship_id).await else { return };
     let (speed, mass, signature) = (fit.value(Key::Ship, ATTR_MAX_VELOCITY), fit.value(Key::Ship, ATTR_MASS), fit.value(Key::Ship, ATTR_SIGNATURE_RADIUS));
     let ship = cx.ship_id;
     cx.world.post(cx.system_id, move |s| {
@@ -232,11 +232,8 @@ pub(super) struct Missile {
 /// Launch a missile ball from `from` at `target`: it flies client-side; on impact it
 /// explodes and deals damage scaled by explosion radius vs. the target's signature.
 pub(super) async fn launch_missile(db: Db, world: Arc<World>, system: i64, from: Ball, target: Ball, owner: i64, module: Option<i64>, m: Missile) -> Result<(), CallError> {
-    let size = db
-        .query_one("SELECT COALESCE(radius, 1)::float8 AS radius, COALESCE(mass, 1)::float8 AS mass FROM sde.inv_types WHERE type_id = $1", &[&m.charge])
-        .await
-        .map_err(db_err)?;
-    let size = SizeRow::from_row(&size);
+    let size = world.sde().types.get(m.charge)
+        .ok_or_else(|| CallError::Internal(anyhow::anyhow!("unknown type {}", m.charge)))?;
     let mut slim = vec![("sourceShipID", Value::Int(from.id))];
     slim.push(("launchModules", Value::list(module.map(Value::Int))));
     let missile = Ball {
@@ -248,8 +245,8 @@ pub(super) async fn launch_missile(db: Db, world: Arc<World>, system: i64, from:
         char_id: None,
         signature_radius: None,
         mode: MODE_MISSILE,
-        radius: size.radius as f32,
-        mass: size.mass,
+        radius: size.radius.unwrap_or(1.0) as f32,
+        mass: size.mass.unwrap_or(1.0),
         max_vel: m.velocity as f32,
         agility: 1.0,
         speed_fraction: 1.0,
@@ -272,7 +269,7 @@ pub(super) async fn launch_missile(db: Db, world: Arc<World>, system: i64, from:
     };
     let missile_id = missile.id;
     world.add_ship(system, missile).await.map_err(CallError::Internal)?;
-    let signature = attr(&attributes(&db, target.type_id).await?, ATTR_SIGNATURE_RADIUS, target.radius as f64);
+    let signature = attr(world.sde(), target.type_id, ATTR_SIGNATURE_RADIUS, target.radius as f64);
     let distance = dist(from.pos, target.pos);
     let delay_ms = seconds_to_ms((distance / m.velocity.max(1.0)).clamp(MIN_MISSILE_FLIGHT_SECONDS, MAX_MISSILE_FLIGHT_SECONDS));
     let (shooter_id, shooter_pilot) = (from.id, from.char_id);
@@ -399,7 +396,7 @@ pub(super) async fn cycle_begin_work(mut cycle: Cycle) {
     }
     let reason = 'work: {
         // Effective attributes as they are now (charges change, modules go offline...).
-        let fit = match Fit::load(&cx.db, cx.char_id, cx.ship_id).await {
+        let fit = match Fit::load(&cx.db, cx.world.sde().clone(), cx.char_id, cx.ship_id).await {
             Ok(f) => f,
             Err(_) => {
                 break 'work "fit unavailable";
@@ -542,28 +539,26 @@ pub(super) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
     let target = call.args.get(2).and_then(|v| v.as_int());
     let repeat = call.args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
     let Some(cx) = ctx(c) else { return Ok(Value::None) };
-    let Some(module) = load_items(&c.db, ItemQuery::IdAt(item_id, cx.ship_id)).await.map_err(db_err)?.into_iter().next() else {
+    let Some(module) = load_items(&c.db, &c.sde, ItemQuery::IdAt(item_id, cx.ship_id)).await.map_err(db_err)?.into_iter().next() else {
         return Ok(Value::None);
     };
-    let row = cx
-        .db
-        .query_opt("SELECT effect_id, guid, duration_attribute_id FROM sde.dogma_effects WHERE name = $1", &[&effect_name])
-        .await
-        .map_err(db_err)?
-        .ok_or_else(|| CallError::Internal(anyhow::anyhow!("unknown effect {effect_name}")))?;
-    let row = EffectRow::from_row(&row);
-    let effect = Effect {
-        id: row.effect_id as i64,
-        guid: row.guid.filter(|g| !g.is_empty()),
-        duration_attribute: row.duration_attribute_id,
-        weapon: weapon_kind(&effect_name),
-        repair: repair_kind(&effect_name),
-        propulsion: matches!(row.effect_id, EFFECT_AFTERBURNER | EFFECT_MICROWARPDRIVE),
-        mining: match effect_name.as_str() {
-            "miningLaser" => Some("effects.Mining"),
-            "miningClouds" => Some("effects.CloudMining"),
-            _ => None,
-        },
+    let effect = {
+        let mut matches = cx.world.sde().dogma.effects_by_name(&effect_name);
+        let row = matches.next().ok_or_else(|| CallError::Internal(anyhow::anyhow!("unknown effect {effect_name}")))?;
+        if matches.next().is_some() { return Err(CallError::Internal(anyhow::anyhow!("multiple effects named {effect_name}"))); }
+        Effect {
+            id: row.effect_id as i64,
+            guid: row.guid.clone().filter(|g| !g.is_empty()),
+            duration_attribute: row.duration_attribute_id,
+            weapon: weapon_kind(&effect_name),
+            repair: repair_kind(&effect_name),
+            propulsion: matches!(row.effect_id, EFFECT_AFTERBURNER | EFFECT_MICROWARPDRIVE),
+            mining: match effect_name.as_str() {
+                "miningLaser" => Some("effects.Mining"),
+                "miningClouds" => Some("effects.CloudMining"),
+                _ => None,
+            },
+        }
     };
     if state().reloading.get(&item_id).is_some_and(|until| *until > filetime_now()) {
         return Err(user_error(messages::MSG_CANT_ACTIVATE_RELOADING_MODULE, vec![("moduleTypeID".into(), Value::tuple([Value::Int(UE_TYPEID), Value::Int(module.type_id as i64)]))]));
@@ -603,7 +598,7 @@ pub(super) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
         let gap = cx.world.with(cx.system_id, move |s| {
             s.ball(ship_id).zip(s.ball(t)).map(|(a, b)| dist(a.pos, b.pos) - a.radius as f64 - b.radius as f64)
         }).await.flatten();
-        let fit = Fit::load(&cx.db, cx.char_id, cx.ship_id).await?;
+        let fit = Fit::load(&cx.db, cx.world.sde().clone(), cx.char_id, cx.ship_id).await?;
         let range = fit.value(Key::Module(item_id), ATTR_MAX_RANGE);
         if gap.is_none_or(|g| g > range) {
             return Err(user_error(messages::MSG_CUSTOM_NOTIFY, vec![("notify".into(), Value::unicode(messages::mining_range(metres_to_km(range))))]));
@@ -612,13 +607,13 @@ pub(super) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
     if state().active.contains_key(&item_id) {
         return Ok(Value::None);
     }
-    let fit = Fit::load(&cx.db, cx.char_id, cx.ship_id).await?;
+    let fit = Fit::load(&cx.db, cx.world.sde().clone(), cx.char_id, cx.ship_id).await?;
     let duration_ms = effect.duration_attribute.map(|a| fit.value(Key::Module(item_id), a)).unwrap_or(DEFAULT_MODULE_DURATION_MS).max(MIN_MODULE_DURATION_MS);
     // The group fires together.
     let mut modules = vec![Module { id: item_id, type_id: module.type_id, flag: module.flag_id }];
     if effect.weapon.is_some() {
         for slave in bank(&cx.db, cx.ship_id, item_id).await?.into_iter().skip(1) {
-            if let Some(m) = load_items(&c.db, ItemQuery::IdAt(slave, cx.ship_id)).await.map_err(db_err)?.into_iter().next() {
+            if let Some(m) = load_items(&c.db, &c.sde, ItemQuery::IdAt(slave, cx.ship_id)).await.map_err(db_err)?.into_iter().next() {
                 modules.push(Module { id: m.item_id, type_id: m.type_id, flag: m.flag_id });
             }
         }
@@ -674,4 +669,5 @@ pub(super) fn deactivate(call: &Call<'_>) -> CallResult {
     }
     Ok(Value::None)
 }
+
 

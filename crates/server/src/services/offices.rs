@@ -3,7 +3,8 @@
 //! time. The office is an item (typeOffice) owned by the corporation at the station, and
 //! the corporation hangar divisions are its contents under flagCorpSAG1-7 (services/
 //! inventory lists and moves them). Renting again before the period ends extends it;
-//! renewing is billed (services/bills).
+//! renewing is billed (services/bills). Station and system data come from the startup SDE;
+//! office records and counts come from game.offices. Impounding is not supported.
 
 use super::corps::is_player_corp;
 use super::{db_err, has_role_or_is_ceo, keyval, notify_error, Call, CallError, CallResult};
@@ -15,6 +16,7 @@ use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::dispatch_world;
 use crate::messages;
+use crate::sde::Sde;
 use crate::space::World;
 use marshal::Value;
 use tracing::info;
@@ -37,18 +39,13 @@ const SECURITY_RENT: f64 = 900_000.0;
 const QUOTE_TOLERANCE: f64 = 0.5;
 
 /// The rent for one period at `station`: dearer in busier, higher-security space.
-pub(super) async fn rent_price(db: &Db, station: i64) -> Result<f64, CallError> {
-    let security: f64 = db
-        .query_opt(
-            "SELECT COALESCE(s.security, 0)::float8 AS security FROM sde.sta_stations st JOIN sde.map_solar_systems s ON s.solar_system_id = st.solar_system_id
-             WHERE st.station_id = $1",
-            &[&(station as i32)],
-        )
-        .await
-        .map_err(db_err)?
-        .map(|r| r.get("security"))
+pub(super) fn rent_price(sde: &Sde, station: i64) -> f64 {
+    let security = sde.map.station(i64::from(station as i32))
+        .and_then(|st| st.solar_system_id)
+        .and_then(|id| sde.map.system(id))
+        .map(|system| system.security.unwrap_or(0.0))
         .unwrap_or(DEFAULT_SECURITY);
-    Ok((BASE_RENT + SECURITY_RENT * security.clamp(0.0, 1.0)).round())
+    (BASE_RENT + SECURITY_RENT * security.clamp(0.0, 1.0)).round()
 }
 
 /// The corporation's office at `station`, if it rents one.
@@ -71,7 +68,7 @@ async fn announce(db: &Db, world: &World, corp: i64, office: i64) -> Result<(), 
 
 /// Rent (or extend) `corp`'s office at `station` for a period, paid from its master wallet.
 pub(super) async fn rent(db: &Db, world: &World, corp: i64, station: i64) -> Result<i64, CallError> {
-    let price = rent_price(db, station).await?;
+    let price = rent_price(world.sde(), station);
     let _trading = super::market::lock().await;
     let now = filetime_now();
     db.transaction(
@@ -104,15 +101,16 @@ async fn may_rent(db: &Db, me: i64, corp: i64) -> Result<bool, CallError> {
 }
 
 /// The office rows the client keeps (officeID, stationID, solarsystemID, stationTypeID).
-async fn my_offices(db: &Db, corp: i64) -> CallResult {
+async fn my_offices(db: &Db, sde: &Sde, corp: i64) -> CallResult {
     let rows = offices::list(db, corp).await.map_err(db_err)?;
     let opt = |v: Option<i64>| v.map(Value::Int).unwrap_or(Value::None);
     Ok(Value::list(rows.iter().map(|r| {
+        let station = sde.map.station(r.station_id);
         keyval([
             ("officeID", Value::Int(r.office_id)),
             ("stationID", Value::Int(r.station_id)),
-            ("solarsystemID", opt(r.solar_system_id)),
-            ("stationTypeID", opt(r.type_id)),
+            ("solarsystemID", opt(station.and_then(|st| st.solar_system_id))),
+            ("stationTypeID", opt(station.and_then(|st| st.type_id))),
             ("typeID", Value::Int(TYPE_OFFICE as i64)),
             ("rentedUntil", Value::Int(r.rented_until)),
         ])
@@ -127,7 +125,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     let corp = c.session.int("corpid").unwrap_or(0);
     let (db, world) = (&c.db, &*c.world);
     if call.method == "GetMyCorporationsOffices" {
-        return Some(my_offices(db, corp).await);
+        return Some(my_offices(db, world.sde(), corp).await);
     }
     // Bound to a station.
     let station = call
@@ -145,7 +143,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             Err(e) => Err(db_err(e)),
         },
         // GetPriceQuote(corpID) -> ISK for one rental period
-        "GetPriceQuote" => rent_price(db, station).await.map(Value::Float),
+        "GetPriceQuote" => Ok(Value::Float(rent_price(world.sde(), station))),
         // RentOffice(cost): the quote the player agreed to.
         "RentOffice" => {
             if !is_player_corp(corp) {
@@ -157,10 +155,9 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                 Err(e) => return Some(Err(e)),
             }
             let quoted = call.args.first().and_then(|v| v.as_float().or_else(|| v.as_int().map(|i| i as f64)));
-            match rent_price(db, station).await {
-                Ok(price) if quoted.is_some_and(|q| q + QUOTE_TOLERANCE < price) => return Some(Err(notify_error(messages::OFFICE_RENT_CHANGED))),
-                Err(e) => return Some(Err(e)),
-                _ => {}
+            let price = rent_price(world.sde(), station);
+            if quoted.is_some_and(|q| q + QUOTE_TOLERANCE < price) {
+                return Some(Err(notify_error(messages::OFFICE_RENT_CHANGED)));
             }
             rent(db, world, corp, station).await.map(|_| Value::None)
         }

@@ -9,14 +9,14 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
     Some(match (call.service, call.method) {
         ("facilityManager", "GetFacilities") => {
             let region = c.session.int("regionid").unwrap_or(0);
-            facilities(&c.db, "s.region_id = $3::bigint", region).await.map(|f| Value::list(f.iter().map(Facility::data)))
+            Ok(Value::list(c.sde.map.stations().filter(|s| s.region_id == Some(region)).filter_map(|s| Facility::from_station(&c.sde, s)).map(|f| f.data())))
         }
-        ("facilityManager", "GetFacility") => facility(&c.db, int(0)).await.map(|f| f.data()),
+        ("facilityManager", "GetFacility") => facility(&c.sde, int(0)).map(|f| f.data()),
         ("facilityManager", "GetFacilitiesByID") => {
             let ids = value_id_list(call.args.first());
             let mut out = vec![];
             for id in ids {
-                match facility(&c.db, id).await {
+                match facility(&c.sde, id) {
                     Ok(f) => out.push(f.data()),
                     Err(CallError::User { .. }) => {}
                     Err(e) => return Some(Err(e)),
@@ -27,7 +27,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         // GetFacilityLocations(facilityID, ownerID): the owner's item hangar there.
         ("facilityManager", "GetFacilityLocations") => {
             let owner = call.args.get(1).and_then(|v| v.as_int()).unwrap_or(me);
-            match facility(&c.db, int(0)).await {
+            match facility(&c.sde, int(0)) {
                 Ok(f) if owner == me => Ok(Value::list([f.location(me)])),
                 Ok(_) | Err(CallError::User { .. }) => Ok(Value::list([])),
                 Err(e) => Err(e),

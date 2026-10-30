@@ -3,8 +3,6 @@
 
 use super::*;
 
-struct TypeGroup { type_id: i32, group_id: Option<i64> }
-impl TypeGroup { fn from_row(r: &tokio_postgres::Row) -> Self { Self { type_id: r.get("type_id"), group_id: r.get("group_id") } } }
 
 // ---------------------------------------------------------------- the sensor overlay
 
@@ -264,7 +262,7 @@ pub(super) async fn recover_probes(c: &mut Client, call: &Call<'_>, destroy: boo
     if !destroy {
         let mut outbox = Outbox::default();
         for (type_id, n) in back {
-            crate::services::items::deposit(&c.db, &mut outbox, char_id, ship, FLAG_CARGO, type_id, n, ship).await?;
+            crate::services::items::deposit(&c.db, &c.sde, &mut outbox, char_id, ship, FLAG_CARGO, type_id, n, ship).await?;
         }
         dispatch_client((), outbox, c)?;
     }
@@ -311,15 +309,9 @@ pub(super) async fn cone_scan(c: &mut Client, call: &Call<'_>) -> CallResult {
         }
         Some(hits)
     }).await.flatten() else { return Ok(Value::list([])) };
-    let types: Vec<i32> = hits.iter().map(|h| h.1).collect::<HashSet<_>>().into_iter().collect();
-    let groups: HashMap<i32, i64> = c
-        .db
-        .query("SELECT type_id, group_id::bigint AS group_id FROM sde.inv_types WHERE type_id = ANY($1)", &[&types])
-        .await
-        .map_err(db_err)?
-        .iter()
-        .map(|r| { let r = TypeGroup::from_row(r); (r.type_id, r.group_id.unwrap_or(0)) })
-        .collect();
+    let groups: HashMap<i32, i64> = hits.iter().filter_map(|&(_, id)| {
+        c.world.sde().types.get(id).map(|t| (id, i64::from(t.group_id.unwrap_or(0))))
+    }).collect();
     Ok(Value::List(
         hits.into_iter()
             .map(|(id, t)| keyval([("id", Value::Int(id)), ("typeID", Value::Int(t as i64)), ("groupID", Value::Int(groups.get(&t).copied().unwrap_or(0)))]))

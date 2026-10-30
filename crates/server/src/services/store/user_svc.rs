@@ -80,7 +80,7 @@ async fn claim_tokens(c: &mut Client, call: &Call<'_>) -> CallResult {
     }
     if station.is_some() && station == c.session.int("stationid") && c.session.int("charid") == Some(char_id) {
         for (item_id, ..) in &created {
-            if let Some(item) = load_items(&c.db, ItemQuery::Id(*item_id)).await.map_err(db_err)?.into_iter().next() {
+            if let Some(item) = load_items(&c.db, &c.sde, ItemQuery::Id(*item_id)).await.map_err(db_err)?.into_iter().next() {
                 c.notify("OnItemChange", vec![item.row(), Value::Dict(vec![(Value::Int(3), Value::Int(0))]), Value::None]);
             }
         }

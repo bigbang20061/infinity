@@ -1,5 +1,5 @@
-//! Character state and mixed corporation lookups used by station and universe services.
-//! Reads and writes `game.characters` and reads `sde.crp_npc_corporations` and `sde.npc_characters`.
+//! Character state and corporation lookups used by station and universe services.
+//! Reads and writes `game.characters`; static NPC identity is resolved by services.
 //! This DAO has no client mirror and does not manage transactions or notifications.
 
 use crate::db::{executor::Executor, Error};
@@ -17,40 +17,16 @@ pub(crate) async fn set_activities_pop_state(ex: &impl Executor, character_id: i
     ex.execute("UPDATE game.characters SET activities_pop_state = $2 WHERE character_id = $1", &[&character_id, &state]).await
 }
 
-pub(crate) struct NpcCorporation {
-    pub name: Option<String>, pub description: Option<String>, pub ticker: Option<String>, pub tax_rate: Option<f64>,
-    pub ceo_id: Option<i64>, pub station_id: Option<i64>, pub race_id: Option<i64>, pub faction_id: Option<i64>,
-    pub member_limit: i64, pub member_count: i64,
+struct MemberCount { member_count: i64 }
+impl MemberCount {
+    fn from_row(row: &tokio_postgres::Row) -> Self { Self { member_count: row.get("member_count") } }
 }
-impl NpcCorporation {
-    fn from_row(row: &tokio_postgres::Row) -> Self {
-        Self { name: row.get("name"), description: row.get("description"), ticker: row.get("ticker"), tax_rate: row.get("tax_rate"),
-            ceo_id: row.get("ceo_id"), station_id: row.get("station_id"), race_id: row.get("race_id"), faction_id: row.get("faction_id"),
-            member_limit: row.get("member_limit"), member_count: row.get("member_count") }
-    }
-}
-
-pub(crate) async fn npc_corporation(ex: &impl Executor, corp_id: i64, member_limit: i64) -> Result<Option<NpcCorporation>, Error> {
-    Ok(ex.query_opt(
-        "SELECT name, COALESCE(data->'description'->>'en', '') AS description, ticker, tax_rate, ceo_id::bigint, station_id::bigint,
-                race_id::bigint, faction_id::bigint, COALESCE(member_limit::bigint, $2::bigint) AS member_limit,
-                (SELECT count(*) FROM game.characters ch WHERE ch.corporation_id = $1::bigint AND NOT ch.deleted) AS member_count
-         FROM sde.crp_npc_corporations WHERE corporation_id = $1::bigint",
-        &[&corp_id, &member_limit],
-    ).await?.as_ref().map(NpcCorporation::from_row))
-}
-
-struct CorporationId { corporation_id: Option<i64> }
-impl CorporationId {
-    fn from_row(row: &tokio_postgres::Row) -> Self { Self { corporation_id: row.get("corporation_id") } }
-}
-
-pub(crate) async fn corporation_for_character(ex: &impl Executor, id: i64) -> Result<Option<i64>, Error> {
-    Ok(ex.query_opt(
-        "SELECT corporation_id FROM game.characters WHERE character_id = $1
-         UNION ALL SELECT (data->>'corporationID')::bigint FROM sde.npc_characters WHERE character_id = $1
-         LIMIT 1", &[&id],
-    ).await?.as_ref().and_then(|row| CorporationId::from_row(row).corporation_id))
+pub(crate) async fn npc_member_count(ex: &impl Executor, corp_id: i64) -> Result<i64, Error> {
+    let row = ex.query_one(
+        "SELECT count(*) AS member_count FROM game.characters ch WHERE ch.corporation_id = $1::bigint AND NOT ch.deleted",
+        &[&corp_id],
+    ).await?;
+    Ok(MemberCount::from_row(&row).member_count)
 }
 
 pub(crate) struct FleetMemberLocation {

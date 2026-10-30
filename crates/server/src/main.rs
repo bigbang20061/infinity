@@ -21,6 +21,7 @@ mod images;
 mod live_sessions;
 mod macho;
 mod messages;
+mod sde;
 mod services;
 mod session;
 mod space;
@@ -125,17 +126,20 @@ async fn main() -> Result<()> {
         .init();
     let cfg = Arc::new(Config::from_env()?);
     let db = db::Db::connect(&cfg.database_url, cfg.database_pool_size).await?;
-    services::recover_pending_reloads(&db).await.map_err(|error| match error {
+    let sde = Arc::new(sde::Sde::load(&db).await?);
+    let types = sde.types.len();
+    info!(target: "infinity_server::db", "database ready ({types} types in SDE)");
+    services::recover_pending_reloads(&db, &sde).await.map_err(|error| match error {
         services::CallError::Internal(e) => e,
         services::CallError::User { msg, .. } => anyhow::anyhow!(msg),
     })?;
-    if let Err(services::CallError::Internal(e)) = services::unbury_sites(&db).await {
+    if let Err(services::CallError::Internal(e)) = services::unbury_sites(&db, &sde).await {
         tracing::warn!("moving sites out of planets failed: {e:#}");
     }
     let hub = chat::Hub::new(&cfg.chat_domain);
-    let world = space::World::new(db.clone(), cfg.system_capacity);
-    tokio::spawn(services::expire_market_orders(db.clone(), world.clone()));
-    tokio::spawn(services::settle_auctions(db.clone(), world.clone()));
+    let world = space::World::new(db.clone(), sde.clone(), cfg.system_capacity);
+    tokio::spawn(services::expire_market_orders(db.clone(), sde.clone(), world.clone()));
+    tokio::spawn(services::settle_auctions(db.clone(), sde.clone(), world.clone()));
     tokio::spawn(services::run_billing(db.clone(), world.clone()));
     let gateway_task = tokio::spawn(log_exit("public gateway", gateway::serve(cfg.gateway_bind.clone(), gateway::Gateway::new(db.clone(), cfg.cdn_url()))));
     let chat_task = tokio::spawn(log_exit("chat", chat::serve(cfg.chat_bind.clone(), hub.clone())));
@@ -174,7 +178,7 @@ async fn main() -> Result<()> {
             result = listener.accept() => result?,
         };
         stream.set_nodelay(true).ok();
-        let (cfg, db, ids, hub, world) = (cfg.clone(), db.clone(), next_client_id.clone(), hub.clone(), world.clone());
+        let (cfg, db, sde, ids, hub, world) = (cfg.clone(), db.clone(), sde.clone(), next_client_id.clone(), hub.clone(), world.clone());
         tokio::spawn(async move {
             let client_id = ids.fetch_add(1, Ordering::Relaxed);
             let conn = conn::Conn::new(stream, peer);
@@ -199,7 +203,7 @@ async fn main() -> Result<()> {
                 return;
             }
             db.add_online(ONLINE_JOIN_DELTA);
-            if let Err(e) = client::Client::new(conn, cfg, db.clone(), hub, world, login).run(&mut registration).await {
+            if let Err(e) = client::Client::new(conn, cfg, db.clone(), sde, hub, world, login).run(&mut registration).await {
                 error!("{peer} session ended with error: {e:#}");
             }
             db.add_online(ONLINE_LEAVE_DELTA);

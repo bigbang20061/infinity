@@ -17,6 +17,8 @@
 //! and repair themselves; a pilot's ship can be destroyed. Active modules apply their effects
 //! (hardeners through fit, propulsion speed via destiny, repairers each cycle), and a kill
 //! pays the NPC's bounty and leaves a wreck with loot.
+//! NPC effects, charge dimensions and wreck mappings come from immutable SDE datasets;
+//! loot prices come from `game.retail_prices` and static eligibility is applied before sampling.
 //! Target locks, reloads, module cycles, pulses and missile impacts use system
 //! actor timers. Database-backed effects run on deferred workers outside the actor.
 //! Reload reservations survive interruptions and return to cargo during startup; reload
@@ -34,7 +36,8 @@
 //! eve/common/script/util/inventoryFlagsCommon.py:9-15,53-60,217-226 describes cargo,
 //! fleet and ammo holds. Remote, foreign and recursively nested containers are unsupported.
 
-use crate::dao::items::loading::{load_items, Item, ItemQuery};
+use crate::dao::items::loading::{Item, ItemQuery};
+use super::items::load_items;
 use super::inventory::{notify_item_change, notify_item_removed};
 use crate::dao::items::quantities::{self, QuantityChange};
 use super::fit::{Fit, Key};
@@ -45,6 +48,7 @@ use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::{Outbox, dispatch_client, dispatch_world};
 use crate::messages;
+use crate::sde::Sde;
 use crate::space::{dist, event, lock_time_ms, metres_to_km, ms_to_seconds, seconds_to_ms, now_ms, now_tick, Ball, NotifyTx, NpcAction, NpcBrain, NpcConfig, NpcEffects, NpcFuture, System, World, MODE_MISSILE, MODE_WARP};
 use marshal::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -226,27 +230,10 @@ fn ctx(c: &Client) -> Option<Ctx> {
         system_id: c.session.int("solarsystemid")?,
     })
 }
-struct AttributeRow { attribute_id: i32, value: f64 }
-impl AttributeRow { fn from_row(row: &tokio_postgres::Row) -> Self { Self { attribute_id: row.get("attribute_id"), value: row.get("value") } } }
-struct ScalarRow { value: f64 }
-impl ScalarRow { fn from_row(row: &tokio_postgres::Row) -> Self { Self { value: row.get("value") } } }
-struct WreckRow { type_id: Option<i32>, radius: f64 }
-impl WreckRow { fn from_row(row: &tokio_postgres::Row) -> Self { Self { type_id: row.get("type_id"), radius: row.get("radius") } } }
-struct SizeRow { radius: f64, mass: f64 }
-impl SizeRow { fn from_row(row: &tokio_postgres::Row) -> Self { Self { radius: row.get("radius"), mass: row.get("mass") } } }
-struct EffectRow { effect_id: i32, guid: Option<String>, duration_attribute_id: Option<i32> }
-impl EffectRow { fn from_row(row: &tokio_postgres::Row) -> Self { Self { effect_id: row.get("effect_id"), guid: row.get("guid"), duration_attribute_id: row.get("duration_attribute_id") } } }
-struct GuidRow { guid: String }
-impl GuidRow { fn from_row(row: &tokio_postgres::Row) -> Self { Self { guid: row.get("guid") } } }
 
 
-async fn attributes(db: &Db, type_id: i32) -> Result<HashMap<i32, f64>, CallError> {
-    let rows = db.query("SELECT attribute_id, value FROM sde.type_attributes WHERE type_id = $1", &[&type_id]).await.map_err(db_err)?;
-    Ok(rows.iter().map(AttributeRow::from_row).map(|r| (r.attribute_id, r.value)).collect())
-}
-
-fn attr(a: &HashMap<i32, f64>, id: i32, default: f64) -> f64 {
-    a.get(&id).copied().unwrap_or(default)
+fn attr(sde: &Sde, type_id: i32, id: i32, default: f64) -> f64 {
+    sde.types.attribute(type_id, id).unwrap_or(default)
 }
 
 /// Stop everything a character was doing in space (docking, jumping, logging off).
@@ -358,7 +345,7 @@ pub(super) fn pulse_effect(c: &mut Client, module: i64, effect_id: i64, target: 
 }
 
 pub async fn spawn_npc(db: Db, world: Arc<World>, system: i64, id: i64, type_id: i32, owner: Option<i64>) -> Result<(), CallError> {
-    let stats = match npc_stats(&db, type_id).await {
+    let stats = match npc_stats(&db, world.sde(), type_id).await {
         Ok(stats) => Arc::new(stats),
         Err(error) => {
             world.post(system, move |s| { s.remove_ball(id); });
@@ -447,3 +434,4 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
 }
 
 #[cfg(test)] mod tests;
+

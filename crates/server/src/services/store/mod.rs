@@ -18,13 +18,13 @@
 //! Purchases and redeeming use `game.store_purchases` and `game.redeem_tokens`.
 //! Clients cannot display oversized balances exactly.
 
-use crate::dao::items::loading::{load_items, ItemQuery};
+use crate::dao::items::loading::ItemQuery;
+use super::items::load_items;
 use super::{db_err, keyval, Call, CallError, CallResult};
 use crate::client::{filetime_now, unix_seconds_from_filetime, Client};
 use crate::consts::FLAG_HANGAR;
 use crate::messages;
 use marshal::Value;
-use std::sync::OnceLock;
 use tracing::info;
 
 /// Daily turnover of login rewards and daily offers (UTC; 11:00 Beijing time).
@@ -71,14 +71,6 @@ async fn grant_token(c: &Client, user_id: i64, type_id: i32, quantity: i64, labe
 }
 
 
-/// `typeID:quantity,typeID:quantity,...`
-fn parse_rewards(s: &str) -> Vec<(i32, i64)> {
-    s.split(',').filter_map(|p| {
-        let (t, q) = p.split_once(':')?;
-        Some((t.parse().ok()?, q.parse().ok()?))
-    })
-    .collect()
-}
 
 
 mod store_manager;

@@ -1,5 +1,5 @@
 //! Contract lifecycle mechanics for contractProxy, mirroring eve/client/script/ui/shared/neocom/contracts.
-//! Uses game contracts and items through database access; corporation contracts are unsupported.
+//! Uses game contracts and items through database access and immutable SDE types and stations; corporation contracts are unsupported.
 
 use super::*;
 use crate::dao::contracts::lifecycle as contract_dao;
@@ -8,6 +8,7 @@ use crate::dao::contracts::lifecycle as contract_dao;
 /// for a multi-contract (fitted ships).
 pub(super) async fn create(c: &Client, info: &Value) -> CallResult {
     let (db, world) = (&c.db, &*c.world);
+    let sde = Arc::clone(&c.sde);
     let me = c.session.int("charid").unwrap_or(0);
     let corp = c.session.int("corpid").unwrap_or(0);
     let int = |k: &str| field(info, k).and_then(|v| v.as_int()).unwrap_or(0);
@@ -24,8 +25,8 @@ pub(super) async fn create(c: &Client, info: &Value) -> CallResult {
     if price < 0.0 || reward < 0.0 || collateral < 0.0 {
         return Err(notify_error(messages::CONTRACT_AMOUNT_NEGATIVE));
     }
-    let start = station(db, int("startStationID")).await?;
-    let end = if kind == TYPE_COURIER { Some(station(db, int("destinationID")).await?) } else { None };
+    let start = station(&c.sde, int("startStationID"))?;
+    let end = if kind == TYPE_COURIER { Some(station(&c.sde, int("destinationID"))?) } else { None };
     let assignee = int("assignedToID");
     if assignee == me {
         return Err(notify_error(messages::CONTRACT_SELF_ASSIGNMENT_FORBIDDEN));
@@ -76,6 +77,7 @@ pub(super) async fn create(c: &Client, info: &Value) -> CallResult {
     let created = db.transaction(
         |db, outbox: &mut Outbox| {
             let input = Arc::clone(&input);
+            let sde = Arc::clone(&sde);
             Box::pin(async move {
     let (groups, requested, title, description) = &*input;
     let open = num_outstanding(db, me).await?;
@@ -86,7 +88,7 @@ pub(super) async fn create(c: &Client, info: &Value) -> CallResult {
     // Every item must be in the issuer's hangar at the start station.
     let mut loaded = HashMap::new();
     for (id, qty) in groups.iter().flatten() {
-        let item = load_items(db, ItemQuery::Id(*id)).await.map_err(db_err)?.pop().ok_or_else(|| notify_error(messages::CONTRACT_ITEM_MISSING))?;
+        let item = load_items(db, &sde, ItemQuery::Id(*id)).await.map_err(db_err)?.pop().ok_or_else(|| notify_error(messages::CONTRACT_ITEM_MISSING))?;
         if item.owner_id != me || item.location_id != start_id || item.flag_id != FLAG_HANGAR {
             return Err(notify_error(messages::CONTRACT_ITEM_MUST_BE_IN_START_HANGAR));
         }
@@ -115,7 +117,8 @@ pub(super) async fn create(c: &Client, info: &Value) -> CallResult {
         for (type_id, qty) in requested {
             contract_dao::insert_requested_item(db, id, *type_id, *qty).await.map_err(db_err)?;
         }
-        contract_dao::update_volume(db, id).await.map_err(db_err)?;
+        let volume = volume(db, &sde, id).await?;
+        contract_dao::update_volume(db, id, volume).await.map_err(db_err)?;
         tell(outbox, if assignee == corp { 0 } else { assignee }, "OnContractAssigned", id);
         created.push(Value::Int(id));
     }
@@ -131,6 +134,17 @@ pub(super) async fn create(c: &Client, info: &Value) -> CallResult {
     Ok(Value::List(created))
 }
 
+async fn volume(db: &(impl crate::db::executor::Executor + ?Sized), sde: &crate::sde::Sde, id: i64) -> Result<f64, CallError> {
+    Ok(sum_volume(shared::items(db, &[id]).await.map_err(db_err)?.iter()
+        .filter(|item| item.in_crate)
+        .filter_map(|item| sde.types.get(item.type_id as i32).and_then(|t| t.volume).map(|volume| volume * item.quantity as f64))))
+}
+
+fn sum_volume(volumes: impl Iterator<Item = f64>) -> f64 {
+    // Match SQL COALESCE(SUM, 0) sign on an empty set.
+    volumes.fold(0.0, |total, v| total + v)
+}
+
 /// `AcceptContract(contractID, forCorp)` -> the contract.
 pub(super) async fn accept(c: &Client, id: i64) -> CallResult {
     let (db, world) = (&c.db, &*c.world);
@@ -138,8 +152,11 @@ pub(super) async fn accept(c: &Client, id: i64) -> CallResult {
     let corp = c.session.int("corpid").unwrap_or(0);
     let _trading = lock().await;
     let now = filetime_now();
+    let sde = Arc::clone(&c.sde);
     db.transaction(
-        |db, outbox: &mut Outbox| Box::pin(async move {
+        |db, outbox: &mut Outbox| {
+            let sde = Arc::clone(&sde);
+            Box::pin(async move {
             let mut k = contract(db, id).await?;
             if k.status != STATUS_OUTSTANDING || k.expired(now) {
                 return Err(user_error(messages::MSG_CON_CONTRACT_NOT_OUTSTANDING, vec![]));
@@ -157,7 +174,7 @@ pub(super) async fn accept(c: &Client, id: i64) -> CallResult {
                     let mut takes = vec![];
                     for w in &wanted {
                         let (type_id, qty) = (w.type_id, w.quantity);
-                        let stacks = load_items(db, ItemQuery::OwnerLocationFlagTypeDescending(me, k.start, FLAG_HANGAR, type_id)).await.map_err(db_err)?;
+                        let stacks = load_items(db, &sde, ItemQuery::OwnerLocationFlagTypeDescending(me, k.start, FLAG_HANGAR, type_id)).await.map_err(db_err)?;
                         let have: i64 = stacks.iter().map(|s| if s.singleton { 1 } else { s.quantity as i64 }).sum();
                         if have < qty as i64 {
                             return Err(notify_error(messages::CONTRACT_REQUIRED_ITEMS_MISSING));
@@ -175,11 +192,11 @@ pub(super) async fn accept(c: &Client, id: i64) -> CallResult {
                             take_items(db, outbox, s, n).await?;
                             left -= n;
                         }
-                        deliver(db, outbox, k.issuer, k.start, type_id, qty).await?;
+                        deliver(db, &sde, outbox, k.issuer, k.start, type_id, qty).await?;
                     }
                     credit(db, outbox, k.issuer, k.price).await?;
                     credit(db, outbox, me, k.reward).await?;
-                    hand_over(db, outbox, id, me, k.start, FLAG_HANGAR).await?;
+                    hand_over(db, &sde, outbox, id, me, k.start, FLAG_HANGAR).await?;
                     k.acceptor = me;
                     k.accepted = now;
                     contract_dao::set_date_accepted(db, id, now).await.map_err(db_err)?;
@@ -189,7 +206,7 @@ pub(super) async fn accept(c: &Client, id: i64) -> CallResult {
                 TYPE_COURIER => {
                     debit(db, outbox, me, k.collateral).await?;
                     let wrap = contract_dao::insert_package(db, TYPE_PLASTIC_WRAP, me, k.start, FLAG_HANGAR, &messages::contract_package_name(id)).await.map_err(db_err)?;
-                    show_items(db, outbox, me, k.start, &[wrap], LOCATION_JUNKYARD).await?;
+                    show_items(db, &sde, outbox, me, k.start, &[wrap], LOCATION_JUNKYARD).await?;
                     k.acceptor = me;
                     k.accepted = now;
                     k.status = STATUS_IN_PROGRESS;
@@ -199,8 +216,9 @@ pub(super) async fn accept(c: &Client, id: i64) -> CallResult {
                 }
                 _ => return Err(notify_error(messages::AUCTION_ONLY_BIDDABLE)),
             }
-            Ok(k.keyval())
-        }),
+            Ok(k.keyval(&sde))
+            })
+        },
         |value, outbox| async move { dispatch_world(value, outbox, world) },
     ).await.map(|value| {
         info!("contracts: {me} accepted contract {id}");
@@ -212,12 +230,16 @@ pub(super) async fn accept(c: &Client, id: i64) -> CallResult {
 /// or call an overdue one in (failed), or turn down a contract assigned to you (rejected).
 pub(super) async fn complete(c: &Client, id: i64, status: i32) -> CallResult {
     let (db, world) = (&c.db, &*c.world);
+    let sde = &c.sde;
     let me = c.session.int("charid").unwrap_or(0);
     let corp = c.session.int("corpid").unwrap_or(0);
     let _trading = lock().await;
     let now = filetime_now();
     db.transaction(
-        |db, outbox: &mut Outbox| Box::pin(async move {
+        |db, outbox: &mut Outbox| {
+            let sde = sde.clone();
+            Box::pin(async move {
+            let sde = &*sde;
             let mut k = contract(db, id).await?;
             match status {
                 STATUS_FINISHED => {
@@ -225,14 +247,14 @@ pub(super) async fn complete(c: &Client, id: i64, status: i32) -> CallResult {
                         return Err(notify_error(messages::COURIER_DELIVERY_REQUIRES_ACCEPTOR));
                     }
                     let wrap = match k.package {
-                        Some(w) => load_items(db, ItemQuery::Id(w)).await.map_err(db_err)?.pop(),
+                        Some(w) => load_items(db, sde, ItemQuery::Id(w)).await.map_err(db_err)?.pop(),
                         None => None,
                     };
                     let Some(wrap) = wrap.filter(|w| w.owner_id == me && w.location_id == k.end) else {
                         return Err(notify_error(messages::COURIER_PACKAGE_MUST_BE_AT_DESTINATION));
                     };
                     take_items(db, outbox, wrap, 1).await?;
-                    hand_over(db, outbox, id, k.issuer, k.end, FLAG_HANGAR).await?;
+                    hand_over(db, sde, outbox, id, k.issuer, k.end, FLAG_HANGAR).await?;
                     credit(db, outbox, me, round2(k.reward + k.collateral)).await?;
                     set_status(db, &mut k, STATUS_FINISHED, now).await?;
                     tell(outbox, k.issuer, "OnContractCompleted", id);
@@ -243,14 +265,14 @@ pub(super) async fn complete(c: &Client, id: i64, status: i32) -> CallResult {
                     }
                     credit(db, outbox, k.issuer, round2(k.collateral + k.reward)).await?;
                     let wrap = match k.package {
-                        Some(w) => load_items(db, ItemQuery::Id(w)).await.map_err(db_err)?.pop(),
+                        Some(w) => load_items(db, sde, ItemQuery::Id(w)).await.map_err(db_err)?.pop(),
                         None => None,
                     };
                     match wrap {
                         Some(w) => {
                             let (location, flag) = (w.location_id, w.flag_id);
                             take_items(db, outbox, w, 1).await?;
-                            hand_over(db, outbox, id, k.acceptor, location, flag).await?;
+                            hand_over(db, sde, outbox, id, k.acceptor, location, flag).await?;
                         }
                         None => destroy_escrow(db, id).await?,
                     }
@@ -267,7 +289,7 @@ pub(super) async fn complete(c: &Client, id: i64, status: i32) -> CallResult {
                 _ => return Err(notify_error(messages::CONTRACT_STATUS_TRANSITION_INVALID)),
             }
             Ok(Value::Bool(true))
-        }),
+        })},
         |value, outbox| async move { dispatch_world(value, outbox, world) },
     ).await.map(|value| {
         info!("contracts: {me} set contract {id} to status {status}");
@@ -276,10 +298,13 @@ pub(super) async fn complete(c: &Client, id: i64, status: i32) -> CallResult {
 }
 
 /// The issuer takes an outstanding (or expired, or rejected) contract back with its escrow.
-pub(super) async fn delete_one(db: &Db, world: &World, me: i64, id: i64) -> Result<(), CallError> {
+pub(super) async fn delete_one(db: &Db, sde: &Arc<crate::sde::Sde>, world: &World, me: i64, id: i64) -> Result<(), CallError> {
     let now = filetime_now();
     db.transaction(
-        |db, outbox: &mut Outbox| Box::pin(async move {
+        |db, outbox: &mut Outbox| {
+            let sde = sde.clone();
+            Box::pin(async move {
+            let sde = &*sde;
             let mut k = contract(db, id).await?;
             if k.issuer != me || !(k.status == STATUS_OUTSTANDING || k.status == STATUS_REJECTED) {
                 return Err(notify_error(messages::CONTRACT_ISSUER_REQUIRED_TO_DELETE));
@@ -287,13 +312,13 @@ pub(super) async fn delete_one(db: &Db, world: &World, me: i64, id: i64) -> Resu
             if k.kind == TYPE_AUCTION && top_bid(db, id).await?.is_some() {
                 return Err(notify_error(messages::BIDDED_AUCTION_CANNOT_BE_DELETED));
             }
-            hand_over(db, outbox, id, me, k.start, FLAG_HANGAR).await?;
+            hand_over(db, sde, outbox, id, me, k.start, FLAG_HANGAR).await?;
             if k.kind != TYPE_AUCTION {
                 credit(db, outbox, me, k.reward).await?;
             }
             set_status(db, &mut k, STATUS_DELETED, now).await?;
             Ok(())
-        }),
+        })},
         |value, outbox| async move { dispatch_world(value, outbox, world) },
     ).await?;
     info!("contracts: {me} deleted contract {id}");
@@ -303,13 +328,17 @@ pub(super) async fn delete_one(db: &Db, world: &World, me: i64, id: i64) -> Resu
 /// `PlaceBid(contractID, amount, forCorp)`; a bid at the buyout wins at once.
 pub(super) async fn place_bid(c: &Client, id: i64, amount: f64) -> CallResult {
     let (db, world) = (&c.db, &*c.world);
+    let sde = &c.sde;
     let amount = round2(amount);
     let me = c.session.int("charid").unwrap_or(0);
     let corp = c.session.int("corpid").unwrap_or(0);
     let _trading = lock().await;
     let now = filetime_now();
     let (amount, buyout) = db.transaction(
-        |db, outbox: &mut Outbox| Box::pin(async move {
+        |db, outbox: &mut Outbox| {
+            let sde = sde.clone();
+            Box::pin(async move {
+    let sde = &*sde;
     let mut k = contract(db, id).await?;
     if k.kind != TYPE_AUCTION || k.status != STATUS_OUTSTANDING || k.expired(now) {
         return Err(user_error(messages::MSG_CON_CONTRACT_NOT_OUTSTANDING, vec![]));
@@ -336,11 +365,11 @@ pub(super) async fn place_bid(c: &Client, id: i64, amount: f64) -> CallResult {
     }
     contract_dao::insert_bid(db, id, me, amount, now).await.map_err(db_err)?;
     if buyout {
-        settle(db, outbox, &mut k, me, amount, now).await?;
+        settle(db, sde, outbox, &mut k, me, amount, now).await?;
         tell(outbox, k.issuer, "OnContractBuyout", id);
     }
     Ok((amount, buyout))
-        }),
+        })},
         |value, outbox| async move { dispatch_world(value, outbox, world) },
     ).await?;
     info!("contracts: {me} bid {amount} ISK on auction {id}");
@@ -351,8 +380,8 @@ pub(super) async fn place_bid(c: &Client, id: i64, amount: f64) -> CallResult {
 }
 
 /// An auction won: the items go to the winner at the start station, the bid to the issuer.
-async fn settle<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, k: &mut Contract, winner: i64, amount: f64, now: i64) -> Result<(), CallError> {
-    hand_over(db, outbox, k.id, winner, k.start, FLAG_HANGAR).await?;
+async fn settle<X: Send>(db: &(impl Executor + ?Sized), sde: &crate::sde::Sde, outbox: &mut Outbox<X>, k: &mut Contract, winner: i64, amount: f64, now: i64) -> Result<(), CallError> {
+    hand_over(db, sde, outbox, k.id, winner, k.start, FLAG_HANGAR).await?;
     credit(db, outbox, k.issuer, amount).await?;
     k.acceptor = winner;
     set_status(db, k, STATUS_FINISHED, now).await?;
@@ -361,22 +390,25 @@ async fn settle<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, 
     Ok(())
 }
 
-pub(super) async fn settle_expired(db: &Db, world: &World) -> Result<(), CallError> {
+pub(super) async fn settle_expired(db: &Db, sde: &Arc<crate::sde::Sde>, world: &World) -> Result<(), CallError> {
     let _trading = lock().await;
     let now = filetime_now();
     let expired = contract_dao::expired_auctions_with_bids(db, TYPE_AUCTION, STATUS_OUTSTANDING, now).await.map_err(db_err)?;
     for k in expired {
         let id = k.id;
         let settled = db.transaction(
-            |db, outbox: &mut Outbox| Box::pin(async move {
+            |db, outbox: &mut Outbox| {
+                let sde = sde.clone();
+                Box::pin(async move {
+                let sde = &*sde;
                 let mut k = contract(db, id).await?;
                 if let Some((winner, amount)) = top_bid(db, id).await? {
-                    settle(db, outbox, &mut k, winner, amount, now).await?;
+                    settle(db, sde, outbox, &mut k, winner, amount, now).await?;
                     Ok(Some((winner, amount)))
                 } else {
                     Ok(None)
                 }
-            }),
+            })},
             |value, outbox| async move { dispatch_world(value, outbox, world) },
         ).await?;
         if let Some((winner, amount)) = settled {
@@ -385,3 +417,5 @@ pub(super) async fn settle_expired(db: &Db, world: &World) -> Result<(), CallErr
     }
     Ok(())
 }
+
+#[cfg(test)] mod tests;

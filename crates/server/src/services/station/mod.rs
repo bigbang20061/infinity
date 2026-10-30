@@ -1,5 +1,5 @@
 //! Station and login services, including station data used by `uisvc.GetStation`.
-//! Station information comes from `sde.sta_stations`; activity auto-popup state is
+//! Station information comes from the startup SDE map; activity auto-popup state is
 //! persisted per character in `game.characters` (missing characters default to 1).
 //! Activity badges and other unmodelled services return empty or no-op fallbacks.
 //! The SettingsInfo code object used by carbonui settingsSvc.UpdateSettingsStatistics

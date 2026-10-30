@@ -1,6 +1,7 @@
 //! Character public information, asset lists and private notes for `charMgr`.
 //! Uses `game.characters`, `game.items`, `game.market_orders` and `game.char_notes`
-//! through DAOs. Contacts and other unmodelled answers use the fixed-answer table.
+//! through DAOs, and startup SDE station data. Contacts and other unmodelled
+//! answers use the fixed-answer table.
 use super::*;
 
 async fn public_info(c: &Client, id: i64) -> Result<Value, CallError> {
@@ -36,11 +37,20 @@ async fn asset_worth(c: &Client) -> CallResult {
 /// charactersheet.GetHomeStationRow(): KeyVal(stationID, solarSystemID, stationTypeID);
 /// the map reads `.stationID` before checking it, so no home station is a None stationID.
 async fn home_station_row(c: &Client, me: i64) -> CallResult {
-    let r = crate::dao::characters::social::home_station(&c.db, me).await.map_err(db_err)?;
+    let id = crate::dao::characters::social::home_station_id(&c.db, me).await.map_err(db_err)?;
+    let Some(r) = id.and_then(|id| c.sde.map.station(id)) else {
+        return Ok(keyval([
+            ("stationID", Value::None),
+            ("solarSystemID", Value::None),
+            ("stationTypeID", Value::None),
+        ]));
+    };
+    let solar_system_id = r.solar_system_id.ok_or_else(|| CallError::Internal(anyhow::anyhow!("home station solar_system_id is null")))?;
+    let type_id = r.type_id.ok_or_else(|| CallError::Internal(anyhow::anyhow!("home station type_id is null")))?;
     Ok(keyval([
-        ("stationID", r.as_ref().map(|r| Value::Int(r.station_id)).unwrap_or(Value::None)),
-        ("solarSystemID", r.as_ref().map(|r| Value::Int(r.solar_system_id)).unwrap_or(Value::None)),
-        ("stationTypeID", r.as_ref().map(|r| Value::Int(r.type_id)).unwrap_or(Value::None)),
+        ("stationID", Value::Int(r.station_id)),
+        ("solarSystemID", Value::Int(solar_system_id)),
+        ("stationTypeID", Value::Int(type_id)),
     ]))
 }
 
@@ -61,20 +71,23 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         ("charMgr", "GetHomeStationRow") => home_station_row(c, me).await,
         // Assets window (invCache global inventory): stations holding the character's items...
         ("charMgr", "ListStations") => match crate::dao::items::social::stations(&c.db, me).await {
-            Ok(rows) => Ok(rowset(
-                &["stationID", "itemCount", "typeID", "solarSystemID"],
-                rows.iter().map(|r| vec![Value::Int(r.location_id), Value::Int(r.count), Value::Int(r.type_id), Value::Int(r.solar_system_id)]).collect(),
+            Ok(rows) => rows.iter().filter_map(|r| c.sde.map.station(r.location_id).map(|station| {
+                let type_id = station.type_id.ok_or_else(|| CallError::Internal(anyhow::anyhow!("station {} has no type", r.location_id)))?;
+                let system_id = station.solar_system_id.ok_or_else(|| CallError::Internal(anyhow::anyhow!("station {} has no solar system", r.location_id)))?;
+                Ok(vec![Value::Int(r.location_id), Value::Int(r.count), Value::Int(type_id), Value::Int(system_id)])
+            })).collect::<Result<Vec<_>, CallError>>().map(|rows| rowset(
+                &["stationID", "itemCount", "typeID", "solarSystemID"], rows,
             )),
             Err(e) => Err(db_err(e)),
         },
         // ...the items at one of them...
         ("charMgr", "ListStationItems") => {
             let station = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
-            crate::dao::items::loading::load_items(&c.db, crate::dao::items::loading::ItemQuery::LocationOwner(station, me)).await.map_err(db_err).map(|items| Value::list(items.iter().map(|i| i.row())))
+            crate::services::items::load_items(&c.db, &c.sde, crate::dao::items::loading::ItemQuery::LocationOwner(station, me)).await.map_err(db_err).map(|items| Value::list(items.iter().map(|i| i.row())))
         }
         // ...and everything the character owns, inside containers and ships too (asset search).
         ("charMgr", "ListIncludingContainers") => {
-            crate::dao::items::loading::load_items(&c.db, crate::dao::items::loading::ItemQuery::OwnerExceptSelf(me)).await.map_err(db_err).map(|items| Value::list(items.iter().map(|i| i.row())))
+            crate::services::items::load_items(&c.db, &c.sde, crate::dao::items::loading::ItemQuery::OwnerExceptSelf(me)).await.map_err(db_err).map(|items| Value::list(items.iter().map(|i| i.row())))
         }
         // The info window's private notes are scoped to this character.
         ("charMgr", "GetNote") => {

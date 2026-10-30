@@ -9,6 +9,6 @@ fn period_start_is_a_utc_timestamp() {
 
 #[test]
 fn rewards_parse() {
-    assert_eq!(parse_rewards("57003:1,72409:2"), vec![(57003, 1), (72409, 2)]);
-    assert!(parse_rewards("").is_empty());
+    assert_eq!(crate::sde::store::parse_rewards(Some("57003:1,72409:2,bad,12:x".into())), vec![(57003, 1), (72409, 2)]);
+    assert!(crate::sde::store::parse_rewards(None).is_empty());
 }

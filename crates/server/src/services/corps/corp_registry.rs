@@ -1,7 +1,7 @@
 //! Player corporation `corpRegistry` dispatch, mirroring
 //! `eve/client/script/ui/services/corporation`.
 //! Uses the shared corporation mechanics in `services::corps` and its DAOs,
-//! including `game.corporations`, `game.characters` and `game.corp_applications`.
+//! including `game.corporations`, `game.characters`, `game.corp_applications` and startup SDE corporations.
 //! Shares are not supported; alliance and organization calls have separate handlers.
 
 use super::*;
@@ -67,7 +67,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
                         return Some(Err(notify_error(messages::CANNOT_REMOVE_MEMBER)));
                     }
                 }
-                if let Err(e) = leave(db, world, *target).await {
+                if let Err(e) = leave(db, &c.sde, world, *target).await {
                     return Some(Err(e));
                 }
             }
@@ -175,7 +175,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         "UpdateTitle" => update_titles(db, world, me, corp, vec![call.args.to_vec()]).await.map(|_| Value::None),
         "UpdateTitles" => update_titles(db, world, me, corp, rowset_lines(call.args.first())).await.map(|_| Value::None),
         "DeleteTitle" => delete_title(db, world, me, corp, int(0).unwrap_or(0)).await.map(|_| Value::None),
-        "ResignFromCEO" => resign_ceo(db, world, me, int(0)).await,
+        "ResignFromCEO" => resign_ceo(db, &c.sde, world, me, int(0)).await,
         "UpdateDivisionNames" => {
             let names: Vec<Option<String>> = (0..CORP_DIVISION_NAME_COUNT).map(|i| call.args.get(i).and_then(|v| v.as_text()).map(|t| t.into_owned())).collect();
             match membership(db, me).await {
@@ -236,6 +236,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
 /// applicationsEnabled, friendlyFire, lpTaxRate)` -> corporationID.
 async fn found(c: &Client, call: &Call<'_>) -> CallResult {
     let (db, world) = (&c.db, &*c.world);
+    let sde = c.sde.clone();
     let me = c.session.int("charid").unwrap_or(0);
     let int = |i: usize| call.args.get(i).and_then(|v| v.as_int()).map(|v| v as i32);
     let (name, ticker, description, url) = (trimmed_arg_text(call, 0), trimmed_arg_text(call, 1).to_uppercase(), trimmed_arg_text(call, 2), trimmed_arg_text(call, 3));
@@ -257,7 +258,11 @@ async fn found(c: &Client, call: &Call<'_>) -> CallResult {
     if is_player_corp(current) && ceo_of(db, current).await? == Some(me) {
         return Err(notify_error(messages::ALREADY_CORP_CEO_MUST_RESIGN_OR_CLOSE));
     }
-    let taken = registry::name_taken(db, &name, &ticker).await.map_err(db_err)?;
+    let result = registry::name_taken(db, &name, &ticker).await.map_err(db_err)?;
+    let taken = result.taken || sde.npc_corporations.iter().any(|corp| {
+        corp.lower_name.as_deref() == Some(result.lower_name.as_str())
+            || corp.upper_ticker.as_deref() == Some(ticker.as_str())
+    });
     if taken {
         return Err(notify_error(messages::CORP_NAME_OR_SHORT_NAME_TAKEN));
     }
@@ -269,13 +274,14 @@ async fn found(c: &Client, call: &Call<'_>) -> CallResult {
     let id = db.transaction(
         |tx, outbox| {
             let (name, ticker, description, url) = (name.clone(), ticker.clone(), description.clone(), url.clone());
+            let sde = sde.clone();
             Box::pin(async move {
                 super::super::wallets::debit(tx, outbox, me, STARTUP_COST).await?;
                 let id = registry::create(tx, &registry::NewCorporation {
                     name: &name, ticker: &ticker, description: &description, url: &url,
                     tax, ceo: me, station, recruiting, friendly, shapes, now,
                 }).await.map_err(db_err)?;
-                set_corp(tx, outbox, me, id, CEO_ROLES, now).await?;
+                set_corp(tx, &sde, outbox, me, id, CEO_ROLES, now).await?;
                 Ok(id)
             })
         },
@@ -320,6 +326,7 @@ async fn old_applications(db: &Db, me: i64) -> CallResult {
 /// `UpdateApplicationOffer(applicationID, characterID, corporationID, text, status, customMessage, date)`.
 async fn update_application(c: &Client, call: &Call<'_>) -> CallResult {
     let (db, world) = (&c.db, &*c.world);
+    let sde = c.sde.clone();
     let me = c.session.int("charid").unwrap_or(0);
     let int = |i: usize| call.args.get(i).and_then(|v| v.as_int()).unwrap_or(0);
     let (app_id, status) = (int(0), int(4) as i32);
@@ -347,6 +354,7 @@ async fn update_application(c: &Client, call: &Call<'_>) -> CallResult {
     db.transaction(
         |tx, outbox| {
             let message = message.clone();
+            let sde = sde.clone();
             Box::pin(async move {
                 let affected = registry::update_application(tx, app_id, status, &message, current).await.map_err(db_err)?;
                 if affected == 0 {
@@ -357,7 +365,7 @@ async fn update_application(c: &Client, call: &Call<'_>) -> CallResult {
                     if is_player_corp(old) && ceo_of(tx, old).await? == Some(applicant) {
                         return Err(notify_error(messages::CEO_MUST_LEAVE_CORP_BEFORE_JOINING));
                     }
-                    set_corp(tx, outbox, applicant, corp, 0, now).await?;
+                    set_corp(tx, &sde, outbox, applicant, corp, 0, now).await?;
                     registry::withdraw_applications(tx, applicant, app_id, APP_WITHDRAWN_BY_CHARACTER, &OPEN_APPLICATION).await.map_err(db_err)?;
                 }
                 Ok(())

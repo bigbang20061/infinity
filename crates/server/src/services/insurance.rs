@@ -1,7 +1,7 @@
 //! Ship insurance (insuranceSvc, bound per station; eve/client/script/ui/station/insurance,
 //! eve/common/script/util/insuranceConst.py).
 //!
-//! A ship's insured value is its retail adjusted price (else its base price). A contract
+//! A ship's insured value is its retail adjusted or average price (else its base price). A contract
 //! (game.insurance) pays out `fraction` of that value when the ship is destroyed and costs
 //! (fraction - 0.4) / 2 of it up front, as insuranceConst prices its packages from Basic
 //! (0.5) to Platinum (1.0); it runs for 12 weeks. Destroyed ships pay their owner and post an
@@ -39,8 +39,14 @@ const INSURER: i64 = 1000132;
 const QUOTE_TOLERANCE_ISK: f64 = 1.0;
 
 /// What a ship type is insured for (the payout at fraction 1.0); 0 if it can't be insured.
-async fn value(db: &(impl Executor + ?Sized), type_id: i32) -> Result<f64, CallError> {
-    Ok(insurance::value(db, type_id, CATEGORY_SHIP).await.map_err(db_err)?.unwrap_or(0.0))
+async fn value(db: &(impl Executor + ?Sized), sde: &crate::sde::Sde, type_id: i32) -> Result<f64, CallError> {
+    let Some(ty) = sde.types.get(type_id).filter(|t| t.category_id == Some(CATEGORY_SHIP)) else { return Ok(0.0); };
+    let price = insurance::value(db, type_id).await.map_err(db_err)?;
+    Ok(price_value(price.as_ref().and_then(|p| p.adjusted), price.as_ref().and_then(|p| p.average), ty.base_price))
+}
+
+fn price_value(adjusted: Option<f64>, average: Option<f64>, base: Option<f64>) -> f64 {
+    adjusted.filter(|v| *v != 0.0).or_else(|| average.filter(|v| *v != 0.0)).or(base).unwrap_or(0.0)
 }
 
 fn contract_row(r: &insurance::Contract) -> Value {
@@ -60,13 +66,13 @@ async fn insure(c: &Client, call: &Call<'_>) -> CallResult {
     let ship = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
     let amount = call.args.get(1).and_then(|v| v.as_float()).unwrap_or(0.0);
     let void_old = call.kwargs.get("voidOld").or(call.args.get(3)).is_some_and(|v| matches!(v, Value::Bool(true)) || v.as_int() == Some(1));
-    let Some(item) = crate::dao::items::loading::load_items(db, crate::dao::items::loading::ItemQuery::Id(ship)).await.map_err(db_err)?.pop() else {
+    let Some(item) = crate::services::items::load_items(db, &c.sde, crate::dao::items::loading::ItemQuery::Id(ship)).await.map_err(db_err)?.pop() else {
         return Err(CallError::User { msg: messages::MSG_INS_COULD_NOT_FIND_ITEM.into(), dict: vec![] });
     };
     if item.owner_id != me || !item.singleton || item.category_id != CATEGORY_SHIP as i64 {
         return Err(notify_error(messages::INSURANCE_REQUIRES_OWN_ASSEMBLED_SHIP));
     }
-    let full = value(db, item.type_id).await?;
+    let full = value(db, &c.sde, item.type_id).await?;
     let Some(fraction) = FRACTIONS.iter().copied().find(|f| (full * (f - BASE_FRACTION) * FRACTION_INCREMENT - amount).abs() < QUOTE_TOLERANCE_ISK) else {
         return Err(notify_error(messages::INSURANCE_QUOTE_EXPIRED));
     };
@@ -93,18 +99,22 @@ async fn insure(c: &Client, call: &Call<'_>) -> CallResult {
 /// A ship was destroyed: pay out its insurance, if it has any that is still running.
 pub async fn ship_destroyed(db: &Db, world: &World, ship: i64) -> Result<(), CallError> {
     let now = filetime_now();
+    let sde = world.sde().clone();
     db.transaction(
-        |tx, outbox: &mut Outbox| Box::pin(async move {
-            let Some(r) = insurance::take_payout(tx, ship).await.map_err(db_err)?
-            else { return Ok(None); };
-            let (owner, type_id, fraction, end) = (r.owner_id, r.type_id, r.fraction, r.end_date);
-            if end < now { return Ok(None); }
-            let payout = super::market::round2(value(tx, type_id).await? * fraction);
-            super::wallets::credit(tx, outbox, owner, payout).await?;
-            let data = format!("{{amount: {payout}, itemID: {ship}, typeID: {type_id}, payout: 0}}");
-            super::mail::notify(tx, outbox, owner, NOTIFICATION_PAYOUT, NOTIFICATION_GROUP_INSURANCE, INSURER, &data).await?;
-            Ok(Some((owner, payout)))
-        }),
+        |tx, outbox: &mut Outbox| {
+            let sde = sde.clone();
+            Box::pin(async move {
+                let Some(r) = insurance::take_payout(tx, ship).await.map_err(db_err)?
+                else { return Ok(None); };
+                let (owner, type_id, fraction, end) = (r.owner_id, r.type_id, r.fraction, r.end_date);
+                if end < now { return Ok(None); }
+                let payout = super::market::round2(value(tx, &sde, type_id).await? * fraction);
+                super::wallets::credit(tx, outbox, owner, payout).await?;
+                let data = format!("{{amount: {payout}, itemID: {ship}, typeID: {type_id}, payout: 0}}");
+                super::mail::notify(tx, outbox, owner, NOTIFICATION_PAYOUT, NOTIFICATION_GROUP_INSURANCE, INSURER, &data).await?;
+                Ok(Some((owner, payout)))
+            })
+        },
         |paid, outbox| async move {
             dispatch_world((), outbox, world)?;
             if let Some((owner, payout)) = paid {
@@ -122,12 +132,12 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     let me = c.session.int("charid").unwrap_or(0);
     let db = &c.db;
     Some(match call.method {
-        "GetInsurancePrice" => value(db, call.args.first().and_then(|v| v.as_int()).unwrap_or(0) as i32).await.map(Value::Float),
+        "GetInsurancePrice" => value(db, &c.sde, call.args.first().and_then(|v| v.as_int()).unwrap_or(0) as i32).await.map(Value::Float),
         "GetInsurancePrices" => {
             let types = value_id_list(call.args.first());
             let mut out = vec![];
             for t in types {
-                match value(db, t as i32).await {
+                match value(db, &c.sde, t as i32).await {
                     Ok(v) => out.push((Value::Int(t), Value::Float(v))),
                     Err(e) => return Some(Err(e)),
                 }
@@ -165,3 +175,5 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         _ => return None,
     })
 }
+
+#[cfg(test)] mod tests;

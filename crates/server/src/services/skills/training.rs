@@ -1,6 +1,6 @@
 //! Skill training calculations and queue policy for characterskills/util.py.
-//! Uses game.skills, game.skill_queue, game.characters, sde.chr_bloodlines
-//! and sde.type_attributes; missing ranks and attributes use server fallbacks.
+//! Uses game.skills, game.skill_queue, game.characters and startup SDE data;
+//! missing ranks and attributes use server fallbacks.
 //! This module does not model attribute modifiers.
 use super::*;
 use super::attributes::{character_attributes_db, CHAR_ATTRIBUTES};
@@ -33,25 +33,13 @@ pub(super) struct SkillType {
     secondary: i64,
 }
 
-pub(super) async fn skill_type(db: &(impl Executor + ?Sized), type_id: i32) -> Result<SkillType, CallError> {
-    let rows = db
-        .query(
-            "SELECT attribute_id, value FROM sde.type_attributes WHERE type_id = $1 AND attribute_id = ANY($2)",
-            &[&type_id, &vec![ATTR_PRIMARY, ATTR_SECONDARY, ATTR_RANK]],
-        )
-        .await
-        .map_err(db_err)?;
-    let mut t = SkillType { rank: FALLBACK_SKILL_RANK, primary: CHAR_ATTRIBUTES[1], secondary: CHAR_ATTRIBUTES[2] };
-    for r in rows {
-        let v: f64 = r.get("value");
-        match r.get::<_, i32>("attribute_id") {
-            ATTR_RANK => t.rank = v,
-            ATTR_PRIMARY => t.primary = v as i64,
-            ATTR_SECONDARY => t.secondary = v as i64,
-            _ => {}
-        }
+pub(super) fn skill_type(sde: &crate::sde::Sde, type_id: i32) -> SkillType {
+    let attribute = |id| sde.types.attribute(type_id, id);
+    SkillType {
+        rank: attribute(ATTR_RANK).unwrap_or(FALLBACK_SKILL_RANK),
+        primary: attribute(ATTR_PRIMARY).map(|v| v as i64).unwrap_or(CHAR_ATTRIBUTES[1]),
+        secondary: attribute(ATTR_SECONDARY).map(|v| v as i64).unwrap_or(CHAR_ATTRIBUTES[2]),
     }
-    Ok(t)
 }
 
 /// Collect finished entries and restore the remaining queue positions.
@@ -99,12 +87,13 @@ pub(super) async fn skills_dict(c: &Client, char_id: i64) -> Result<Value, CallE
         info!("character {char_id} finished training skill {type_id} to level {level}");
     }
     let training = in_training_sp(&c.db, char_id, now).await?;
-    let rows = training_dao::ranked(&c.db, char_id, ATTR_RANK, FALLBACK_SKILL_RANK).await.map_err(db_err)?;
+    let rows = training_dao::current(&c.db, char_id).await.map_err(db_err)?;
     let now = filetime_now();
     Ok(Value::Dict(
         rows.iter()
             .map(|r| {
-                let (type_id, level, mut sp, rank) = (r.type_id, r.level, r.skill_points, r.rank);
+                let (type_id, level, mut sp) = (r.type_id, r.level, r.skill_points);
+                let rank = skill_type(&c.sde, type_id).rank;
                 if let Some((t, trained)) = training {
                     if t == type_id {
                         sp = sp.max(trained);
@@ -172,14 +161,16 @@ pub(super) async fn save_queue(c: &mut Client, char_id: i64, queue: &Value, acti
     };
     entries.sort();
     let db = c.db.clone();
+    let sde = c.sde.clone();
     db.transaction(
         |tx, outbox: &mut Outbox| {
             let entries = entries.clone();
+            let sde = sde.clone();
             Box::pin(async move {
     let mut done = collect_finished(tx, char_id, now).await?;
     let training = in_training_sp(tx, char_id, now).await?;
     let plan = plan_skills(&done, training);
-    let attrs = character_attributes_db(tx, char_id).await?;
+    let attrs = character_attributes_db(tx, &sde, char_id).await?;
     let mut current: HashMap<i32, (i32, i64)> = training_dao::current(tx, char_id).await.map_err(db_err)?.into_iter().map(|r| (r.type_id, (r.level, r.skill_points))).collect();
     let training = training.filter(|(type_id, _)| current.contains_key(type_id) || plan.get(type_id).is_some_and(|(level, _)| level.is_some()));
     for (&type_id, &(level, sp)) in &plan {
@@ -195,7 +186,7 @@ pub(super) async fn save_queue(c: &mut Client, char_id: i64, queue: &Value, acti
     queue_dao::clear(tx, char_id).await.map_err(db_err)?;
     let mut t = now;
     for (pos, (_, type_id, to_level)) in entries.into_iter().enumerate() {
-        let st = skill_type(tx, type_id as i32).await?;
+        let st = skill_type(&sde, type_id as i32);
         let (cur_level, cur_sp) = current.get(&(type_id as i32)).copied().unwrap_or((0, 0));
         let start_sp = if cur_level as i64 == to_level - 1 { cur_sp.max(sp_for_level(st.rank, to_level - 1)) } else { sp_for_level(st.rank, to_level - 1) };
         let dest_sp = sp_for_level(st.rank, to_level);

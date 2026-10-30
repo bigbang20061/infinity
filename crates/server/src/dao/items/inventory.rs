@@ -1,15 +1,10 @@
-//! Inventory capacity, slots and item mutations using `game.items`, `sde.inv_types`
-//! and `sde.type_attributes`.
+//! Inventory slots and item mutations using `game.items`.
 //! This DAO has no direct client mirror or wire contract; owning services supply those.
 //! Transactions, refusals, notifications and World are caller concerns.
 use crate::db::{executor::Executor, Error};
 use super::loading::Item;
 use tokio_postgres::Row;
 
-pub(crate) struct Capacity { pub capacity: f64, pub used: f64 }
-impl Capacity { fn from_row(r: &Row) -> Self { Self { capacity: r.get("capacity"), used: r.get("used") } } }
-pub(crate) struct SlotCount { pub value: f64 }
-impl SlotCount { fn from_row(r: &Row) -> Self { Self { value: r.get("value") } } }
 pub(crate) struct SlotFlag { pub flag_id: i32 }
 impl SlotFlag { fn from_row(r: &Row) -> Self { Self { flag_id: r.get("flag_id") } } }
 pub(crate) struct ItemId { pub item_id: i64 }
@@ -22,13 +17,6 @@ pub(crate) async fn type_id(ex: &(impl Executor + ?Sized), item: i64) -> Result<
     Ok(ex.query_opt("SELECT type_id FROM game.items WHERE item_id = $1", &[&item]).await?.as_ref().map(|r| TypeId::from_row(r).type_id))
 }
 
-pub(crate) async fn capacity(ex: &(impl Executor + ?Sized), id: i64, attr: i32) -> Result<Option<Capacity>, Error> {
-    Ok(ex.query_opt("SELECT COALESCE((SELECT value FROM sde.type_attributes a WHERE a.type_id = i.type_id AND a.attribute_id = $2),
-                                     t.capacity, 0) AS capacity,
-                            COALESCE((SELECT sum(t2.volume * GREATEST(c.quantity, 1)) FROM game.items c
-                                      JOIN sde.inv_types t2 USING (type_id) WHERE c.location_id = i.item_id), 0) AS used
-                     FROM game.items i JOIN sde.inv_types t USING (type_id) WHERE i.item_id = $1", &[&id, &attr]).await?.as_ref().map(Capacity::from_row))
-}
 pub(crate) async fn split(ex: &(impl Executor + ?Sized), item: &Item, quantity: i32, owner: i64, location: i64, flag: i32, singleton: bool) -> Result<Option<i64>, Error> {
     let affected = ex.execute("UPDATE game.items SET quantity = quantity - $2 WHERE item_id = $1 AND quantity = $3 AND owner_id = $4 AND location_id = $5 AND flag_id = $6 AND singleton = $7 AND NOT singleton AND quantity > $2 AND $2 > 0", &[&item.item_id, &quantity, &item.quantity, &item.owner_id, &item.location_id, &item.flag_id, &item.singleton]).await?;
     if affected == 0 { return Ok(None); }
@@ -36,7 +24,6 @@ pub(crate) async fn split(ex: &(impl Executor + ?Sized), item: &Item, quantity: 
     Ok(Some(ItemId::from_row(&row).item_id))
 }
 pub(crate) async fn delete(ex: &(impl Executor + ?Sized), id: i64) -> Result<(), Error> { ex.execute("DELETE FROM game.items WHERE item_id = $1", &[&id]).await?; Ok(()) }
-pub(crate) async fn slot_count(ex: &(impl Executor + ?Sized), ship: i64, attr: i32) -> Result<Option<SlotCount>, Error> { Ok(ex.query_opt("SELECT a.value FROM game.items i JOIN sde.type_attributes a ON a.type_id = i.type_id AND a.attribute_id = $2 WHERE i.item_id = $1", &[&ship, &attr]).await?.as_ref().map(SlotCount::from_row)) }
 pub(crate) async fn slot_flags(ex: &(impl Executor + ?Sized), ship: i64) -> Result<Vec<SlotFlag>, Error> { Ok(ex.query("SELECT flag_id FROM game.items WHERE location_id = $1", &[&ship]).await?.iter().map(SlotFlag::from_row).collect()) }
 pub(crate) async fn move_item(ex: &(impl Executor + ?Sized), id: i64, location: i64, flag: i32, owner: i64, singleton: bool, fitting: bool) -> Result<(), Error> { ex.execute("UPDATE game.items SET location_id = $2, flag_id = $3, owner_id = $4, singleton = $5,
                                 online = online AND $6, x = NULL, y = NULL, z = NULL WHERE item_id = $1", &[&id, &location, &flag, &owner, &singleton, &fitting]).await?; Ok(()) }
