@@ -1,5 +1,7 @@
-//! Infinity emulator server. One process plays proxy and sol node, and also
-//! serves chat (XMPP) and the image server.
+//! Infinity emulator server: proxy and sol node, gateway, chat, image server and CDN.
+//! The handshake mirrors the client's macho networking; state comes from the game
+//! database and SDE. On SIGINT or SIGTERM, listeners stop and changed pilot
+//! positions are flushed with a bounded wait; existing sessions are not drained.
 
 mod cdn;
 mod retail;
@@ -21,7 +23,7 @@ use anyhow::{Context, Result};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Server allocation policy: initial ephemeral client ID.
 const FIRST_CLIENT_ID: i64 = 1_000_000_000_000;
@@ -31,6 +33,8 @@ const ONLINE_JOIN_DELTA: i64 = 1;
 const ONLINE_LEAVE_DELTA: i64 = -1;
 /// Server policy: leave capacity for administrators and tools under PostgreSQL's default 100 connections.
 const DATABASE_POOL_SIZE_DEFAULT: usize = 16;
+/// Server design decision: bound the shutdown position flush to ten seconds.
+const POSITION_FLUSH_TIMEOUT_SECS: u64 = 10;
 
 /// Values the client checks during the handshake; defaults match the
 /// Infinity build 3653293 start.ini and eveMachoNetVersion.machoVersion.
@@ -123,17 +127,42 @@ async fn main() -> Result<()> {
     tokio::spawn(services::expire_market_orders(db.clone(), world.clone()));
     tokio::spawn(services::settle_auctions(db.clone(), world.clone()));
     tokio::spawn(services::run_billing(db.clone(), world.clone()));
-    tokio::spawn(log_exit("public gateway", gateway::serve(cfg.gateway_bind.clone(), gateway::Gateway::new(db.clone(), cfg.cdn_url()))));
-    tokio::spawn(log_exit("chat", chat::serve(cfg.chat_bind.clone(), hub.clone())));
+    let gateway_task = tokio::spawn(log_exit("public gateway", gateway::serve(cfg.gateway_bind.clone(), gateway::Gateway::new(db.clone(), cfg.cdn_url()))));
+    let chat_task = tokio::spawn(log_exit("chat", chat::serve(cfg.chat_bind.clone(), hub.clone())));
     let upstream = images::Upstream::new(&cfg.image_upstream);
-    tokio::spawn(log_exit("image server", images::serve("images", cfg.image_bind.clone(), cfg.image_dir.clone().into(), upstream.clone())));
-    tokio::spawn(log_exit("content cdn", images::serve("cdn", cfg.cdn_bind.clone(), cfg.image_dir.clone().into(), upstream)));
+    let image_task = tokio::spawn(log_exit("image server", images::serve("images", cfg.image_bind.clone(), cfg.image_dir.clone().into(), upstream.clone())));
+    let cdn_task = tokio::spawn(log_exit("content cdn", images::serve("cdn", cfg.cdn_bind.clone(), cfg.image_dir.clone().into(), upstream)));
     let listener = TcpListener::bind(&cfg.bind).await.with_context(|| format!("binding {}", cfg.bind))?;
     info!("listening on {} (macho {}, build {}, {}@{})", cfg.bind, cfg.macho_version, cfg.boot_build, cfg.boot_codename, cfg.boot_region);
 
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("registering SIGTERM handler")?;
+    let shutdown = async {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                result = tokio::signal::ctrl_c() => result.context("handling SIGINT"),
+                result = sigterm.recv() => result.context("SIGTERM handler closed").map(|_| ()),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c().await.context("handling SIGINT")
+        }
+    };
+    tokio::pin!(shutdown);
     let next_client_id = Arc::new(AtomicI64::new(FIRST_CLIENT_ID));
+    // The biased select polls and registers the signal handler before accepting clients.
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer) = tokio::select! {
+            biased;
+            result = &mut shutdown => {
+                result?;
+                break;
+            }
+            result = listener.accept() => result?,
+        };
         stream.set_nodelay(true).ok();
         let (cfg, db, ids, hub, world) = (cfg.clone(), db.clone(), next_client_id.clone(), hub.clone(), world.clone());
         tokio::spawn(async move {
@@ -158,6 +187,27 @@ async fn main() -> Result<()> {
             db.add_online(ONLINE_LEAVE_DELTA);
         });
     }
+    drop(listener);
+    gateway_task.abort();
+    chat_task.abort();
+    image_task.abort();
+    cdn_task.abort();
+    let _ = tokio::join!(gateway_task, chat_task, image_task, cdn_task);
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(POSITION_FLUSH_TIMEOUT_SECS),
+        world.flush_positions(),
+    ).await {
+        Ok(Ok(positions_written)) => info!(positions_written, "position snapshot shutdown flush"),
+        Ok(Err(e)) => {
+            warn!("position snapshot shutdown flush failed: {e:#}");
+            info!(outcome = "failed", "position snapshot shutdown flush");
+        }
+        Err(_) => {
+            warn!("position snapshot shutdown flush timed out");
+            info!(outcome = "timed out", "position snapshot shutdown flush");
+        }
+    }
+    Ok(())
 }
 
 

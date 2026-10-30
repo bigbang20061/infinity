@@ -1,7 +1,8 @@
 //! Actor-owned ballpark state and visibility, mirroring michelle.py and destiny.
 //! Celestials are supplied by the facade from SDE; dynamic state is in memory.
 //! NPC decisions, spawn-group callbacks and transient timers run in the tick;
-//! DB effects use a worker. Neither timers nor dynamic balls survive a restart.
+//! DB effects and changed pilot position snapshots use workers. Timers and
+//! non-position dynamic state do not survive a restart.
 use super::*;
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -15,7 +16,7 @@ type Timer = Box<dyn FnOnce(&mut System) + Send>;
 
 #[derive(Default)]
 pub struct System {
-    id: i64,
+    pub(super) id: i64,
     balls: HashMap<i64, Ball>,
     pilots: HashMap<i64, i64>,
     observers: HashMap<i64, (i64, DestinyTx)>,
@@ -33,6 +34,10 @@ pub struct System {
     pub(super) groups: HashMap<u64, npc::SpawnGroup>,
     pub(super) member_groups: HashMap<i64, std::collections::HashSet<u64>>,
     pub(super) due_brains: Vec<i64>,
+    pub(super) snapshot_context: Option<snapshot::Context>,
+    pub(super) snapshot_positions: HashMap<i64, (u64, V3)>,
+    pub(super) snapshot_generation: u64,
+    pub(super) snapshot_due: i64,
 }
 impl System {
     pub fn new(id: i64, registry: Arc<Pilots>) -> Self {
@@ -84,12 +89,18 @@ impl System {
         self.take(ball.id);
         if let Some(char_id) = ball.char_id {
             self.pilots.insert(char_id, ball.id);
+            self.snapshot_generation = self.snapshot_generation.checked_add(1).expect("snapshot generation exhausted");
+            self.snapshot_positions.insert(ball.id, (self.snapshot_generation, ball.pos));
+            if self.snapshot_due == 0 {
+                self.snapshot_due = self.ms.saturating_add(snapshot::POSITION_SNAPSHOT_INTERVAL_MS as i64);
+            }
         }
         self.balls.insert(ball.id, ball);
     }
 
     pub fn take(&mut self, id: i64) -> Option<Ball> {
         let ball = self.balls.remove(&id)?;
+        self.snapshot_positions.remove(&id);
         if let Some(char_id) = ball.char_id {
             if self.pilots.get(&char_id) == Some(&id) {
                 self.pilots.remove(&char_id);
@@ -123,6 +134,12 @@ impl System {
     pub fn tick(&mut self, ms: i64) {
         self.observers.retain(|_, (_, tx)| !tx.is_closed());
         self.ms = ms;
+        if self.pilots.is_empty() {
+            self.snapshot_due = 0;
+        } else if self.snapshot_due != 0 && ms >= self.snapshot_due {
+            self.snapshot_due = ms.saturating_add(snapshot::POSITION_SNAPSHOT_INTERVAL_MS as i64);
+            snapshot::schedule(self);
+        }
         if self.is_cold() { return; }
         self.pending = Some(HashMap::new());
         self.evolve_all(ms);
