@@ -35,7 +35,6 @@ async fn epic_arc_messages(c: &Client) -> CallResult {
     }
     let rows = c
         .db
-        .client
         .query(
             "SELECT k, m.key::int, (m.data->'messages'->>k)::bigint
              FROM sde_native.missions m, jsonb_object_keys(m.data->'messages') k
@@ -67,7 +66,6 @@ async fn allowed_factions(c: &Client, corp_id: i64) -> CallResult {
     }
     let rows = c
         .db
-        .client
         .query("SELECT faction_id FROM game.corp_enlistment_factions WHERE corporation_id = $1 ORDER BY faction_id", &[&corp_id])
         .await
         .map_err(db_err)?;
@@ -81,9 +79,9 @@ async fn set_allowed_factions(c: &Client, call: &Call<'_>) -> CallResult {
         Some(Value::List(l) | Value::Tuple(l)) => l.iter().filter_map(|v| v.as_int()).filter(|f| FW_FACTIONS.contains(f)).collect(),
         _ => vec![],
     };
-    c.db.client.execute("DELETE FROM game.corp_enlistment_factions WHERE corporation_id = $1", &[&corp_id]).await.map_err(db_err)?;
+    c.db.execute("DELETE FROM game.corp_enlistment_factions WHERE corporation_id = $1", &[&corp_id]).await.map_err(db_err)?;
     for f in &factions {
-        c.db.client
+        c.db
             .execute("INSERT INTO game.corp_enlistment_factions (corporation_id, faction_id) VALUES ($1, $2)", &[&corp_id, f])
             .await
             .map_err(db_err)?;

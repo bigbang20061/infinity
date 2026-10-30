@@ -119,7 +119,6 @@ async fn meta(db: &Db) -> Result<Arc<HashMap<i32, (f64, bool)>>, CallError> {
         return Ok(m);
     }
     let rows = db
-        .client
         .query("SELECT attribute_id, COALESCE(default_value, 0)::float8, COALESCE(stackable, true) FROM sde.dogma_attributes", &[])
         .await
         .map_err(db_err)?;
@@ -148,7 +147,6 @@ async fn types(db: &Db, types: &[i32]) -> Result<HashMap<i32, Arc<TypeData>>, Ca
         return Ok(out);
     }
     let base = db
-        .client
         .query(
             "SELECT type_id, COALESCE(group_id, 0), COALESCE(category_id, 0), mass::float8, capacity::float8, volume::float8, radius::float8
              FROM sde.inv_types WHERE type_id = ANY($1)",
@@ -157,12 +155,10 @@ async fn types(db: &Db, types: &[i32]) -> Result<HashMap<i32, Arc<TypeData>>, Ca
         .await
         .map_err(db_err)?;
     let attrs = db
-        .client
         .query("SELECT type_id, attribute_id, value FROM sde.type_attributes WHERE type_id = ANY($1)", &[&missing])
         .await
         .map_err(db_err)?;
     let mods = db
-        .client
         .query(
             "SELECT te.type_id, COALESCE(e.effect_category, 0), m->>'func', COALESCE(m->>'domain', ''), COALESCE((m->>'operation')::int, $3),
                     COALESCE((m->>'modifiedAttributeID')::int, 0), COALESCE((m->>'modifyingAttributeID')::int, 0),
@@ -173,7 +169,7 @@ async fn types(db: &Db, types: &[i32]) -> Result<HashMap<i32, Arc<TypeData>>, Ca
         )
         .await
         .map_err(db_err)?;
-    let effects = db.client.query("SELECT type_id, effect_id FROM sde.type_effects WHERE type_id = ANY($1)", &[&missing]).await.map_err(db_err)?;
+    let effects = db.query("SELECT type_id, effect_id FROM sde.type_effects WHERE type_id = ANY($1)", &[&missing]).await.map_err(db_err)?;
     let mut built: HashMap<i32, TypeData> = base
         .iter()
         .map(|r| (r.get(0), TypeData { group: r.get(1), category: r.get(2), attrs: HashMap::new(), modifiers: vec![], effects: HashSet::new() }))
@@ -250,15 +246,13 @@ impl Fit {
     pub async fn load(db: &Db, char_id: i64, ship: i64) -> Result<Fit, CallError> {
         let char_type: i32 = TYPE_CHARACTER;
         let ship_type: i32 = db
-            .client
             .query_opt("SELECT type_id FROM game.items WHERE item_id = $1", &[&ship])
             .await
             .map_err(db_err)?
             .map(|r| r.get(0))
             .unwrap_or(0);
-        let skills = db.client.query("SELECT type_id, level FROM game.skills WHERE character_id = $1", &[&char_id]).await.map_err(db_err)?;
+        let skills = db.query("SELECT type_id, level FROM game.skills WHERE character_id = $1", &[&char_id]).await.map_err(db_err)?;
         let modules = db
-            .client
             .query(
                 "SELECT item_id, type_id, COALESCE(online, false), flag_id FROM game.items WHERE location_id = $1
                  AND (flag_id BETWEEN $2 AND $3 OR flag_id BETWEEN $4 AND $5 OR flag_id BETWEEN $6 AND $7)",
@@ -266,7 +260,7 @@ impl Fit {
             )
             .await
             .map_err(db_err)?;
-        let charges = db.client.query("SELECT flag_id, type_id FROM game.module_charges WHERE ship_id = $1", &[&ship]).await.map_err(db_err)?;
+        let charges = db.query("SELECT flag_id, type_id FROM game.module_charges WHERE ship_id = $1", &[&ship]).await.map_err(db_err)?;
         let mut all: Vec<i32> = vec![char_type, ship_type];
         all.extend(skills.iter().map(|r| r.get::<_, i32>(0)));
         all.extend(modules.iter().map(|r| r.get::<_, i32>(1)));

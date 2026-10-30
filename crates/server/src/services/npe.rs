@@ -24,7 +24,6 @@ const STATE_SKIPPED: i16 = 3;
 /// A character's tutorial state: stored, else SKIPPED (the tutorial is never offered).
 async fn state_of(c: &Client, char_id: i64) -> Result<i16, CallError> {
     Ok(c.db
-        .client
         .query_opt("SELECT state FROM game.air_npe_state WHERE character_id = $1", &[&char_id])
         .await
         .map_err(db_err)?
@@ -33,7 +32,7 @@ async fn state_of(c: &Client, char_id: i64) -> Result<i16, CallError> {
 }
 
 async fn set_state(c: &mut Client, char_id: i64, state: i16) -> Result<(), CallError> {
-    c.db.client
+    c.db
         .execute(
             "INSERT INTO game.air_npe_state (character_id, state, changed_at) VALUES ($1, $2, $3)
              ON CONFLICT (character_id) DO UPDATE SET state = EXCLUDED.state, changed_at = EXCLUDED.changed_at",

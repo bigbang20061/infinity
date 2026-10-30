@@ -50,7 +50,6 @@ pub fn sp_for_level(rank: f64, level: i64) -> i64 {
 pub async fn character_attributes(c: &Client, char_id: i64) -> Result<HashMap<i64, f64>, CallError> {
     let r = c
         .db
-        .client
         .query_one(
             "SELECT b.charisma, b.intelligence, b.memory, b.perception, b.willpower
              FROM game.characters ch JOIN sde.chr_bloodlines b USING (bloodline_id) WHERE ch.character_id = $1",
@@ -70,7 +69,6 @@ struct SkillType {
 async fn skill_type(c: &Client, type_id: i32) -> Result<SkillType, CallError> {
     let rows = c
         .db
-        .client
         .query(
             "SELECT attribute_id, value FROM sde.type_attributes WHERE type_id = $1 AND attribute_id = ANY($2)",
             &[&type_id, &vec![ATTR_PRIMARY, ATTR_SECONDARY, ATTR_RANK]],
@@ -94,7 +92,6 @@ async fn skill_type(c: &Client, type_id: i32) -> Result<SkillType, CallError> {
 pub async fn grant_starting_skills(c: &Client, char_id: i64, race_id: i32) -> Result<(), CallError> {
     let rows = c
         .db
-        .client
         .query(
             "SELECT (s->>'_key')::int, (s->>'_value')::int FROM sde.chr_races r, jsonb_array_elements(r.data->'skills') s WHERE r.race_id = $1",
             &[&race_id],
@@ -105,7 +102,6 @@ pub async fn grant_starting_skills(c: &Client, char_id: i64, race_id: i32) -> Re
         let (type_id, level): (i32, i32) = (r.get(0), r.get(1));
         let rank = skill_type(c, type_id).await?.rank;
         c.db
-            .client
             .execute(
                 "INSERT INTO game.skills (character_id, type_id, level, skill_points) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
                 &[&char_id, &type_id, &level, &sp_for_level(rank, level as i64)],
@@ -121,7 +117,6 @@ async fn advance_training(c: &Client, char_id: i64) -> Result<(), CallError> {
     let now = filetime_now();
     let done = c
         .db
-        .client
         .query(
             "DELETE FROM game.skill_queue WHERE character_id = $1 AND end_time IS NOT NULL AND end_time <= $2
              RETURNING type_id, to_level, dest_sp",
@@ -132,7 +127,6 @@ async fn advance_training(c: &Client, char_id: i64) -> Result<(), CallError> {
     for r in &done {
         let (type_id, level, sp): (i32, i32, i64) = (r.get(0), r.get(1), r.get(2));
         c.db
-            .client
             .execute(
                 "INSERT INTO game.skills (character_id, type_id, level, skill_points) VALUES ($1, $2, $3, $4)
                  ON CONFLICT (character_id, type_id) DO UPDATE SET level = GREATEST(game.skills.level, EXCLUDED.level),
@@ -145,7 +139,6 @@ async fn advance_training(c: &Client, char_id: i64) -> Result<(), CallError> {
     }
     if !done.is_empty() {
         c.db
-            .client
             .execute(
                 "UPDATE game.skill_queue q SET position = n.rn - 1 FROM
                     (SELECT position, row_number() OVER (ORDER BY position) rn FROM game.skill_queue WHERE character_id = $1) n
@@ -162,7 +155,6 @@ async fn advance_training(c: &Client, char_id: i64) -> Result<(), CallError> {
 async fn in_training_sp(c: &Client, char_id: i64) -> Result<Option<(i32, i64)>, CallError> {
     let r = c
         .db
-        .client
         .query_opt(
             "SELECT type_id, start_sp, dest_sp, start_time, end_time FROM game.skill_queue WHERE character_id = $1 AND position = 0",
             &[&char_id],
@@ -183,7 +175,6 @@ async fn skills_dict(c: &Client, char_id: i64) -> Result<Value, CallError> {
     let training = in_training_sp(c, char_id).await?;
     let rows = c
         .db
-        .client
         .query(
             "SELECT s.type_id, s.level, s.skill_points, COALESCE(a.value, $3::float8)
              FROM game.skills s LEFT JOIN sde.type_attributes a ON a.type_id = s.type_id AND a.attribute_id = $2
@@ -226,7 +217,6 @@ async fn queue_list(c: &Client, char_id: i64) -> Result<Value, CallError> {
     advance_training(c, char_id).await?;
     let rows = c
         .db
-        .client
         .query(
             "SELECT position, type_id, to_level, start_sp, dest_sp, start_time, end_time
              FROM game.skill_queue WHERE character_id = $1 ORDER BY position",
@@ -270,7 +260,6 @@ async fn save_queue(c: &Client, char_id: i64, queue: &Value, activate: bool) -> 
     // Bank SP earned on the skill that was training, so a reordered queue resumes from it.
     if let Some((t, sp)) = training {
         c.db
-            .client
             .execute(
                 "UPDATE game.skills SET skill_points = GREATEST(skill_points, $3) WHERE character_id = $1 AND type_id = $2",
                 &[&char_id, &t, &sp],
@@ -281,14 +270,13 @@ async fn save_queue(c: &Client, char_id: i64, queue: &Value, activate: bool) -> 
     let attrs = character_attributes(c, char_id).await?;
     let current: HashMap<i32, (i32, i64)> = c
         .db
-        .client
         .query("SELECT type_id, level, skill_points FROM game.skills WHERE character_id = $1", &[&char_id])
         .await
         .map_err(db_err)?
         .iter()
         .map(|r| (r.get(0), (r.get(1), r.get(2))))
         .collect();
-    c.db.client.execute("DELETE FROM game.skill_queue WHERE character_id = $1", &[&char_id]).await.map_err(db_err)?;
+    c.db.execute("DELETE FROM game.skill_queue WHERE character_id = $1", &[&char_id]).await.map_err(db_err)?;
     let mut t = filetime_now();
     for (pos, (_, type_id, to_level)) in entries.into_iter().enumerate() {
         let st = skill_type(c, type_id as i32).await?;
@@ -305,7 +293,6 @@ async fn save_queue(c: &Client, char_id: i64, queue: &Value, activate: bool) -> 
             (None, None)
         };
         c.db
-            .client
             .execute(
                 "INSERT INTO game.skill_queue (character_id, position, type_id, to_level, start_sp, dest_sp, start_time, end_time)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
@@ -326,7 +313,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         (SKILL_HANDLER, "GetSkillChangesForISIS") => Ok(Value::list([])),
         (SKILL_HANDLER, "CheckAndSendNotifications") => Ok(Value::None),
         (SKILL_HANDLER, "GetSkillQueueAndFreePoints") => {
-            let free: i64 = match c.db.client.query_one("SELECT free_skill_points FROM game.characters WHERE character_id = $1", &[&me]).await {
+            let free: i64 = match c.db.query_one("SELECT free_skill_points FROM game.characters WHERE character_id = $1", &[&me]).await {
                 Ok(r) => r.get(0),
                 Err(e) => return Some(Err(db_err(e))),
             };
@@ -351,14 +338,13 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             Err(e) => Err(e),
         },
         (SKILL_HANDLER, "GetFreeSkillPoints") => {
-            match c.db.client.query_one("SELECT free_skill_points FROM game.characters WHERE character_id = $1", &[&me]).await {
+            match c.db.query_one("SELECT free_skill_points FROM game.characters WHERE character_id = $1", &[&me]).await {
                 Ok(r) => Ok(Value::Int(r.get(0))),
                 Err(e) => Err(db_err(e)),
             }
         }
         (SKILL_HANDLER, "GetSkillPoints") => match c
             .db
-            .client
             .query_one("SELECT COALESCE(sum(skill_points), 0)::bigint FROM game.skills WHERE character_id = $1", &[&me])
             .await
         {

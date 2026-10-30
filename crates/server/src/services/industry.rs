@@ -112,7 +112,6 @@ async fn activity(db: &Db, bp_type: i32, activity: i32) -> Result<Option<Activit
     let Some(name) = activity_name(activity) else { return Ok(None) };
     let key = bp_type.to_string();
     let Some(head) = db
-        .client
         .query_opt(
             "SELECT (data->'activities'->$2->>'time')::float8, COALESCE((data->>'maxProductionLimit')::int, 1)
              FROM sde_native.blueprints WHERE key = $1 AND data->'activities' ? $2",
@@ -129,9 +128,9 @@ async fn activity(db: &Db, bp_type: i32, activity: i32) -> Result<Option<Activit
              FROM sde_native.blueprints b, jsonb_array_elements(COALESCE(b.data->'activities'->$2->'{part}', '[]')) e WHERE b.key = $1"
         )
     };
-    let materials = db.client.query(&list("materials"), &[&key, &name]).await.map_err(db_err)?;
-    let products = db.client.query(&list("products"), &[&key, &name]).await.map_err(db_err)?;
-    let skills = db.client.query(&list("skills"), &[&key, &name]).await.map_err(db_err)?;
+    let materials = db.query(&list("materials"), &[&key, &name]).await.map_err(db_err)?;
+    let products = db.query(&list("products"), &[&key, &name]).await.map_err(db_err)?;
+    let skills = db.query(&list("skills"), &[&key, &name]).await.map_err(db_err)?;
     Ok(Some(Activity {
         time: head.get::<_, Option<f64>>(0).unwrap_or(0.0),
         materials: materials.iter().map(|r| (r.get(0), r.get(1))).collect(),
@@ -146,7 +145,7 @@ async fn activity(db: &Db, bp_type: i32, activity: i32) -> Result<Option<Activit
 async fn blueprint_price(db: &Db, bp_type: i32) -> Result<f64, CallError> {
     let Some(m) = activity(db, bp_type, MANUFACTURING).await? else { return Ok(0.0) };
     let ids: Vec<i32> = m.materials.iter().map(|(t, _)| *t).collect();
-    let rows = db.client.query("SELECT type_id, adjusted FROM game.retail_prices WHERE type_id = ANY($1)", &[&ids]).await.map_err(db_err)?;
+    let rows = db.query("SELECT type_id, adjusted FROM game.retail_prices WHERE type_id = ANY($1)", &[&ids]).await.map_err(db_err)?;
     let price: HashMap<i32, f64> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
     Ok(m.materials.iter().map(|(t, q)| price.get(t).copied().unwrap_or(0.0) * *q as f64).sum())
 }
@@ -168,7 +167,6 @@ struct Blueprint {
 
 async fn blueprint(db: &Db, item_id: i64) -> Result<Blueprint, CallError> {
     let r = db
-        .client
         .query_opt(
             "SELECT i.item_id, i.type_id, i.owner_id, st.station_id::bigint, i.singleton, i.quantity,
                     COALESCE(b.material_efficiency, 0), COALESCE(b.time_efficiency, 0), COALESCE(b.runs, $2)
@@ -198,7 +196,7 @@ async fn blueprint(db: &Db, item_id: i64) -> Result<Blueprint, CallError> {
 }
 
 async fn set_blueprint(db: &Db, item_id: i64, me: i32, te: i32, runs: i32) -> Result<(), CallError> {
-    db.client
+    db
         .execute(
             "INSERT INTO game.blueprints (item_id, material_efficiency, time_efficiency, runs) VALUES ($1, $2, $3, $4)
              ON CONFLICT (item_id) DO UPDATE SET material_efficiency = $2, time_efficiency = $3, runs = $4",
@@ -283,7 +281,7 @@ const FACILITY_SELECT: &str = "SELECT s.station_id::bigint, s.type_id::bigint, C
     FROM sde.sta_stations s LEFT JOIN sde_native.stationoperations o ON o.key = s.operation_id::text";
 
 async fn facilities(db: &Db, where_sql: &str, arg: i64) -> Result<Vec<Facility>, CallError> {
-    let rows = db.client.query(&format!("{FACILITY_SELECT} WHERE {where_sql}"), &[&STATION_SERVICE_FACTORY, &STATION_SERVICE_LABORATORY, &arg]).await.map_err(db_err)?;
+    let rows = db.query(&format!("{FACILITY_SELECT} WHERE {where_sql}"), &[&STATION_SERVICE_FACTORY, &STATION_SERVICE_LABORATORY, &arg]).await.map_err(db_err)?;
     Ok(rows
         .iter()
         .map(|r| Facility { id: r.get(0), type_id: r.get(1), owner: r.get(2), system: r.get(3), security: r.get(4), factory: r.get(5), laboratory: r.get(6) })
@@ -298,7 +296,6 @@ async fn facility(db: &Db, id: i64) -> Result<Facility, CallError> {
 /// The owner's materials in their item hangar at a facility: typeID -> quantity.
 async fn available(db: &Db, owner: i64, station: i64) -> Result<HashMap<i32, i64>, CallError> {
     let rows = db
-        .client
         .query(
             "SELECT type_id, sum(quantity)::bigint FROM game.items
              WHERE owner_id = $1 AND location_id = $2 AND flag_id = $3 AND NOT singleton GROUP BY type_id",
@@ -405,7 +402,7 @@ impl Job {
 }
 
 async fn job(db: &Db, id: i64) -> Result<Job, CallError> {
-    db.client
+    db
         .query_opt(&format!("{JOB_SELECT} WHERE job_id = $1"), &[&id])
         .await
         .map_err(db_err)?
@@ -423,7 +420,6 @@ fn tell_job(world: &World, j: &Job) {
 /// Decryptor bonuses (inventionPropabilityMultiplier, ME, TE, max runs) of an invention input.
 async fn decryptor(db: &Db, type_id: i32) -> Result<(f64, i32, i32, i32), CallError> {
     let rows = db
-        .client
         .query(
             "SELECT attribute_id, value FROM sde.type_attributes WHERE type_id = $1 AND attribute_id = ANY($2)",
             &[&type_id, &vec![ATTR_INVENTION_PROBABILITY_MULTIPLIER, ATTR_INVENTION_ME_MODIFIER, ATTR_INVENTION_TE_MODIFIER, ATTR_INVENTION_MAX_RUN_MODIFIER]],
@@ -515,7 +511,6 @@ async fn plan(
             seconds *= char_attr(ATTR_MANUFACTURE_TIME_MULTIPLIER);
             for (skill, _) in &act.skills {
                 let per_level: Option<f64> = db
-                    .client
                     .query_opt("SELECT value FROM sde.type_attributes WHERE type_id = $1 AND attribute_id = $2", &[skill, &ATTR_MANUFACTURE_TIME_PER_LEVEL])
                     .await
                     .map_err(db_err)?
@@ -563,7 +558,6 @@ async fn plan(
 /// Active jobs per activity of an installer (GetJobCounts).
 async fn job_counts(db: &Db, installer: i64) -> Result<HashMap<i32, i64>, CallError> {
     let rows = db
-        .client
         .query("SELECT activity_id, count(*) FROM game.industry_jobs WHERE installer_id = $1 AND status = $2 GROUP BY 1", &[&installer, &INDUSTRY_JOB_STATUS_INSTALLED])
         .await
         .map_err(db_err)?;
@@ -592,7 +586,6 @@ async fn install(c: &Client, request: &Value) -> CallResult {
         return Err(user_error("IndustryBlueprintAccessDenied", vec![]));
     }
     let busy: bool = db
-        .client
         .query_one("SELECT EXISTS (SELECT 1 FROM game.industry_jobs WHERE blueprint_id = $1 AND status = $2)", &[&bp.item_id, &INDUSTRY_JOB_STATUS_INSTALLED])
         .await
         .map_err(db_err)?
@@ -624,7 +617,7 @@ async fn install(c: &Client, request: &Value) -> CallResult {
     if runs > max_runs || (activity_id == COPYING && licensed_runs > act.max_production_limit) {
         return Err(notify_error("流程数超出了蓝图允许的范围。"));
     }
-    let skill_rows = db.client.query("SELECT type_id, level FROM game.skills WHERE character_id = $1", &[&me]).await.map_err(db_err)?;
+    let skill_rows = db.query("SELECT type_id, level FROM game.skills WHERE character_id = $1", &[&me]).await.map_err(db_err)?;
     let skills: HashMap<i32, i32> = skill_rows.iter().map(|r| (r.get(0), r.get(1))).collect();
     if let Some((skill, level)) = act.skills.iter().find(|(s, l)| skills.get(s).copied().unwrap_or(0) < *l) {
         return Err(notify_error(&format!("该项目需要技能 {skill} 达到 {level} 级。")));
@@ -657,7 +650,6 @@ async fn install(c: &Client, request: &Value) -> CallResult {
         let mut decryptor = None;
         for t in requested.keys() {
             let group: Option<i32> = db
-                .client
                 .query_opt("SELECT group_id FROM sde.inv_types WHERE type_id = $1", &[t])
                 .await
                 .map_err(db_err)?
@@ -698,12 +690,11 @@ async fn install(c: &Client, request: &Value) -> CallResult {
     // A blueprint in a stack is split off as its own item for the job.
     if !bp.singleton {
         let location: i64 =
-            db.client.query_one("SELECT location_id FROM game.items WHERE item_id = $1", &[&bp.item_id]).await.map_err(db_err)?.get(0);
+            db.query_one("SELECT location_id FROM game.items WHERE item_id = $1", &[&bp.item_id]).await.map_err(db_err)?.get(0);
         if bp.quantity > 1 {
             let stack = load_items_db(db, "i.item_id = $1", &[&bp.item_id]).await?.pop().ok_or_else(|| user_error("BlueprintNotFound", vec![]))?;
             take_items(db, world, stack, 1).await?;
             bp.item_id = db
-                .client
                 .query_one(
                     "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton) VALUES ($1, $2, $3, $4, 1, true) RETURNING item_id",
                     &[&bp.type_id, &me, &location, &FLAG_HANGAR],
@@ -713,7 +704,7 @@ async fn install(c: &Client, request: &Value) -> CallResult {
                 .get(0);
             show_items(db, world, me, location, &[bp.item_id], LOCATION_JUNKYARD).await?;
         } else {
-            db.client.execute("UPDATE game.items SET singleton = true WHERE item_id = $1", &[&bp.item_id]).await.map_err(db_err)?;
+            db.execute("UPDATE game.items SET singleton = true WHERE item_id = $1", &[&bp.item_id]).await.map_err(db_err)?;
         }
     }
     let now = filetime_now();
@@ -742,7 +733,6 @@ async fn install(c: &Client, request: &Value) -> CallResult {
         status: INDUSTRY_JOB_STATUS_INSTALLED,
     };
     j.id = db
-        .client
         .query_one(
             "INSERT INTO game.industry_jobs (installer_id, owner_id, activity_id, blueprint_id, blueprint_type_id, blueprint_copy, facility_id,
                                              solar_system_id, runs, licensed_runs, product_type_id, optional_type_id, cost, probability,
@@ -781,8 +771,8 @@ async fn install(c: &Client, request: &Value) -> CallResult {
 async fn destroy_blueprint(db: &Db, world: &World, item_id: i64) -> Result<(), CallError> {
     if let Some(item) = load_items_db(db, "i.item_id = $1", &[&item_id]).await?.pop() {
         let owner = item.owner_id;
-        db.client.execute("DELETE FROM game.items WHERE item_id = $1", &[&item_id]).await.map_err(db_err)?;
-        db.client.execute("DELETE FROM game.blueprints WHERE item_id = $1", &[&item_id]).await.map_err(db_err)?;
+        db.execute("DELETE FROM game.items WHERE item_id = $1", &[&item_id]).await.map_err(db_err)?;
+        db.execute("DELETE FROM game.blueprints WHERE item_id = $1", &[&item_id]).await.map_err(db_err)?;
         let old = item.location_id;
         let gone = super::dogma::Item { location_id: LOCATION_JUNKYARD, ..item };
         world.notify_pilot(owner, "OnItemChange", vec![gone.row(), Value::Dict(vec![(Value::Int(IX_LOCATION_ID), Value::Int(old))]), Value::None]);
@@ -796,7 +786,6 @@ async fn make_copies(db: &Db, world: &World, owner: i64, station: i64, type_id: 
     let mut ids = vec![];
     for _ in 0..count {
         let id: i64 = db
-            .client
             .query_one(
                 "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton) VALUES ($1, $2, $3, $4, $5::bigint::integer, true) RETURNING item_id",
                 &[&type_id, &owner, &station, &FLAG_HANGAR, &BLUEPRINT_COPY_QUANTITY],
@@ -871,7 +860,7 @@ async fn deliver_job(db: &Db, world: &World, j: &mut Job, by: i64) -> Result<(),
     j.successful_runs = Some(successful);
     j.completed = Some(filetime_now());
     j.completed_by = Some(by);
-    db.client
+    db
         .execute(
             "UPDATE game.industry_jobs SET status = $2, successful_runs = $3, completed_date = $4, completed_by = $5 WHERE job_id = $1",
             &[&j.id, &j.status, &j.successful_runs, &j.completed, &j.completed_by],
@@ -960,11 +949,11 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             let owner = int(0);
             let completed = call.args.get(1).is_some_and(|v| matches!(v, Value::Bool(true)) || v.as_int().is_some_and(|i| i != 0));
             let rows = if completed {
-                c.db.client
+                c.db
                     .query(&format!("{JOB_SELECT} WHERE owner_id = $1 AND (status = $2 OR completed_date >= $3) ORDER BY job_id"), &[&owner, &INDUSTRY_JOB_STATUS_INSTALLED, &(filetime_now() - COMPLETED_JOB_HISTORY_DAYS * FILETIME_DAY)])
                     .await
             } else {
-                c.db.client.query(&format!("{JOB_SELECT} WHERE owner_id = $1 AND status = $2 ORDER BY job_id"), &[&owner, &INDUSTRY_JOB_STATUS_INSTALLED]).await
+                c.db.query(&format!("{JOB_SELECT} WHERE owner_id = $1 AND status = $2 ORDER BY job_id"), &[&owner, &INDUSTRY_JOB_STATUS_INSTALLED]).await
             };
             match rows {
                 Ok(rows) => Ok(Value::list(rows.iter().map(|r| job_from_row(r).keyval()))),
@@ -1005,7 +994,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                     j.completed_by = Some(me);
                     match c
                         .db
-                        .client
                         .execute("UPDATE game.industry_jobs SET status = $2, completed_date = $3, completed_by = $4 WHERE job_id = $1", &[&j.id, &j.status, &j.completed, &me])
                         .await
                     {

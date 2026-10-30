@@ -23,7 +23,6 @@ const MAX_CLONE_NAME_LENGTH: usize = 100;
 
 async fn skill(c: &Client, me: i64, skill: i32) -> Result<i64, CallError> {
     Ok(c.db
-        .client
         .query_opt("SELECT level FROM game.skills WHERE character_id = $1 AND type_id = $2", &[&me, &skill])
         .await
         .map_err(db_err)?
@@ -40,7 +39,7 @@ async fn clone_rows(c: &Client, me: i64) -> Result<Value, CallError> {
         ("typeID", DbType::I4),
         ("cloneName", DbType::WStr),
     ]);
-    let rows = c.db.client.query("SELECT clone_id, location_id, name FROM game.jump_clones WHERE owner_id = $1 ORDER BY clone_id", &[&me]).await.map_err(db_err)?;
+    let rows = c.db.query("SELECT clone_id, location_id, name FROM game.jump_clones WHERE owner_id = $1 ORDER BY clone_id", &[&me]).await.map_err(db_err)?;
     let lines = rows
         .iter()
         .map(|r| header.row(&[Value::Int(r.get(0)), Value::Int(me), Value::Int(r.get(1)), Value::Int(TYPE_CAPSULE as i64), Value::unicode(r.get::<_, String>(2))]))
@@ -51,7 +50,7 @@ async fn clone_rows(c: &Client, me: i64) -> Result<Value, CallError> {
 /// `GetCloneState` -> KeyVal(clones, implants, timeLastJump).
 async fn clone_state(c: &Client, me: i64) -> CallResult {
     let last: Option<i64> =
-        c.db.client.query_one("SELECT last_clone_jump FROM game.characters WHERE character_id = $1", &[&me]).await.map_err(db_err)?.get(0);
+        c.db.query_one("SELECT last_clone_jump FROM game.characters WHERE character_id = $1", &[&me]).await.map_err(db_err)?.get(0);
     Ok(super::keyval([
         ("clones", clone_rows(c, me).await?),
         ("implants", crowset(&DbRowDescriptor::new([("jumpCloneID", DbType::I4), ("typeID", DbType::I4)]), vec![])),
@@ -64,14 +63,14 @@ async fn install(c: &Client, me: i64) -> CallResult {
         return Err(notify_error("你必须停靠在空间站内才能安装远距克隆。"));
     };
     let max = skill(c, me, SKILL_INFOMORPH_PSYCHOLOGY).await? + skill(c, me, SKILL_ADVANCED_INFOMORPH_PSYCHOLOGY).await?;
-    let rows = c.db.client.query("SELECT location_id FROM game.jump_clones WHERE owner_id = $1", &[&me]).await.map_err(db_err)?;
+    let rows = c.db.query("SELECT location_id FROM game.jump_clones WHERE owner_id = $1", &[&me]).await.map_err(db_err)?;
     if rows.iter().any(|r| r.get::<_, i64>(0) == station) {
         return Err(notify_error("你在这个空间站已经有一个远距克隆。"));
     }
     if rows.len() as i64 >= max {
         return Err(notify_error(&format!("你的意识形态心理学技能允许 {max} 个远距克隆。")));
     }
-    c.db.client.execute("INSERT INTO game.jump_clones (owner_id, location_id) VALUES ($1, $2)", &[&me, &station]).await.map_err(db_err)?;
+    c.db.execute("INSERT INTO game.jump_clones (owner_id, location_id) VALUES ($1, $2)", &[&me, &station]).await.map_err(db_err)?;
     info!("clones: {me} installed a jump clone at {station}");
     c.world.notify_pilot(me, "OnJumpCloneCacheInvalidated", vec![]);
     Ok(Value::None)
@@ -83,7 +82,7 @@ async fn jump(c: &mut Client, me: i64, dest: i64, clone_id: i64) -> CallResult {
         return Err(CallError::User { msg: "NotAtStation".into(), dict: vec![] });
     };
     let last: Option<i64> =
-        c.db.client.query_one("SELECT last_clone_jump FROM game.characters WHERE character_id = $1", &[&me]).await.map_err(db_err)?.get(0);
+        c.db.query_one("SELECT last_clone_jump FROM game.characters WHERE character_id = $1", &[&me]).await.map_err(db_err)?.get(0);
     let cooldown = (BASE_JUMP_COOLDOWN_HOURS - skill(c, me, SKILL_INFOMORPH_SYNCHRONIZING).await?) * FILETIME_HOUR;
     let now = filetime_now();
     if let Some(ready) = last.map(|l| l + cooldown).filter(|r| *r > now) {
@@ -92,7 +91,6 @@ async fn jump(c: &mut Client, me: i64, dest: i64, clone_id: i64) -> CallResult {
     }
     let target = c
         .db
-        .client
         .query_opt(
             "SELECT s.station_id::bigint, s.solar_system_id::bigint, s.constellation_id::bigint, s.region_id::bigint
              FROM game.jump_clones j JOIN sde.sta_stations s ON s.station_id::bigint = j.location_id
@@ -107,18 +105,17 @@ async fn jump(c: &mut Client, me: i64, dest: i64, clone_id: i64) -> CallResult {
         return Err(notify_error("你已经在该空间站中。"));
     }
     // The body left behind becomes a clone here; the destination clone is used up.
-    c.db.client.execute("DELETE FROM game.jump_clones WHERE clone_id = $1", &[&clone_id]).await.map_err(db_err)?;
-    c.db.client
+    c.db.execute("DELETE FROM game.jump_clones WHERE clone_id = $1", &[&clone_id]).await.map_err(db_err)?;
+    c.db
         .execute("INSERT INTO game.jump_clones (owner_id, location_id) SELECT $1, $2 WHERE NOT EXISTS (SELECT 1 FROM game.jump_clones WHERE owner_id = $1 AND location_id = $2)", &[&me, &station])
         .await
         .map_err(db_err)?;
     // The pod the pilot sat in stays empty; they wake in a new one.
     if let Some(ship) = c.session.int("shipid") {
-        c.db.client.execute("DELETE FROM game.items WHERE item_id = $1 AND type_id = $2", &[&ship, &TYPE_CAPSULE]).await.map_err(db_err)?;
+        c.db.execute("DELETE FROM game.items WHERE item_id = $1 AND type_id = $2", &[&ship, &TYPE_CAPSULE]).await.map_err(db_err)?;
     }
     let capsule: i64 = c
         .db
-        .client
         .query_one(
             "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton) VALUES ($1, $2, $3, $4, 1, true) RETURNING item_id",
             &[&TYPE_CAPSULE, &me, &to, &FLAG_HANGAR],
@@ -126,7 +123,7 @@ async fn jump(c: &mut Client, me: i64, dest: i64, clone_id: i64) -> CallResult {
         .await
         .map_err(db_err)?
         .get(0);
-    c.db.client
+    c.db
         .execute(
             "UPDATE game.characters SET ship_id = $2, station_id = $3, solar_system_id = $4, constellation_id = $5, region_id = $6, last_clone_jump = $7
              WHERE character_id = $1",
@@ -163,7 +160,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "GetPriceForClone" => Ok(Value::Float(0.0)),
         "InstallCloneInStation" => install(c, me).await,
         "InstallCloneInStructure" => Err(notify_error("暂不支持建筑。")),
-        "DestroyInstalledClone" => match c.db.client.execute("DELETE FROM game.jump_clones WHERE clone_id = $1 AND owner_id = $2", &[&int(0), &me]).await {
+        "DestroyInstalledClone" => match c.db.execute("DELETE FROM game.jump_clones WHERE clone_id = $1 AND owner_id = $2", &[&int(0), &me]).await {
             Ok(_) => {
                 c.world.notify_pilot(me, "OnJumpCloneCacheInvalidated", vec![]);
                 Ok(Value::None)
@@ -173,7 +170,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         // SetJumpCloneName(cloneID, name)
         "SetJumpCloneName" => {
             let name = value_text(call.args.get(1), MAX_CLONE_NAME_LENGTH);
-            c.db.client
+            c.db
                 .execute("UPDATE game.jump_clones SET name = $3 WHERE clone_id = $1 AND owner_id = $2", &[&int(0), &me, &name])
                 .await
                 .map(|_| Value::None)

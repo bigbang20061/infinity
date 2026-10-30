@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 marshal = { path = "../marshal" }
 anyhow.workspace = true
+deadpool-postgres.workspace = true
 tokio.workspace = true
 tokio-postgres.workspace = true
 tracing.workspace = true

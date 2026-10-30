@@ -34,7 +34,6 @@ const QUOTE_TOLERANCE: f64 = 0.5;
 /// The rent for one period at `station`: dearer in busier, higher-security space.
 pub(super) async fn rent_price(db: &Db, station: i64) -> Result<f64, CallError> {
     let security: f64 = db
-        .client
         .query_opt(
             "SELECT COALESCE(s.security, 0)::float8 FROM sde.sta_stations st JOIN sde.map_solar_systems s ON s.solar_system_id = st.solar_system_id
              WHERE st.station_id = $1",
@@ -50,7 +49,6 @@ pub(super) async fn rent_price(db: &Db, station: i64) -> Result<f64, CallError> 
 /// The corporation's office at `station`, if it rents one.
 pub(super) async fn office_at(db: &Db, corp: i64, station: i64) -> Result<Option<i64>, CallError> {
     Ok(db
-        .client
         .query_opt("SELECT office_id FROM game.offices WHERE corporation_id = $1 AND station_id = $2", &[&corp, &station])
         .await
         .map_err(db_err)?
@@ -59,7 +57,7 @@ pub(super) async fn office_at(db: &Db, corp: i64, station: i64) -> Result<Option
 
 /// Whether `item` is an office, and whose.
 pub(super) async fn office_owner(db: &Db, item: i64) -> Result<Option<i64>, CallError> {
-    Ok(db.client.query_opt("SELECT corporation_id FROM game.offices WHERE office_id = $1", &[&item]).await.map_err(db_err)?.map(|r| r.get(0)))
+    Ok(db.query_opt("SELECT corporation_id FROM game.offices WHERE office_id = $1", &[&item]).await.map_err(db_err)?.map(|r| r.get(0)))
 }
 
 /// Tell the corporation's online members its offices changed.
@@ -77,14 +75,13 @@ pub(super) async fn rent(db: &Db, world: &World, corp: i64, station: i64) -> Res
     super::corpwallet::corp_debit(db, world, corp, ACCOUNT_CASH, price).await?;
     let now = filetime_now();
     if let Some(office) = office_at(db, corp, station).await? {
-        db.client
+        db
             .execute("UPDATE game.offices SET rented_until = GREATEST(rented_until, $2) + $3 WHERE office_id = $1", &[&office, &now, &(RENTAL_DAYS * FILETIME_DAY)])
             .await
             .map_err(db_err)?;
         return Ok(office);
     }
     let office: i64 = db
-        .client
         .query_one(
             "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton) VALUES ($1, $2, $3, $4, 1, true) RETURNING item_id",
             &[&TYPE_OFFICE, &corp, &station, &OFFICE_ITEM_FLAG],
@@ -92,7 +89,7 @@ pub(super) async fn rent(db: &Db, world: &World, corp: i64, station: i64) -> Res
         .await
         .map_err(db_err)?
         .get(0);
-    db.client
+    db
         .execute(
             "INSERT INTO game.offices (office_id, corporation_id, station_id, rented_until) VALUES ($1, $2, $3, $4)",
             &[&office, &corp, &station, &(now + RENTAL_DAYS * FILETIME_DAY)],
@@ -112,7 +109,6 @@ async fn may_rent(db: &Db, me: i64, corp: i64) -> Result<bool, CallError> {
 /// The office rows the client keeps (officeID, stationID, solarsystemID, stationTypeID).
 async fn my_offices(db: &Db, corp: i64) -> CallResult {
     let rows = db
-        .client
         .query(
             "SELECT o.office_id, o.station_id, st.solar_system_id::bigint, st.type_id::bigint, o.rented_until FROM game.offices o
              LEFT JOIN sde.sta_stations st ON st.station_id = o.station_id WHERE o.corporation_id = $1 ORDER BY o.office_id",
@@ -150,11 +146,11 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         .or_else(|| c.session.int("stationid"))?;
     Some(match call.method {
         // [corporationID] with an office here.
-        "GetCorporationsWithOffices" => match db.client.query("SELECT corporation_id FROM game.offices WHERE station_id = $1", &[&station]).await {
+        "GetCorporationsWithOffices" => match db.query("SELECT corporation_id FROM game.offices WHERE station_id = $1", &[&station]).await {
             Ok(rows) => Ok(Value::list(rows.iter().map(|r| Value::Int(r.get(0))))),
             Err(e) => Err(db_err(e)),
         },
-        "GetEmptyOfficeCount" => match db.client.query_one("SELECT count(*) FROM game.offices WHERE station_id = $1", &[&station]).await {
+        "GetEmptyOfficeCount" => match db.query_one("SELECT count(*) FROM game.offices WHERE station_id = $1", &[&station]).await {
             Ok(r) => Ok(Value::Int((STATION_OFFICE_SLOTS - r.get::<_, i64>(0)).max(0))),
             Err(e) => Err(db_err(e)),
         },
@@ -190,14 +186,14 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                 Ok(None) => return Some(Ok(Value::None)),
                 Err(e) => return Some(Err(e)),
             };
-            match db.client.query_opt("SELECT 1 FROM game.items WHERE location_id = $1 LIMIT 1", &[&office]).await {
+            match db.query_opt("SELECT 1 FROM game.items WHERE location_id = $1 LIMIT 1", &[&office]).await {
                 Ok(Some(_)) => return Some(Err(notify_error("请先清空军团机库再退租办公室。"))),
                 Err(e) => return Some(Err(db_err(e))),
                 Ok(None) => {}
             }
             let removed = async {
-                db.client.execute("DELETE FROM game.offices WHERE office_id = $1", &[&office]).await.map_err(db_err)?;
-                db.client.execute("DELETE FROM game.items WHERE item_id = $1", &[&office]).await.map_err(db_err)?;
+                db.execute("DELETE FROM game.offices WHERE office_id = $1", &[&office]).await.map_err(db_err)?;
+                db.execute("DELETE FROM game.items WHERE item_id = $1", &[&office]).await.map_err(db_err)?;
                 announce(db, world, corp, office).await?;
                 info!("offices: {corp} gave up office {office} at {station}");
                 Ok::<_, CallError>(Value::None)

@@ -123,7 +123,6 @@ fn is_criminal(char_id: i64, now: i64) -> bool {
 
 pub async fn security_status(db: &Db, char_id: i64) -> Result<f64, CallError> {
     Ok(db
-        .client
         .query_opt("SELECT security_status FROM game.characters WHERE character_id = $1", &[&char_id])
         .await
         .map_err(db_err)?
@@ -133,7 +132,6 @@ pub async fn security_status(db: &Db, char_id: i64) -> Result<f64, CallError> {
 
 async fn system_security(db: &Db, system: i64) -> Result<f64, CallError> {
     Ok(db
-        .client
         .query_opt("SELECT COALESCE(security, 0)::float8 FROM sde.map_solar_systems WHERE solar_system_id = $1::bigint", &[&system])
         .await
         .map_err(db_err)?
@@ -144,7 +142,6 @@ async fn system_security(db: &Db, system: i64) -> Result<f64, CallError> {
 /// Move a pilot's security status `fraction` of the way to `toward` (+10 or -10).
 async fn shift_security(db: &Db, world: &World, char_id: i64, fraction: f64, toward: f64) -> Result<f64, CallError> {
     let new: f64 = db
-        .client
         .query_one(
             "UPDATE game.characters SET security_status = GREATEST(-10, LEAST(10, security_status + ($3 - security_status) * $2))
              WHERE character_id = $1 RETURNING security_status",
@@ -256,7 +253,7 @@ fn clear_flag_later(db: Db, world: Arc<World>, char_id: i64, until: i64) {
             }
             break;
         }
-        let system: Option<i64> = match db.client.query_opt("SELECT solar_system_id FROM game.characters WHERE character_id = $1", &[&char_id]).await {
+        let system: Option<i64> = match db.query_opt("SELECT solar_system_id FROM game.characters WHERE character_id = $1", &[&char_id]).await {
             Ok(r) => r.and_then(|r| r.get(0)),
             Err(e) => {
                 warn!("crimewatch: locating {char_id}: {e}");
@@ -322,7 +319,6 @@ pub async fn ship_lost(db: &Db, world: &World, system: i64, victim: i64, victim_
     let mut blob = String::from("<doc><attackers>");
     for (char_id, c) in &attackers {
         let corp: i64 = db
-            .client
             .query_opt("SELECT corporation_id FROM game.characters WHERE character_id = $1", &[char_id])
             .await
             .map_err(db_err)?
@@ -338,7 +334,7 @@ pub async fn ship_lost(db: &Db, world: &World, system: i64, victim: i64, victim_
     blob += "</items></doc>";
     let mut types: Vec<i32> = items.iter().map(|i| i.0).collect();
     types.push(ship_type);
-    let prices = db.client.query("SELECT type_id, average FROM game.retail_prices WHERE type_id = ANY($1)", &[&types]).await.map_err(db_err)?;
+    let prices = db.query("SELECT type_id, average FROM game.retail_prices WHERE type_id = ANY($1)", &[&types]).await.map_err(db_err)?;
     let price: HashMap<i32, f64> = prices.iter().map(|r| (r.get(0), r.get(1))).collect();
     let isk_lost = price.get(&ship_type).copied().unwrap_or(0.0) + items.iter().map(|(t, _, _, q)| price.get(t).copied().unwrap_or(0.0) * *q as f64).sum::<f64>();
     let damage_taken: f64 = attackers.iter().map(|(_, c)| c.damage).sum();
@@ -347,7 +343,7 @@ pub async fn ship_lost(db: &Db, world: &World, system: i64, victim: i64, victim_
         None => (None, Contribution::default()),
     };
     let final_corp: Option<i64> = match final_char {
-        Some(ch) => db.client.query_opt("SELECT corporation_id FROM game.characters WHERE character_id = $1", &[&ch]).await.map_err(db_err)?.map(|r| r.get(0)),
+        Some(ch) => db.query_opt("SELECT corporation_id FROM game.characters WHERE character_id = $1", &[&ch]).await.map_err(db_err)?.map(|r| r.get(0)),
         None => None,
     };
     let final_sec = match final_char {
@@ -356,7 +352,6 @@ pub async fn ship_lost(db: &Db, world: &World, system: i64, victim: i64, victim_
     };
     let involved: Vec<i64> = attackers.iter().map(|(ch, _)| *ch).collect();
     let kill_id: i64 = db
-        .client
         .query_one(
             "INSERT INTO game.killmails (kill_time, solar_system_id, victim_id, victim_corp_id, victim_ship_type, damage_taken, final_char_id,
                                          final_corp_id, final_ship_type, final_weapon_type, final_damage, final_sec_status, isk_lost,
@@ -440,7 +435,6 @@ async fn killmails(c: &Client, kills: Option<bool>, key: i64, num: i64, before: 
     };
     let rows = c
         .db
-        .client
         .query(
             &format!(
                 "SELECT kill_id, kill_time, solar_system_id, victim_id, victim_corp_id, victim_ship_type, damage_taken, final_char_id,

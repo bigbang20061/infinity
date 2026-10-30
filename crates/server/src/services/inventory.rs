@@ -82,7 +82,6 @@ async fn self_item(c: &Client, container: &Container) -> Result<Value, CallError
     // A station (or other static location) as an item.
     let r = c
         .db
-        .client
         .query_opt(
             "SELECT c.type_id, s.owner_id::bigint, c.solar_system_id::bigint, c.group_id::bigint, t.category_id::bigint
              FROM sde.map_celestials c JOIN sde.inv_types t USING (type_id)
@@ -115,7 +114,6 @@ async fn capacity(c: &Client, container: &Container) -> Result<Value, CallError>
         Container::Item(id) => {
             let r = c
                 .db
-                .client
                 .query_opt(
                     "SELECT COALESCE((SELECT value FROM sde.type_attributes a WHERE a.type_id = i.type_id AND a.attribute_id = $2),
                                      t.capacity, 0),
@@ -154,7 +152,7 @@ pub async fn notify_item_change(c: &mut Client, item_id: i64, change: Vec<(i64, 
 
 /// Tell the client an item is gone (moved to the junkyard), then delete it.
 async fn destroy_item(c: &mut Client, item: Item) -> Result<(), CallError> {
-    c.db.client.execute("DELETE FROM game.items WHERE item_id = $1", &[&item.item_id]).await.map_err(db_err)?;
+    c.db.execute("DELETE FROM game.items WHERE item_id = $1", &[&item.item_id]).await.map_err(db_err)?;
     let old_location = item.location_id;
     let gone = Item { location_id: LOCATION_JUNKYARD, ..item };
     let change = Value::Dict(vec![(Value::Int(IX_LOCATION_ID), Value::Int(old_location))]);
@@ -169,7 +167,6 @@ async fn free_slot(c: &Client, ship: i64, module_type: i32) -> Result<Option<i32
     const SLOTS: [(i32, i32, i32, i32); 5] = [(11, 12, 11, 8), (13, 13, 19, 8), (12, 14, 27, 8), (2663, 1137, 92, 8), (3772, 1367, 125, 8)];
     let effects: Vec<i32> = c
         .db
-        .client
         .query("SELECT effect_id FROM sde.type_effects WHERE type_id = $1", &[&module_type])
         .await
         .map_err(db_err)?
@@ -179,7 +176,6 @@ async fn free_slot(c: &Client, ship: i64, module_type: i32) -> Result<Option<i32
     let Some(&(_, count_attr, first, max)) = SLOTS.iter().find(|s| effects.contains(&s.0)) else { return Ok(None) };
     let count: f64 = c
         .db
-        .client
         .query_opt(
             "SELECT a.value FROM game.items i JOIN sde.type_attributes a ON a.type_id = i.type_id AND a.attribute_id = $2 WHERE i.item_id = $1",
             &[&ship, &count_attr],
@@ -190,7 +186,6 @@ async fn free_slot(c: &Client, ship: i64, module_type: i32) -> Result<Option<i32
         .unwrap_or(0.0);
     let used: Vec<i32> = c
         .db
-        .client
         .query("SELECT flag_id FROM game.items WHERE location_id = $1", &[&ship])
         .await
         .map_err(db_err)?
@@ -244,14 +239,13 @@ async fn move_item(c: &mut Client, container: &Container, item_id: i64, flag: Op
     // Fitting takes one module off a stack; otherwise the requested quantity, or all of it.
     let take = if fitting { Some(1) } else { qty }.filter(|q| *q > 0 && !item.singleton && (*q as i32) < item.quantity);
     let moved_id = if let Some(q) = take {
-        c.db.client
+        c.db
             .execute("UPDATE game.items SET quantity = quantity - $2 WHERE item_id = $1", &[&item_id, &(q as i32)])
             .await
             .map_err(db_err)?;
         notify_item_change(c, item_id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
         let new_id: i64 = c
             .db
-            .client
             .query_one(
                 "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton) VALUES ($1, $2, $3, $4, $5, $6) RETURNING item_id",
                 &[&item.type_id, &owner, &location, &flag, &(q as i32), &fitting],
@@ -263,7 +257,7 @@ async fn move_item(c: &mut Client, container: &Container, item_id: i64, flag: Op
         new_id
     } else {
         let singleton = item.singleton || fitting;
-        c.db.client
+        c.db
             .execute(
                 "UPDATE game.items SET location_id = $2, flag_id = $3, owner_id = $4, singleton = $5,
                         online = online AND $6, x = NULL, y = NULL, z = NULL WHERE item_id = $1",
@@ -290,7 +284,7 @@ async fn merge(c: &mut Client, source_id: i64, dest_id: i64, qty: i64) -> Result
     }
     let qty = qty.clamp(1, src.quantity as i64) as i32;
     let (dst_old, src_old) = (dst.quantity, src.quantity);
-    c.db.client.execute("UPDATE game.items SET quantity = quantity + $2 WHERE item_id = $1", &[&dest_id, &qty]).await.map_err(db_err)?;
+    c.db.execute("UPDATE game.items SET quantity = quantity + $2 WHERE item_id = $1", &[&dest_id, &qty]).await.map_err(db_err)?;
     notify_item_change(c, dest_id, vec![(IX_STACK_SIZE, Value::Int(dst_old as i64))]).await?;
     if qty >= src_old {
         let src = load_items(c, "i.item_id = $1", &[&source_id]).await?.into_iter().next();
@@ -298,7 +292,7 @@ async fn merge(c: &mut Client, source_id: i64, dest_id: i64, qty: i64) -> Result
             destroy_item(c, src).await?;
         }
     } else {
-        c.db.client.execute("UPDATE game.items SET quantity = quantity - $2 WHERE item_id = $1", &[&source_id, &qty]).await.map_err(db_err)?;
+        c.db.execute("UPDATE game.items SET quantity = quantity - $2 WHERE item_id = $1", &[&source_id, &qty]).await.map_err(db_err)?;
         notify_item_change(c, source_id, vec![(IX_STACK_SIZE, Value::Int(src_old as i64))]).await?;
     }
     Ok(())
@@ -357,14 +351,13 @@ pub async fn broker(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                 return Some(Ok(Value::None));
             }
             let r = async {
-                c.db.client
+                c.db
                     .execute("UPDATE game.items SET quantity = quantity - $2 WHERE item_id = $1", &[&item_id, &qty])
                     .await
                     .map_err(db_err)?;
                 notify_item_change(c, item_id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
                 let new_id: i64 = c
                     .db
-                    .client
                     .query_one(
                         "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity) VALUES ($1, $2, $3, $4, $5) RETURNING item_id",
                         &[&item.type_id, &item.owner_id, &item.location_id, &item.flag_id, &qty],
@@ -397,7 +390,7 @@ pub async fn broker(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "SetLabel" => {
             let item_id = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
             let name = call.args.get(1).and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
-            if let Err(e) = c.db.client.execute("UPDATE game.items SET name = $2 WHERE item_id = $1 AND owner_id = $3", &[&item_id, &name, &char_id]).await {
+            if let Err(e) = c.db.execute("UPDATE game.items SET name = $2 WHERE item_id = $1 AND owner_id = $3", &[&item_id, &name, &char_id]).await {
                 return Some(Err(db_err(e)));
             }
             Value::None

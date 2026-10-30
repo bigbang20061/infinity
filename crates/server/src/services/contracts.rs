@@ -215,7 +215,7 @@ fn contract_from_row(r: &tokio_postgres::Row) -> Contract {
 
 /// Contracts matching `where_sql` (parameters from $1), newest first.
 async fn contracts(db: &Db, where_sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<Contract>, CallError> {
-    let rows = db.client.query(&format!("{CONTRACT_SELECT} WHERE {where_sql} ORDER BY c.contract_id DESC LIMIT 1000"), params).await.map_err(db_err)?;
+    let rows = db.query(&format!("{CONTRACT_SELECT} WHERE {where_sql} ORDER BY c.contract_id DESC LIMIT 1000"), params).await.map_err(db_err)?;
     Ok(rows.iter().map(contract_from_row).collect())
 }
 
@@ -226,7 +226,7 @@ async fn contract(db: &Db, id: i64) -> Result<Contract, CallError> {
 async fn set_status(db: &Db, k: &mut Contract, status: i32) -> Result<(), CallError> {
     k.status = status;
     k.completed = filetime_now();
-    db.client
+    db
         .execute("UPDATE game.contracts SET status = $2, date_completed = $3, acceptor_id = $4 WHERE contract_id = $1", &[&k.id, &status, &k.completed, &k.acceptor])
         .await
         .map_err(db_err)?;
@@ -236,7 +236,6 @@ async fn set_status(db: &Db, k: &mut Contract, status: i32) -> Result<(), CallEr
 /// contractID -> the contract's item KeyVals.
 async fn items_of(db: &Db, ids: &[i64]) -> Result<HashMap<i64, Vec<Value>>, CallError> {
     let rows = db
-        .client
         .query("SELECT contract_id, item_id, type_id::bigint, quantity::bigint, in_crate FROM game.contract_items WHERE contract_id = ANY($1)", &[&ids.to_vec()])
         .await
         .map_err(db_err)?;
@@ -264,7 +263,6 @@ async fn items_of(db: &Db, ids: &[i64]) -> Result<HashMap<i64, Vec<Value>>, Call
 /// contractID -> bid KeyVals, highest first.
 async fn bids_of(db: &Db, ids: &[i64]) -> Result<HashMap<i64, Vec<Value>>, CallError> {
     let rows = db
-        .client
         .query("SELECT bid_id, contract_id, bidder_id, amount, date FROM game.contract_bids WHERE contract_id = ANY($1) ORDER BY amount DESC", &[&ids.to_vec()])
         .await
         .map_err(db_err)?;
@@ -309,7 +307,7 @@ async fn listing(db: &Db, list: &[Contract]) -> CallResult {
 }
 
 async fn docked_at(db: &Db, char_id: i64) -> Result<Option<i64>, CallError> {
-    Ok(db.client.query_opt("SELECT station_id FROM game.characters WHERE character_id = $1", &[&char_id]).await.map_err(db_err)?.and_then(|r| r.get(0)))
+    Ok(db.query_opt("SELECT station_id FROM game.characters WHERE character_id = $1", &[&char_id]).await.map_err(db_err)?.and_then(|r| r.get(0)))
 }
 
 /// Tell `owner` about items now in their hangar at `station`, if they have it open.
@@ -330,7 +328,6 @@ async fn escrow_item(db: &Db, world: &World, item: Item, quantity: i32, contract
     let (item_id, quantity) = if !item.singleton && quantity < item.quantity {
         take_items(db, world, item, quantity).await?;
         let id: i64 = db
-            .client
             .query_one(
                 "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity) VALUES ($1, $2, $3, $4, $5) RETURNING item_id",
                 &[&type_id, &owner, &escrow, &FLAG_HANGAR, &quantity],
@@ -340,7 +337,7 @@ async fn escrow_item(db: &Db, world: &World, item: Item, quantity: i32, contract
             .get(0);
         (id, quantity)
     } else {
-        db.client.execute("UPDATE game.items SET location_id = $2 WHERE item_id = $1", &[&item.item_id, &escrow]).await.map_err(db_err)?;
+        db.execute("UPDATE game.items SET location_id = $2 WHERE item_id = $1", &[&item.item_id, &escrow]).await.map_err(db_err)?;
         let old = item.location_id;
         let quantity = if item.singleton { 1 } else { item.quantity };
         let id = item.item_id;
@@ -348,7 +345,7 @@ async fn escrow_item(db: &Db, world: &World, item: Item, quantity: i32, contract
         world.notify_pilot(owner, "OnItemChange", vec![gone.row(), Value::Dict(vec![(Value::Int(IX_LOCATION_ID), Value::Int(old))]), Value::None]);
         (id, quantity)
     };
-    db.client
+    db
         .execute(
             "INSERT INTO game.contract_items (contract_id, item_id, type_id, quantity, in_crate) VALUES ($1, $2, $3, $4, true)",
             &[&contract_id, &item_id, &type_id, &quantity],
@@ -360,7 +357,6 @@ async fn escrow_item(db: &Db, world: &World, item: Item, quantity: i32, contract
 
 async fn escrowed_ids(db: &Db, contract_id: i64) -> Result<Vec<i64>, CallError> {
     let rows = db
-        .client
         .query("SELECT item_id FROM game.contract_items WHERE contract_id = $1 AND in_crate AND item_id IS NOT NULL", &[&contract_id])
         .await
         .map_err(db_err)?;
@@ -370,25 +366,24 @@ async fn escrowed_ids(db: &Db, contract_id: i64) -> Result<Vec<i64>, CallError> 
 /// Give the escrowed items (and whatever they hold) to `owner` at `location`/`flag`.
 async fn hand_over(db: &Db, world: &World, contract_id: i64, owner: i64, location: i64, flag: i32) -> Result<(), CallError> {
     let ids = escrowed_ids(db, contract_id).await?;
-    db.client
+    db
         .execute("UPDATE game.items SET owner_id = $2, location_id = $3, flag_id = $4 WHERE item_id = ANY($1)", &[&ids, &owner, &location, &flag])
         .await
         .map_err(db_err)?;
-    db.client.execute("UPDATE game.items SET owner_id = $2 WHERE location_id = ANY($1)", &[&ids, &owner]).await.map_err(db_err)?;
+    db.execute("UPDATE game.items SET owner_id = $2 WHERE location_id = ANY($1)", &[&ids, &owner]).await.map_err(db_err)?;
     show_items(db, world, owner, location, &ids, -contract_id).await
 }
 
 /// Lose the escrowed items (a courier package that no longer exists).
 async fn destroy_escrow(db: &Db, contract_id: i64) -> Result<(), CallError> {
     let ids = escrowed_ids(db, contract_id).await?;
-    db.client.execute("DELETE FROM game.items WHERE location_id = ANY($1)", &[&ids]).await.map_err(db_err)?;
-    db.client.execute("DELETE FROM game.items WHERE item_id = ANY($1)", &[&ids]).await.map_err(db_err)?;
+    db.execute("DELETE FROM game.items WHERE location_id = ANY($1)", &[&ids]).await.map_err(db_err)?;
+    db.execute("DELETE FROM game.items WHERE item_id = ANY($1)", &[&ids]).await.map_err(db_err)?;
     Ok(())
 }
 
 async fn top_bid(db: &Db, contract_id: i64) -> Result<Option<(i64, f64)>, CallError> {
     Ok(db
-        .client
         .query_opt("SELECT bidder_id, amount FROM game.contract_bids WHERE contract_id = $1 ORDER BY amount DESC, bid_id LIMIT 1", &[&contract_id])
         .await
         .map_err(db_err)?
@@ -403,7 +398,6 @@ fn tell(world: &World, char_id: i64, event: &str, contract_id: i64) {
 
 async fn max_outstanding(db: &Db, char_id: i64) -> Result<i64, CallError> {
     let rows = db
-        .client
         .query(
             "SELECT type_id, level FROM game.skills WHERE character_id = $1 AND type_id = ANY($2)",
             &[&char_id, &vec![SKILL_CONTRACTING, SKILL_ADVANCED_CONTRACTING]],
@@ -416,7 +410,6 @@ async fn max_outstanding(db: &Db, char_id: i64) -> Result<i64, CallError> {
 
 async fn num_outstanding(db: &Db, char_id: i64) -> Result<i64, CallError> {
     Ok(db
-        .client
         .query_one("SELECT count(*) FROM game.contracts WHERE issuer_id = $1 AND status = $2", &[&char_id, &STATUS_OUTSTANDING])
         .await
         .map_err(db_err)?
@@ -516,7 +509,6 @@ async fn create(c: &Client, info: &Value) -> CallResult {
     for group in &groups {
         debit(db, world, me, escrow_isk).await?;
         let id: i64 = db
-            .client
             .query_one(
                 "INSERT INTO game.contracts (type, issuer_id, issuer_corp_id, assignee_id, start_station_id, end_station_id, price, reward,
                                              collateral, title, description, num_days, status, date_issued, date_expired)
@@ -548,7 +540,7 @@ async fn create(c: &Client, info: &Value) -> CallResult {
             }
         }
         for (type_id, qty) in &requested {
-            db.client
+            db
                 .execute(
                     "INSERT INTO game.contract_items (contract_id, type_id, quantity, in_crate) VALUES ($1, $2, $3, false)",
                     &[&id, type_id, qty],
@@ -556,7 +548,7 @@ async fn create(c: &Client, info: &Value) -> CallResult {
                 .await
                 .map_err(db_err)?;
         }
-        db.client
+        db
             .execute(
                 "UPDATE game.contracts SET volume = (SELECT COALESCE(sum(t.volume * ci.quantity), 0) FROM game.contract_items ci
                                                      JOIN sde.inv_types t USING (type_id) WHERE ci.contract_id = $1 AND ci.in_crate)
@@ -594,7 +586,6 @@ async fn accept(c: &Client, id: i64) -> CallResult {
         TYPE_ITEM_EXCHANGE => {
             // The requested items must all be in the acceptor's hangar at the start station.
             let wanted = db
-                .client
                 .query("SELECT type_id, quantity FROM game.contract_items WHERE contract_id = $1 AND NOT in_crate", &[&id])
                 .await
                 .map_err(db_err)?;
@@ -631,14 +622,13 @@ async fn accept(c: &Client, id: i64) -> CallResult {
             hand_over(db, world, id, me, k.start, FLAG_HANGAR).await?;
             k.acceptor = me;
             k.accepted = now;
-            db.client.execute("UPDATE game.contracts SET date_accepted = $2 WHERE contract_id = $1", &[&id, &now]).await.map_err(db_err)?;
+            db.execute("UPDATE game.contracts SET date_accepted = $2 WHERE contract_id = $1", &[&id, &now]).await.map_err(db_err)?;
             set_status(db, &mut k, STATUS_FINISHED).await?;
             tell(world, k.issuer, "OnContractCompleted", id);
         }
         TYPE_COURIER => {
             debit(db, world, me, k.collateral).await?;
             let wrap: i64 = db
-                .client
                 .query_one(
                     "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton, custom_info)
                      VALUES ($1, $2, $3, $4, 1, true, $5) RETURNING item_id",
@@ -652,7 +642,7 @@ async fn accept(c: &Client, id: i64) -> CallResult {
             k.accepted = now;
             k.status = STATUS_IN_PROGRESS;
             k.package = Some(wrap);
-            db.client
+            db
                 .execute(
                     "UPDATE game.contracts SET acceptor_id = $2, date_accepted = $3, status = $4, package_id = $5 WHERE contract_id = $1",
                     &[&id, &me, &now, &STATUS_IN_PROGRESS, &wrap],
@@ -776,7 +766,7 @@ async fn place_bid(c: &Client, id: i64, amount: f64) -> CallResult {
         credit(db, world, bidder, best).await?;
         tell(world, bidder, "OnContractOutbid", id);
     }
-    db.client
+    db
         .execute("INSERT INTO game.contract_bids (contract_id, bidder_id, amount, date) VALUES ($1, $2, $3, $4)", &[&id, &me, &amount, &now])
         .await
         .map_err(db_err)?;
@@ -912,7 +902,6 @@ async fn search(c: &Client, kw: &Value) -> CallResult {
     let refs: Vec<&(dyn ToSql + Sync)> = params.iter().map(|p| p.as_ref() as &(dyn ToSql + Sync)).collect();
     let started = std::time::Instant::now();
     let rows = db
-        .client
         .query(&format!("{CONTRACT_SELECT} WHERE {sql} ORDER BY {column} {dir}, c.contract_id LIMIT {MAX_SEARCH_RESULTS}"), &refs)
         .await
         .map_err(db_err)?;
@@ -957,7 +946,7 @@ async fn list_for_owner(c: &Client, call: &Call<'_>) -> CallResult {
     }
     let num = call.kwargs.get("num").and_then(|v| v.as_int()).unwrap_or(100).clamp(1, 1000);
     let refs: Vec<&(dyn ToSql + Sync)> = params.iter().map(|p| p.as_ref() as &(dyn ToSql + Sync)).collect();
-    let rows = c.db.client.query(&format!("{CONTRACT_SELECT} WHERE {sql} ORDER BY c.contract_id DESC LIMIT {num}"), &refs).await.map_err(db_err)?;
+    let rows = c.db.query(&format!("{CONTRACT_SELECT} WHERE {sql} ORDER BY c.contract_id DESC LIMIT {num}"), &refs).await.map_err(db_err)?;
     let list: Vec<Contract> = rows.iter().map(contract_from_row).collect();
     listing(&c.db, &list).await
 }
@@ -1037,7 +1026,6 @@ async fn escrow(c: &Client) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
     let r = c
         .db
-        .client
         .query_one(
             "SELECT (SELECT COALESCE(sum(reward), 0) FROM game.contracts WHERE issuer_id = $1 AND type <> $2 AND status IN ($3, $4))
                   + (SELECT COALESCE(sum(b.amount), 0) FROM game.contract_bids b JOIN game.contracts k USING (contract_id)
@@ -1076,7 +1064,6 @@ async fn split_stack(c: &Client, station_id: i64, item_id: i64, quantity: i64) -
     let (type_id, flag, quantity) = (item.type_id, item.flag_id, quantity as i32);
     take_items(db, world, item, quantity).await?;
     let id: i64 = db
-        .client
         .query_one(
             "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity) VALUES ($1, $2, $3, $4, $5) RETURNING item_id",
             &[&type_id, &me, &station_id, &flag, &quantity],
@@ -1170,7 +1157,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             let ids = value_id_list(call.args.get(1));
             match c
                 .db
-                .client
                 .query("SELECT location_id, count(*) FROM game.items WHERE location_id = ANY($1) AND owner_id = $2 GROUP BY 1", &[&ids, &me])
                 .await
             {

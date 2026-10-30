@@ -37,7 +37,6 @@ const QUOTE_TOLERANCE_ISK: f64 = 1.0;
 /// What a ship type is insured for (the payout at fraction 1.0); 0 if it can't be insured.
 async fn value(db: &Db, type_id: i32) -> Result<f64, CallError> {
     Ok(db
-        .client
         .query_opt(
             "SELECT COALESCE(NULLIF(r.adjusted, 0), NULLIF(r.average, 0), t.base_price, 0)::float8
              FROM sde.inv_types t LEFT JOIN game.retail_prices r USING (type_id) WHERE t.type_id = $1 AND t.category_id = $2",
@@ -78,13 +77,13 @@ async fn insure(c: &Client, call: &Call<'_>) -> CallResult {
     let Some(fraction) = FRACTIONS.iter().copied().find(|f| (full * (f - BASE_FRACTION) * FRACTION_INCREMENT - amount).abs() < QUOTE_TOLERANCE_ISK) else {
         return Err(notify_error("保险报价已过期，请重新打开窗口。"));
     };
-    let existing = db.client.query_opt(&format!("{CONTRACT_SELECT} WHERE ship_id = $1"), &[&ship]).await.map_err(db_err)?;
+    let existing = db.query_opt(&format!("{CONTRACT_SELECT} WHERE ship_id = $1"), &[&ship]).await.map_err(db_err)?;
     if existing.is_some() && !void_old {
         return Err(CallError::User { msg: "InsureShipFailedSingleContract".into(), dict: vec![("ownerID".into(), Value::Int(me))] });
     }
     super::market::debit(db, world, me, amount).await?;
     let now = filetime_now();
-    db.client
+    db
         .execute(
             "INSERT INTO game.insurance (ship_id, owner_id, type_id, fraction, start_date, end_date) VALUES ($1, $2, $3, $4, $5, $6)
              ON CONFLICT (ship_id) DO UPDATE SET owner_id = $2, type_id = $3, fraction = $4, start_date = $5, end_date = $6",
@@ -101,7 +100,6 @@ async fn insure(c: &Client, call: &Call<'_>) -> CallResult {
 /// A ship was destroyed: pay out its insurance, if it has any that is still running.
 pub async fn ship_destroyed(db: &Db, world: &World, ship: i64) -> Result<(), CallError> {
     let Some(r) = db
-        .client
         .query_opt("DELETE FROM game.insurance WHERE ship_id = $1 RETURNING owner_id, type_id, fraction, end_date", &[&ship])
         .await
         .map_err(db_err)?
@@ -144,14 +142,14 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             if call.args.first().and_then(|v| v.as_int()).unwrap_or(0) != 0 {
                 return Some(Ok(Value::list([])));
             }
-            match db.client.query(&format!("{CONTRACT_SELECT} WHERE owner_id = $1 AND end_date > $2"), &[&me, &filetime_now()]).await {
+            match db.query(&format!("{CONTRACT_SELECT} WHERE owner_id = $1 AND end_date > $2"), &[&me, &filetime_now()]).await {
                 Ok(rows) => Ok(Value::list(rows.iter().map(contract_row))),
                 Err(e) => Err(db_err(e)),
             }
         }
         "GetContractForShip" => {
             let ship = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
-            match db.client.query_opt(&format!("{CONTRACT_SELECT} WHERE ship_id = $1 AND end_date > $2"), &[&ship, &filetime_now()]).await {
+            match db.query_opt(&format!("{CONTRACT_SELECT} WHERE ship_id = $1 AND end_date > $2"), &[&ship, &filetime_now()]).await {
                 Ok(r) => Ok(r.map(|r| contract_row(&r)).unwrap_or(Value::None)),
                 Err(e) => Err(db_err(e)),
             }
@@ -159,7 +157,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "InsureShip" => insure(c, call).await,
         "UnInsureShip" => {
             let ship = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
-            match db.client.execute("DELETE FROM game.insurance WHERE ship_id = $1 AND owner_id = $2", &[&ship, &me]).await {
+            match db.execute("DELETE FROM game.insurance WHERE ship_id = $1 AND owner_id = $2", &[&ship, &me]).await {
                 Ok(_) => {
                     c.world.notify_pilot(me, "OnShipInsured", vec![]);
                     Ok(Value::None)

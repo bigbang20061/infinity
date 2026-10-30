@@ -56,7 +56,6 @@ const AGENT_LEVEL_FOUR: i64 = 4;
 
 pub async fn standing(db: &Db, char_id: i64, from: i64) -> Result<f64, CallError> {
     Ok(db
-        .client
         .query_opt("SELECT standing FROM game.standings WHERE char_id = $1 AND from_id = $2", &[&char_id, &from])
         .await
         .map_err(db_err)?
@@ -71,7 +70,7 @@ pub async fn modify(db: &Db, world: &World, char_id: i64, from: i64, change: f64
     }
     let old = standing(db, char_id, from).await?;
     let new = if change > 0.0 { old + (STANDING_LIMIT - old) * change } else { old + (STANDING_LIMIT + old) * change }.clamp(-STANDING_LIMIT, STANDING_LIMIT);
-    db.client
+    db
         .execute(
             "INSERT INTO game.standings (char_id, from_id, standing) VALUES ($1, $2, $3)
              ON CONFLICT (char_id, from_id) DO UPDATE SET standing = $3",
@@ -120,7 +119,6 @@ pub async fn mission_declined(db: &Db, world: &World, char_id: i64, agent: i64, 
 
 pub async fn lp_balance(db: &Db, char_id: i64, corp: i64) -> Result<i64, CallError> {
     Ok(db
-        .client
         .query_opt("SELECT amount FROM game.lp_balances WHERE char_id = $1 AND corp_id = $2", &[&char_id, &corp])
         .await
         .map_err(db_err)?
@@ -137,7 +135,7 @@ pub async fn add_lp(db: &Db, world: &World, char_id: i64, corp: i64, amount: i64
     if before + amount < 0 {
         return Err(notify_error(&format!("你在该军团只有 {before} 忠诚点。")));
     }
-    db.client
+    db
         .execute(
             "INSERT INTO game.lp_balances (char_id, corp_id, amount) VALUES ($1, $2, $3)
              ON CONFLICT (char_id, corp_id) DO UPDATE SET amount = game.lp_balances.amount + $3",
@@ -152,7 +150,6 @@ pub async fn add_lp(db: &Db, world: &World, char_id: i64, corp: i64, amount: i64
 /// A corporation's LP store: (offerID = typeID, typeID, LP, ISK).
 async fn offers(db: &Db, corp: i64) -> Result<Vec<(i32, i64, i64)>, CallError> {
     let rows = db
-        .client
         .query(
             "SELECT t.type_id, r.average
              FROM sde_native.npccorporations c
@@ -203,7 +200,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     let int = |i: usize| call.args.get(i).and_then(|v| v.as_int()).unwrap_or(0);
     let db = &c.db;
     Some(match (call.service, call.method) {
-        ("standingMgr", "GetCharStandings") => match db.client.query("SELECT from_id, standing FROM game.standings WHERE char_id = $1", &[&me]).await {
+        ("standingMgr", "GetCharStandings") => match db.query("SELECT from_id, standing FROM game.standings WHERE char_id = $1", &[&me]).await {
             Ok(rows) => Ok(rowset(&["fromID", "standing"], rows.iter().map(|r| vec![Value::Int(r.get(0)), Value::Float(r.get(1))]).collect())),
             Err(e) => Err(db_err(e)),
         },
@@ -211,7 +208,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         ("standingMgr", "GetStandingTransactions") | ("standingMgr", "GetStandingCompositions") => Ok(Value::list([])),
 
         // [(issuerCorpID, amount)]
-        ("LPSvc", "GetAllMyCharacterWalletLPBalances") => match db.client.query("SELECT corp_id, amount FROM game.lp_balances WHERE char_id = $1 AND amount > 0", &[&me]).await {
+        ("LPSvc", "GetAllMyCharacterWalletLPBalances") => match db.query("SELECT corp_id, amount FROM game.lp_balances WHERE char_id = $1 AND amount > 0", &[&me]).await {
             Ok(rows) => Ok(Value::list(rows.iter().map(|r| Value::tuple([Value::Int(r.get(0)), Value::Int(r.get(1))])))),
             Err(e) => Err(db_err(e)),
         },

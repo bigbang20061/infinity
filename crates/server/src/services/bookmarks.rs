@@ -75,7 +75,6 @@ fn bookmark_row(r: &tokio_postgres::Row) -> Value {
 
 async fn own_folder(db: &Db, me: i64, folder: i64) -> Result<(), CallError> {
     let mine: bool = db
-        .client
         .query_one("SELECT EXISTS (SELECT 1 FROM game.bookmark_folders WHERE folder_id = $1 AND owner_id = $2)", &[&folder, &me])
         .await
         .map_err(db_err)?
@@ -95,7 +94,6 @@ async fn add(db: &Db, me: i64, folder: i64, subfolder: Option<i64>, item: Option
     let now = filetime_now();
     let expiry = expiry_minutes.filter(|m| *m > 0).map(|m| now + m * FILETIME_MINUTE);
     let id: i64 = db
-        .client
         .query_one(
             "INSERT INTO game.bookmarks (folder_id, subfolder_id, creator_id, item_id, type_id, location_id, x, y, z, memo, note, created, expiry)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING bookmark_id",
@@ -133,7 +131,6 @@ async fn static_location(c: &Client, call: &Call<'_>) -> CallResult {
     let item = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
     let r = c
         .db
-        .client
         .query_opt(
             "SELECT s.solar_system_id::bigint, s.type_id, c.x, c.y, c.z FROM sde.sta_stations s JOIN sde.map_celestials c ON c.item_id = s.station_id::bigint
              WHERE s.station_id::bigint = $1
@@ -194,13 +191,12 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     Some(match call.method {
         // -> (folders, bookmarks, subfolders)
         "GetMyActiveBookmarks" => {
-            let folders = match db.client.query("SELECT folder_id, name, description FROM game.bookmark_folders WHERE owner_id = $1 ORDER BY folder_id", &[&me]).await {
+            let folders = match db.query("SELECT folder_id, name, description FROM game.bookmark_folders WHERE owner_id = $1 ORDER BY folder_id", &[&me]).await {
                 Ok(r) => r,
                 Err(e) => return Some(Err(db_err(e))),
             };
             let now = filetime_now();
             let bookmarks = match db
-                .client
                 .query(
                     &format!("{BOOKMARK_SELECT} WHERE folder_id IN (SELECT folder_id FROM game.bookmark_folders WHERE owner_id = $1) AND (expiry IS NULL OR expiry > $2)"),
                     &[&me, &now],
@@ -211,7 +207,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                 Err(e) => return Some(Err(db_err(e))),
             };
             let subfolders = match db
-                .client
                 .query("SELECT subfolder_id, folder_id, name FROM game.bookmark_subfolders WHERE folder_id IN (SELECT folder_id FROM game.bookmark_folders WHERE owner_id = $1)", &[&me])
                 .await
             {
@@ -226,7 +221,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         }
         // AddFolder(isPersonal, name, description, adminGroupID, manageGroupID, useGroupID, viewGroupID)
         "AddFolder" => match db
-            .client
             .query_one(
                 "INSERT INTO game.bookmark_folders (owner_id, name, description) VALUES ($1, $2, $3) RETURNING folder_id, name, description",
                 &[&me, &value_text(call.args.get(1), MAX_NAME), &value_text(call.args.get(2), MAX_DESCRIPTION)],
@@ -238,7 +232,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         },
         // UpdateFolder(folderID, name, description, ...) -> access level
         "UpdateFolder" => db
-            .client
             .execute(
                 "UPDATE game.bookmark_folders SET name = $3, description = $4 WHERE folder_id = $1 AND owner_id = $2",
                 &[&int(0), &me, &value_text(call.args.get(1), MAX_NAME), &value_text(call.args.get(2), MAX_DESCRIPTION)],
@@ -252,13 +245,13 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                 return Some(Err(e));
             }
             for sql in ["DELETE FROM game.bookmarks WHERE folder_id = $1", "DELETE FROM game.bookmark_subfolders WHERE folder_id = $1", "DELETE FROM game.bookmark_folders WHERE folder_id = $1"] {
-                if let Err(e) = db.client.execute(sql, &[&folder]).await {
+                if let Err(e) = db.execute(sql, &[&folder]).await {
                     return Some(Err(db_err(e)));
                 }
             }
             Ok(Value::None)
         }
-        "GetFolderInfo" => match db.client.query_opt("SELECT folder_id, name, description FROM game.bookmark_folders WHERE folder_id = $1 AND owner_id = $2", &[&int(0), &me]).await {
+        "GetFolderInfo" => match db.query_opt("SELECT folder_id, name, description FROM game.bookmark_folders WHERE folder_id = $1 AND owner_id = $2", &[&int(0), &me]).await {
             Ok(r) => Ok(r.map(|r| folder_row(&r, me)).unwrap_or(Value::None)),
             Err(e) => Err(db_err(e)),
         },
@@ -271,7 +264,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                 return Some(Err(e));
             }
             match db
-                .client
                 .query_one("INSERT INTO game.bookmark_subfolders (folder_id, name) VALUES ($1, $2) RETURNING subfolder_id, folder_id, name", &[&folder, &value_text(call.args.get(1), MAX_NAME)])
                 .await
             {
@@ -284,7 +276,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             if let Err(e) = own_folder(db, me, int(0)).await {
                 return Some(Err(e));
             }
-            db.client
+            db
                 .execute("UPDATE game.bookmark_subfolders SET name = $3 WHERE subfolder_id = $2 AND folder_id = $1", &[&int(0), &int(1), &value_text(call.args.get(2), MAX_NAME)])
                 .await
                 .map(|n| Value::Bool(n > 0))
@@ -295,11 +287,11 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             if let Err(e) = own_folder(db, me, int(0)).await {
                 return Some(Err(e));
             }
-            let deleted = match db.client.query("DELETE FROM game.bookmarks WHERE folder_id = $1 AND subfolder_id = $2 RETURNING bookmark_id", &[&int(0), &int(1)]).await {
+            let deleted = match db.query("DELETE FROM game.bookmarks WHERE folder_id = $1 AND subfolder_id = $2 RETURNING bookmark_id", &[&int(0), &int(1)]).await {
                 Ok(r) => r,
                 Err(e) => return Some(Err(db_err(e))),
             };
-            if let Err(e) = db.client.execute("DELETE FROM game.bookmark_subfolders WHERE subfolder_id = $1", &[&int(1)]).await {
+            if let Err(e) = db.execute("DELETE FROM game.bookmark_subfolders WHERE subfolder_id = $1", &[&int(1)]).await {
                 return Some(Err(db_err(e)));
             }
             Ok(Value::list(deleted.iter().map(|r| Value::Int(r.get(0)))))
@@ -312,7 +304,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                 return Some(Err(e));
             }
             let cancel = call.args.get(6).is_some_and(|v| matches!(v, Value::Bool(true)) || v.as_int() == Some(1));
-            db.client
+            db
                 .execute(
                     "UPDATE game.bookmarks SET memo = $3, note = $4, subfolder_id = $5, folder_id = $6, expiry = CASE WHEN $7 THEN NULL ELSE expiry END
                      WHERE bookmark_id = $1 AND folder_id = $2 AND folder_id IN (SELECT folder_id FROM game.bookmark_folders WHERE owner_id = $8)",
@@ -326,7 +318,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "DeleteBookmarks" => {
             let wanted = value_id_list(call.args.get(1));
             match db
-                .client
                 .query(
                     "DELETE FROM game.bookmarks WHERE folder_id = $1 AND bookmark_id = ANY($2)
                      AND folder_id IN (SELECT folder_id FROM game.bookmark_folders WHERE owner_id = $3) RETURNING bookmark_id",
@@ -345,7 +336,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                 return Some(Err(e));
             }
             match db
-                .client
                 .query(
                     "UPDATE game.bookmarks SET folder_id = $2, subfolder_id = $3 WHERE folder_id = $1 AND bookmark_id = ANY($4)
                      AND folder_id IN (SELECT folder_id FROM game.bookmark_folders WHERE owner_id = $5) RETURNING bookmark_id, folder_id, subfolder_id",
@@ -373,7 +363,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                 return Some(Err(e));
             }
             match db
-                .client
                 .query(
                     "INSERT INTO game.bookmarks (folder_id, subfolder_id, creator_id, item_id, type_id, location_id, x, y, z, memo, note, created, expiry)
                      SELECT $2, $3, $4, item_id, type_id, location_id, x, y, z, memo, note, created, expiry FROM game.bookmarks

@@ -246,7 +246,6 @@ fn class_from_security(security: f64) -> i64 {
 
 async fn system_info(db: &Db, system: i64) -> Result<SystemInfo, CallError> {
     let r = db
-        .client
         .query_one(
             "SELECT COALESCE(s.security, 0)::float8, s.faction_id::bigint, s.region_id::bigint,
                     (CASE WHEN s.solar_system_id < 31000000
@@ -279,7 +278,6 @@ async fn systems_of_class(db: &Db, class: i64) -> Result<Vec<i64>, CallError> {
         return Ok(map.get(&class).cloned().unwrap_or_default());
     }
     let rows = db
-        .client
         .query(
             "SELECT s.solar_system_id::bigint,
                     COALESCE(CASE WHEN s.solar_system_id < 31000000
@@ -336,7 +334,6 @@ pub async fn unbury_sites(db: &Db) -> Result<(), CallError> {
     // (table, key column, has overlay/asteroids)
     for (table, key, exploration) in [("game.exploration_sites", "site_id", true), ("game.agent_missions", "(character_id, agent_id)", false)] {
         let rows = db
-            .client
             .query(
                 &format!(
                     "SELECT {key}::text, s.x, s.y, s.z, p.x, p.y, p.z, COALESCE(p.radius, 0)::float8 FROM {table} s
@@ -356,7 +353,7 @@ pub async fn unbury_sites(db: &Db) -> Result<(), CallError> {
             let delta = [new[0] - old[0], new[1] - old[1], new[2] - old[2]];
             if exploration {
                 let site: i64 = id.parse().unwrap_or(0);
-                db.client
+                db
                     .execute(
                         "UPDATE game.exploration_sites SET x = x + $2, y = y + $3, z = z + $4,
                                 overlay_x = overlay_x + $2, overlay_y = overlay_y + $3, overlay_z = overlay_z + $4 WHERE site_id = $1",
@@ -364,12 +361,12 @@ pub async fn unbury_sites(db: &Db) -> Result<(), CallError> {
                     )
                     .await
                     .map_err(db_err)?;
-                db.client
+                db
                     .execute("UPDATE game.asteroids SET x = x + $2, y = y + $3, z = z + $4 WHERE field_id = $1", &[&site, &delta[0], &delta[1], &delta[2]])
                     .await
                     .map_err(db_err)?;
             } else {
-                db.client
+                db
                     .execute(
                         "UPDATE game.agent_missions SET x = x + $2, y = y + $3, z = z + $4 WHERE (character_id, agent_id)::text = $1",
                         &[&id, &delta[0], &delta[1], &delta[2]],
@@ -395,7 +392,6 @@ struct DungeonPick {
 /// complexes are scanned down as signatures, open sites show as anomalies.
 async fn pick_combat_dungeon(db: &Db, faction: i64, difficulty: (i64, i64), gated: bool, sleeper: bool) -> Result<Option<DungeonPick>, CallError> {
     let r = db
-        .client
         .query_opt(
             "SELECT d.key::bigint, (d.data->>'dungeonNameID')::bigint, COALESCE((d.data->>'difficulty')::bigint, 1)
              FROM sde_native.dungeons d LEFT JOIN sde_native.localization_fsd_en_us l ON l.key = d.data->>'dungeonNameID'
@@ -479,7 +475,6 @@ async fn wormhole_pair(
     taken: &mut HashSet<String>,
 ) -> Result<Option<(Site, Site)>, CallError> {
     let types = db
-        .client
         .query(
             "SELECT t.type_id, a.value::bigint FROM sde.inv_types t
              JOIN sde.type_attributes a ON a.type_id = t.type_id AND a.attribute_id = $1
@@ -506,7 +501,6 @@ async fn wormhole_pair(
         return Ok(None);
     };
     let a = db
-        .client
         .query_one(
             "SELECT COALESCE((SELECT value FROM sde.type_attributes WHERE type_id = $1 AND attribute_id = $2), 960),
                     COALESCE((SELECT value FROM sde.type_attributes WHERE type_id = $1 AND attribute_id = $3), 1000000000),
@@ -594,7 +588,7 @@ fn site_from_row(r: &tokio_postgres::Row) -> Site {
 async fn save_site(db: &Db, s: &Site) -> Result<(), CallError> {
     let w = s.wormhole.as_ref();
     let kind: i16 = if s.kind == Kind::Anomaly { 0 } else { 1 };
-    db.client
+    db
         .execute(
             &format!(
                 "INSERT INTO game.exploration_sites ({SITE_COLUMNS})
@@ -652,8 +646,8 @@ async fn persist(db: &Db, site_id: i64) -> Result<(), CallError> {
 }
 
 async fn delete_site(db: &Db, site_id: i64) -> Result<(), CallError> {
-    db.client.execute("DELETE FROM game.exploration_sites WHERE site_id = $1", &[&site_id]).await.map_err(db_err)?;
-    db.client.execute("DELETE FROM game.exploration_scanned WHERE site_id = $1", &[&site_id]).await.map_err(db_err)?;
+    db.execute("DELETE FROM game.exploration_sites WHERE site_id = $1", &[&site_id]).await.map_err(db_err)?;
+    db.execute("DELETE FROM game.exploration_scanned WHERE site_id = $1", &[&site_id]).await.map_err(db_err)?;
     Ok(())
 }
 
@@ -663,7 +657,6 @@ async fn is_scanned(db: &Db, char_id: i64, site_id: i64) -> Result<bool, CallErr
         return Ok(true);
     }
     let found = db
-        .client
         .query_opt("SELECT 1 FROM game.exploration_scanned WHERE character_id = $1 AND site_id = $2", &[&char_id, &site_id])
         .await
         .map_err(db_err)?
@@ -678,7 +671,7 @@ async fn mark_scanned(db: &Db, char_id: i64, site_id: i64) -> Result<(), CallErr
     if !state().scanned.insert((char_id, site_id)) {
         return Ok(());
     }
-    db.client
+    db
         .execute("INSERT INTO game.exploration_scanned (character_id, site_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", &[&char_id, &site_id])
         .await
         .map_err(db_err)?;
@@ -704,7 +697,6 @@ async fn ensure_loaded(db: &Db, world: &Arc<World>, system: i64) -> Result<(), C
     }
     if NEXT_SITE_ID.load(Ordering::Relaxed) == 0 {
         let next: i64 = db
-            .client
             .query_one(
                 "SELECT GREATEST(nextval('game.exploration_site_seq'), COALESCE((SELECT max(site_id) + 1 FROM game.exploration_sites), 0))",
                 &[],
@@ -715,7 +707,7 @@ async fn ensure_loaded(db: &Db, world: &Arc<World>, system: i64) -> Result<(), C
         NEXT_SITE_ID.store(next, Ordering::Relaxed);
     }
     // Wormholes past their lifetime close at both ends.
-    db.client
+    db
         .execute(
             "DELETE FROM game.exploration_sites WHERE wh_born IS NOT NULL AND wh_born + (wh_life_minutes * 60 * 10000000)::bigint < $1",
             &[&filetime_now()],
@@ -723,13 +715,11 @@ async fn ensure_loaded(db: &Db, world: &Arc<World>, system: i64) -> Result<(), C
         .await
         .map_err(db_err)?;
     let rows = db
-        .client
         .query(&format!("SELECT {SITE_COLUMNS} FROM game.exploration_sites WHERE system_id = $1"), &[&system])
         .await
         .map_err(db_err)?;
     let stored: Vec<Site> = rows.iter().map(site_from_row).collect();
     let generated = db
-        .client
         .query_opt("SELECT 1 FROM game.exploration_systems WHERE system_id = $1", &[&system])
         .await
         .map_err(db_err)?
@@ -751,7 +741,7 @@ async fn ensure_loaded(db: &Db, world: &Arc<World>, system: i64) -> Result<(), C
         save_site(db, s).await?;
     }
     if !generated {
-        db.client
+        db
             .execute("INSERT INTO game.exploration_systems (system_id, generated_at) VALUES ($1, $2) ON CONFLICT DO NOTHING", &[&system, &filetime_now()])
             .await
             .map_err(db_err)?;
@@ -878,7 +868,6 @@ async fn mining_site(db: &Db, system: i64, info: &SystemInfo, field: super::mini
         Field::Gas => (ARCHETYPE_GAS, if jspace { "%Reservoir%" } else { "% Nebula" }),
     };
     let r = db
-        .client
         .query_opt(
             "SELECT d.key::bigint, (d.data->>'dungeonNameID')::bigint
              FROM sde_native.dungeons d JOIN sde_native.localization_fsd_en_us l ON l.key = d.data->>'dungeonNameID'
@@ -923,7 +912,6 @@ async fn hack_site(db: &Db, system: i64, info: &SystemInfo, relic: bool, taken: 
     };
     let archetype = if relic { ARCHETYPE_RELIC } else { ARCHETYPE_DATA };
     let r = db
-        .client
         .query_opt(
             "SELECT d.key::bigint, (d.data->>'dungeonNameID')::bigint, d.data->>'archetypeID' = $2
              FROM sde_native.dungeons d JOIN sde_native.localization_fsd_en_us l ON l.key = d.data->>'dungeonNameID'
@@ -937,7 +925,6 @@ async fn hack_site(db: &Db, system: i64, info: &SystemInfo, relic: bool, taken: 
     let r = match r {
         Some(r) => Some(r),
         None => db
-            .client
             .query_opt(
                 "SELECT d.key::bigint, (d.data->>'dungeonNameID')::bigint, true FROM sde_native.dungeons d
                  WHERE d.data->>'archetypeID' = $1 AND (d.data->>'factionID')::bigint = $2 AND d.data ? 'dungeonNameID'
@@ -1021,7 +1008,6 @@ async fn broadcast_sites(world: &World, system: i64, added: &[Site], removed: &[
 /// time (ms, Astrometric Acquisition).
 async fn probe_skills(db: &Db, char_id: i64) -> Result<(f64, f64), CallError> {
     let rows = db
-        .client
         .query("SELECT type_id, level FROM game.skills WHERE character_id = $1 AND type_id = ANY($2)", &[&char_id, &vec![SKILL_ASTROMETRICS, SKILL_RANGEFINDING, SKILL_ACQUISITION]])
         .await
         .map_err(db_err)?;
@@ -1050,7 +1036,6 @@ pub async fn launch_probes(c: &mut Client, call: &Call<'_>) -> CallResult {
     };
     let Some(flag) = c
         .db
-        .client
         .query_opt("SELECT flag_id FROM game.items WHERE item_id = $1 AND location_id = $2", &[&module, &ship])
         .await
         .map_err(db_err)?
@@ -1060,7 +1045,6 @@ pub async fn launch_probes(c: &mut Client, call: &Call<'_>) -> CallResult {
     };
     let Some(loaded) = c
         .db
-        .client
         .query_opt("SELECT type_id, quantity FROM game.module_charges WHERE ship_id = $1 AND flag_id = $2", &[&ship, &flag])
         .await
         .map_err(db_err)?
@@ -1074,9 +1058,9 @@ pub async fn launch_probes(c: &mut Client, call: &Call<'_>) -> CallResult {
         return Ok(Value::None);
     }
     if take == have {
-        c.db.client.execute("DELETE FROM game.module_charges WHERE ship_id = $1 AND flag_id = $2", &[&ship, &flag]).await.map_err(db_err)?;
+        c.db.execute("DELETE FROM game.module_charges WHERE ship_id = $1 AND flag_id = $2", &[&ship, &flag]).await.map_err(db_err)?;
     } else {
-        c.db.client
+        c.db
             .execute("UPDATE game.module_charges SET quantity = quantity - $3 WHERE ship_id = $1 AND flag_id = $2", &[&ship, &flag, &take])
             .await
             .map_err(db_err)?;
@@ -1084,7 +1068,6 @@ pub async fn launch_probes(c: &mut Client, call: &Call<'_>) -> CallResult {
     c.notify("OnModuleAttributeChanges", vec![super::combat::quantity_change(char_id, ship, flag, type_id, (have - take) as i64, have as i64)]);
     let attrs = c
         .db
-        .client
         .query_one(
             "SELECT COALESCE((SELECT value FROM sde.type_attributes WHERE type_id = $1 AND attribute_id = $2), 40),
                     COALESCE((SELECT value FROM sde.type_attributes WHERE type_id = $1 AND attribute_id = $3), 3600000)",
@@ -1334,7 +1317,6 @@ async fn cone_scan(c: &mut Client, call: &Call<'_>) -> CallResult {
     let types: Vec<i32> = hits.iter().map(|h| h.1).collect::<HashSet<_>>().into_iter().collect();
     let groups: HashMap<i32, i64> = c
         .db
-        .client
         .query("SELECT type_id, group_id::bigint FROM sde.inv_types WHERE type_id = ANY($1)", &[&types])
         .await
         .map_err(db_err)?
@@ -1437,7 +1419,6 @@ fn track_site_clearance(db: Db, world: Arc<World>, site_id: i64, system: i64, me
 async fn spawn_rats(c: &mut Client, system: i64, center: V3, faction: i64, groups: &[String], spread: (f64, f64)) -> Result<Vec<i64>, CallError> {
     let corp: i64 = c
         .db
-        .client
         .query_opt("SELECT corporation_id::bigint FROM sde.chr_factions WHERE faction_id::bigint = $1", &[&faction])
         .await
         .map_err(db_err)?
@@ -1448,7 +1429,6 @@ async fn spawn_rats(c: &mut Client, system: i64, center: V3, faction: i64, group
     for group in groups {
         let Some(r) = c
             .db
-            .client
             .query_opt(
                 "SELECT t.type_id, COALESCE(t.radius, 50)::float8, COALESCE(t.mass, 1000000)::float8,
                         (SELECT value FROM sde.type_attributes WHERE type_id = t.type_id AND attribute_id = 37),
@@ -1528,7 +1508,6 @@ pub async fn belt_rats(c: &mut Client, system: i64, belt: i64, center: V3) -> Re
     }
     let is_belt = c
         .db
-        .client
         .query_opt("SELECT 1 FROM sde.map_celestials WHERE item_id = $1 AND group_id = $2", &[&belt, &GROUP_ASTEROID_BELT])
         .await
         .map_err(db_err)?
@@ -1573,7 +1552,7 @@ async fn replace_site(db: &Db, world: &World, site_id: i64) -> Result<(), CallEr
     delete_site(db, site_id).await?;
     for id in old.containers.iter().flatten() {
         world.remove_ball(system, *id).await;
-        db.client.execute("DELETE FROM game.items WHERE location_id = $1 OR item_id = $1", &[id]).await.map_err(db_err)?;
+        db.execute("DELETE FROM game.items WHERE location_id = $1 OR item_id = $1", &[id]).await.map_err(db_err)?;
     }
     let info = system_info(db, system).await?;
     let mut taken: HashSet<String> = system_sites(system).into_iter().map(|s| s.target).collect();
@@ -1891,7 +1870,6 @@ async fn spawn_containers(c: &mut Client, site: &Site) -> Result<(), CallError> 
     let skill = if relic { SKILL_ARCHAEOLOGY } else { SKILL_HACKING };
     let types = c
         .db
-        .client
         .query(
             "SELECT t.type_id, COALESCE(t.radius, 300)::float8 FROM sde.inv_types t
              JOIN sde.type_attributes h ON h.type_id = t.type_id
@@ -1917,7 +1895,6 @@ async fn spawn_containers(c: &mut Client, site: &Site) -> Result<(), CallError> 
         let pos = [site.pos[0] + v[0] * d, site.pos[1] + v[1] * d * 0.3, site.pos[2] + v[2] * d];
         let id: i64 = c
             .db
-            .client
             .query_one(
                 "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton, x, y, z)
                  VALUES ($1, 1, $2, 0, 1, true, $3, $4, $5) RETURNING item_id",
@@ -1929,7 +1906,6 @@ async fn spawn_containers(c: &mut Client, site: &Site) -> Result<(), CallError> 
         let stacks = 2 + (rand01() * 2.0) as i64;
         let loot = c
             .db
-            .client
             .query(
                 "SELECT t.type_id, r.average FROM sde.inv_types t JOIN game.retail_prices r USING (type_id)
                  WHERE t.published AND t.group_id = ANY($1) AND r.average BETWEEN 1000 AND $2
@@ -1941,7 +1917,7 @@ async fn spawn_containers(c: &mut Client, site: &Site) -> Result<(), CallError> 
         for r in &loot {
             let (loot_type, price): (i32, f64) = (r.get(0), r.get(1));
             let quantity = ((value / stacks as f64 / price.max(1.0)) * (0.5 + rand01())).round().clamp(1.0, 500.0) as i32;
-            c.db.client
+            c.db
                 .execute("INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity) VALUES ($1, 1, $2, 0, $3)", &[&loot_type, &id, &quantity])
                 .await
                 .map_err(db_err)?;
@@ -1959,7 +1935,6 @@ async fn spawn_containers(c: &mut Client, site: &Site) -> Result<(), CallError> 
 /// Put a stored site's containers back in space after a restart.
 async fn restore_containers(db: &Db, world: &World, site: &Site, ids: &[i64]) -> Result<(), CallError> {
     let rows = db
-        .client
         .query(
             "SELECT i.item_id, i.type_id, i.x, i.y, i.z, COALESCE(t.radius, 300)::float8 FROM game.items i JOIN sde.inv_types t USING (type_id)
              WHERE i.item_id = ANY($1) AND i.x IS NOT NULL",
@@ -2018,7 +1993,7 @@ pub(super) async fn container_hacked(db: &Db, world: &Arc<World>, container: i64
         return Ok(());
     };
     persist(db, site_id).await?;
-    db.client.execute("UPDATE game.items SET owner_id = $2 WHERE location_id = $1", &[&container, &char_id]).await.map_err(db_err)?;
+    db.execute("UPDATE game.items SET owner_id = $2 WHERE location_id = $1", &[&container, &char_id]).await.map_err(db_err)?;
     let Some(site) = state().sites.get(&site_id).cloned() else { return Ok(()) };
     set_container_state(world, site.system, container, 2).await;
     if site.containers.as_ref().is_some_and(|c| c.iter().all(|id| site.hacked.contains(id))) {
@@ -2053,7 +2028,6 @@ pub(super) async fn gm_wormhole(c: &mut Client) -> Result<String, CallError> {
         None => {
             let r = c
                 .db
-                .client
                 .query_opt("SELECT site_id, system_id FROM game.exploration_sites WHERE wh_type IS NOT NULL ORDER BY random() LIMIT 1", &[])
                 .await
                 .map_err(db_err)?
@@ -2093,7 +2067,6 @@ pub(super) async fn gm_sites(c: &mut Client) -> Result<String, CallError> {
         let name: Option<String> = match s.name_id {
             Some(id) => c
                 .db
-                .client
                 .query_opt("SELECT data->>'text' FROM sde_native.localization_fsd_zh WHERE key = $1::text", &[&id.to_string()])
                 .await
                 .map_err(db_err)?

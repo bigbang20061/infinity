@@ -489,7 +489,6 @@ impl World {
         if self.running(system_id).is_some() { return Ok(()); }
         let rows = self
             .db
-            .client
             .query(
                 "SELECT c.item_id, c.type_id, COALESCE(c.radius, t.radius, $2::float8)::float8, c.x, c.y, c.z,
                         COALESCE(s.owner_id, 1)::bigint, c.group_id::bigint,

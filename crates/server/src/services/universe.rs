@@ -84,7 +84,6 @@ const CORP_HEADER: &[&str] = &[
 async fn corporation(c: &Client, corp_id: i64) -> Result<Value, CallError> {
     let r = c
         .db
-        .client
         .query_opt(
             "SELECT name, COALESCE(data->'description'->>'en', ''), ticker, tax_rate, ceo_id::bigint, station_id::bigint,
                     race_id::bigint, faction_id::bigint, COALESCE(member_limit::bigint, $2::bigint),
@@ -133,7 +132,6 @@ async fn corporation(c: &Client, corp_id: i64) -> Result<Value, CallError> {
 async fn station_counts(c: &Client) -> Result<Value, CallError> {
     let rows = c
         .db
-        .client
         .query("SELECT solar_system_id::bigint, count(*) FROM sde.sta_stations GROUP BY solar_system_id", &[])
         .await
         .map_err(db_err)?;
@@ -141,7 +139,7 @@ async fn station_counts(c: &Client) -> Result<Value, CallError> {
 }
 
 async fn industry_cost_modifiers(c: &Client) -> Result<Value, CallError> {
-    let rows = c.db.client.query("SELECT solar_system_id::bigint FROM sde.map_solar_systems", &[]).await.map_err(db_err)?;
+    let rows = c.db.query("SELECT solar_system_id::bigint FROM sde.map_solar_systems", &[]).await.map_err(db_err)?;
     Ok(Value::Dict(rows.iter().map(|r| (Value::Int(r.get(0)), Value::Float(INDUSTRY_COST_MODIFIER))).collect()))
 }
 
@@ -209,7 +207,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             let id = arg_int(0).unwrap_or(0);
             let r = c
                 .db
-                .client
                 .query_opt(
                     "SELECT corporation_id FROM game.characters WHERE character_id = $1
                      UNION ALL SELECT (data->>'corporationID')::bigint FROM sde.npc_characters WHERE character_id = $1

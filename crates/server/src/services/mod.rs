@@ -101,7 +101,7 @@ impl From<anyhow::Error> for CallError {
 
 pub type CallResult = Result<Value, CallError>;
 
-pub fn db_err(e: tokio_postgres::Error) -> CallError {
+pub fn db_err(e: impl Into<anyhow::Error>) -> CallError {
     CallError::Internal(e.into())
 }
 
@@ -167,13 +167,13 @@ pub(super) async fn has_role_or_is_ceo(db: &Db, char_id: i64, corp_id: i64, role
 
 /// Iterate character IDs for all non-deleted members of `corp_id`; database errors propagate.
 pub(super) async fn active_corporation_member_ids(db: &Db, corp_id: i64) -> Result<impl Iterator<Item = i64>, CallError> {
-    let rows = db.client.query("SELECT character_id FROM game.characters WHERE corporation_id = $1 AND NOT deleted", &[&corp_id]).await.map_err(db_err)?;
+    let rows = db.query("SELECT character_id FROM game.characters WHERE corporation_id = $1 AND NOT deleted", &[&corp_id]).await.map_err(db_err)?;
     Ok(rows.into_iter().map(|r| r.get(0)))
 }
 
 /// Choose a planet and its radius; callers retain their fallback and offset policy.
 pub async fn site_position(db: &Db, system: i64) -> Result<Option<(V3, f64)>, CallError> {
-    let planet = db.client.query_opt(
+    let planet = db.query_opt(
         "SELECT x, y, z, COALESCE(radius, 0)::float8 FROM sde.map_celestials WHERE solar_system_id = $1 AND group_id = $2 ORDER BY random() LIMIT 1",
         &[&(system as i32), &GROUP_PLANET],
     ).await.map_err(db_err)?;

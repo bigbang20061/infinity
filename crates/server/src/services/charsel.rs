@@ -79,7 +79,6 @@ async fn name_code(c: &Client, name: &str) -> Result<i64, CallError> {
     }
     let taken = c
         .db
-        .client
         .query_opt("SELECT 1 FROM game.characters WHERE lower(name) = lower($1) AND NOT deleted", &[&name])
         .await
         .map_err(db_err)?
@@ -91,7 +90,6 @@ async fn name_code(c: &Client, name: &str) -> Result<i64, CallError> {
 async fn starting_location(c: &Client, school_id: Option<i64>, race_id: i64) -> Result<(i64, i64, i64, i64, i64), CallError> {
     let row = c
         .db
-        .client
         .query_opt(
             "WITH school AS (
                  SELECT data FROM sde_native.schools
@@ -114,7 +112,6 @@ async fn starting_location(c: &Client, school_id: Option<i64>, race_id: i64) -> 
 async fn character_rows(c: &Client) -> Result<Vec<Value>, CallError> {
     let rows = c
         .db
-        .client
         .query(
             "SELECT ch.character_id, ch.name, ch.corporation_id, ch.station_id, ch.solar_system_id, ch.balance::float8, ch.skill_points,
                     (extract(epoch FROM ch.logoff_at) * $2::bigint)::bigint + $3::bigint,
@@ -172,7 +169,7 @@ pub async fn log_off(c: &mut Client) -> CallResult {
     let Some(char_id) = c.session.int("charid") else { return Ok(Value::Bool(true)) };
     super::combat::reset(c);
     c.leave_world().await.map_err(CallError::Internal)?;
-    c.db.client.execute("UPDATE game.characters SET logoff_at = now() WHERE character_id = $1", &[&char_id]).await.map_err(db_err)?;
+    c.db.execute("UPDATE game.characters SET logoff_at = now() WHERE character_id = $1", &[&char_id]).await.map_err(db_err)?;
     let cleared = [
         "charid", "corpid", "corprole", "rolesAtAll", "rolesAtBase", "rolesAtHQ", "rolesAtOther", "corpAccountKey", "allianceid", "warfactionid",
         "genderID", "bloodlineID", "raceID", "hqID", "stationid", "solarsystemid", "solarsystemid2", "constellationid", "regionid", "shipid",
@@ -185,7 +182,7 @@ pub async fn log_off(c: &mut Client) -> CallResult {
 /// A character of this account that isn't deleted.
 async fn own_character(c: &Client, call: &Call<'_>) -> Result<i64, CallError> {
     let char_id = arg_int(call, 0).unwrap_or(0);
-    c.db.client
+    c.db
         .query_opt("SELECT 1 FROM game.characters WHERE character_id = $1 AND user_id = $2 AND NOT deleted", &[&char_id, &c.login.user_id])
         .await
         .map_err(db_err)?
@@ -197,7 +194,6 @@ async fn own_character(c: &Client, call: &Call<'_>) -> Result<i64, CallError> {
 async fn ensure_ship(c: &Client, char_id: i64, race_id: i32, station_id: i64) -> Result<i64, CallError> {
     if let Some(r) = c
         .db
-        .client
         .query_opt(
             "SELECT ship_id FROM game.characters ch JOIN game.items i ON i.item_id = ch.ship_id WHERE ch.character_id = $1",
             &[&char_id],
@@ -209,7 +205,6 @@ async fn ensure_ship(c: &Client, char_id: i64, race_id: i32, station_id: i64) ->
     }
     let ship_type: i32 = c
         .db
-        .client
         .query_opt("SELECT ship_type_id FROM sde.chr_races WHERE race_id = $1 AND ship_type_id IS NOT NULL", &[&race_id])
         .await
         .map_err(db_err)?
@@ -217,7 +212,6 @@ async fn ensure_ship(c: &Client, char_id: i64, race_id: i32, station_id: i64) ->
         .unwrap_or(FALLBACK_ROOKIE_SHIP);
     let ship_id: i64 = c
         .db
-        .client
         .query_one(
             "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton)
              VALUES ($1, $2, $3, $4, 1, true) RETURNING item_id",
@@ -226,7 +220,7 @@ async fn ensure_ship(c: &Client, char_id: i64, race_id: i32, station_id: i64) ->
         .await
         .map_err(db_err)?
         .get(0);
-    c.db.client.execute("UPDATE game.characters SET ship_id = $2 WHERE character_id = $1", &[&char_id, &ship_id]).await.map_err(db_err)?;
+    c.db.execute("UPDATE game.characters SET ship_id = $2 WHERE character_id = $1", &[&char_id, &ship_id]).await.map_err(db_err)?;
     info!(user = c.login.user_id, "issued rookie ship {ship_id} (type {ship_type}) to character {char_id}");
     Ok(ship_id)
 }
@@ -235,7 +229,6 @@ async fn ensure_ship(c: &Client, char_id: i64, race_id: i32, station_id: i64) ->
 async fn select_character(c: &mut Client, char_id: i64) -> Result<(), CallError> {
     let r = c
         .db
-        .client
         .query_opt(
             &format!("SELECT corporation_id, station_id, solar_system_id, constellation_id, region_id, gender_id, bloodline_id, race_id, name,
                     {EFFECTIVE_ROLES_SQL},
@@ -252,7 +245,6 @@ async fn select_character(c: &mut Client, char_id: i64) -> Result<(), CallError>
     // A character that logged off in space resumes in its ship at the stored position.
     let space_ship = c
         .db
-        .client
         .query_opt(
             "SELECT i.item_id, i.x, i.y, i.z FROM game.characters ch JOIN game.items i ON i.item_id = ch.ship_id
              WHERE ch.character_id = $1 AND i.location_id = ch.solar_system_id AND i.x IS NOT NULL",
@@ -267,7 +259,6 @@ async fn select_character(c: &mut Client, char_id: i64) -> Result<(), CallError>
     };
     let has_skills = c
         .db
-        .client
         .query_opt("SELECT 1 FROM game.skills WHERE character_id = $1 LIMIT 1", &[&char_id])
         .await
         .map_err(db_err)?
@@ -275,7 +266,7 @@ async fn select_character(c: &mut Client, char_id: i64) -> Result<(), CallError>
     if !has_skills {
         super::skills::grant_starting_skills(c, char_id, race).await?;
     }
-    c.db.client.execute("UPDATE game.characters SET logoff_at = now() WHERE character_id = $1", &[&char_id]).await.map_err(db_err)?;
+    c.db.execute("UPDATE game.characters SET logoff_at = now() WHERE character_id = $1", &[&char_id]).await.map_err(db_err)?;
     let int = Value::Int;
     let opt = |v: Option<i64>| v.map(Value::Int).unwrap_or(Value::None);
     let corp: i64 = r.get(0);
@@ -320,7 +311,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
         "GetCharacterSelectionData" => {
             let created: i64 = c
                 .db
-                .client
                 .query_one(
                     "SELECT (extract(epoch FROM created_at) * $2::bigint)::bigint + $3::bigint FROM game.accounts WHERE user_id = $1",
                     &[&c.login.user_id, &FILETIME_SECOND, &FILETIME_UNIX_EPOCH],
@@ -345,7 +335,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
         "GetNumCharacters" => {
             let n: i64 = c
                 .db
-                .client
                 .query_one("SELECT count(*) FROM game.characters WHERE user_id = $1 AND NOT deleted", &[&c.login.user_id])
                 .await
                 .map_err(db_err)?
@@ -357,13 +346,13 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
         "PrepareCharacterForDelete" => {
             let char_id = own_character(c, call).await?;
             let when = crate::client::filetime_now() + BIOMASS_DELAY_SECS * FILETIME_SECOND;
-            c.db.client.execute("UPDATE game.characters SET delete_prepare_at = $2 WHERE character_id = $1", &[&char_id, &when]).await.map_err(db_err)?;
+            c.db.execute("UPDATE game.characters SET delete_prepare_at = $2 WHERE character_id = $1", &[&char_id, &when]).await.map_err(db_err)?;
             info!(user = c.login.user_id, "character {char_id} submitted to the biomass queue");
             Ok(Value::Int(when))
         }
         "CancelCharacterDeletePrepare" => {
             let char_id = own_character(c, call).await?;
-            c.db.client.execute("UPDATE game.characters SET delete_prepare_at = NULL WHERE character_id = $1", &[&char_id]).await.map_err(db_err)?;
+            c.db.execute("UPDATE game.characters SET delete_prepare_at = NULL WHERE character_id = $1", &[&char_id]).await.map_err(db_err)?;
             Ok(Value::None)
         }
         // DeleteCharacter(charID) -> an error message key, or None once deleted.
@@ -371,7 +360,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
             let char_id = own_character(c, call).await?;
             let deleted = c
                 .db
-                .client
                 .execute(
                     "UPDATE game.characters SET deleted = true WHERE character_id = $1 AND delete_prepare_at IS NOT NULL AND delete_prepare_at <= $2",
                     &[&char_id, &crate::client::filetime_now()],
@@ -425,7 +413,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
             let (corp, station, system, constellation, region) = starting_location(c, school_id, race_id).await?;
             let row = c
                 .db
-                .client
                 .query_one(
                     "INSERT INTO game.characters (user_id, name, race_id, bloodline_id, gender_id, ancestry_id, school_id,
                          corporation_id, station_id, solar_system_id, constellation_id, region_id, balance, appearance, portrait, home_station_id)

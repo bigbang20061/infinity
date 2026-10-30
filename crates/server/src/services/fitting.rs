@@ -30,7 +30,7 @@ async fn board(c: &mut Client, ship_id: i64) -> CallResult {
     if !ship.singleton {
         return Err(user_error("CantBoardUnassembledShip", vec![]));
     }
-    c.db.client
+    c.db
         .execute("UPDATE game.characters SET ship_id = $2 WHERE character_id = $1", &[&char_id, &ship_id])
         .await
         .map_err(db_err)?;
@@ -52,11 +52,10 @@ async fn assemble(c: &mut Client, call: &Call<'_>) -> CallResult {
         }
         // One hull off a stack becomes the ship; the rest stays packaged.
         let ship_id = if item.quantity > 1 {
-            c.db.client.execute("UPDATE game.items SET quantity = quantity - 1 WHERE item_id = $1", &[&id]).await.map_err(db_err)?;
+            c.db.execute("UPDATE game.items SET quantity = quantity - 1 WHERE item_id = $1", &[&id]).await.map_err(db_err)?;
             notify_item_change(c, id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
             let new_id: i64 = c
                 .db
-                .client
                 .query_one(
                     "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton, name)
                      VALUES ($1, $2, $3, $4, 1, true, $5) RETURNING item_id",
@@ -68,7 +67,7 @@ async fn assemble(c: &mut Client, call: &Call<'_>) -> CallResult {
             notify_item_change(c, new_id, vec![(IX_LOCATION_ID, Value::Int(0))]).await?;
             new_id
         } else {
-            c.db.client
+            c.db
                 .execute("UPDATE game.items SET singleton = true, name = COALESCE($2, name) WHERE item_id = $1", &[&id, &name])
                 .await
                 .map_err(db_err)?;
@@ -107,7 +106,6 @@ async fn repackage(c: &mut Client, call: &Call<'_>) -> CallResult {
         if item.category_id == CATEGORY_SHIP as i64 {
             let fitted: i64 = c
                 .db
-                .client
                 .query_one("SELECT count(*) FROM game.items WHERE location_id = $1", &[&id])
                 .await
                 .map_err(db_err)?
@@ -116,7 +114,7 @@ async fn repackage(c: &mut Client, call: &Call<'_>) -> CallResult {
                 return Err(CallError::User { msg: "ConfirmRepackageSomethingWithUpgrades".into(), dict: vec![] });
             }
         }
-        c.db.client
+        c.db
             .execute("UPDATE game.items SET singleton = false, online = false, name = NULL WHERE item_id = $1", &[&id])
             .await
             .map_err(db_err)?;
@@ -151,7 +149,7 @@ async fn fittings(c: &mut Client, call: &Call<'_>) -> CallResult {
             _ => Value::None,
         });
     }
-    let db = &c.db.client;
+    let db = &c.db;
     const COLS: &str = "fitting_id, owner_id, name, description, ship_type_id, fit_types, fit_flags, fit_qty";
     Ok(match call.method {
         // {fittingID: KeyVal(fittingID, ownerID, name, description, shipTypeID, fitData)}
@@ -207,7 +205,7 @@ async fn rename_fitting(c: &Client, call: &Call<'_>) -> CallResult {
     let char_id = c.session.int("charid").unwrap_or(0);
     let id = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
     let text = |i: usize| call.args.get(i).and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
-    c.db.client
+    c.db
         .execute("UPDATE game.fittings SET name = $3, description = $4 WHERE fitting_id = $1 AND owner_id = $2", &[&id, &char_id, &text(2), &text(3)])
         .await
         .map_err(db_err)?;
@@ -223,7 +221,6 @@ async fn rename_fitting(c: &Client, call: &Call<'_>) -> CallResult {
 async fn blueprints(c: &Client, owner: i64, item: Option<i64>) -> Result<Vec<Value>, CallError> {
     let rows = c
         .db
-        .client
         .query(
             "SELECT i.item_id, i.type_id, i.owner_id, i.location_id, i.flag_id, i.quantity, i.singleton,
                     COALESCE(loc.type_id, st.type_id), COALESCE(st.solar_system_id::bigint, loc.location_id, ch.solar_system_id),

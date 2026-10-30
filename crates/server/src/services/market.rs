@@ -107,7 +107,6 @@ async fn orders(c: &Client, type_id: i64) -> CallResult {
     let region = c.session.int("regionid").unwrap_or(0);
     let rows = c
         .db
-        .client
         .query(
             &format!("SELECT {ORDER_COLUMNS} FROM game.market_orders WHERE type_id = $2 AND region_id = $3 AND vol_remaining > 0 ORDER BY price"),
             &[&today(), &(type_id as i32), &region],
@@ -136,7 +135,6 @@ async fn orders(c: &Client, type_id: i64) -> CallResult {
 async fn best_asks(c: &Client, column: &str, id: i64, as_rows: bool) -> CallResult {
     let rows = c
         .db
-        .client
         .query(
             &format!(
                 "SELECT DISTINCT ON (type_id) type_id::bigint, price, vol_remaining::bigint, station_id
@@ -178,7 +176,6 @@ pub(super) struct Station {
 
 pub(super) async fn station(db: &Db, id: i64) -> Result<Station, CallError> {
     let r = db
-        .client
         .query_opt(
             "SELECT station_id::bigint, solar_system_id::bigint, constellation_id::bigint, region_id::bigint, COALESCE(owner_id, 0)::bigint
              FROM sde.sta_stations WHERE station_id = $1::bigint",
@@ -196,7 +193,7 @@ pub(super) async fn graph(db: &Db) -> Result<&'static HashMap<i64, Vec<i64>>, Ca
     if let Some(g) = GRAPH.get() {
         return Ok(g);
     }
-    let rows = db.client.query("SELECT from_solar_system_id::bigint, to_solar_system_id::bigint FROM sde.map_jumps", &[]).await.map_err(db_err)?;
+    let rows = db.query("SELECT from_solar_system_id::bigint, to_solar_system_id::bigint FROM sde.map_jumps", &[]).await.map_err(db_err)?;
     let mut g: HashMap<i64, Vec<i64>> = HashMap::new();
     for r in &rows {
         g.entry(r.get(0)).or_default().push(r.get(1));
@@ -252,7 +249,6 @@ struct Skills {
 async fn skills(db: &Db, char_id: i64) -> Result<Skills, CallError> {
     let wanted = vec![SKILL_TRADE, SKILL_RETAIL, SKILL_BROKER_RELATIONS, SKILL_WHOLESALE, SKILL_MARGIN_TRADING, SKILL_ACCOUNTING, SKILL_TYCOON];
     let rows = db
-        .client
         .query("SELECT type_id, level FROM game.skills WHERE character_id = $1 AND type_id = ANY($2)", &[&char_id, &wanted])
         .await
         .map_err(db_err)?;
@@ -271,7 +267,7 @@ fn broker_fee(rate: f64, amount: f64) -> f64 {
 }
 
 async fn check_order_slots(db: &Db, char_id: i64, skills: &Skills) -> Result<(), CallError> {
-    let open: i64 = db.client.query_one("SELECT count(*) FROM game.market_orders WHERE char_id = $1", &[&char_id]).await.map_err(db_err)?.get(0);
+    let open: i64 = db.query_one("SELECT count(*) FROM game.market_orders WHERE char_id = $1", &[&char_id]).await.map_err(db_err)?.get(0);
     if open >= skills.order_cap {
         return Err(notify_error(&format!("你已有 {open} 个未完成的市场订单，达到了交易技能允许的上限。")));
     }
@@ -279,7 +275,7 @@ async fn check_order_slots(db: &Db, char_id: i64, skills: &Skills) -> Result<(),
 }
 
 async fn balance(db: &Db, char_id: i64) -> Result<f64, CallError> {
-    Ok(db.client.query_one("SELECT balance::float8 FROM game.characters WHERE character_id = $1", &[&char_id]).await.map_err(db_err)?.get(0))
+    Ok(db.query_one("SELECT balance::float8 FROM game.characters WHERE character_id = $1", &[&char_id]).await.map_err(db_err)?.get(0))
 }
 
 fn not_enough_money(have: f64, amount: f64) -> CallError {
@@ -299,7 +295,6 @@ pub(super) async fn credit(db: &Db, world: &World, char_id: i64, amount: f64) ->
         return Ok(());
     }
     let balance: f64 = db
-        .client
         .query_one(
             "UPDATE game.characters SET balance = balance + $2::float8::numeric WHERE character_id = $1 RETURNING balance::float8",
             &[&char_id, &amount],
@@ -316,7 +311,6 @@ pub(super) async fn debit(db: &Db, world: &World, char_id: i64, amount: f64) -> 
         return Ok(());
     }
     let row = db
-        .client
         .query_opt(
             "UPDATE game.characters SET balance = balance - $2::float8::numeric
              WHERE character_id = $1 AND balance >= $2::float8::numeric RETURNING balance::float8",
@@ -337,12 +331,12 @@ pub(super) async fn debit(db: &Db, world: &World, char_id: i64, amount: f64) -> 
 pub(super) async fn take_items(db: &Db, world: &World, item: Item, quantity: i32) -> Result<(), CallError> {
     let owner = item.owner_id;
     if quantity >= item.quantity {
-        db.client.execute("DELETE FROM game.items WHERE item_id = $1", &[&item.item_id]).await.map_err(db_err)?;
+        db.execute("DELETE FROM game.items WHERE item_id = $1", &[&item.item_id]).await.map_err(db_err)?;
         let old = item.location_id;
         let gone = Item { location_id: LOCATION_JUNKYARD, ..item };
         world.notify_pilot(owner, "OnItemChange", vec![gone.row(), Value::Dict(vec![(Value::Int(IX_LOCATION_ID), Value::Int(old))]), Value::None]);
     } else {
-        db.client.execute("UPDATE game.items SET quantity = quantity - $2 WHERE item_id = $1", &[&item.item_id, &quantity]).await.map_err(db_err)?;
+        db.execute("UPDATE game.items SET quantity = quantity - $2 WHERE item_id = $1", &[&item.item_id, &quantity]).await.map_err(db_err)?;
         let left = Item { quantity: item.quantity - quantity, ..item };
         let change = Value::Dict(vec![(Value::Int(IX_STACK_SIZE), Value::Int((left.quantity + quantity) as i64))]);
         world.notify_pilot(owner, "OnItemChange", vec![left.row(), change, Value::None]);
@@ -353,7 +347,6 @@ pub(super) async fn take_items(db: &Db, world: &World, item: Item, quantity: i32
 /// Put `quantity` x `type_id` in `owner`'s hangar at `station`, onto a stack there if there is one.
 pub(super) async fn deliver(db: &Db, world: &World, owner: i64, station: i64, type_id: i32, quantity: i32) -> Result<(), CallError> {
     let stack = db
-        .client
         .query_opt(
             "SELECT item_id, quantity FROM game.items WHERE location_id = $1 AND flag_id = $2 AND type_id = $3 AND owner_id = $4 AND NOT singleton LIMIT 1",
             &[&station, &FLAG_HANGAR, &type_id, &owner],
@@ -363,12 +356,11 @@ pub(super) async fn deliver(db: &Db, world: &World, owner: i64, station: i64, ty
     let (item_id, change) = match stack {
         Some(r) => {
             let (id, old): (i64, i32) = (r.get(0), r.get(1));
-            db.client.execute("UPDATE game.items SET quantity = quantity + $2 WHERE item_id = $1", &[&id, &quantity]).await.map_err(db_err)?;
+            db.execute("UPDATE game.items SET quantity = quantity + $2 WHERE item_id = $1", &[&id, &quantity]).await.map_err(db_err)?;
             (id, (IX_STACK_SIZE, old as i64))
         }
         None => {
             let id: i64 = db
-                .client
                 .query_one(
                     "INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity) VALUES ($1, $2, $3, $4, $5) RETURNING item_id",
                     &[&type_id, &owner, &station, &FLAG_HANGAR, &quantity],
@@ -381,7 +373,7 @@ pub(super) async fn deliver(db: &Db, world: &World, owner: i64, station: i64, ty
     };
     // Only a pilot docked there has that hangar loaded.
     let docked: Option<i64> =
-        db.client.query_opt("SELECT station_id FROM game.characters WHERE character_id = $1", &[&owner]).await.map_err(db_err)?.and_then(|r| r.get(0));
+        db.query_opt("SELECT station_id FROM game.characters WHERE character_id = $1", &[&owner]).await.map_err(db_err)?.and_then(|r| r.get(0));
     if docked == Some(station) {
         if let Some(item) = load_items_db(db, "i.item_id = $1", &[&item_id]).await?.pop() {
             let change = Value::Dict(vec![(Value::Int(change.0), Value::Int(change.1))]);
@@ -392,7 +384,7 @@ pub(super) async fn deliver(db: &Db, world: &World, owner: i64, station: i64, ty
 }
 
 async fn record(db: &Db, type_id: i32, quantity: i32, price: f64, buyer: i64, seller: i64, at: &Station) -> Result<(), CallError> {
-    db.client
+    db
         .execute(
             "INSERT INTO game.market_transactions (type_id, quantity, price, buyer_id, seller_id, station_id, region_id, date)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
@@ -445,7 +437,7 @@ fn order_from_row(r: &tokio_postgres::Row) -> Order {
 }
 
 async fn my_order(db: &Db, char_id: i64, order_id: i64) -> Result<Order, CallError> {
-    db.client
+    db
         .query_opt(&format!("{ORDER_SELECT} WHERE o.order_id = $2 AND o.char_id = $3"), &[&today(), &order_id, &char_id])
         .await
         .map_err(db_err)?
@@ -455,7 +447,6 @@ async fn my_order(db: &Db, char_id: i64, order_id: i64) -> Result<Order, CallErr
 
 async fn insert_order(db: &Db, o: &mut Order) -> Result<(), CallError> {
     o.id = db
-        .client
         .query_one(
             "INSERT INTO game.market_orders (type_id, char_id, station_id, solar_system_id, constellation_id, region_id, price,
                                              vol_entered, vol_remaining, min_volume, bid, range, duration, issued, escrow)
@@ -486,7 +477,7 @@ async fn insert_order(db: &Db, o: &mut Order) -> Result<(), CallError> {
 
 /// Move a player's order to the history.
 async fn close(db: &Db, o: &Order, state: i32) -> Result<(), CallError> {
-    db.client
+    db
         .execute(
             "WITH gone AS (DELETE FROM game.market_orders WHERE order_id = $1 RETURNING *)
              INSERT INTO game.market_order_history (order_id, type_id, char_id, station_id, region_id, price, vol_entered, vol_remaining,
@@ -552,7 +543,7 @@ async fn consume(db: &Db, world: &World, o: &mut Order, quantity: i32) -> Result
         }
         close(db, o, STATE_CLOSED).await?;
     } else {
-        db.client
+        db
             .execute("UPDATE game.market_orders SET vol_remaining = $2, escrow = $3 WHERE order_id = $1", &[&o.id, &o.vol_remaining, &o.escrow])
             .await
             .map_err(db_err)?;
@@ -566,7 +557,6 @@ async fn consume(db: &Db, world: &World, o: &mut Order, quantity: i32) -> Result
 async fn hit_bids(db: &Db, world: &World, seller: i64, at: &Station, type_id: i32, floor: f64, quantity: i32) -> Result<i32, CallError> {
     let g = graph(db).await?;
     let rows = db
-        .client
         .query(
             &format!(
                 "{ORDER_SELECT} WHERE o.type_id = $2 AND o.region_id = $3 AND o.bid AND o.vol_remaining > 0 AND o.price >= $4::float8 - 0.005
@@ -611,7 +601,6 @@ async fn hit_bids(db: &Db, world: &World, seller: i64, at: &Station, type_id: i3
 async fn lift_asks(db: &Db, world: &World, buyer: i64, at: &Station, range: i64, type_id: i32, cap: f64, quantity: i32, from_wallet: bool) -> Result<(i32, f64), CallError> {
     let g = graph(db).await?;
     let rows = db
-        .client
         .query(
             &format!(
                 "{ORDER_SELECT} WHERE o.type_id = $2 AND o.region_id = $3 AND NOT o.bid AND o.vol_remaining > 0 AND o.price <= $4::float8 + 0.005
@@ -805,7 +794,7 @@ async fn modify(c: &Client, order_id: i64, new_price: f64) -> CallResult {
     o.price = new_price;
     o.escrow = escrow;
     o.issued = filetime_now();
-    db.client
+    db
         .execute("UPDATE game.market_orders SET price = $2, escrow = $3, issued = $4 WHERE order_id = $1", &[&o.id, &o.price, &o.escrow, &o.issued])
         .await
         .map_err(db_err)?;
@@ -852,7 +841,6 @@ pub async fn expire_orders(db: Db, world: Arc<World>) {
 async fn expire(db: &Db, world: &World) -> Result<(), CallError> {
     let _trading = lock().await;
     let rows = db
-        .client
         .query(&format!("{ORDER_SELECT} WHERE o.char_id IS NOT NULL AND o.issued + o.duration::bigint * $2 <= $3"), &[&today(), &FILETIME_DAY, &filetime_now()])
         .await
         .map_err(db_err)?;
@@ -873,7 +861,7 @@ async fn my_orders(c: &Client) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
     let here = c.session.int("solarsystemid2").unwrap_or(0);
     let g = graph(&c.db).await?;
-    let rows = c.db.client.query(&format!("{ORDER_SELECT} WHERE o.char_id = $2 ORDER BY o.order_id"), &[&today(), &me]).await.map_err(db_err)?;
+    let rows = c.db.query(&format!("{ORDER_SELECT} WHERE o.char_id = $2 ORDER BY o.order_id"), &[&today(), &me]).await.map_err(db_err)?;
     let header = DbRowDescriptor::new([
         ("orderID", DbType::I8),
         ("typeID", DbType::I4),
@@ -930,7 +918,6 @@ async fn order_history(c: &Client) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
     let rows = c
         .db
-        .client
         .query(
             "SELECT order_id, type_id::bigint, region_id, station_id, range::bigint, bid, price, vol_entered::bigint, vol_remaining::bigint,
                     issued, min_volume::bigint, duration::bigint, state::bigint, closed
@@ -991,7 +978,6 @@ async fn transactions(c: &Client, from: Option<i64>) -> CallResult {
     let from = from.unwrap_or(filetime_now() - DEFAULT_TRANSACTION_HISTORY_DAYS * FILETIME_DAY);
     let rows = c
         .db
-        .client
         .query(
             "SELECT transaction_id, date, type_id::bigint, quantity::bigint, price, station_id, buyer_id, seller_id
              FROM game.market_transactions WHERE (buyer_id = $1 OR seller_id = $1) AND date >= $2 ORDER BY date DESC LIMIT 2500",
@@ -1038,7 +1024,6 @@ async fn escrow(c: &Client) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
     let r = c
         .db
-        .client
         .query_one(
             "SELECT COALESCE(sum(escrow) FILTER (WHERE bid), 0)::float8, COALESCE(sum(price * vol_remaining) FILTER (WHERE NOT bid), 0)::float8
              FROM game.market_orders WHERE char_id = $1",
@@ -1067,7 +1052,6 @@ async fn price_history(c: &Client, type_ids: &[i32]) -> Result<HashMap<i32, (Val
     let today = today();
     let rows = c
         .db
-        .client
         .query(
             "SELECT type_id, date / $3 * $3 AS day, min(price), max(price), sum(price * quantity) / sum(quantity), sum(quantity)::bigint, count(*)
              FROM game.market_transactions WHERE region_id = $1 AND type_id = ANY($2) AND date >= $4

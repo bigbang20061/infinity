@@ -59,7 +59,6 @@ fn settings_info_code() -> Vec<u8> {
 async fn station_info(c: &Client) -> Result<Value, CallError> {
     let rows = c
         .db
-        .client
         .query(
             "SELECT station_id::bigint, type_id::bigint, owner_id::bigint, solar_system_id::bigint, constellation_id::bigint,
                     region_id::bigint, operation_id::bigint, x, y, z, security
@@ -144,7 +143,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         // The activities window's auto-popup setting (0: open it at login), kept per character.
         ("activityMgr", "GetActivitiesPopState") => {
             let me = c.session.int("charid").unwrap_or(0);
-            match c.db.client.query_opt("SELECT activities_pop_state FROM game.characters WHERE character_id = $1", &[&me]).await {
+            match c.db.query_opt("SELECT activities_pop_state FROM game.characters WHERE character_id = $1", &[&me]).await {
                 Ok(r) => int(r.map(|r| r.get::<_, i32>(0) as i64).unwrap_or(1)),
                 Err(e) => return Some(Err(db_err(e))),
             }
@@ -152,7 +151,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         ("activityMgr", "SetActivitiesPopState") => {
             let me = c.session.int("charid").unwrap_or(0);
             let state = call.args.first().and_then(|v| v.as_int()).unwrap_or(1) as i32;
-            match c.db.client.execute("UPDATE game.characters SET activities_pop_state = $2 WHERE character_id = $1", &[&me, &state]).await {
+            match c.db.execute("UPDATE game.characters SET activities_pop_state = $2 WHERE character_id = $1", &[&me, &state]).await {
                 Ok(_) => Value::Bool(true),
                 Err(e) => return Some(Err(db_err(e))),
             }
@@ -170,7 +169,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             let station = c.session.int("stationid").unwrap_or(0);
             let r = match c
                 .db
-                .client
                 .query_one(
                     "SELECT owner_id::bigint, station_id::bigint, operation_id::bigint, type_id::bigint FROM sde.sta_stations WHERE station_id = $1",
                     &[&(station as i32)],

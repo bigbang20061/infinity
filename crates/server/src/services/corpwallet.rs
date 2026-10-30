@@ -36,7 +36,6 @@ fn key_name(key: i32) -> String {
 
 pub(super) async fn corp_balance(db: &Db, corp: i64, key: i32) -> Result<f64, CallError> {
     Ok(db
-        .client
         .query_opt("SELECT balance::float8 FROM game.corp_wallets WHERE corporation_id = $1 AND account_key = $2", &[&corp, &key])
         .await
         .map_err(db_err)?
@@ -57,7 +56,6 @@ pub(super) async fn corp_credit(db: &Db, world: &World, corp: i64, key: i32, amo
         return Ok(());
     }
     let balance: f64 = db
-        .client
         .query_one(
             "INSERT INTO game.corp_wallets (corporation_id, account_key, balance) VALUES ($1, $2, $3::float8::numeric)
              ON CONFLICT (corporation_id, account_key) DO UPDATE SET balance = game.corp_wallets.balance + $3::float8::numeric
@@ -75,7 +73,6 @@ pub(super) async fn corp_debit(db: &Db, world: &World, corp: i64, key: i32, amou
         return Ok(());
     }
     let row = db
-        .client
         .query_opt(
             "UPDATE game.corp_wallets SET balance = balance - $3::float8::numeric
              WHERE corporation_id = $1 AND account_key = $2 AND balance >= $3::float8::numeric RETURNING balance::float8",
@@ -104,7 +101,7 @@ async fn pay_to(db: &Db, world: &World, to: i64, to_key: Option<i32>, amount: f6
         let key = to_key.filter(|k| valid_key(*k)).unwrap_or(ACCOUNT_CASH);
         return corp_credit(db, world, to, key, amount).await;
     }
-    let exists = db.client.query_opt("SELECT 1 FROM game.characters WHERE character_id = $1 AND NOT deleted", &[&to]).await.map_err(db_err)?.is_some();
+    let exists = db.query_opt("SELECT 1 FROM game.characters WHERE character_id = $1 AND NOT deleted", &[&to]).await.map_err(db_err)?.is_some();
     if !exists {
         return Err(notify_error("只能向玩家角色或玩家军团转账。"));
     }

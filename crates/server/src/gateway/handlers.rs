@@ -41,8 +41,8 @@ pub async fn handle(gw: &Gateway, caller: &Caller, name: &str, req: &DynamicMess
     }
 }
 
-fn db(gw: &Gateway) -> Result<&tokio_postgres::Client> {
-    Ok(&gw.db.as_ref().context("gateway has no database")?.client)
+fn db(gw: &Gateway) -> Result<&crate::db::Db> {
+    gw.db.as_ref().context("gateway has no database")
 }
 
 fn msg_field(m: &DynamicMessage, field: &str) -> Option<DynamicMessage> {
@@ -97,7 +97,7 @@ async fn names_by_user(gw: &Gateway, caller: &Caller) -> Result<DynamicMessage> 
 async fn plex_balance(gw: &Gateway, caller: &Caller) -> Result<DynamicMessage> {
     let mut rsp = response_for("eve_public.plex.vault.api.BalanceRequest")?;
     let user = caller.user_id.context("no user")?;
-    let plex = crate::db::Db::plex_balance(db(gw)?, user).await?;
+    let plex = db(gw)?.plex_balance(user).await?;
     let mut balance = child(&rsp.descriptor(), "balance")?;
     set(&mut balance, "total_in_cents", PV::I64(plex * PLEX_HUNDREDTHS))?;
     set(&mut rsp, "balance", PV::Message(balance))?;

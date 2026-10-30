@@ -135,7 +135,7 @@ fn alliance_line(r: &tokio_postgres::Row) -> Vec<Value> {
 }
 
 async fn alliance_line_of(db: &Db, alliance: i64) -> Result<Option<Vec<Value>>, CallError> {
-    Ok(db.client.query_opt(&format!("{ALLIANCE_SELECT} WHERE a.alliance_id = $1"), &[&alliance]).await.map_err(db_err)?.map(|r| alliance_line(&r)))
+    Ok(db.query_opt(&format!("{ALLIANCE_SELECT} WHERE a.alliance_id = $1"), &[&alliance]).await.map_err(db_err)?.map(|r| alliance_line(&r)))
 }
 
 async fn alliance_row(db: &Db, alliance: i64) -> CallResult {
@@ -157,7 +157,6 @@ fn member_header() -> DbRowDescriptor {
 /// (corporationID, line) of each member corporation.
 async fn member_lines(db: &Db, alliance: i64) -> Result<Vec<(i64, Vec<Value>)>, CallError> {
     let rows = db
-        .client
         .query(
             "SELECT corporation_id, chosen_executor_id, COALESCE(alliance_joined, created) FROM game.corporations
              WHERE alliance_id = $1 AND NOT deleted ORDER BY corporation_id",
@@ -207,7 +206,6 @@ fn application_line(r: &tokio_postgres::Row) -> Vec<Value> {
 
 async fn application_line_of(db: &Db, alliance: i64, corp: i64) -> Result<Option<Vec<Value>>, CallError> {
     Ok(db
-        .client
         .query_opt(&format!("{APPLICATION_SELECT} WHERE alliance_id = $1 AND corporation_id = $2"), &[&alliance, &corp])
         .await
         .map_err(db_err)?
@@ -225,7 +223,6 @@ fn relationship_header() -> DbRowDescriptor {
 /// Every non-deleted character of the corporations in `alliance`, or of `corp` alone.
 async fn pilots(db: &Db, alliance: Option<i64>, corp: Option<i64>) -> Result<Vec<i64>, CallError> {
     let rows = db
-        .client
         .query(
             "SELECT ch.character_id FROM game.characters ch JOIN game.corporations co ON co.corporation_id = ch.corporation_id
              WHERE NOT ch.deleted AND (co.alliance_id = $1 OR co.corporation_id = $2)",
@@ -265,14 +262,14 @@ async fn member_changed(db: &Db, world: &World, alliance: i64, corp: i64, old: O
 /// Put `corp` in `alliance` (or none): history, and every member's session.
 async fn set_alliance(db: &Db, world: &World, corp: i64, alliance: Option<i64>) -> Result<(), CallError> {
     let now = filetime_now();
-    db.client
+    db
         .execute(
             "UPDATE game.corporations SET alliance_id = $2, alliance_joined = $3, chosen_executor_id = NULL WHERE corporation_id = $1",
             &[&corp, &alliance, &alliance.map(|_| now)],
         )
         .await
         .map_err(db_err)?;
-    db.client
+    db
         .execute("INSERT INTO game.alliance_history (corporation_id, alliance_id, start_date) VALUES ($1, $2, $3)", &[&corp, &alliance, &now])
         .await
         .map_err(db_err)?;
@@ -292,7 +289,7 @@ async fn unallied_ceo_corp(db: &Db, me: i64) -> Result<i64, CallError> {
     if !is_player_corp(corp) || ceo_of(db, corp).await? != Some(me) {
         return Err(notify_error("只有玩家军团的 CEO 才能这样做。"));
     }
-    let allied: Option<i64> = db.client.query_one("SELECT alliance_id FROM game.corporations WHERE corporation_id = $1", &[&corp]).await.map_err(db_err)?.get(0);
+    let allied: Option<i64> = db.query_one("SELECT alliance_id FROM game.corporations WHERE corporation_id = $1", &[&corp]).await.map_err(db_err)?.get(0);
     if allied.is_some() {
         return Err(notify_error("你的军团已经在一个联盟中。"));
     }
@@ -312,7 +309,6 @@ async fn create(c: &Client, call: &Call<'_>) -> CallResult {
         return Err(notify_error("联盟简称必须为 2 到 5 个字母、数字、点或短横线。"));
     }
     let taken: bool = db
-        .client
         .query_one(
             "SELECT EXISTS (SELECT 1 FROM game.alliances WHERE NOT deleted AND (lower(name) = lower($1) OR upper(short_name) = $2))",
             &[&name, &short_name],
@@ -326,7 +322,6 @@ async fn create(c: &Client, call: &Call<'_>) -> CallResult {
     let _trading = super::market::lock().await;
     super::corpwallet::corp_debit(db, world, corp, ACCOUNT_CASH, CREATION_COST).await?;
     let id: i64 = db
-        .client
         .query_one(
             "INSERT INTO game.alliances (name, short_name, description, url, executor_corp_id, creator_corp_id, creator_char_id, created)
              VALUES ($1, $2, $3, $4, $5, $5, $6, $7) RETURNING alliance_id",
@@ -335,7 +330,7 @@ async fn create(c: &Client, call: &Call<'_>) -> CallResult {
         .await
         .map_err(db_err)?
         .get(0);
-    db.client.execute("DELETE FROM game.alliance_applications WHERE corporation_id = $1", &[&corp]).await.map_err(db_err)?;
+    db.execute("DELETE FROM game.alliance_applications WHERE corporation_id = $1", &[&corp]).await.map_err(db_err)?;
     set_alliance(db, world, corp, Some(id)).await?;
     info!("alliances: {me} of {corp} founded {id} <{short_name}> {name}");
     Ok(Value::Int(id))
@@ -345,7 +340,6 @@ async fn create(c: &Client, call: &Call<'_>) -> CallResult {
 /// with its last member.
 pub(super) async fn leave_alliance(db: &Db, world: &World, corp: i64) -> Result<(), CallError> {
     let Some(r) = db
-        .client
         .query_opt(
             "SELECT co.alliance_id, a.executor_corp_id FROM game.corporations co JOIN game.alliances a ON a.alliance_id = co.alliance_id
              WHERE co.corporation_id = $1",
@@ -361,14 +355,13 @@ pub(super) async fn leave_alliance(db: &Db, world: &World, corp: i64) -> Result<
     let old_alliance = alliance_line_of(db, alliance).await?;
     member_changed_before_leaving(db, world, alliance, corp, old_member).await?;
     set_alliance(db, world, corp, None).await?;
-    db.client
+    db
         .execute("UPDATE game.corporations SET chosen_executor_id = NULL WHERE alliance_id = $1 AND chosen_executor_id = $2", &[&alliance, &corp])
         .await
         .map_err(db_err)?;
     if executor == Some(corp) {
         // The largest remaining member takes over; none left closes the alliance.
         let next: Option<i64> = db
-            .client
             .query_opt(
                 "SELECT co.corporation_id FROM game.corporations co WHERE co.alliance_id = $1 AND NOT co.deleted
                  ORDER BY (SELECT count(*) FROM game.characters ch WHERE ch.corporation_id = co.corporation_id AND NOT ch.deleted) DESC, co.corporation_id
@@ -380,12 +373,12 @@ pub(super) async fn leave_alliance(db: &Db, world: &World, corp: i64) -> Result<
             .map(|r| r.get(0));
         match next {
             Some(next) => {
-                db.client.execute("UPDATE game.alliances SET executor_corp_id = $2 WHERE alliance_id = $1", &[&alliance, &next]).await.map_err(db_err)?;
+                db.execute("UPDATE game.alliances SET executor_corp_id = $2 WHERE alliance_id = $1", &[&alliance, &next]).await.map_err(db_err)?;
                 info!("alliances: {next} is now executor of {alliance}");
             }
             None => {
-                db.client.execute("UPDATE game.alliances SET deleted = true, executor_corp_id = NULL WHERE alliance_id = $1", &[&alliance]).await.map_err(db_err)?;
-                db.client.execute("DELETE FROM game.alliance_applications WHERE alliance_id = $1", &[&alliance]).await.map_err(db_err)?;
+                db.execute("UPDATE game.alliances SET deleted = true, executor_corp_id = NULL WHERE alliance_id = $1", &[&alliance]).await.map_err(db_err)?;
+                db.execute("DELETE FROM game.alliance_applications WHERE alliance_id = $1", &[&alliance]).await.map_err(db_err)?;
                 info!("alliances: {alliance} closed");
             }
         }
@@ -402,7 +395,6 @@ async fn member_changed_before_leaving(db: &Db, world: &World, alliance: i64, co
 /// Join an accepted corporation to the alliance.
 async fn admit(db: &Db, world: &World, alliance: i64, corp: i64) -> Result<(), CallError> {
     let allied: Option<i64> = db
-        .client
         .query_opt("SELECT alliance_id FROM game.corporations WHERE corporation_id = $1 AND NOT deleted", &[&corp])
         .await
         .map_err(db_err)?
@@ -415,11 +407,10 @@ async fn admit(db: &Db, world: &World, alliance: i64, corp: i64) -> Result<(), C
     set_alliance(db, world, corp, Some(alliance)).await?;
     // Other applications of a corporation that joined lapse.
     let others = db
-        .client
         .query(&format!("{APPLICATION_SELECT} WHERE corporation_id = $1 AND alliance_id <> $2"), &[&corp, &alliance])
         .await
         .map_err(db_err)?;
-    db.client.execute("DELETE FROM game.alliance_applications WHERE corporation_id = $1 AND alliance_id <> $2", &[&corp, &alliance]).await.map_err(db_err)?;
+    db.execute("DELETE FROM game.alliance_applications WHERE corporation_id = $1 AND alliance_id <> $2", &[&corp, &alliance]).await.map_err(db_err)?;
     for r in &others {
         application_changed(db, world, r.get(0), corp, Some(application_line(r))).await?;
     }
@@ -438,7 +429,6 @@ fn bound_alliance(c: &Client, call: &Call<'_>) -> Option<i64> {
 async fn executor_director(db: &Db, me: i64, alliance: i64) -> Result<bool, CallError> {
     let (corp, roles) = membership(db, me).await?;
     let executor: Option<i64> = db
-        .client
         .query_opt("SELECT executor_corp_id FROM game.alliances WHERE alliance_id = $1 AND NOT deleted", &[&alliance])
         .await
         .map_err(db_err)?
@@ -458,10 +448,9 @@ async fn support_executor(db: &Db, world: &World, me: i64, alliance: i64, candid
         return Err(notify_error("该军团不是联盟成员。"));
     }
     let old = members.iter().find(|(c, _)| *c == corp).map(|(_, l)| l.clone());
-    db.client.execute("UPDATE game.corporations SET chosen_executor_id = $2 WHERE corporation_id = $1", &[&corp, &candidate]).await.map_err(db_err)?;
+    db.execute("UPDATE game.corporations SET chosen_executor_id = $2 WHERE corporation_id = $1", &[&corp, &candidate]).await.map_err(db_err)?;
     member_changed(db, world, alliance, corp, old).await?;
     let r = db
-        .client
         .query_one(
             "SELECT COALESCE(sum(n) FILTER (WHERE co.chosen_executor_id = $2), 0)::bigint, COALESCE(sum(n), 0)::bigint
              FROM game.corporations co
@@ -475,7 +464,6 @@ async fn support_executor(db: &Db, world: &World, me: i64, alliance: i64, candid
     if backing * MAJORITY_DENOMINATOR > total {
         let old_alliance = alliance_line_of(db, alliance).await?;
         let changed = db
-            .client
             .execute("UPDATE game.alliances SET executor_corp_id = $2 WHERE alliance_id = $1 AND executor_corp_id IS DISTINCT FROM $2", &[&alliance, &candidate])
             .await
             .map_err(db_err)?;
@@ -522,7 +510,7 @@ async fn corp_registry(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                 Ok(corp) => corp,
                 Err(e) => return Some(Err(e)),
             };
-            match db.client.query_opt("SELECT 1 FROM game.alliances WHERE alliance_id = $1 AND NOT deleted", &[&alliance]).await {
+            match db.query_opt("SELECT 1 FROM game.alliances WHERE alliance_id = $1 AND NOT deleted", &[&alliance]).await {
                 Ok(Some(_)) => {}
                 Ok(None) => return Some(Err(notify_error("该联盟已不存在。"))),
                 Err(e) => return Some(Err(db_err(e))),
@@ -535,7 +523,6 @@ async fn corp_registry(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                 return Some(Err(CallError::User { msg: "CantApplyTwiceToAlliance".into(), dict: vec![] }));
             }
             let stored = db
-                .client
                 .execute(
                     "INSERT INTO game.alliance_applications (alliance_id, corporation_id, application_text, state, created) VALUES ($1, $2, $3, $4, $5)
                      ON CONFLICT (alliance_id, corporation_id) DO UPDATE SET application_text = $3, state = $4, created = $5",
@@ -551,7 +538,7 @@ async fn corp_registry(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         // {allianceID: application} of the session's corporation.
         "GetAllianceApplications" => {
             let corp = c.session.int("corpid").unwrap_or(0);
-            match db.client.query(&format!("{APPLICATION_SELECT} WHERE corporation_id = $1"), &[&corp]).await {
+            match db.query(&format!("{APPLICATION_SELECT} WHERE corporation_id = $1"), &[&corp]).await {
                 Ok(rows) => {
                     let header = application_header();
                     let rows = rows.iter().map(|r| (r.get::<_, i64>(0), header.row(&application_line(r)))).collect();
@@ -570,7 +557,7 @@ async fn corp_registry(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                 Ok(old) => old,
                 Err(e) => return Some(Err(e)),
             };
-            match db.client.execute("DELETE FROM game.alliance_applications WHERE alliance_id = $1 AND corporation_id = $2", &[&alliance, &corp]).await {
+            match db.execute("DELETE FROM game.alliance_applications WHERE alliance_id = $1 AND corporation_id = $2", &[&alliance, &corp]).await {
                 Ok(_) if old.is_some() => application_changed(db, world, alliance, corp, old).await.map(|_| Value::None),
                 Ok(_) => Ok(Value::None),
                 Err(e) => Err(db_err(e)),
@@ -592,7 +579,7 @@ async fn alliance_registry(c: &mut Client, call: &Call<'_>) -> Option<CallResult
         // GetRankedAlliances(maxLen): the largest alliances by pilots.
         "GetRankedAlliances" => {
             let limit = call.args.first().and_then(|v| v.as_int()).unwrap_or(DEFAULT_RANKED_LIMIT).clamp(1, MAX_RANKED_LIMIT);
-            return Some(match db.client.query(&format!("{ALLIANCE_SELECT} WHERE NOT a.deleted ORDER BY 12 DESC, a.alliance_id LIMIT $1"), &[&limit]).await {
+            return Some(match db.query(&format!("{ALLIANCE_SELECT} WHERE NOT a.deleted ORDER BY 12 DESC, a.alliance_id LIMIT $1"), &[&limit]).await {
                 Ok(rows) => {
                     let header = alliance_header();
                     Ok(crowset(&header, rows.iter().map(|r| header.row(&alliance_line(r))).collect()))
@@ -615,7 +602,6 @@ async fn alliance_registry(c: &mut Client, call: &Call<'_>) -> Option<CallResult
                 return Some(Ok(Value::list([])));
             }
             let rows = db
-                .client
                 .query(
                     "SELECT h.alliance_id, h.start_date, COALESCE(a.deleted, false) FROM game.alliance_history h
                      LEFT JOIN game.alliances a ON a.alliance_id = h.alliance_id WHERE h.corporation_id = $1
@@ -650,7 +636,6 @@ async fn alliance_registry(c: &mut Client, call: &Call<'_>) -> Option<CallResult
             }
             let old = alliance_line_of(db, alliance).await.ok().flatten();
             match db
-                .client
                 .execute("UPDATE game.alliances SET description = $2, url = $3 WHERE alliance_id = $1", &[&alliance, &trimmed_arg_text(call, 0), &trimmed_arg_text(call, 1)])
                 .await
             {
@@ -663,7 +648,7 @@ async fn alliance_registry(c: &mut Client, call: &Call<'_>) -> Option<CallResult
             indexed_rowset(&header, "corporationID", lines.into_iter().map(|(corp, l)| (corp, header.row(&l))).collect())
         }),
         // {corporationID: application}
-        "GetApplications" => match db.client.query(&format!("{APPLICATION_SELECT} WHERE alliance_id = $1"), &[&alliance]).await {
+        "GetApplications" => match db.query(&format!("{APPLICATION_SELECT} WHERE alliance_id = $1"), &[&alliance]).await {
             Ok(rows) => {
                 let header = application_header();
                 let rows = rows.iter().map(|r| (r.get::<_, i64>(1), header.row(&application_line(r)))).collect();
@@ -693,7 +678,6 @@ async fn alliance_registry(c: &mut Client, call: &Call<'_>) -> Option<CallResult
             }
             let stored = if state == APP_ACCEPTED { APP_EFFECTIVE } else { APP_REJECTED };
             match db
-                .client
                 .execute("UPDATE game.alliance_applications SET state = $3 WHERE alliance_id = $1 AND corporation_id = $2", &[&alliance, &corp, &stored])
                 .await
             {
@@ -724,7 +708,7 @@ async fn alliance_registry(c: &mut Client, call: &Call<'_>) -> Option<CallResult
             }
         }
         // {toID: row(toID, relationship)}
-        "GetRelationships" => match db.client.query("SELECT to_id, relationship FROM game.alliance_relationships WHERE alliance_id = $1", &[&alliance]).await {
+        "GetRelationships" => match db.query("SELECT to_id, relationship FROM game.alliance_relationships WHERE alliance_id = $1", &[&alliance]).await {
             Ok(rows) => {
                 let header = relationship_header();
                 let rows = rows.iter().map(|r| (r.get::<_, i64>(0), header.row(&[Value::Int(r.get(0)), Value::Int(r.get::<_, i32>(1) as i64)]))).collect();
@@ -738,13 +722,13 @@ async fn alliance_registry(c: &mut Client, call: &Call<'_>) -> Option<CallResult
                 return Some(Err(notify_error("只有执行军团的董事才能设置联盟关系。")));
             }
             let (relationship, to) = if call.method == "SetRelationship" { (Some(int(0) as i32), int(1)) } else { (None, int(0)) };
-            let old: Option<i32> = match db.client.query_opt("SELECT relationship FROM game.alliance_relationships WHERE alliance_id = $1 AND to_id = $2", &[&alliance, &to]).await {
+            let old: Option<i32> = match db.query_opt("SELECT relationship FROM game.alliance_relationships WHERE alliance_id = $1 AND to_id = $2", &[&alliance, &to]).await {
                 Ok(r) => r.map(|r| r.get(0)),
                 Err(e) => return Some(Err(db_err(e))),
             };
             let stored = match relationship {
                 Some(rel) => {
-                    db.client
+                    db
                         .execute(
                             "INSERT INTO game.alliance_relationships (alliance_id, to_id, relationship) VALUES ($1, $2, $3)
                              ON CONFLICT (alliance_id, to_id) DO UPDATE SET relationship = $3",
@@ -752,7 +736,7 @@ async fn alliance_registry(c: &mut Client, call: &Call<'_>) -> Option<CallResult
                         )
                         .await
                 }
-                None => db.client.execute("DELETE FROM game.alliance_relationships WHERE alliance_id = $1 AND to_id = $2", &[&alliance, &to]).await,
+                None => db.execute("DELETE FROM game.alliance_relationships WHERE alliance_id = $1 AND to_id = $2", &[&alliance, &to]).await,
             };
             if let Err(e) = stored {
                 return Some(Err(db_err(e)));
@@ -765,7 +749,7 @@ async fn alliance_registry(c: &mut Client, call: &Call<'_>) -> Option<CallResult
         // The alliance's bills (services/bills), paid by the executor's accountants.
         "GetBills" => super::bills::bills(db, alliance, false).await,
         "GetBillsReceivable" => super::bills::bills(db, alliance, true).await,
-        "GetBillBalance" => match db.client.query_opt("SELECT amount::float8 FROM game.bills WHERE bill_id = $1 AND debtor_id = $2", &[&int(0), &alliance]).await {
+        "GetBillBalance" => match db.query_opt("SELECT amount::float8 FROM game.bills WHERE bill_id = $1 AND debtor_id = $2", &[&int(0), &alliance]).await {
             Ok(r) => Ok(Value::Float(r.map(|r| r.get(0)).unwrap_or(0.0))),
             Err(e) => Err(db_err(e)),
         },
@@ -773,13 +757,13 @@ async fn alliance_registry(c: &mut Client, call: &Call<'_>) -> Option<CallResult
         "PayBill" => {
             let (bill, key) = (int(0), call.kwargs.get("fromAccountKey").and_then(|v| v.as_int()).unwrap_or(int(1)) as i32);
             let corp = c.session.int("corpid").unwrap_or(0);
-            let owed = match db.client.query_opt("SELECT 1 FROM game.bills WHERE bill_id = $1 AND debtor_id = $2", &[&bill, &alliance]).await {
+            let owed = match db.query_opt("SELECT 1 FROM game.bills WHERE bill_id = $1 AND debtor_id = $2", &[&bill, &alliance]).await {
                 Ok(r) => r.is_some(),
                 Err(e) => return Some(Err(db_err(e))),
             };
             let allowed = executor_director(db, me, alliance).await.unwrap_or(false)
                 || (super::bills::is_accountant(db, me, corp).await.unwrap_or(false)
-                    && db.client.query_opt("SELECT 1 FROM game.alliances WHERE alliance_id = $1 AND executor_corp_id = $2", &[&alliance, &corp]).await.ok().flatten().is_some());
+                    && db.query_opt("SELECT 1 FROM game.alliances WHERE alliance_id = $1 AND executor_corp_id = $2", &[&alliance, &corp]).await.ok().flatten().is_some());
             if !owed || !allowed || !super::corpwallet::may_take(db, me, corp, key).await.unwrap_or(false) {
                 return Some(Err(notify_error("你无法支付该账单。")));
             }
