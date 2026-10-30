@@ -77,6 +77,7 @@ Any other tag starts nothing.
 | Image server and content CDN | `images.rs`, `cdn.rs` |
 | Captured retail data | `retail.rs` and `crates/server/retail/` |
 | Database access and schema | `db/mod.rs` (`Db`: pool, statement methods, startup), `db/transaction.rs` (`Db::transaction`), `db/executor.rs` (`Executor`), `db/outbox.rs` (`Outbox`), `crates/server/sql/game_schema.sql` |
+| Static data (SDE) | `sde/mod.rs` (`Sde`: loaded once at startup, read-only, shared as `Arc<Sde>`; one module per dataset such as `types`, `dogma`, `map`, `industry`, `missions`), `dao/sde/` (the only static-data SQL, run once by the loader) |
 | Game data access (all `game.*` SQL) | `dao/`: one module per kind of data (`accounts`, `characters`, `items`, `wallets`, `skills`, `market`, `contracts`, ...); a feature's statements on shared data live in `dao/<data>/<feature>.rs` |
 | Player-visible text and client message names | `messages.rs` |
 | Wire format | `crates/marshal` |
@@ -152,7 +153,7 @@ Any other tag starts nothing.
 
 ### Shared state and concurrency
 
-- Module-level runtime state uses `static STATE: OnceLock<Mutex<State>>` behind a `state()` accessor. Keep critical sections short.
+- Module-level runtime state uses `static STATE: OnceLock<Mutex<State>>` behind a `state()` accessor. Keep critical sections short. Static data is not runtime state: never cache it in a module, read it from `Sde`.
 - Never hold a `std::sync::Mutex` guard across `.await`.
 - Every solar system in space is an actor: a tokio task that owns its `System` and advances it every 100 ms. Reach it only through `World`:
   - `world.with(system, move |s| ...).await` runs a closure inside the actor and returns its value (`None` if the system is not running).
@@ -189,7 +190,7 @@ Helpers and constants used by more than one module, each defined once:
   - Rows are read by column name into a named struct with one `from_row` per row shape, never by position. Give computed columns an alias so they have a name. A presence check is `query_opt(...).await?.is_some()`.
   - Data used by several features lives in the dao module of that data (`dao/items`, `dao/characters`, `dao/wallets`, `dao/skills`, ...). A feature that adds statements there does so in a file named after the feature. Search the module before adding a statement; never write a second copy.
   - SQL assembled from fragments lives in `dao/` together with its builder. Services pass typed filter values, never SQL text.
-  - Queries that read only static data (`sde.*`, `sde_native.*`) stay with their service until static data is loaded at startup (#5).
+  - Static data (`sde.*`, `sde_native.*`, `sde_compat.*`) is read only by the loaders in `dao/sde/`, once at startup, into `Sde`. Services read it from `&Sde`: synchronous, no lock, no await, no query. A statement never joins `game.*` with static tables; the dao returns game rows and the service enriches them from `Sde`.
 - **One business operation, one transaction.** An operation that writes more than one row, or more than one table, runs in `db.transaction(operation, dispatch)`.
   - `operation` gets the transaction and an `Outbox`. The runner commits, or rolls back on error.
   - The runner reruns `operation` once on a deadlock or serialization failure, so `operation` must be safe to repeat: capture inputs before the call and rebuild any mutable state inside it.
@@ -208,7 +209,7 @@ Helpers and constants used by more than one module, each defined once:
   - `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`
   - guarded backfill `UPDATE`s
 - Never edit or remove an existing statement in a way that breaks a database created by an earlier version. Add new statements to the relevant section, with a comment naming the owning module.
-- Query static data through the typed `sde.*` tables. The raw `sde_native` / `sde_compat` `jsonb` tables are for data that has no typed table yet.
+- The `dao/sde/` loaders read the typed `sde.*` tables, and the raw `sde_native` / `sde_compat` `jsonb` tables only for data that has no typed table yet. Load only the tables and fields the server reads; a new static read adds a field to a dataset in `sde/`, never a runtime query.
 - Never edit the dumps under `db/` by hand. Regenerate them with `scripts/db-dump.ps1`, in a commit of their own.
 - Persist what players would expect to survive a restart. If state is kept in memory on purpose, say so in the module docs.
 
