@@ -27,7 +27,6 @@ impl NpcCorporations {
         Ok(Self { rows: dao::sde::corporations::load(db).await? })
     }
 
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) fn get(&self, id: i64) -> Option<&NpcCorporation> {
         self.rows.binary_search_by_key(&id, |row| row.corporation_id).ok().map(|index| &self.rows[index])
     }

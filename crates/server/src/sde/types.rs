@@ -17,10 +17,8 @@ pub(crate) struct TypeData {
     pub(crate) portion_size: Option<i32>,
     pub(crate) base_price: Option<f64>,
     pub(crate) published: Option<bool>,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) market_group_id: Option<i32>,
     pub(crate) race_id: Option<i32>,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) icon_id: Option<i32>,
     attributes: Vec<(i32, f64)>, effects: Vec<TypeEffect>,
     modifiers: HashMap<i32, Vec<(usize, usize)>>,
@@ -58,7 +56,6 @@ impl TypeData {
 struct Children { attributes: Vec<(i32, f64)>, effects: Vec<TypeEffect>, materials: Vec<TypeMaterial> }
 pub(crate) struct Types {
     types: Vec<TypeData>, by_id: HashMap<i32, usize>, groups: HashMap<i32, Group>,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     categories: HashMap<i32, Category>,
     group_types: HashMap<i32, Vec<i32>>, category_types: HashMap<i32, Vec<i32>>, orphans: HashMap<i32, Children>,
     modified_attributes: HashSet<i32>,
@@ -100,7 +97,6 @@ impl Types {
     pub(crate) fn iter(&self) -> impl Iterator<Item = &TypeData> { self.types.iter() }
     pub(crate) fn len(&self) -> usize { self.types.len() }
     pub(crate) fn group(&self, id: i32) -> Option<&Group> { self.groups.get(&id) }
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) fn category(&self, id: i32) -> Option<&Category> { self.categories.get(&id) }
     #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) fn group_types(&self, id: i32) -> &[i32] { self.group_types.get(&id).map_or(&[], Vec::as_slice) }

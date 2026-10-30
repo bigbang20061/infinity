@@ -9,7 +9,7 @@
 //! materials from the blueprint's ME, time from its TE and the character's industry
 //! attributes (services::fit), and cost from the estimated item value (adjusted prices) times
 //! the system cost index plus the facility tax, the SCC surcharge and, in high-sec, the
-//! security tax. Blueprint data is the client's own (sde_native.blueprints). Corporation jobs
+//! security tax. Blueprint and station-operation data comes from the immutable typed SDE. Corporation jobs
 //! aren't supported.
 
 use super::contracts::{field, show_items};
@@ -18,7 +18,7 @@ use super::items::load_items;
 use crate::dao::industry::{self as industry_dao, Blueprint, Job};
 use super::fit::{Fit, Key};
 use super::items::{deliver, take_items};
-use super::market::{graph, jumps, lock};
+use super::market::{jumps, lock};
 use super::wallets::debit;
 use super::{db_err, keyval, notify_error, rand01, user_error, value_id_list, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
@@ -27,6 +27,7 @@ use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::{dispatch_world, Outbox};
 use crate::messages;
+use crate::sde::industry::{MANUFACTURING, RESEARCH_TIME, RESEARCH_MATERIAL, COPYING, INVENTION};
 use marshal::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -36,11 +37,6 @@ use tracing::info;
 const COMPLETED_JOB_HISTORY_DAYS: i64 = 90;
 
 // industry.const
-const MANUFACTURING: i32 = 1;
-const RESEARCH_TIME: i32 = 3;
-const RESEARCH_MATERIAL: i32 = 4;
-const COPYING: i32 = 5;
-const INVENTION: i32 = 8;
 const STATUS_DELIVERED: i32 = 101;
 const STATUS_CANCELLED: i32 = 102;
 const MAX_MATERIAL_EFFICIENCY: i32 = 10;
@@ -107,8 +103,18 @@ struct Facility {
 }
 
 impl Facility {
-    fn from_row(r: &tokio_postgres::Row) -> Self {
-        Self { id: r.get("station_id"), type_id: r.get("type_id"), owner: r.get("owner_id"), system: r.get("solar_system_id"), security: r.get("security"), factory: r.get("factory"), laboratory: r.get("laboratory") }
+    fn from_station(sde: &crate::sde::Sde, station: &crate::sde::map::Station) -> Option<Self> {
+        let factory = sde.industry.has_service(station.operation_id, STATION_SERVICE_FACTORY);
+        let laboratory = sde.industry.has_service(station.operation_id, STATION_SERVICE_LABORATORY);
+        Self::from_station_services(station, factory, laboratory)
+    }
+
+    fn from_station_services(station: &crate::sde::map::Station, factory: bool, laboratory: bool) -> Option<Self> {
+        let type_id = station.type_id.expect("SDE industry station has no type_id");
+        let system = station.solar_system_id.expect("SDE industry station has no solar_system_id");
+        if !factory && !laboratory { return None; }
+        Some(Self { id: station.station_id, type_id, owner: station.owner_id.unwrap_or(0),
+            system, security: station.security.unwrap_or(0.0), factory, laboratory })
     }
 
     fn activities(&self) -> Vec<i32> {
@@ -167,22 +173,9 @@ impl Facility {
     }
 }
 
-const FACILITY_SELECT: &str = "SELECT s.station_id::bigint, s.type_id::bigint, COALESCE(s.owner_id, 0)::bigint AS owner_id, s.solar_system_id::bigint,
-        COALESCE(s.security, 0)::float8 AS security, COALESCE(o.data->'services' @> to_jsonb($1::int), false) AS factory,
-        COALESCE(o.data->'services' @> to_jsonb($2::int), false) AS laboratory
-    FROM sde.sta_stations s LEFT JOIN sde_native.stationoperations o ON o.key = s.operation_id::text";
-
-async fn facilities(db: &(impl Executor + ?Sized), where_sql: &str, arg: i64) -> Result<Vec<Facility>, CallError> {
-    let rows = db.query(&format!("{FACILITY_SELECT} WHERE {where_sql}"), &[&STATION_SERVICE_FACTORY, &STATION_SERVICE_LABORATORY, &arg]).await.map_err(db_err)?;
-    Ok(rows
-        .iter()
-        .map(Facility::from_row)
-        .filter(|f| f.factory || f.laboratory)
-        .collect())
-}
-
-async fn facility(db: &(impl Executor + ?Sized), id: i64) -> Result<Facility, CallError> {
-    facilities(db, "s.station_id = $3::bigint", id).await?.pop().ok_or_else(|| notify_error(messages::NO_INDUSTRIAL_SERVICES))
+fn facility(sde: &crate::sde::Sde, id: i64) -> Result<Facility, CallError> {
+    sde.map.station(id).and_then(|s| Facility::from_station(sde, s))
+        .ok_or_else(|| notify_error(messages::NO_INDUSTRIAL_SERVICES))
 }
 
 /// The owner's materials in their item hangar at a facility: typeID -> quantity.
@@ -256,3 +249,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests;
+

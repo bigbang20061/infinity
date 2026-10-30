@@ -2,142 +2,36 @@
 //! Uses blueprint SDE data and game jobs, items and wallets; corporation jobs are unsupported.
 
 use super::*;
-fn activity_name(activity: i32) -> Option<&'static str> {
-    Some(match activity {
-        MANUFACTURING => "manufacturing",
-        RESEARCH_TIME => "research_time",
-        RESEARCH_MATERIAL => "research_material",
-        COPYING => "copying",
-        INVENTION => "invention",
-        _ => return None,
-    })
-}
+use crate::sde::{Sde, industry::Activity};
 
-/// A blueprint type's activity (sde_native.blueprints `activities.<name>`).
-struct Activity {
-    time: f64,
-    materials: Vec<(i32, i64)>,
-    /// (typeID, quantity, probability)
-    products: Vec<(i32, i64, f64)>,
-    skills: Vec<(i32, i32)>,
-    max_production_limit: i32,
-}
-
-struct ActivityHeadRow {
-    time: Option<f64>,
-    max_production_limit: i32,
-}
-
-impl ActivityHeadRow {
-    fn from_row(row: &tokio_postgres::Row) -> Self {
-        Self { time: row.get("time"), max_production_limit: row.get("max_production_limit") }
-    }
-}
-
-struct ActivityPartRow {
-    type_id: i32,
-    quantity: i64,
-    level: i32,
-    probability: f64,
-}
-
-impl ActivityPartRow {
-    fn from_row(row: &tokio_postgres::Row) -> Self {
-        Self { type_id: row.get("type_id"), quantity: row.get("quantity"), level: row.get("level"), probability: row.get("probability") }
-    }
-}
-
-async fn activity(db: &(impl Executor + ?Sized), bp_type: i32, activity: i32) -> Result<Option<Activity>, CallError> {
-    let Some(name) = activity_name(activity) else { return Ok(None) };
-    let key = bp_type.to_string();
-    let Some(head) = db
-        .query_opt(
-            "SELECT (data->'activities'->$2->>'time')::float8 AS time, COALESCE((data->>'maxProductionLimit')::int, 1) AS max_production_limit
-             FROM sde_native.blueprints WHERE key = $1 AND data->'activities' ? $2",
-            &[&key, &name],
-        )
-        .await
-        .map_err(db_err)?
-    else {
-        return Ok(None);
-    };
-    let list = |part: &str| {
-        format!(
-            "SELECT (e->>'typeID')::int AS type_id, COALESCE((e->>'quantity')::bigint, 1) AS quantity, COALESCE((e->>'level')::int, 0) AS level, COALESCE((e->>'probability')::float8, 1) AS probability
-             FROM sde_native.blueprints b, jsonb_array_elements(COALESCE(b.data->'activities'->$2->'{part}', '[]')) e WHERE b.key = $1"
-        )
-    };
-    let materials = db.query(&list("materials"), &[&key, &name]).await.map_err(db_err)?;
-    let products = db.query(&list("products"), &[&key, &name]).await.map_err(db_err)?;
-    let skills = db.query(&list("skills"), &[&key, &name]).await.map_err(db_err)?;
-    let head = ActivityHeadRow::from_row(&head);
-    Ok(Some(Activity {
-        time: head.time.unwrap_or(0.0),
-        materials: materials.iter().map(ActivityPartRow::from_row).map(|r| (r.type_id, r.quantity)).collect(),
-        products: products.iter().map(ActivityPartRow::from_row).map(|r| (r.type_id, r.quantity, r.probability)).collect(),
-        skills: skills.iter().map(ActivityPartRow::from_row).map(|r| (r.type_id, r.level)).collect(),
-        max_production_limit: head.max_production_limit,
-    }))
-}
 
 /// industryCommon.GetBlueprintPrice: the adjusted value of what the blueprint's manufacturing
 /// takes, at base quantities (the estimated item value of one run).
-async fn blueprint_price(db: &(impl Executor + ?Sized), bp_type: i32) -> Result<f64, CallError> {
-    let Some(m) = activity(db, bp_type, MANUFACTURING).await? else { return Ok(0.0) };
+async fn blueprint_price(db: &(impl Executor + ?Sized), sde: &Sde, bp_type: i32) -> Result<f64, CallError> {
+    let Some(m) = sde.industry.activity(bp_type, MANUFACTURING) else { return Ok(0.0) };
     let ids: Vec<i32> = m.materials.iter().map(|(t, _)| *t).collect();
     let price = industry_dao::prices(db, &ids).await.map_err(db_err)?;
     Ok(m.materials.iter().map(|(t, q)| price.get(t).copied().unwrap_or(0.0) * *q as f64).sum())
 }
 
-async fn blueprint(db: &(impl Executor + ?Sized), item_id: i64) -> Result<Blueprint, CallError> {
-    industry_dao::blueprint(db, item_id).await.map_err(db_err)?
-        .ok_or_else(|| user_error(messages::MSG_BLUEPRINT_NOT_FOUND, vec![]))
+async fn blueprint(db: &(impl Executor + ?Sized), sde: &Sde, item_id: i64) -> Result<Blueprint, CallError> {
+    let mut bp = industry_dao::blueprint(db, item_id).await.map_err(db_err)?
+        .ok_or_else(|| user_error(messages::MSG_BLUEPRINT_NOT_FOUND, vec![]))?;
+    bp.station = bp.station.filter(|id| sde.map.station(*id).is_some());
+    Ok(bp)
 }
 
 async fn set_blueprint(db: &(impl Executor + ?Sized), item_id: i64, me: i32, te: i32, runs: i32) -> Result<(), CallError> {
     industry_dao::set_blueprint(db, item_id, me, te, runs).await.map_err(db_err)
 }
 
-struct AttributeRow {
-    attribute_id: i32,
-    value: f64,
-}
-
-impl AttributeRow {
-    fn from_row(r: &tokio_postgres::Row) -> Self {
-        Self { attribute_id: r.get("attribute_id"), value: r.get("value") }
-    }
-}
-
-struct ValueRow { value: f64 }
-impl ValueRow {
-    fn from_row(r: &tokio_postgres::Row) -> Self { Self { value: r.get("value") } }
-}
-
-struct GroupRow { group_id: Option<i32> }
-impl GroupRow {
-    fn from_row(r: &tokio_postgres::Row) -> Self { Self { group_id: r.get("group_id") } }
-}
-
-/// Decryptor bonuses (inventionPropabilityMultiplier, ME, TE, max runs) of an invention input.
-async fn decryptor(db: &(impl Executor + ?Sized), type_id: i32) -> Result<(f64, i32, i32, i32), CallError> {
-    let rows = db
-        .query(
-            "SELECT attribute_id, value FROM sde.type_attributes WHERE type_id = $1 AND attribute_id = ANY($2)",
-            &[&type_id, &vec![ATTR_INVENTION_PROBABILITY_MULTIPLIER, ATTR_INVENTION_ME_MODIFIER, ATTR_INVENTION_TE_MODIFIER, ATTR_INVENTION_MAX_RUN_MODIFIER]],
-        )
-        .await
-        .map_err(db_err)?;
-    let attr = |a: i32, d: f64| rows.iter().find_map(|r| {
-        let r = AttributeRow::from_row(r);
-        (r.attribute_id == a).then_some(r.value)
-    }).unwrap_or(d);
-    Ok((
-        attr(ATTR_INVENTION_PROBABILITY_MULTIPLIER, 1.0),
-        attr(ATTR_INVENTION_ME_MODIFIER, 0.0) as i32,
-        attr(ATTR_INVENTION_TE_MODIFIER, 0.0) as i32,
-        attr(ATTR_INVENTION_MAX_RUN_MODIFIER, 0.0) as i32,
-    ))
+/// Decryptor bonuses from explicitly present type attributes.
+fn decryptor(sde: &Sde, type_id: i32) -> (f64, i32, i32, i32) {
+    let attr = |a, d| sde.types.attribute(type_id, a).unwrap_or(d);
+    (attr(ATTR_INVENTION_PROBABILITY_MULTIPLIER, 1.0),
+     attr(ATTR_INVENTION_ME_MODIFIER, 0.0) as i32,
+     attr(ATTR_INVENTION_TE_MODIFIER, 0.0) as i32,
+     attr(ATTR_INVENTION_MAX_RUN_MODIFIER, 0.0) as i32)
 }
 
 /// What a job will take, how long and what it costs, as the industry package computes it.
@@ -152,6 +46,7 @@ struct Plan {
 #[allow(clippy::too_many_arguments)]
 async fn plan(
     db: &(impl Executor + ?Sized),
+    sde: &Sde,
     fit: &Fit,
     skills: &HashMap<i32, i32>,
     bp: &Blueprint,
@@ -180,7 +75,7 @@ async fn plan(
         let base = act.products.iter().map(|p| p.2).sum::<f64>() / act.products.len().max(1) as f64;
         let skill_bonus = 1.0 + act.skills.iter().map(|(s, _)| level(*s) * INVENTION_SKILL_PROBABILITY).sum::<f64>();
         let decryptor_multiplier = match optional {
-            Some(d) => decryptor(db, d).await?.0,
+            Some(d) => decryptor(sde, d).0,
             None => 1.0,
         };
         probability = (base * skill_bonus * decryptor_multiplier).clamp(0.0, 1.0);
@@ -215,11 +110,7 @@ async fn plan(
             seconds *= 1.0 - bp.te as f64 / 100.0;
             seconds *= char_attr(ATTR_MANUFACTURE_TIME_MULTIPLIER);
             for (skill, _) in &act.skills {
-                let per_level: Option<f64> = db
-                    .query_opt("SELECT value FROM sde.type_attributes WHERE type_id = $1 AND attribute_id = $2", &[skill, &ATTR_MANUFACTURE_TIME_PER_LEVEL])
-                    .await
-                    .map_err(db_err)?
-                    .map(|r| ValueRow::from_row(&r).value);
+                let per_level = sde.types.attribute(*skill, ATTR_MANUFACTURE_TIME_PER_LEVEL);
                 if let Some(p) = per_level {
                     seconds *= 1.0 + p * level(*skill) / 100.0;
                 }
@@ -244,11 +135,11 @@ async fn plan(
         _ => None,
     };
     let job_cost = match activity_id {
-        MANUFACTURING => blueprint_price(db, bp.type_id).await? * runs as f64,
-        COPYING => blueprint_price(db, bp.type_id).await? * COST_PERCENTAGE * licensed_runs as f64 * runs as f64,
-        RESEARCH_TIME | RESEARCH_MATERIAL if act.time > 0.0 => blueprint_price(db, bp.type_id).await? * COST_PERCENTAGE * base_seconds / act.time,
+        MANUFACTURING => blueprint_price(db, sde, bp.type_id).await? * runs as f64,
+        COPYING => blueprint_price(db, sde, bp.type_id).await? * COST_PERCENTAGE * licensed_runs as f64 * runs as f64,
+        RESEARCH_TIME | RESEARCH_MATERIAL if act.time > 0.0 => blueprint_price(db, sde, bp.type_id).await? * COST_PERCENTAGE * base_seconds / act.time,
         INVENTION => match product {
-            Some(p) => blueprint_price(db, p).await? * COST_PERCENTAGE * runs as f64,
+            Some(p) => blueprint_price(db, sde, p).await? * COST_PERCENTAGE * runs as f64,
             None => 0.0,
         },
         _ => 0.0,
@@ -268,7 +159,6 @@ pub(super) async fn job_counts(db: &(impl Executor + ?Sized), installer: i64) ->
 /// `InstallJob(job.dump())` -> jobID.
 pub(super) async fn install(c: &Client, request: &Value) -> CallResult {
     let (db, world) = (&c.db, &*c.world);
-    let sde = &c.sde;
     let me = c.session.int("charid").unwrap_or(0);
     let int = |k: &str| request.get(k).filter(|v| !v.is_none()).and_then(|v| v.as_int());
     let activity_id = int("activityID").unwrap_or(0) as i32;
@@ -288,17 +178,16 @@ pub(super) async fn install(c: &Client, request: &Value) -> CallResult {
     let product_request = int("productTypeID").map(|p| p as i32);
     let here = c.session.int("solarsystemid2").unwrap_or(0);
     let ship = c.session.int("shipid").unwrap_or(0);
-    let system_graph = graph(db).await?;
     let fit = Arc::new(Fit::load(db, c.sde.clone(), me, ship).await?);
+    let sde = Arc::clone(&c.sde);
     let now = filetime_now();
     let j = db.transaction(
         |tx, outbox: &mut Outbox| {
             let requested = requested.clone();
             let fit = Arc::clone(&fit);
-            let sde = sde.clone();
+            let sde = Arc::clone(&sde);
             Box::pin(async move {
-                let sde = &*sde;
-                let mut bp = blueprint(tx, blueprint_id).await?;
+                let mut bp = blueprint(tx, &sde, blueprint_id).await?;
                 if bp.owner != me {
                     return Err(user_error(messages::MSG_INDUSTRY_BLUEPRINT_ACCESS_DENIED, vec![]));
                 }
@@ -306,14 +195,14 @@ pub(super) async fn install(c: &Client, request: &Value) -> CallResult {
                 if busy {
                     return Err(notify_error(messages::BLUEPRINT_IN_USE));
                 }
-                let fac = facility(tx, facility_id).await?;
+                let fac = facility(&sde, facility_id)?;
                 if !fac.activities().contains(&activity_id) {
                     return Err(notify_error(messages::INDUSTRY_ACTIVITY_UNAVAILABLE));
                 }
                 if bp.station != Some(fac.id) {
                     return Err(notify_error(messages::BLUEPRINT_MUST_BE_AT_FACILITY));
                 }
-                let Some(act) = activity(tx, bp.type_id, activity_id).await? else {
+                let Some(act) = sde.industry.activity(bp.type_id, activity_id) else {
                     return Err(notify_error(messages::BLUEPRINT_ACTIVITY_INVALID));
                 };
                 // Originals research and copy; only copies are invented from.
@@ -337,7 +226,7 @@ pub(super) async fn install(c: &Client, request: &Value) -> CallResult {
                 // Remote jobs need Supply Chain Management / Scientific Networking.
                 let reach_skill = if activity_id == MANUFACTURING { SKILL_SUPPLY_CHAIN_MANAGEMENT } else { SKILL_SCIENTIFIC_NETWORKING };
                 let reach = DISTANCE_PER_LEVEL[skills.get(&reach_skill).copied().unwrap_or(0).clamp(0, 5) as usize];
-                if jumps(system_graph, here, fac.system, reach).is_none() {
+                if jumps(&sde.map, here, fac.system, reach).is_none() {
                     return Err(notify_error(messages::FACILITY_OUTSIDE_REMOTE_INDUSTRY_RANGE));
                 }
                 let slots = if activity_id == MANUFACTURING {
@@ -358,11 +247,7 @@ pub(super) async fn install(c: &Client, request: &Value) -> CallResult {
                 let optional = if activity_id == INVENTION {
                     let mut decryptor = None;
                     for t in requested.keys() {
-                        let group: Option<i32> = tx
-                            .query_opt("SELECT group_id FROM sde.inv_types WHERE type_id = $1", &[t])
-                            .await
-                            .map_err(db_err)?
-                            .and_then(|r| GroupRow::from_row(&r).group_id);
+                        let group = sde.types.get(*t).and_then(|r| r.group_id);
                         if group == Some(GROUP_DECRYPTORS) {
                             decryptor = Some(*t);
                         }
@@ -371,7 +256,7 @@ pub(super) async fn install(c: &Client, request: &Value) -> CallResult {
                 } else {
                     None
                 };
-                let p = plan(tx, &fit, &skills, &bp, &act, activity_id, runs, licensed_runs, product_request, optional, &fac).await?;
+                let p = plan(tx, &sde, &fit, &skills, &bp, act, activity_id, runs, licensed_runs, product_request, optional, &fac).await?;
 
                 let have = available(tx, me, fac.id).await?;
                 if let Some((t, q)) = p.materials.iter().find(|(t, q)| have.get(t).copied().unwrap_or(0) < *q) {
@@ -380,7 +265,7 @@ pub(super) async fn install(c: &Client, request: &Value) -> CallResult {
                 debit(tx, outbox, me, p.total_cost).await?;
                 for (type_id, quantity) in &p.materials {
                     let mut left = *quantity;
-                    let stacks = load_items(tx, sde, ItemQuery::OwnerLocationFlagTypeStackAscending(me, fac.id, FLAG_HANGAR, *type_id)).await.map_err(db_err)?;
+                    let stacks = load_items(tx, &sde, ItemQuery::OwnerLocationFlagTypeStackAscending(me, fac.id, FLAG_HANGAR, *type_id)).await.map_err(db_err)?;
                     for s in stacks {
                         if left == 0 {
                             break;
@@ -394,10 +279,10 @@ pub(super) async fn install(c: &Client, request: &Value) -> CallResult {
                 if !bp.singleton {
                     let location = industry_dao::item_location(tx, bp.item_id).await.map_err(db_err)?;
                     if bp.quantity > 1 {
-                        let stack = load_items(tx, sde, ItemQuery::Id(bp.item_id)).await.map_err(db_err)?.pop().ok_or_else(|| user_error(messages::MSG_BLUEPRINT_NOT_FOUND, vec![]))?;
+                        let stack = load_items(tx, &sde, ItemQuery::Id(bp.item_id)).await.map_err(db_err)?.pop().ok_or_else(|| user_error(messages::MSG_BLUEPRINT_NOT_FOUND, vec![]))?;
                         take_items(tx, outbox, stack, 1).await?;
                         bp.item_id = crate::dao::items::creation::rookie_ship(tx, bp.type_id, me, location, FLAG_HANGAR).await.map_err(db_err)?;
-                        show_items(tx, sde, outbox, me, location, &[bp.item_id], LOCATION_JUNKYARD).await?;
+                        show_items(tx, &sde, outbox, me, location, &[bp.item_id], LOCATION_JUNKYARD).await?;
                     } else {
                         industry_dao::make_singleton(tx, bp.item_id).await.map_err(db_err)?;
                     }
@@ -462,13 +347,13 @@ async fn make_copies<X: Send>(db: &(impl Executor + ?Sized), sde: &crate::sde::S
 }
 
 /// Deliver a finished job's output to the owner's hangar at the facility.
-async fn deliver_job<X: Send>(db: &(impl Executor + ?Sized), sde: &crate::sde::Sde, outbox: &mut Outbox<X>, j: &mut Job, by: i64, invention_successful: i32, completed: i64) -> Result<(), CallError> {
-    let bp = match blueprint(db, j.blueprint_id).await {
+async fn deliver_job<X: Send>(db: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<X>, j: &mut Job, by: i64, invention_successful: i32, completed: i64) -> Result<(), CallError> {
+    let bp = match blueprint(db, sde, j.blueprint_id).await {
         Ok(bp) => Some(bp),
         Err(CallError::User { .. }) => None,
         Err(error) => return Err(error),
     };
-    let act = activity(db, j.blueprint_type, j.activity).await?;
+    let act = sde.industry.activity(j.blueprint_type, j.activity);
     let mut successful = j.runs;
     match (j.activity, &act) {
         (MANUFACTURING, Some(act)) => {
@@ -502,7 +387,7 @@ async fn deliver_job<X: Send>(db: &(impl Executor + ?Sized), sde: &crate::sde::S
         (INVENTION, Some(act)) => {
             successful = invention_successful;
             let (_, d_me, d_te, d_runs) = match j.optional_type {
-                Some(d) => decryptor(db, d).await?,
+                Some(d) => decryptor(sde, d),
                 None => (1.0, 0, 0, 0),
             };
             if let Some(&(product, per_run, _)) = act.products.iter().find(|p| Some(p.0) == j.product_type).or(act.products.first()) {
@@ -536,7 +421,6 @@ async fn deliver_job<X: Send>(db: &(impl Executor + ?Sized), sde: &crate::sde::S
 
 pub(super) async fn complete(c: &Client, id: i64) -> Result<(), CallError> {
     let (db, world) = (&c.db, &*c.world);
-    let sde = &c.sde;
     let me = c.session.int("charid").unwrap_or(0);
     let _trading = lock().await;
     let j = job(db, id).await?;
@@ -551,13 +435,13 @@ pub(super) async fn complete(c: &Client, id: i64) -> Result<(), CallError> {
     }
     let successful = if j.activity == INVENTION { (0..j.runs).filter(|_| rand01() < j.probability).count() as i32 } else { j.runs };
     let completed = filetime_now();
+    let sde = Arc::clone(&c.sde);
     let delivered = db.transaction(
         |tx, outbox: &mut Outbox| {
             let mut j = j.clone();
-            let sde = sde.clone();
+            let sde = Arc::clone(&sde);
             Box::pin(async move {
-                let sde = &*sde;
-                deliver_job(tx, sde, outbox, &mut j, me, successful, completed).await?;
+                deliver_job(tx, &sde, outbox, &mut j, me, successful, completed).await?;
                 Ok(j)
             })
         },
@@ -566,4 +450,5 @@ pub(super) async fn complete(c: &Client, id: i64) -> Result<(), CallError> {
     info!("industry: job {} delivered ({}/{} runs)", delivered.id, delivered.successful_runs.unwrap_or(0), delivered.runs);
     Ok(())
 }
+
 

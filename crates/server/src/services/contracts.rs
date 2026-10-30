@@ -17,6 +17,7 @@
 //! supported yet.
 //! Contract lifecycle mutations and stack splits commit their database changes atomically;
 //! their notifications are delivered only after commit.
+//! Contract and item state comes from game tables; station ancestry comes from the loaded SDE.
 
 mod lifecycle;
 mod lists;
@@ -37,6 +38,7 @@ use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::{dispatch_world, Outbox};
 use crate::messages;
+use crate::sde::Sde;
 use crate::space::World;
 use marshal::{DbRowDescriptor, DbType, Value};
 use std::collections::HashMap;
@@ -123,8 +125,10 @@ impl Contract {
         self.assignee == 0 || self.assignee == char_id || self.assignee == corp_id
     }
 
-    fn keyval(&self) -> Value {
+    fn keyval(&self, sde: &Sde) -> Value {
         let int = Value::Int;
+        let start = sde.map.station(self.start);
+        let end = sde.map.station(self.end);
         keyval([
             ("contractID", int(self.id)),
             ("type", int(self.kind as i64)),
@@ -144,11 +148,11 @@ impl Contract {
             ("numDays", int(self.num_days as i64)),
             ("expires", int(self.accepted + self.num_days as i64 * FILETIME_DAY)),
             ("startStationID", int(self.start)),
-            ("startSolarSystemID", int(self.start_system)),
-            ("startRegionID", int(self.start_region)),
+            ("startSolarSystemID", int(start.and_then(|s| s.solar_system_id).unwrap_or(0))),
+            ("startRegionID", int(start.and_then(|s| s.region_id).unwrap_or(0))),
             ("endStationID", int(self.end)),
-            ("endSolarSystemID", int(self.end_system)),
-            ("endRegionID", int(self.end_region)),
+            ("endSolarSystemID", int(end.and_then(|s| s.solar_system_id).unwrap_or(0))),
+            ("endRegionID", int(end.and_then(|s| s.region_id).unwrap_or(0))),
             ("price", Value::Float(self.price)),
             ("reward", Value::Float(self.reward)),
             ("collateral", Value::Float(self.collateral)),
@@ -215,14 +219,14 @@ async fn bids_of(db: &Db, ids: &[i64]) -> Result<HashMap<i64, Vec<Value>>, CallE
 }
 
 /// `KeyVal(contract, items, bids)` per contract (GetContract, SearchContracts).
-async fn bundles(db: &Db, list: &[Contract]) -> Result<Vec<Value>, CallError> {
+async fn bundles(db: &Db, sde: &Sde, list: &[Contract]) -> Result<Vec<Value>, CallError> {
     let ids: Vec<i64> = list.iter().map(|k| k.id).collect();
     let (mut items, mut bids) = (items_of(db, &ids).await?, bids_of(db, &ids).await?);
     Ok(list
         .iter()
         .map(|k| {
             keyval([
-                ("contract", k.keyval()),
+                ("contract", k.keyval(sde)),
                 ("items", Value::List(items.remove(&k.id).unwrap_or_default())),
                 ("bids", Value::List(bids.remove(&k.id).unwrap_or_default())),
             ])
@@ -231,11 +235,11 @@ async fn bundles(db: &Db, list: &[Contract]) -> Result<Vec<Value>, CallError> {
 }
 
 /// `KeyVal(contracts, items={contractID: items})` (the my-contracts lists).
-async fn listing(db: &Db, list: &[Contract]) -> CallResult {
+async fn listing(db: &Db, sde: &Sde, list: &[Contract]) -> CallResult {
     let ids: Vec<i64> = list.iter().map(|k| k.id).collect();
     let items = items_of(db, &ids).await?;
     Ok(keyval([
-        ("contracts", Value::list(list.iter().map(Contract::keyval))),
+        ("contracts", Value::list(list.iter().map(|k| k.keyval(sde)))),
         ("items", Value::Dict(items.into_iter().map(|(id, v)| (Value::Int(id), Value::List(v))).collect())),
     ]))
 }
@@ -338,7 +342,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             None => Err(notify_error(messages::CONTRACT_CREATION_REQUEST_MISSING)),
         },
         "GetContract" => match contract(&c.db, int(0)).await {
-            Ok(k) => bundles(&c.db, &[k]).await.map(|mut b| b.pop().unwrap_or(Value::None)),
+            Ok(k) => bundles(&c.db, &c.sde, &[k]).await.map(|mut b| b.pop().unwrap_or(Value::None)),
             Err(e) => Err(e),
         },
         "AcceptContract" if for_corp(1) => Err(notify_error(messages::CORPORATION_CONTRACTS_UNSUPPORTED)),
@@ -371,18 +375,18 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         }
         "SearchContracts" => search(c, call.kwargs).await,
         "GetContractListForOwner" => list_for_owner(c, call).await,
-        "GetMyBids" if for_corp(0) => listing(&c.db, &[]).await,
+        "GetMyBids" if for_corp(0) => listing(&c.db, &c.sde, &[]).await,
         "GetMyBids" => match bidding_on(&c.db, me).await {
-            Ok(list) => listing(&c.db, &list).await,
+            Ok(list) => listing(&c.db, &c.sde, &list).await,
             Err(e) => Err(e),
         },
-        "GetMyExpiredContractList" if for_corp(0) => listing(&c.db, &[]).await,
+        "GetMyExpiredContractList" if for_corp(0) => listing(&c.db, &c.sde, &[]).await,
         "GetMyExpiredContractList" => match needing_attention(&c.db, me).await {
-            Ok(list) => listing(&c.db, &list).await,
+            Ok(list) => listing(&c.db, &c.sde, &list).await,
             Err(e) => Err(e),
         },
         // GetMyCurrentContractList(isAccepted, forCorp)
-        "GetMyCurrentContractList" if for_corp(1) => listing(&c.db, &[]).await,
+        "GetMyCurrentContractList" if for_corp(1) => listing(&c.db, &c.sde, &[]).await,
         "GetMyCurrentContractList" => {
             let list = if for_corp(0) {
                 in_progress(&c.db, me).await
@@ -390,7 +394,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                 query::list(&c.db, Filter::Issuer(me, STATUS_OUTSTANDING)).await.map_err(db_err)
             };
             match list {
-                Ok(list) => listing(&c.db, &list).await,
+                Ok(list) => listing(&c.db, &c.sde, &list).await,
                 Err(e) => Err(e),
             }
         }
@@ -414,7 +418,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         // GetCourierContractFromItemID(wrapItemID) -> the contract, or None
         "GetCourierContractFromItemID" => {
             match query::list(&c.db, Filter::Package(int(0), STATUS_IN_PROGRESS)).await.map_err(db_err) {
-                Ok(mut list) => Ok(list.pop().map(|k| k.keyval()).unwrap_or(Value::None)),
+                Ok(mut list) => Ok(list.pop().map(|k| k.keyval(&c.sde)).unwrap_or(Value::None)),
                 Err(e) => Err(e),
             }
         }
@@ -422,3 +426,4 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         _ => return None,
     })
 }
+

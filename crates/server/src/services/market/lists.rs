@@ -1,6 +1,7 @@
 //! Market order and transaction list formatting for marketProxy
-//! (`eve/client/script/ui/services/marketsvc.py`), backed by market DAO queries.
-//! Matching, order mutation and notification dispatch are handled separately.
+//! (`eve/client/script/ui/services/marketsvc.py`), backed by market DAO queries and
+//! the startup-loaded SDE map. Matching, order mutation and notification dispatch
+//! are handled separately.
 use super::*;
 /// Columns of an order row; the client sets `jumps` itself (RefreshJumps).
 fn order_header() -> DbRowDescriptor {
@@ -61,7 +62,6 @@ pub(super) async fn best_asks(c: &Client, area: Area, id: i64, as_rows: bool) ->
 pub(super) async fn my_orders(c: &Client) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
     let here = c.session.int("solarsystemid2").unwrap_or(0);
-    let g = graph(&c.db).await?;
     let rows = orders::my_orders(&c.db, me, today()).await.map_err(db_err)?;
     let header = DbRowDescriptor::new([
         ("orderID", DbType::I8),
@@ -106,7 +106,7 @@ pub(super) async fn my_orders(c: &Client) -> CallResult {
                 Value::Bool(false),
                 Value::Float(o.escrow),
                 Value::Int(ACCOUNT_CASH as i64),
-                Value::Int(jumps(g, here, o.at.system, UNREACHABLE).unwrap_or(UNREACHABLE)),
+                Value::Int(jumps(&c.sde.map, here, o.at.system, UNREACHABLE).unwrap_or(UNREACHABLE)),
             ])
         })
         .collect();

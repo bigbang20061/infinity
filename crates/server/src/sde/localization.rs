@@ -4,7 +4,6 @@
 
 use crate::{dao, db::Db};
 
-#[expect(dead_code, reason = "read by Phase 1 of #5")]
 pub(crate) struct LocalizedText {
     pub id: i64,
     pub text: Option<String>,
@@ -26,7 +25,6 @@ impl Localization {
         self.english.binary_search_by_key(&id, |row| row.id).ok().and_then(|index| self.english[index].text.as_deref())
     }
 
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) fn chinese(&self, id: i64) -> Option<&str> {
         self.chinese.binary_search_by_key(&id, |row| row.id).ok().and_then(|index| self.chinese[index].text.as_deref())
     }

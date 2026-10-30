@@ -5,7 +5,6 @@
 //! DAO. Balance notifications include `userid`; clients cannot display oversized
 //! balances exactly.
 use super::*;
-use crate::dao::store::catalogue::{TYPE_INFO_COLUMNS, TYPE_INFO_JOINS};
 const PLX: &str = "PLX";
 const TYPE_PLEX: i32 = 44992;
 const PERIOD_DAY: i64 = 1;
@@ -38,11 +37,22 @@ struct Catalogue {
     categories: Vec<Category>,
     offers: Vec<Offer>,
 }
+fn service_price(average: Option<f64>, plex_isk: f64, list_price: i64) -> i64 {
+    average.filter(|p| crate::dao::store::catalogue::positive_price(*p)).map(|p| ((p / plex_isk).round() as i64).max(1)).unwrap_or(list_price)
+}
+
 
 async fn build_catalogue(c: &Client) -> Result<Catalogue, CallError> {
-    let db = &c.db;
-    let plex_isk = crate::dao::store::catalogue::plex_price(db, TYPE_PLEX).await.map_err(db_err)?.unwrap_or(23_500_000.0);
+    let prices = crate::dao::store::catalogue::prices(&c.db).await.map_err(db_err)?;
+    let plex_isk = prices.get(&TYPE_PLEX).copied().unwrap_or(23_500_000.0);
     let to_plex = |isk: f64| ((isk / plex_isk).round() as i64).max(1);
+    let sde = &c.sde;
+    let presentation = |type_id: i32| -> Result<(String, String), CallError> {
+        let t = sde.types.get(type_id).ok_or_else(|| db_err(anyhow::anyhow!("missing store type {type_id}")))?;
+        let name = sde.store.presentation(type_id).and_then(|p| p.name_id).and_then(|id| sde.localization.chinese(id)).or(t.name.as_deref()).expect("store type has no localized or typed name");
+        let image = t.icon_id.and_then(|id| sde.store.icon(id)).unwrap_or("");
+        Ok((name.to_owned(), image.to_owned()))
+    };
     let mut cat = Catalogue::default();
     let mut root = |id: i64, name: &str, home: bool| cat.categories.push(Category { id, name: name.into(), parent: None, home });
     root(62, messages::DAILY_GIFT_CATEGORY_NAME, true);
@@ -61,16 +71,13 @@ async fn build_catalogue(c: &Client) -> Result<Catalogue, CallError> {
     }
 
     // Daily free gift.
-    let row = db
-        .query_one(&format!("SELECT {TYPE_INFO_COLUMNS} FROM sde.inv_types t {TYPE_INFO_JOINS} WHERE t.type_id = $1"), &[&DAILY_GIFT_TYPE])
-        .await
-        .map_err(db_err)?;
+    let (name, image) = presentation(DAILY_GIFT_TYPE)?;
     cat.offers.push(Offer {
         id: DAILY_GIFT_OFFER,
         type_id: DAILY_GIFT_TYPE,
         quantity: 1,
-        name: row.get("name"),
-        image: row.get("image"),
+        name,
+        image,
         category: 6201,
         price: 0,
         daily: true,
@@ -78,55 +85,52 @@ async fn build_catalogue(c: &Client) -> Result<Catalogue, CallError> {
 
     // Skill services: retail price where it traded, else the store's list price.
     for (type_id, list_price) in [(40520, 250), (45635, 50), (34133, 485)] {
-        let row = crate::dao::store::catalogue::service(db, type_id).await.map_err(db_err)?;
-        let price = row.average.map(to_plex).unwrap_or(list_price);
-        cat.offers.push(Offer { id: type_id as i64, type_id, quantity: 1, name: row.name, image: row.image, category: 201, price, daily: false });
+        let (name, image) = presentation(type_id)?;
+        let price = service_price(prices.get(&type_id).copied(), plex_isk, list_price);
+        cat.offers.push(Offer { id: type_id as i64, type_id, quantity: 1, name, image, category: 201, price, daily: false });
     }
 
     // Permanent SKINs visible on Serenity that traded there, by the hull's race.
-    let rows = crate::dao::store::catalogue::skins(db).await.map_err(db_err)?;
-    for r in rows {
-        let category = match r.race_id {
-            4 => 101,
-            1 => 102,
-            8 => 103,
-            2 => 104,
-            _ => 105,
-        };
-        let type_id = r.type_id;
-        cat.offers.push(Offer { id: type_id as i64, type_id, quantity: 1, name: r.name, image: r.image, category, price: to_plex(r.average), daily: false });
+    for r in sde.store.skins() {
+        let Some(t) = sde.types.get(r.type_id).filter(|t| t.published == Some(true)) else { continue };
+        let Some(average) = prices.get(&t.type_id).copied().filter(|p| crate::dao::store::catalogue::positive_price(*p)) else { continue };
+        let race = r.hull.and_then(|id| sde.types.get(id)).and_then(|h| h.race_id).unwrap_or(0);
+        let category = match race { 4 => 101, 1 => 102, 8 => 103, 2 => 104, _ => 105 };
+        let (name, image) = presentation(t.type_id)?;
+        let type_id = t.type_id;
+        cat.offers.push(Offer { id: type_id as i64, type_id, quantity: 1, name, image, category, price: to_plex(average), daily: false });
     }
 
     // Apparel that traded on Serenity, under its market group's parent (男装, 女装, 饰品...).
-    let rows = crate::dao::store::catalogue::apparel(db, messages::APPAREL_CATEGORY_NAME).await.map_err(db_err)?;
-    for r in rows {
-        let category = 21_000_000 + r.group_id;
+    for t in sde.types.iter().filter(|t| t.published == Some(true)) {
+        if t.category_id.and_then(|id| sde.types.category(id)).and_then(|c| c.name.as_deref()) != Some("Apparel") { continue; }
+        let Some(average) = prices.get(&t.type_id).copied().filter(|p| crate::dao::store::catalogue::positive_price(*p)) else { continue };
+        let Some(group) = t.market_group_id.and_then(|id| sde.store.group(id)) else { continue };
+        let Some(group) = sde.store.group(group.parent.unwrap_or(group.id)) else { continue };
+        let category = 21_000_000 + i64::from(group.id);
         if !cat.categories.iter().any(|c| c.id == category) {
-            sub(&mut cat, category, &r.group_name, 21);
+            let name = group.name_id.and_then(|id| sde.localization.chinese(id)).unwrap_or(messages::APPAREL_CATEGORY_NAME);
+            sub(&mut cat, category, name, 21);
         }
-        let type_id = r.type_id;
-        cat.offers.push(Offer { id: type_id as i64, type_id, quantity: 1, name: r.name, image: r.image, category, price: to_plex(r.average), daily: false });
+        let type_id = t.type_id;
+        let (name, image) = presentation(type_id)?;
+        cat.offers.push(Offer { id: type_id as i64, type_id, quantity: 1, name, image, category, price: to_plex(average), daily: false });
     }
 
     // Crates that traded on Serenity, with their splash art.
-    let rows = crate::dao::store::catalogue::crates(db).await.map_err(db_err)?;
-    for r in rows {
-        let type_id = r.type_id;
-        let image = if r.splash.is_empty() { r.image } else { r.splash };
-        cat.offers.push(Offer { id: type_id as i64, type_id, quantity: 1, name: r.name, image, category: 4901, price: to_plex(r.average), daily: false });
+    for r in sde.store.crates() {
+        let Some(t) = sde.types.get(r.type_id).filter(|t| t.published == Some(true)) else { continue };
+        let Some(average) = prices.get(&t.type_id).copied().filter(|p| crate::dao::store::catalogue::positive_price(*p)) else { continue };
+        let type_id = t.type_id;
+        let (name, image) = presentation(type_id)?;
+        let image = if r.splash.is_empty() { image } else { r.splash.clone() };
+        cat.offers.push(Offer { id: type_id as i64, type_id, quantity: 1, name, image, category: 4901, price: to_plex(average), daily: false });
     }
     info!("store: {} offers in {} categories", cat.offers.len(), cat.categories.len());
     Ok(cat)
 }
 
-async fn catalogue(c: &Client) -> Result<&'static Catalogue, CallError> {
-    static CATALOGUE: OnceLock<Catalogue> = OnceLock::new();
-    if let Some(cat) = CATALOGUE.get() {
-        return Ok(cat);
-    }
-    let built = build_catalogue(c).await?;
-    Ok(CATALOGUE.get_or_init(|| built))
-}
+async fn catalogue(c: &Client) -> Result<Catalogue, CallError> { build_catalogue(c).await }
 fn category_json(cat: &Category) -> Value {
     Value::dict([
         ("id", Value::Int(cat.id)),
@@ -244,3 +248,6 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         _ => return None,
     })
 }
+
+#[cfg(test)] mod tests;
+

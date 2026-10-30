@@ -46,11 +46,8 @@ pub(crate) struct Station {
     pub type_id: Option<i64>,
     pub owner_id: Option<i64>,
     pub solar_system_id: Option<i64>,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub constellation_id: Option<i64>,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub region_id: Option<i64>,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub operation_id: Option<i64>,
     #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub x: Option<f64>,
@@ -58,7 +55,6 @@ pub(crate) struct Station {
     pub y: Option<f64>,
     #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub z: Option<f64>,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub security: Option<f64>,
 }
 pub(crate) struct Celestial {
@@ -94,7 +90,6 @@ pub(crate) struct Map {
     system_stations: HashMap<i64, Vec<usize>>,
     #[expect(dead_code, reason = "read by Phase 1 of #5")]
     owner_stations: HashMap<i64, Vec<usize>>,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     jumps: HashMap<i64, Vec<i64>>,
 }
 
@@ -141,6 +136,5 @@ impl Map {
     pub(crate) fn stations_in_system(&self, system: i64) -> impl Iterator<Item = &Station> { self.system_stations.get(&system).into_iter().flatten().map(|&i| &self.stations[i]) }
     #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) fn stations_by_owner(&self, owner: i64) -> impl Iterator<Item = &Station> { self.owner_stations.get(&owner).into_iter().flatten().map(|&i| &self.stations[i]) }
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) fn jumps(&self, system: i64) -> &[i64] { self.jumps.get(&system).map_or(&[], Vec::as_slice) }
 }

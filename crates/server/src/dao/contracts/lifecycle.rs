@@ -1,5 +1,5 @@
 //! Contract lifecycle persistence for contractProxy (eve/client/script/ui/shared/neocom/contracts).
-//! Uses game contracts, contract items, bids and items, plus SDE item volumes.
+//! Uses game contracts, contract items, bids and items.
 //! Transaction management and contract policy remain in the service.
 
 use crate::db::{Error, executor::Executor};
@@ -42,10 +42,8 @@ pub(crate) async fn insert_requested_item(ex: &(impl Executor + ?Sized), id: i64
     ex.execute("INSERT INTO game.contract_items (contract_id, type_id, quantity, in_crate) VALUES ($1, $2, $3, false)", &[&id, &type_id, &quantity]).await
 }
 
-pub(crate) async fn update_volume(ex: &(impl Executor + ?Sized), id: i64) -> Result<u64, Error> {
-    ex.execute("UPDATE game.contracts SET volume = (SELECT COALESCE(sum(t.volume * ci.quantity), 0) FROM game.contract_items ci
-                                                     JOIN sde.inv_types t USING (type_id) WHERE ci.contract_id = $1 AND ci.in_crate)
-                 WHERE contract_id = $1", &[&id]).await
+pub(crate) async fn update_volume(ex: &(impl Executor + ?Sized), id: i64, volume: f64) -> Result<u64, Error> {
+    ex.execute("UPDATE game.contracts SET volume = $2 WHERE contract_id = $1", &[&id, &volume]).await
 }
 
 pub(crate) struct RequestedItem { pub type_id: i32, pub quantity: i32 }

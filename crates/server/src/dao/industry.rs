@@ -1,7 +1,7 @@
 //! Industry persistence for blueprints, jobs and materials.
 //! The owning services support `eve/client/script/industry`; this DAO has no wire contract.
 //! Uses `game.items`, `game.blueprints`, `game.industry_jobs`, `game.retail_prices`
-//! and `sde.sta_stations`. Corporation jobs are unsupported by the services;
+//! Corporation jobs are unsupported by the services;
 //! policy, transactions and notifications remain with callers. Cancellation is guarded by installed status.
 
 use std::collections::HashMap;
@@ -9,11 +9,10 @@ use crate::consts::{BLUEPRINT_COPY_QUANTITY, BLUEPRINT_INFINITE_RUNS};
 use crate::db::{self, executor::Executor};
 use tokio_postgres::Row;
 
-const BLUEPRINT_SQL: &str = "SELECT i.item_id, i.type_id, i.owner_id, st.station_id::bigint, i.singleton, i.quantity,
+const BLUEPRINT_SQL: &str = "SELECT i.item_id, i.type_id, i.owner_id, COALESCE(loc.location_id, i.location_id)::bigint AS station_id, i.singleton, i.quantity,
                     COALESCE(b.material_efficiency, 0) AS material_efficiency, COALESCE(b.time_efficiency, 0) AS time_efficiency, COALESCE(b.runs, $2) AS runs
              FROM game.items i
              LEFT JOIN game.items loc ON loc.item_id = i.location_id
-             LEFT JOIN sde.sta_stations st ON st.station_id::bigint = COALESCE(loc.location_id, i.location_id)
              LEFT JOIN game.blueprints b ON b.item_id = i.item_id
              WHERE i.item_id = $1";
 const SET_BLUEPRINT_SQL: &str = "INSERT INTO game.blueprints (item_id, material_efficiency, time_efficiency, runs) VALUES ($1, $2, $3, $4)

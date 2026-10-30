@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use crate::{dao::sde::dogma as dao, db::Db};
 
 pub(crate) struct Attribute {
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) attribute_id: i32,
     #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) name: Option<String>,
@@ -58,7 +57,6 @@ impl Dogma {
         let effect = &self.effects[effect];
         (effect, &effect.modifiers[modifier])
     }
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
     pub(crate) fn attributes_by_name<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a Attribute> { self.attribute_names.get(name).into_iter().flatten().map(|&i| &self.attributes[i]) }
     pub(crate) fn effects_by_name<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a Effect> { self.effect_names.get(name).into_iter().flatten().map(|&i| &self.effects[i]) }
     pub(crate) fn attribute_count(&self) -> usize { self.attributes.len() }

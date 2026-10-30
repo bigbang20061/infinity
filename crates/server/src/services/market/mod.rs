@@ -9,8 +9,8 @@
 //! fee, both as marketutil computes them (skilllimits, brokerFee) at zero standings. A sell
 //! order holds its items and a buy order its ISK in escrow until it fills, is cancelled or
 //! expires; closed orders move to game.market_order_history, and every fill is a row of
-//! game.market_transactions (wallet transactions and price history). Ranges in jumps are
-//! counted on the stargate graph (sde.map_jumps) within the region.
+//! game.market_transactions (wallet transactions and price history). Ranges in jumps use
+//! the startup-loaded SDE map. The SQL startup seed is the static-data exception.
 
 use crate::dao::items::loading::ItemQuery;
 use super::items::load_items;
@@ -129,35 +129,17 @@ pub(super) async fn lock() -> tokio::sync::MutexGuard<'static, ()> {
 }
 
 
-pub(super) async fn station(db: &(impl Executor + ?Sized), id: i64) -> Result<Station, CallError> {
-    let r = db
-        .query_opt(
-            "SELECT station_id::bigint, solar_system_id::bigint, constellation_id::bigint, region_id::bigint, COALESCE(owner_id, 0)::bigint AS owner_id
-             FROM sde.sta_stations WHERE station_id = $1::bigint",
-            &[&id],
-        )
-        .await
-        .map_err(db_err)?
-        .ok_or_else(|| notify_error(messages::NO_MARKET_AT_LOCATION))?;
-    Ok(Station { id: r.get("station_id"), system: r.get("solar_system_id"), constellation: r.get("constellation_id"), region: r.get("region_id"), owner: r.get("owner_id") })
+pub(super) fn station(sde: &crate::sde::Sde, id: i64) -> Result<Station, CallError> {
+    let r = sde.map.station(id).ok_or_else(|| notify_error(messages::NO_MARKET_AT_LOCATION))?;
+    Ok(market_station(r))
 }
 
-/// Solar system -> the systems one stargate jump away.
-pub(super) async fn graph(db: &Db) -> Result<&'static HashMap<i64, Vec<i64>>, CallError> {
-    static GRAPH: OnceLock<HashMap<i64, Vec<i64>>> = OnceLock::new();
-    if let Some(g) = GRAPH.get() {
-        return Ok(g);
-    }
-    let rows = db.query("SELECT from_solar_system_id::bigint, to_solar_system_id::bigint FROM sde.map_jumps", &[]).await.map_err(db_err)?;
-    let mut g: HashMap<i64, Vec<i64>> = HashMap::new();
-    for r in &rows {
-        g.entry(r.get("from_solar_system_id")).or_default().push(r.get("to_solar_system_id"));
-    }
-    Ok(GRAPH.get_or_init(|| g))
+fn market_station(r: &crate::sde::map::Station) -> Station {
+    Station { id: r.station_id, system: r.solar_system_id.expect("station solar system is null"), constellation: r.constellation_id.expect("station constellation is null"), region: r.region_id.expect("station region is null"), owner: r.owner_id.unwrap_or(0) }
 }
 
 /// Stargate jumps from `from` to `to`, looking no further than `max`.
-pub(super) fn jumps(g: &HashMap<i64, Vec<i64>>, from: i64, to: i64, max: i64) -> Option<i64> {
+pub(super) fn jumps(g: &crate::sde::map::Map, from: i64, to: i64, max: i64) -> Option<i64> {
     if from == to {
         return Some(0);
     }
@@ -166,7 +148,7 @@ pub(super) fn jumps(g: &HashMap<i64, Vec<i64>>, from: i64, to: i64, max: i64) ->
     for d in 1..=max {
         let mut next = vec![];
         for s in frontier {
-            for &n in g.get(&s).into_iter().flatten() {
+            for &n in g.jumps(s) {
                 if n == to {
                     return Some(d);
                 }
@@ -184,7 +166,7 @@ pub(super) fn jumps(g: &HashMap<i64, Vec<i64>>, from: i64, to: i64, max: i64) ->
 }
 
 /// May an order of `range` placed at `at` trade with something at `other`?
-fn in_range(g: &HashMap<i64, Vec<i64>>, range: i64, at: &Station, other: &Station) -> bool {
+fn in_range(g: &crate::sde::map::Map, range: i64, at: &Station, other: &Station) -> bool {
     match range {
         RANGE_STATION => at.id == other.id,
         RANGE_SOLAR_SYSTEM => at.system == other.system,
@@ -318,7 +300,7 @@ async fn consume<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>,
 
 /// Sell up to `quantity` x `type_id` at `at` to the best bids paying at least `floor`.
 /// Returns how many sold.
-async fn hit_bids(db: &(impl Executor + ?Sized), sde: &crate::sde::Sde, outbox: &mut Outbox<MarketEffect>, g: &HashMap<i64, Vec<i64>>, seller: i64, at: &Station, type_id: i32, floor: f64, quantity: i32, now: i64) -> Result<i32, CallError> {
+async fn hit_bids(db: &(impl Executor + ?Sized), outbox: &mut Outbox<MarketEffect>, sde: &crate::sde::Sde, seller: i64, at: &Station, type_id: i32, floor: f64, quantity: i32, now: i64) -> Result<i32, CallError> {
     let rows = orders::bids(db, now / FILETIME_DAY * FILETIME_DAY, type_id, at.region, floor).await.map_err(db_err)?;
     let tax = skills(db, seller).await?.sales_tax;
     let mut left = quantity;
@@ -326,9 +308,10 @@ async fn hit_bids(db: &(impl Executor + ?Sized), sde: &crate::sde::Sde, outbox: 
         if left == 0 {
             break;
         }
-        if !in_range(g, bid.range, &bid.at, at) {
+        if !in_range(&sde.map, bid.range, &bid.at, at) {
             continue;
         }
+        bid.at.owner = sde.map.station(bid.at.id).and_then(|s| s.owner_id).unwrap_or(0);
         let available = if bid.char_id.is_some() { bid.vol_remaining } else { left };
         let q = left.min(available);
         if q < bid.min_volume && available >= bid.min_volume {
@@ -351,16 +334,17 @@ async fn hit_bids(db: &(impl Executor + ?Sized), sde: &crate::sde::Sde, outbox: 
 /// than `cap`, paying from the wallet unless an order's escrow covers it.
 /// Returns (bought, spent).
 #[allow(clippy::too_many_arguments)]
-async fn lift_asks(db: &(impl Executor + ?Sized), sde: &crate::sde::Sde, outbox: &mut Outbox<MarketEffect>, g: &HashMap<i64, Vec<i64>>, buyer: i64, at: &Station, range: i64, type_id: i32, cap: f64, quantity: i32, from_wallet: bool, now: i64) -> Result<(i32, f64), CallError> {
+async fn lift_asks(db: &(impl Executor + ?Sized), outbox: &mut Outbox<MarketEffect>, sde: &crate::sde::Sde, buyer: i64, at: &Station, range: i64, type_id: i32, cap: f64, quantity: i32, from_wallet: bool, now: i64) -> Result<(i32, f64), CallError> {
     let rows = orders::asks(db, now / FILETIME_DAY * FILETIME_DAY, type_id, at.region, cap).await.map_err(db_err)?;
     let (mut left, mut spent) = (quantity, 0.0);
     for mut ask in rows {
         if left == 0 {
             break;
         }
-        if !in_range(g, range, at, &ask.at) {
+        if !in_range(&sde.map, range, at, &ask.at) {
             continue;
         }
+        ask.at.owner = sde.map.station(ask.at.id).and_then(|s| s.owner_id).unwrap_or(0);
         let available = if ask.char_id.is_some() { ask.vol_remaining } else { left };
         let q = left.min(available);
         let value = round2(ask.price * q as f64);
@@ -390,7 +374,6 @@ async fn lift_asks(db: &(impl Executor + ?Sized), sde: &crate::sde::Sde, outbox:
 #[allow(clippy::too_many_arguments)]
 async fn place_buy(c: &Client, station_id: i64, type_id: i64, price: f64, quantity: i64, range: i64, min_volume: i64, duration: i64) -> CallResult {
     let (db, world) = (&c.db, &*c.world);
-    let sde = &c.sde;
     let me = c.session.int("charid").unwrap_or(0);
     let price = valid_price(price)?;
     if quantity <= 0 || quantity > i32::MAX as i64 || !(0..=MAX_DURATION).contains(&duration) {
@@ -399,18 +382,19 @@ async fn place_buy(c: &Client, station_id: i64, type_id: i64, price: f64, quanti
     let (type_id, quantity) = (type_id as i32, quantity as i32);
     let min_volume = (min_volume.clamp(1, quantity as i64)) as i32;
     let _trading = lock().await;
-    let at = station(db, station_id).await?;
-    let g = graph(db).await?;
+    let at = station(&c.sde, station_id)?;
+    let sde = Arc::clone(&c.sde);
     let now = filetime_now();
-    db.transaction(|db, outbox: &mut Outbox<MarketEffect>| { let sde = sde.clone(); Box::pin(async move {
-    let sde = &*sde;
+    db.transaction(|db, outbox: &mut Outbox<MarketEffect>| {
+    let sde = Arc::clone(&sde);
+    Box::pin(async move {
     let skills = skills(db, me).await?;
     if duration > 0 {
         check_order_slots(db, me, &skills).await?;
         let escrow = round2(price * quantity as f64);
         require_balance(db, me, escrow + broker_fee(skills.broker_fee, escrow)).await?;
     }
-    let (bought, _) = lift_asks(db, sde, outbox, g, me, &at, range, type_id, price, quantity, true, now).await?;
+    let (bought, _) = lift_asks(db, outbox, &sde, me, &at, range, type_id, price, quantity, true, now).await?;
     let mut order = Order {
         id: 0,
         type_id,
@@ -441,25 +425,25 @@ async fn place_buy(c: &Client, station_id: i64, type_id: i64, price: f64, quanti
     outbox.operation(MarketEffect::Placed { buyer: true, owner: me, order: order.id, quantity: order.vol_remaining, type_id, price });
     tell_owner(outbox, &order, "Add");
     Ok(order_keyval(&order))
-    })}, |value, outbox| async move { dispatch_market(value, outbox, world) }).await
+    }) }, |value, outbox| async move { dispatch_market(value, outbox, world) }).await
 }
 
 /// One item of `PlaceMultiSellOrder`: sell to the bids now, and with a duration list the
 /// rest as a sell order. Returns whether anything sold or was listed.
 async fn place_sell(c: &Client, item_id: i64, station_id: i64, type_id: i64, price: f64, quantity: i64, duration: i64) -> Result<bool, CallError> {
     let (db, world) = (&c.db, &*c.world);
-    let sde = &c.sde;
     let me = c.session.int("charid").unwrap_or(0);
     let price = valid_price(price)?;
     if quantity <= 0 || !(0..=MAX_DURATION).contains(&duration) {
         return Err(user_error(messages::MSG_MKT_ORDER_DID_NOT_MATCH, vec![]));
     }
     let _trading = lock().await;
-    let g = graph(db).await?;
+    let sde = Arc::clone(&c.sde);
     let now = filetime_now();
-    db.transaction(|db, outbox: &mut Outbox<MarketEffect>| { let sde = sde.clone(); Box::pin(async move {
-    let sde = &*sde;
-    let item = load_items(db, sde, ItemQuery::Id(item_id)).await.map_err(db_err)?.pop().ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
+    db.transaction(|db, outbox: &mut Outbox<MarketEffect>| {
+    let sde = Arc::clone(&sde);
+    Box::pin(async move {
+    let item = load_items(db, &sde, ItemQuery::Id(item_id)).await.map_err(db_err)?.pop().ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
     if item.owner_id != me || item.location_id != station_id || item.flag_id != FLAG_HANGAR || item.type_id as i64 != type_id {
         return Err(notify_error(messages::MARKET_SELL_ITEM_MUST_BE_IN_STATION_HANGAR));
     }
@@ -467,10 +451,10 @@ async fn place_sell(c: &Client, item_id: i64, station_id: i64, type_id: i64, pri
         return Err(user_error(messages::MSG_REPACKAGE_BEFORE_SELLING, vec![("item".into(), Value::Int(type_id))]));
     }
     let (type_id, quantity) = (item.type_id, quantity.min(item.quantity as i64) as i32);
-    let at = station(db, station_id).await?;
+    let at = station(&sde, station_id)?;
     let skills = skills(db, me).await?;
     if duration == 0 {
-        let sold = hit_bids(db, sde, outbox, g, me, &at, type_id, price, quantity, now).await?;
+        let sold = hit_bids(db, outbox, &sde, me, &at, type_id, price, quantity, now).await?;
         if sold == 0 {
             return Err(user_error(messages::MSG_MKT_ORDER_DID_NOT_MATCH, vec![]));
         }
@@ -497,7 +481,7 @@ async fn place_sell(c: &Client, item_id: i64, station_id: i64, type_id: i64, pri
     require_balance(db, me, broker_fee(skills.broker_fee, price * quantity as f64)).await?;
     // The items go into escrow first; what the bids don't take stays listed.
     take_items(db, outbox, item, quantity).await?;
-    let sold = hit_bids(db, sde, outbox, g, me, &at, type_id, price, quantity, now).await?;
+    let sold = hit_bids(db, outbox, &sde, me, &at, type_id, price, quantity, now).await?;
     let mut order = Order {
         id: 0,
         type_id,
@@ -521,21 +505,21 @@ async fn place_sell(c: &Client, item_id: i64, station_id: i64, type_id: i64, pri
     outbox.operation(MarketEffect::Placed { buyer: false, owner: me, order: order.id, quantity: order.vol_remaining, type_id, price });
     tell_owner(outbox, &order, "Add");
     Ok(true)
-    })}, |value, outbox| async move { dispatch_market(value, outbox, world) }).await
+    }) }, |value, outbox| async move { dispatch_market(value, outbox, world) }).await
 }
 
 /// `ModifyCharOrder`: reprice an open order, paying the modification fee (and topping up or
 /// releasing a buy order's escrow). A price that crosses the book trades at once.
 async fn modify(c: &Client, order_id: i64, new_price: f64) -> CallResult {
     let (db, world) = (&c.db, &*c.world);
-    let sde = &c.sde;
     let me = c.session.int("charid").unwrap_or(0);
     let new_price = valid_price(new_price)?;
     let _trading = lock().await;
-    let g = graph(db).await?;
+    let sde = Arc::clone(&c.sde);
     let now = filetime_now();
-    db.transaction(|db, outbox: &mut Outbox<MarketEffect>| { let sde = sde.clone(); Box::pin(async move {
-    let sde = &*sde;
+    db.transaction(|db, outbox: &mut Outbox<MarketEffect>| {
+    let sde = Arc::clone(&sde);
+    Box::pin(async move {
     let mut o = my_order(db, me, order_id, now / FILETIME_DAY * FILETIME_DAY).await?;
     let skills = skills(db, me).await?;
     let volume = o.vol_remaining as f64;
@@ -553,12 +537,12 @@ async fn modify(c: &Client, order_id: i64, new_price: f64) -> CallResult {
     trading::reprice(db, o.id, o.price, o.escrow, o.issued).await.map_err(db_err)?;
     outbox.operation(MarketEffect::Repriced { owner: me, order: o.id, price: new_price });
     let traded = if o.bid {
-        let (bought, spent) = lift_asks(db, sde, outbox, g, me, &o.at, o.range, o.type_id, o.price, o.vol_remaining, false, now).await?;
+        let (bought, spent) = lift_asks(db, outbox, &sde, me, &o.at, o.range, o.type_id, o.price, o.vol_remaining, false, now).await?;
         // The escrow paid this order's price; cheaper asks leave change.
         credit(db, outbox, me, round2(o.price * bought as f64 - spent)).await?;
         bought
     } else {
-        hit_bids(db, sde, outbox, g, me, &o.at, o.type_id, o.price, o.vol_remaining, now).await?
+        hit_bids(db, outbox, &sde, me, &o.at, o.type_id, o.price, o.vol_remaining, now).await?
     };
     if traded > 0 {
         consume(db, outbox, &mut o, traded, now).await?;
@@ -566,7 +550,7 @@ async fn modify(c: &Client, order_id: i64, new_price: f64) -> CallResult {
         tell_owner(outbox, &o, "Modify");
     }
     Ok(Value::None)
-    })}, |value, outbox| async move { dispatch_market(value, outbox, world) }).await
+    }) }, |value, outbox| async move { dispatch_market(value, outbox, world) }).await
 }
 
 /// `CancelCharOrder`: close an open order and hand back its escrow (the broker's fee stays paid).
@@ -714,3 +698,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         _ => return None,
     })
 }
+
+#[cfg(test)]
+mod tests;
+
