@@ -11,6 +11,7 @@
 
 pub(crate) mod accounts;
 pub(crate) mod alliances;
+pub(crate) mod asteroids;
 pub(crate) mod bills;
 pub(crate) mod bookmarks;
 pub(crate) mod calendar;

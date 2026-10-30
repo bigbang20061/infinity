@@ -13,6 +13,7 @@ pub(crate) mod fit;
 pub(crate) mod fitting;
 pub(crate) mod inventory;
 pub(crate) mod loading;
+pub(crate) mod mining;
 pub(crate) mod positions;
 pub(crate) mod quantities;
 pub(crate) mod ship;
