@@ -5,12 +5,18 @@
 //! Fitting modules themselves is inventory moves into slot flags (inventory.rs) plus
 //! the online state dogma.rs keeps.
 //! Assembly updates packaged source hulls atomically before creating assembled hulls.
+//! Assembly follows menucheckers/itemCheckers.py:93-115 and
+//! eve/client/script/ui/services/menuSvcExtras/invItemFunctions.py:175-177:
+//! current personal station hangar or active ship cargo in space, excluding modular ships in space.
+//! Repackaging follows invItemFunctions.py:544-580 and itemCheckers.py:688-705,953-957:
+//! direct personal hangars at named SDE stations, including remote stations.
+//! Corporation, array and player-structure access is not modeled.
 
 use super::dogma::{load_items, load_items_db, ship_state, wire_quantity};
 use super::inventory::notify_item_change;
 use super::{db_err, keyval, user_error, value_field, value_id_list, value_ids, Call, CallError, CallResult};
 use crate::client::Client;
-use crate::consts::{BLUEPRINT_INFINITE_RUNS, CATEGORY_SHIP, FLAG_HANGAR, INDUSTRY_JOB_STATUS_INSTALLED, IX_LOCATION_ID, IX_SINGLETON, IX_STACK_SIZE};
+use crate::consts::{BLUEPRINT_INFINITE_RUNS, CATEGORY_SHIP, FLAG_CARGO, FLAG_HANGAR, INDUSTRY_JOB_STATUS_INSTALLED, IX_LOCATION_ID, IX_SINGLETON, IX_STACK_SIZE};
 use crate::db::outbox::{dispatch_client, Outbox};
 use marshal::Value;
 use std::collections::BTreeMap;
@@ -18,6 +24,8 @@ use tracing::info;
 
 /// SDE invCategories: Blueprint.
 const CATEGORY_BLUEPRINT: i64 = 9;
+/// SDE invGroups: Strategic Cruiser (inventorycommon/util.py:126-127).
+const GROUP_STRATEGIC_CRUISER: i64 = 963;
 /// Server response limit advertised by blueprintManager.GetLimits.
 const MAX_BLUEPRINT_RESULTS: i64 = 10_000;
 
@@ -64,6 +72,8 @@ fn assembly_source_change(original: i32, remaining: i32) -> Vec<(i64, Value)> {
 /// AssembleShip(itemIDs, name=, subSystems=) -> the assembled ship's itemID (or IDs).
 async fn assemble(c: &mut Client, call: &Call<'_>) -> CallResult {
     let char_id = c.session.int("charid").unwrap_or(0);
+    let station = c.session.int("stationid");
+    let active_ship = c.session.int("shipid");
     let ids = value_ids(call.args.first());
     let name = call.kwargs.get("name").and_then(|v| v.as_text()).map(|t| t.into_owned());
     let db = c.db.clone();
@@ -77,9 +87,23 @@ async fn assemble(c: &mut Client, call: &Call<'_>) -> CallResult {
                 let mut actions = Vec::new();
                 for id in ids {
                     if !sources.contains_key(&id) {
-                        if let Some(item) = load_items_db(tx, "i.item_id = $1 AND i.owner_id = $2", &[&id, &char_id]).await?.into_iter().next() {
-                            sources.insert(id, (item, None::<i32>));
+                        let item = load_items_db(tx, "i.item_id = $1", &[&id]).await?.into_iter().next()
+                            .ok_or_else(|| super::notify_error("该物品已不在原处。"))?;
+                        let valid_source = if let Some(station) = station {
+                            item.location_id == station && item.flag_id == FLAG_HANGAR
+                        } else if Some(item.location_id) == active_ship && item.flag_id == FLAG_CARGO {
+                            let carrier = load_items_db(tx, "i.item_id = $1", &[&item.location_id]).await?.into_iter().next();
+                            carrier.is_some_and(|carrier| carrier.owner_id == char_id && carrier.category_id == CATEGORY_SHIP as i64)
+                        } else {
+                            false
+                        };
+                        if item.owner_id != char_id || !valid_source {
+                            return Err(super::notify_error("该物品已不在原处。"));
                         }
+                        if station.is_none() && item.group_id == GROUP_STRATEGIC_CRUISER && !item.singleton {
+                            return Err(user_error("CantAssembleModularShipInSpace", vec![]));
+                        }
+                        sources.insert(id, (item, None::<i32>));
                     }
                     let Some((item, remaining)) = sources.get_mut(&id) else { continue };
                     if item.category_id != CATEGORY_SHIP as i64 || item.singleton {
@@ -140,23 +164,30 @@ async fn repackage(c: &mut Client, call: &Call<'_>) -> CallResult {
     let active_ship = c.session.int("shipid");
     let mut ids = vec![];
     if let Some(Value::Dict(by_station)) = call.args.first() {
-        for (_, items) in by_station {
+        for (named_station, items) in by_station {
+            let named_station = named_station.as_int().ok_or_else(|| super::notify_error("该物品已不在原处。"))?;
             for pair in items.items().unwrap_or_default() {
-                if let Some(id) = pair.items().and_then(|p| p.first()).and_then(|v| v.as_int()) {
-                    ids.push(id);
-                }
+                let pair = pair.items().unwrap_or_default();
+                let id = pair.first().and_then(|v| v.as_int()).ok_or_else(|| super::notify_error("该物品已不在原处。"))?;
+                let location = pair.get(1).and_then(|v| v.as_int()).ok_or_else(|| super::notify_error("该物品已不在原处。"))?;
+                ids.push((id, location, named_station));
             }
         }
     }
-    let mut planned = std::collections::BTreeSet::new();
-    for id in ids {
+    let mut planned = std::collections::BTreeMap::new();
+    for (id, location, named_station) in ids {
         if Some(id) == active_ship {
             return Err(user_error("CantRepackageActiveShip", vec![]));
         }
-        if planned.contains(&id) {
+        let item = load_items(c, "i.item_id = $1", &[&id]).await?.into_iter().next()
+            .ok_or_else(|| super::notify_error("该物品已不在原处。"))?;
+        if item.owner_id != char_id || item.location_id != named_station || item.location_id != location || item.flag_id != FLAG_HANGAR
+            || c.db.query_opt("SELECT 1 FROM sde.sta_stations WHERE station_id = $1::bigint", &[&named_station]).await.map_err(db_err)?.is_none() {
+            return Err(super::notify_error("该物品已不在原处。"));
+        }
+        if planned.contains_key(&id) {
             continue;
         }
-        let Some(item) = load_items(c, "i.item_id = $1 AND i.owner_id = $2", &[&id, &char_id]).await?.into_iter().next() else { continue };
         if !item.singleton {
             continue;
         }
@@ -167,11 +198,14 @@ async fn repackage(c: &mut Client, call: &Call<'_>) -> CallResult {
                 return Err(CallError::User { msg: "ConfirmRepackageSomethingWithUpgrades".into(), dict: vec![] });
             }
         }
-        planned.insert(id);
+        planned.insert(id, item.location_id);
     }
-    for id in planned {
-        c.db.execute("UPDATE game.items SET singleton = false, online = false, name = NULL WHERE item_id = $1", &[&id])
+    for (id, station) in planned {
+        let changed = c.db.execute("UPDATE game.items SET singleton = false, online = false, name = NULL WHERE item_id = $1 AND owner_id = $2 AND location_id = $3 AND flag_id = $4 AND singleton", &[&id, &char_id, &station, &FLAG_HANGAR])
             .await.map_err(db_err)?;
+        if changed == 0 {
+            return Err(super::notify_error("该物品已不在原处。"));
+        }
         let mut outbox = Outbox::default();
         notify_item_change(&c.db, &mut outbox, id, vec![(IX_SINGLETON, Value::Bool(true))]).await?;
         dispatch_client((), outbox, c)?;
