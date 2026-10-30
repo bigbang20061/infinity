@@ -31,8 +31,6 @@ pub mod cmd {
     pub const PING_RSP: i64 = 21;
 }
 
-/// Client machoNet MACHONETERR_UNMACHODESTINATION.
-pub const ERR_UNMACHODESTINATION: i64 = 0;
 /// Client machoNet MACHONETERR_WRAPPEDEXCEPTION.
 pub const ERR_WRAPPEDEXCEPTION: i64 = 2;
 /// Client machoNetAddress ADDRESS_TYPE_NODE.

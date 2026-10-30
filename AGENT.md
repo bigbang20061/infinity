@@ -12,12 +12,11 @@ These rules apply to anyone changing this repository, coding agents and humans a
   Use placeholders such as `<client folder>` or `<name>` instead.
 - **Never commit anything derived from a client install.** This includes:
   - `/sde/` and `/client/`
-  - `crates/server/proto/*.desc`
   - anything under `/tools/`
   - client caches, settings, and logs (`/logs/`)
 
-  The only captured data in the tree is `crates/server/retail/`, which is wired in through `crates/server/src/retail.rs`.
-- **Release builds only.** Use `--release` for every build, test and run. Do not add debug profiles or rely on debug builds.
+  The only captured data in the tree is `crates/server/retail/`, which is wired in through `crates/server/src/retail.rs`, and the protobuf descriptor set `crates/server/proto/eve_protos.desc`, which the public gateway compiles in.
+- **Release builds only.** Use `--release` for every build, test and run. Do not add debug profiles or rely on debug builds. Builds are warning-free; CI denies warnings.
 - **The client is the specification.** Argument shapes, return shapes and behaviour come from the client's own Python (`eve/client/script/...`, `eve/common/script/...`, `carbon/common/script/...`) and from carbonengine sources. When the live server's data or logic never shipped with the client (dungeon layouts, LP offers, the store catalogue, the hacking board generator), build the closest faithful substitute and document it in the module docs.
 - **Keep diffs minimal and on-topic.** No drive-by refactors, renames or reformatting of code you are not changing. Cleanups that the rules below require (removing a duplicate helper, naming a constant, migrating to the one mechanism) go into a commit of their own, never mixed into a feature commit.
 - **One architecture per concern.** Each concern is handled one way across the whole server. When a mechanism replaces another, migrate every caller and delete the old one in the same change: no parallel paths, compatibility shims, aliases, re-exports or flags that keep an old design alive. For example, space state is reached only through `World`, and timed effects in space run only on actor timers (see Shared state and concurrency).
@@ -31,7 +30,7 @@ These rules apply to anyone changing this repository, coding agents and humans a
 
 ## 2. Build, test, run
 
-`crates/server/proto/eve_protos.desc` must exist before the server crate compiles; this includes its tests (see README).
+The server crate embeds `crates/server/proto/eve_protos.desc` at compile time; it is committed (see README).
 
 | Task | Command |
 |---|---|
@@ -42,6 +41,24 @@ These rules apply to anyone changing this repository, coding agents and humans a
 | Rebuild and restart the server | `docker compose up -d --build server` |
 | End-to-end check with the client | `scripts/iterate.ps1` (`-Seconds`, `-AutoSelect`, `-NoBuild`) |
 | Inspect a marshal stream | `marshal-dump [--check] <file>...` |
+
+**CI.** Every change reaches `main` through a pull request.
+- `main` accepts a merge only when both checks of the `CI` workflow pass on a branch that is up to date with `main`:
+  - `test-linux`: release build of every target, and all tests.
+  - `build-windows`: release build.
+- Both deny warnings (`RUSTFLAGS=-D warnings`) and use the toolchain pinned in `rust-toolchain.toml`.
+- The Dockerfile's `rust:` image uses the same version. Change both together.
+- Both build only when the change touches code.
+  - Code means `crates/` (except Markdown files), `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml` and `.github/workflows/`.
+  - For any other change, such as docs, `db/`, `scripts/` or Docker files, the checks report as skipped, which satisfies the merge rule.
+  - If the workflow cannot tell what changed, it builds.
+
+**Releases.** Pushing a tag `vMAJOR.MINOR.PATCH` (for example `v0.1.0`) on a commit that is on `main` runs the `Release` workflow:
+1. It reruns the Linux tests.
+2. It packages every workspace binary for x86_64 Linux and Windows, plus `SHA256SUMS`.
+3. It publishes them as a GitHub release.
+
+Any other tag starts nothing.
 
 ## 3. Code map
 
@@ -180,4 +197,5 @@ Stay inside the existing ranges, and pick a fresh, non-overlapping range for any
 - Make one logical change per commit.
 - Start the message with a short imperative summary line. Use the body to explain why, and which client behaviour the change matches.
 - Update the module `//!` docs, the README (features, limitations, configuration) and this handbook when behaviour or workflow changes.
-- Do not commit generated or local artifacts: `target/`, logs, client files, descriptor sets, editor or tool state.
+- Do not commit generated or local artifacts: `target/`, logs, client files, editor or tool state.
+- A pull request merges only when CI passes (see Build, test, run).

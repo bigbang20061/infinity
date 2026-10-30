@@ -5,13 +5,12 @@ use std::collections::BTreeMap;
 
 pub struct Session {
     pub sid: i64,
-    pub client_id: i64,
     attrs: BTreeMap<String, Value>,
 }
 
 impl Session {
-    pub fn new(sid: i64, client_id: i64) -> Self {
-        Session { sid, client_id, attrs: BTreeMap::new() }
+    pub fn new(sid: i64) -> Self {
+        Session { sid, attrs: BTreeMap::new() }
     }
 
     pub fn get(&self, key: &str) -> &Value {

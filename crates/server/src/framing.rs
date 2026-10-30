@@ -32,7 +32,6 @@ pub(crate) fn inflate(payload: &[u8]) -> io::Result<Vec<u8>> {
 
 pub struct Frame {
     pub payload: Vec<u8>,
-    pub oob: Option<Vec<u8>>,
 }
 
 /// Read one packet; `Ok(None)` on clean EOF at a packet boundary.
@@ -54,19 +53,20 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Option<Fr
     let mut body = vec![0u8; len];
     r.read_exact(&mut body).await?;
 
-    let (oob, mut payload) = if header & FLAG_OOB != 0 && body.len() >= HEADER_BYTES {
+    let mut payload = if header & FLAG_OOB != 0 && body.len() >= HEADER_BYTES {
         let n = u32::from_le_bytes(body[..HEADER_BYTES].try_into().unwrap()) as usize;
         if HEADER_BYTES + n > body.len() {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "OOB length exceeds packet"));
         }
-        (Some(body[HEADER_BYTES..HEADER_BYTES + n].to_vec()), body[HEADER_BYTES + n..].to_vec())
+        body.drain(..HEADER_BYTES + n);
+        body
     } else {
-        (None, body)
+        body
     };
     if header & FLAG_ZLIB != 0 {
         payload = inflate(&payload)?;
     }
-    Ok(Some(Frame { payload, oob }))
+    Ok(Some(Frame { payload }))
 }
 
 pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, payload: &[u8]) -> io::Result<()> {
@@ -79,31 +79,4 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, payload: &[u8]) -> io
     w.write_all(&buf).await
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{inflate, read_frame, FLAG_ZLIB};
-    use flate2::{write::ZlibEncoder, Compression};
-    use std::io::Write;
-
-    #[tokio::test]
-    async fn inflates_zlib_payload_and_frame() {
-        let payload = b"compressed packet payload";
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(payload).unwrap();
-        let compressed = encoder.finish().unwrap();
-
-        assert_eq!(inflate(&compressed).unwrap(), payload);
-
-        let header = FLAG_ZLIB | compressed.len() as u32;
-        let mut frame = header.to_le_bytes().to_vec();
-        frame.extend_from_slice(&compressed);
-        let decoded = read_frame(&mut frame.as_slice()).await.unwrap().unwrap();
-        assert_eq!(decoded.payload, payload);
-        assert!(decoded.oob.is_none());
-    }
-
-    #[test]
-    fn rejects_malformed_zlib() {
-        assert!(inflate(&[0xff, 0xff, 0xff, 0xff]).is_err());
-    }
-}
+#[cfg(test)] mod tests;
