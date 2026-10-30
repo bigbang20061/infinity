@@ -12,7 +12,7 @@ fn operations_and_stacking() {
 
 #[test]
 fn unknown_type_uses_attribute_default() {
-    let meta = super::Attribute { attribute_id: 1, name: None, default_value: Some(7.5), stackable: None };
+    let meta = super::Attribute { attribute_id: 1, default_value: Some(7.5), stackable: None };
     assert_eq!(super::base_attribute(None, Some(&meta), 1), 7.5);
     assert_eq!(super::base_attribute(None, None, 1), 0.0);
     let null_default = super::Attribute { default_value: None, ..meta };

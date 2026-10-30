@@ -7,8 +7,6 @@ use crate::{dao::sde::dogma as dao, db::Db};
 
 pub(crate) struct Attribute {
     pub(crate) attribute_id: i32,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
-    pub(crate) name: Option<String>,
     pub(crate) default_value: Option<f64>, pub(crate) stackable: Option<bool>
 }
 pub(crate) struct Modifier { pub(crate) func: String, pub(crate) domain: String, pub(crate) op: i32, pub(crate) modified: i32, pub(crate) modifying: i32, pub(crate) group: Option<i32>, pub(crate) skill: Option<i32> }
@@ -20,10 +18,6 @@ pub(crate) struct Effect {
     pub(crate) duration_attribute_id: Option<i32>,
     modifiers: Vec<Modifier>
 }
-impl Effect {
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
-    pub(crate) fn modifiers(&self) -> &[Modifier] { &self.modifiers }
-}
 pub(crate) struct Dogma { attributes: Vec<Attribute>, effects: Vec<Effect>, attribute_ids: HashMap<i32, usize>, effect_ids: HashMap<i32, usize>, attribute_names: HashMap<String, Vec<usize>>, effect_names: HashMap<String, Vec<usize>> }
 impl Dogma {
     pub(crate) async fn load(db: &Db) -> anyhow::Result<Self> {
@@ -32,7 +26,7 @@ impl Dogma {
         for r in attributes {
             let pos = result.attributes.len(); result.attribute_ids.insert(r.attribute_id, pos);
             if let Some(name) = &r.name { result.attribute_names.entry(name.clone()).or_default().push(pos); }
-            result.attributes.push(Attribute { attribute_id: r.attribute_id, name: r.name, default_value: r.default_value, stackable: r.stackable });
+            result.attributes.push(Attribute { attribute_id: r.attribute_id, default_value: r.default_value, stackable: r.stackable });
         }
         for r in effects {
             let pos = result.effects.len(); result.effect_ids.insert(r.effect_id, pos);

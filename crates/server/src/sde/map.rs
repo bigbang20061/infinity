@@ -71,8 +71,6 @@ pub(crate) struct Map {
     station_index: HashMap<i64, usize>,
     celestial_index: HashMap<i64, usize>,
     system_celestials: HashMap<i64, Vec<usize>>,
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
-    system_stations: HashMap<i64, Vec<usize>>,
     owner_stations: HashMap<i64, Vec<usize>>,
     jumps: HashMap<i64, Vec<i64>>,
 }
@@ -93,16 +91,14 @@ impl Map {
         for (i, row) in celestials.iter().enumerate() {
             if let Some(system) = row.solar_system_id { system_celestials.entry(system).or_default().push(i); }
         }
-        let mut system_stations: HashMap<i64, Vec<usize>> = HashMap::new();
         let mut owner_stations: HashMap<i64, Vec<usize>> = HashMap::new();
         for (i, row) in stations.iter().enumerate() {
-            if let Some(system) = row.solar_system_id { system_stations.entry(system).or_default().push(i); }
             if let Some(owner) = row.owner_id { owner_stations.entry(owner).or_default().push(i); }
         }
         let mut adjacency: HashMap<i64, Vec<i64>> = HashMap::new();
         for row in jumps { adjacency.entry(row.from_solar_system_id).or_default().push(row.to_solar_system_id); }
         for destinations in adjacency.values_mut() { destinations.sort_unstable(); destinations.dedup(); }
-        Ok(Self { systems, regions, constellations, stargates, stations, celestials, system_index, region_index, constellation_index, stargate_index, station_index, celestial_index, system_celestials, system_stations, owner_stations, jumps: adjacency })
+        Ok(Self { systems, regions, constellations, stargates, stations, celestials, system_index, region_index, constellation_index, stargate_index, station_index, celestial_index, system_celestials, owner_stations, jumps: adjacency })
     }
     pub(crate) fn system(&self, id: i64) -> Option<&SolarSystem> { self.system_index.get(&id).map(|&i| &self.systems[i]) }
     pub(crate) fn region(&self, id: i64) -> Option<&Region> { self.region_index.get(&id).map(|&i| &self.regions[i]) }
@@ -114,8 +110,6 @@ impl Map {
     pub(crate) fn stations(&self) -> impl Iterator<Item = &Station> { self.stations.iter() }
     pub(crate) fn all_celestials(&self) -> impl Iterator<Item = &Celestial> { self.celestials.iter() }
     pub(crate) fn celestials(&self, system: i64) -> impl Iterator<Item = &Celestial> { self.system_celestials.get(&system).into_iter().flatten().map(|&i| &self.celestials[i]) }
-    #[expect(dead_code, reason = "read by Phase 1 of #5")]
-    pub(crate) fn stations_in_system(&self, system: i64) -> impl Iterator<Item = &Station> { self.system_stations.get(&system).into_iter().flatten().map(|&i| &self.stations[i]) }
     pub(crate) fn stations_by_owner(&self, owner: i64) -> impl Iterator<Item = &Station> { self.owner_stations.get(&owner).into_iter().flatten().map(|&i| &self.stations[i]) }
     pub(crate) fn jumps(&self, system: i64) -> &[i64] { self.jumps.get(&system).map_or(&[], Vec::as_slice) }
 }
