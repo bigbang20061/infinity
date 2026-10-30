@@ -536,6 +536,14 @@ CREATE TABLE IF NOT EXISTS game.jump_clones (
     name        text NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS jump_clones_owner_idx ON game.jump_clones (owner_id);
+-- services/clones.rs: retain the oldest clone per station; duplicate names are discarded.
+-- Implants are not modelled, so there is no implant data to transfer.
+DELETE FROM game.jump_clones AS duplicate
+USING game.jump_clones AS retained
+WHERE duplicate.owner_id = retained.owner_id
+  AND duplicate.location_id = retained.location_id
+  AND duplicate.clone_id > retained.clone_id;
+CREATE UNIQUE INDEX IF NOT EXISTS jump_clones_owner_location_idx ON game.jump_clones (owner_id, location_id);
 ALTER TABLE game.characters ADD COLUMN IF NOT EXISTS last_clone_jump bigint;
 
 -- Personal bookmark folders, subfolders and bookmarks (services/bookmarks.rs).
