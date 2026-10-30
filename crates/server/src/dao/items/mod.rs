@@ -11,6 +11,7 @@ pub(crate) mod creation;
 pub(crate) mod dogma;
 pub(crate) mod fit;
 pub(crate) mod fitting;
+pub(crate) mod hacking;
 pub(crate) mod inventory;
 pub(crate) mod loading;
 pub(crate) mod mining;
