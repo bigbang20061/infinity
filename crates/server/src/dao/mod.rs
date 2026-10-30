@@ -8,6 +8,7 @@
 //! Transactions, refusals, notifications and World are caller concerns.
 
 pub(crate) mod accounts;
+pub(crate) mod bills;
 pub(crate) mod characters;
 pub(crate) mod contracts;
 pub(crate) mod insurance;
