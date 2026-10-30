@@ -11,8 +11,9 @@
 //! owns an actor with a 100 ms tick and closure messages. Destiny stamps remain
 //! whole seconds. NPC decisions, spawn groups and closure timers live in the actor;
 //! NPC combat effects run sequentially and deferred jobs concurrently outside it.
-//! Timers fire on ticks in deadline and scheduling order; persistent timers and
-//! position snapshots are not supported.
+//! Timers fire on ticks in deadline and scheduling order; timers are not persistent.
+//! Changed pilot positions are periodically saved to game.items and flushed at shutdown.
+//! Other dynamic ball state is not persisted here.
 //! Shared vector distances are defined here for simulation and service callers.
 
 use crate::consts::{AU, DAMAGE_LAYER_COUNT, FILETIME_SECOND, SECONDS_PER_MINUTE};
@@ -28,6 +29,7 @@ mod actor;
 mod system;
 mod npc;
 mod warpin;
+mod snapshot;
 pub use npc::{HOSTILE_TO_ALL, NpcAction, NpcBrain, NpcConfig, NpcEffects, NpcFuture};
 pub use system::System;
 use actor::SystemHandle;
@@ -561,7 +563,7 @@ impl World {
         }
         info!("loaded solar system {system_id} with {} celestials", system.balls().count());
 
-        let handle = actor::start(system, system_id, Arc::downgrade(&self.systems));
+        let handle = actor::start(system, system_id, Arc::downgrade(&self.systems), self.db.clone());
         self.systems.lock().unwrap().insert(system_id, handle);
         Ok(())
     }
@@ -570,12 +572,28 @@ impl World {
         if systems.get(&id).is_some_and(|h| h.is_closed()) { systems.remove(&id); }
         systems.get(&id).cloned()
     }
+    /// Flush changed pilots in currently running systems without loading any systems.
+    pub async fn flush_positions(&self) -> Result<u64> {
+        let handles: Vec<_> = self.systems.lock().unwrap().values().filter(|h| !h.is_closed()).cloned().collect();
+        let mut flushes = tokio::task::JoinSet::new();
+        for handle in handles {
+            flushes.spawn(snapshot::flush(handle, self.db.clone()));
+        }
+        let mut written = 0;
+        let mut errors = Vec::new();
+        while let Some(result) = flushes.join_next().await {
+            match result {
+                Ok(Ok(count)) => written += count,
+                Ok(Err(error)) => errors.push(format!("{error:#}")),
+                Err(error) => errors.push(format!("position flush task failed: {error}")),
+            }
+        }
+        if errors.is_empty() { Ok(written) }
+        else { Err(anyhow::anyhow!("position flush failed after writing {written} positions: {}", errors.join("; "))) }
+    }
     /// No implicit loading. A missing/dead actor returns None.
     pub async fn with<R: Send + 'static>(&self, id: i64, f: impl FnOnce(&mut System) -> R + Send + 'static) -> Option<R> {
-        let handle = self.running(id)?;
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        handle.send(Box::new(move |s| { let _ = tx.send(f(s)); })).ok()?;
-        rx.await.ok()
+        self.running(id)?.with(f).await
     }
     /// No implicit loading; no-op if the system is not running.
     pub fn post(&self, id: i64, f: impl FnOnce(&mut System) + Send + 'static) {

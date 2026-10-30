@@ -10,3 +10,7 @@
 
 # Local client folder remembered by scripts/client-root.ps1
 /.client-root
+
+# Local code index and scratch files
+/.codegraph
+/tmp

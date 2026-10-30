@@ -70,7 +70,7 @@ Any other tag starts nothing.
 | Packet loop, session changes, notifications | `client.rs`, `session.rs`, `macho.rs`, `conn.rs`, `framing.rs` |
 | Remote service dispatch | `services/mod.rs` (`dispatch`) and one module per feature under `services/` |
 | Server-side dogma | `services/fit.rs` (effective attributes), `services/dogma.rs` (dogmaIM) |
-| Space simulation and destiny | `space/mod.rs` (`World` facade, `Ball`, destiny encoding, pilot registry and jump queues), `space/system.rs` (`System`: one system's state, tick, timers), `space/actor.rs` (per-system mailbox and 100 ms tick loop), `space/npc.rs` (NPC brains, spawn groups, effects worker) |
+| Space simulation and destiny | `space/mod.rs` (`World` facade, `Ball`, destiny encoding, pilot registry and jump queues), `space/system.rs` (`System`: one system's state, tick, timers), `space/actor.rs` (per-system mailbox and 100 ms tick loop), `space/npc.rs` (NPC brains, spawn groups, effects worker), `space/snapshot.rs` (periodic pilot position saves and the shutdown flush) |
 | Public gateway (gRPC) | `gateway/mod.rs`, `gateway/handlers.rs` |
 | Chat | `chat.rs` |
 | Image server and content CDN | `images.rs`, `cdn.rs` |

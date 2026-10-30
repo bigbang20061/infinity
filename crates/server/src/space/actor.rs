@@ -16,12 +16,21 @@ const TICK_LATENESS_BUDGET_MS: u64 = 100;
 /// D6 server mailbox budget.
 const MAILBOX_DEPTH_BUDGET: usize = 10_000;
 
-type Job = Box<dyn FnOnce(&mut System) + Send>;
+pub(super) type Job = Box<dyn FnOnce(&mut System) + Send>;
 #[derive(Clone)]
-pub(super) struct SystemHandle(mpsc::UnboundedSender<Job>);
+pub(super) struct SystemHandle {
+    pub(super) tx: mpsc::UnboundedSender<Job>,
+    pub(super) gate: Arc<tokio::sync::Mutex<()>>,
+    pub(super) written: Arc<std::sync::atomic::AtomicU64>,
+}
 impl SystemHandle {
-    pub(super) fn is_closed(&self) -> bool { self.0.is_closed() }
-    pub(super) fn send(&self, job: Job) -> std::result::Result<(), mpsc::error::SendError<Job>> { self.0.send(job) }
+    pub(super) fn is_closed(&self) -> bool { self.tx.is_closed() }
+    pub(super) fn send(&self, job: Job) -> std::result::Result<(), mpsc::error::SendError<Job>> { self.tx.send(job) }
+    pub(super) async fn with<R: Send + 'static>(&self, f: impl FnOnce(&mut System) -> R + Send + 'static) -> Option<R> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.send(Box::new(move |s| { let _ = tx.send(f(s)); })).ok()?;
+        rx.await.ok()
+    }
 }
 
 pub(super) async fn after(handle: Option<SystemHandle>, delay_ms: u64) -> bool {
@@ -32,10 +41,14 @@ pub(super) async fn after(handle: Option<SystemHandle>, delay_ms: u64) -> bool {
     }
     rx.await.is_ok()
 }
-pub(super) fn start(mut system: System, id: i64, systems: Weak<Mutex<HashMap<i64, SystemHandle>>>) -> SystemHandle {
+pub(super) fn start(mut system: System, id: i64, systems: Weak<Mutex<HashMap<i64, SystemHandle>>>, db: Db) -> SystemHandle {
     npc::start_worker(&mut system);
     let (tx, mut rx) = mpsc::unbounded_channel::<Job>();
     let identity = tx.downgrade();
+    let handle = SystemHandle { tx, gate: Arc::new(tokio::sync::Mutex::new(())), written: Arc::new(std::sync::atomic::AtomicU64::new(0)) };
+    system.snapshot_context = Some(snapshot::Context {
+        tx: handle.tx.downgrade(), gate: handle.gate.clone(), written: handle.written.clone(), db,
+    });
     let task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(TICK_INTERVAL_MS));
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -65,12 +78,12 @@ pub(super) fn start(mut system: System, id: i64, systems: Weak<Mutex<HashMap<i64
         if let Err(error) = task.await { warn!(system = id, %error, "space actor stopped"); }
         if let Some(systems) = systems.upgrade() {
             let mut systems = systems.lock().unwrap();
-            if systems.get(&id).is_some_and(|h| identity.upgrade().is_some_and(|tx| tx.same_channel(&h.0))) {
+            if systems.get(&id).is_some_and(|h| identity.upgrade().is_some_and(|tx| tx.same_channel(&h.tx))) {
                 systems.remove(&id);
             }
         }
     });
-    SystemHandle(tx)
+    handle
 }
 
 #[cfg(test)]
@@ -81,7 +94,7 @@ mod tests {
     async fn waits_follow_timer_execution_and_actor_lifetime() {
         assert!(!after(None, 100).await);
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let handle = SystemHandle(tx);
+        let handle = SystemHandle { tx, gate: Arc::new(tokio::sync::Mutex::new(())), written: Arc::new(std::sync::atomic::AtomicU64::new(0)) };
         let waiter = tokio::spawn(after(Some(handle.clone()), 100));
         let mut system = System::default();
         rx.recv().await.unwrap()(&mut system);
