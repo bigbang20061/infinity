@@ -1,0 +1,302 @@
+//! Constant replies for unmodelled remote services.
+//! Mirrors client remote-service calls; no database or state is accessed.
+//! Stateful and argument-dependent services are handled by their feature modules.
+
+use super::{keyval, notify_error, rowset, Call, CallResult};
+use super::universe::{WARZONES, DYNAMIC_RESOURCE_MAX_OUTPUT};
+use marshal::Value;
+use super::fleets::MAX_MEMBERS;
+use crate::consts::FAR_FUTURE;
+/// Client paperdoll.State.no_recustomization.
+const PAPERDOLL_NO_RECUSTOMIZATION: i64 = 0;
+
+/// CPython 2.7 code flags: CO_OPTIMIZED | CO_NEWLOCALS | CO_NOFREE.
+const SETTINGS_CODE_FLAGS: i32 = 0x43;
+/// CPython 2.7 bytecode for BUILD_MAP 0; RETURN_VALUE.
+const SETTINGS_CODE_BYTES: &[u8] = &[0x69, 0x00, 0x00, 0x53];
+/// CPython 2.7 `marshal.dumps(code)` for `def SettingsInfo(): return {}`.
+/// carbonui settingsSvc.UpdateSettingsStatistics loads it into a function and calls it.
+fn settings_info_code() -> Vec<u8> {
+    fn i32le(out: &mut Vec<u8>, v: i32) {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    fn s(out: &mut Vec<u8>, b: &[u8]) {
+        out.push(b's');
+        i32le(out, b.len() as i32);
+        out.extend_from_slice(b);
+    }
+    fn empty_tuple(out: &mut Vec<u8>) {
+        out.push(b'(');
+        i32le(out, 0);
+    }
+    let mut o = vec![b'c'];
+    i32le(&mut o, 0); // argcount
+    i32le(&mut o, 0); // nlocals
+    i32le(&mut o, 1); // stacksize
+    i32le(&mut o, SETTINGS_CODE_FLAGS);
+    s(&mut o, SETTINGS_CODE_BYTES);
+    o.push(b'(');
+    i32le(&mut o, 1);
+    o.push(b'N'); // consts = (None,)
+    empty_tuple(&mut o); // names
+    empty_tuple(&mut o); // varnames
+    empty_tuple(&mut o); // freevars
+    empty_tuple(&mut o); // cellvars
+    s(&mut o, b"infinity-emu"); // filename
+    s(&mut o, b"SettingsInfo"); // name
+    i32le(&mut o, 1); // firstlineno
+    s(&mut o, b""); // lnotab
+    o
+}
+/// Client kiring.common.const.ANTI_ADDICTION_PASS_CODE.
+const ANTI_ADDICTION_PASS_CODE: i64 = 201;
+
+pub(super) fn universe(call: &Call<'_>) -> Option<CallResult> {
+    let history_header = ["solarSystemID", "value1", "value2", "value3"];
+    Some(Ok(match (call.service, call.method) {
+        ("map", "GetHistory") => rowset(&history_header, vec![]),
+        ("map", "GetSolarSystemVisits") => Value::list([]),
+        ("map", "GetMyExtraMapInfo") => Value::None,
+        ("map", "GetMyExtraMapInfoAgents") => rowset(&["fromID", "rank"], vec![]),
+        ("map", "GetDeadspaceComplexMap") | ("map", "GetDeadspaceAgentsMap") => Value::None,
+        ("map", "GetBeaconCount") => Value::Dict(vec![]),
+        ("map", "GetIndustryJobsOverLast") => rowset(&history_header, vec![]),
+        ("map", "GetInsurgencySystem") => Value::None,
+        ("map", "GetAllRoamingWeatherSystems") => Value::Dict(vec![]),
+        ("map", "GetTriglavianMinorVictorySystems") | ("map", "GetEdencomMinorVictorySystems") | ("map", "GetEdencomFortressSystems") => {
+            Value::list([])
+        }
+        ("stationSvc", "GetAllianceSystems") => Value::list([]),
+        // (jumpBridgeGates, hasAccessTo, hasNoAccessTo)
+        ("structureDirectory", "GetStructureMapData") => Value::list([]),
+        // SKIN licences the character has activated: none yet.
+        ("shipCosmeticsMgr", "GetLicencedSkins") | ("shipCosmeticsMgr", "GetLicencedSkinsForShipType") => Value::list([]),
+        ("structureDirectory", "GetJumpBridgesWithMyAccess") => Value::tuple([Value::list([]), Value::list([]), Value::list([])]),
+        ("dynamicResourceCacheMgr", "GetDBSMapData") => Value::Dict(vec![]),
+        // Bounty output range and its equilibrium (mapFilterDynamicBounty reads all three).
+        ("dynamicResourceCacheMgr", "GetDynamicResourceSettings") => Value::dict([
+            ("minOutput", Value::Float(0.0)),
+            ("maxOutput", Value::Float(DYNAMIC_RESOURCE_MAX_OUTPUT)),
+            ("equilibriumValue", Value::Float(1.0)),
+        ]),
+        ("structureDirectory", "GetSolarSystemsWithBeacons") => Value::list([]),
+        // {solarSystemID: [instances] or count}; the Agency's anomaly trackers iterate these
+        // as dicts and add the current system's sites from the sensor overlay themselves.
+        ("dungeonInstanceCacheMgr", _) => Value::Dict(vec![]),
+        ("fwWarzoneSolarsystem", "GetAllWarzonesOccupationStates") | ("fwWarzoneSolarsystem", "GetAllWarzonesOccupationStatesUncached") => {
+            Value::Dict(WARZONES.iter().map(|(id, _)| (Value::Int(*id), Value::Dict(vec![]))).collect())
+        }
+        // (pilots by solarSystemID, docked pilots by solarSystemID, divisor)
+        ("machoNet", "GetClusterGameStatisticsForClient") => Value::tuple([Value::Dict(vec![]), Value::Dict(vec![]), Value::Int(1)]),
+        // {warzoneID: {solarSystemID: occupationState}}: no system is contested yet, but every
+        // warzone must be present (WarzoneStatusGauge indexes it by the faction's warzone).
+        ("fwWarzoneSolarsystem", "GetAllWarzones") => {
+            Value::Dict(WARZONES.iter().map(|(id, factions)| (Value::Int(*id), Value::list(factions.iter().map(|f| Value::Int(*f))))).collect())
+        }
+
+        // ---- corporations ----
+        ("corpmgr", "GetAssetInventory") | ("corpmgr", "GetAssetInventoryForLocation") | ("corpmgr", "SearchAssets") => Value::list([]),
+        // A player character's corporation, or an NPC's (agents) from the SDE.
+        ("corpRegistry", "GetOldApplications") | ("corpRegistry", "GetAllianceApplications") => Value::Dict(vec![]),
+        ("corpRegistry", "GetPendingAutoKicks") => Value::list([]),
+        ("corpRegistry", "GetShareholders") => rowset(&["shareholderID", "shares", "shareholderCorporationID"], vec![]),
+        ("corpRegistry", "GetSharesByShareholder") => rowset(&["shareholderID", "shares", "corporationID"], vec![]),
+        ("corpRegistry", "GetStructureReinforceDefault") => Value::None,
+        ("corpRegistry", "DoesMyCorpAcceptStructures") | ("corpRegistry", "DoesCorpRestrictCorpMails") => Value::Bool(false),
+        ("warsInfoMgr", "GetWarsByOwnerID") => Value::Dict(vec![]),
+        ("warsInfoMgr", "GetTop") | ("warsInfoMgr", "GetWarsRequiringAssistance") => Value::list([]),
+        ("allianceRegistry", "GetDaysInAlliance") => Value::Int(0),
+        ("allianceRegistry", "GetAllianceMembersOlderThan") => Value::list([]),
+
+        // ---- wallet ----
+        ("rewardMgr", "GetRewardLPLogs") => Value::list([]),
+        ("account", "GetJournal") | ("account", "GetJournalForAccounts") | ("account", "GetTransactions") => Value::list([]),
+        ("account", "GetWalletDivisionsInfo") => Value::list([]),
+        ("lookupSvc", _) => Value::list([]),
+
+        // ---- mail, notifications, contracts ----
+        // labelID -> KeyVal(labelID, name, color); the static labels are added client-side
+        ("mailingListsMgr", "GetJoinedLists") => Value::Dict(vec![]),
+        // Client-side settings blobs (yaml); nothing reads them back yet.
+        ("charMgr", "SaveCharacterSetting") => Value::None,
+
+        ("map", "GetIncursionGlobalReport") => Value::list([]),
+        // md5(str([])): the client's cached (empty) flagged-site list is current.
+        ("browserLockdownSvc", "GetFlaggedSitesHash") => Value::str("d751713988987e9331980363e24189ce"),
+        ("browserLockdownSvc", "GetFlaggedSitesList") => Value::list([]),
+        ("charMgr", "GetPrivateInfoOnCorpChange") => Value::None,
+
+        // ---- agency / job board ----
+        ("dungeonExplorationMgr", "GetMyEscalatingPathDetails") => Value::list([]),
+        // (factionID, directFactionID, corpFactionID): not enlisted.
+        ("fwCharacterEnlistmentMgr", "GetMyEnlistment") => Value::tuple([Value::None, Value::None, Value::None]),
+        // FILETIME the direct-enlistment cooldown ends; never enlisted, so none.
+        ("fwCharacterEnlistmentMgr", "GetMyDirectEnlistmentCooldownTimestamp") => Value::Int(0),
+        // Not enlisted in a militia: no ranks.
+        ("facWarMgr", "GetMyCharacterRankOverview") => Value::list([]),
+        // (medals, medalInfo): medals come from player corporations; medalInfo is only
+        // Filter()ed per received medal.
+        ("corporationSvc", "GetMedalsReceived") => Value::tuple([Value::list([]), Value::list([])]),
+        // An NPC corporation's market supply and demand (typeID, sellPrice, buyPrice...): none traded.
+        ("corporationSvc", "GetCorpInfo") => Value::list([]),
+        // NPC corporations hold no shareholder votes.
+        ("voteManager", "CanViewVotes") => Value::Bool(false),
+        // No shared bookmark folders exist (accessGroupBookmarkMgr.AddFolder keeps none).
+        ("accessGroupBookmarkMgr", "SearchFoldersWithAdminAccess") => Value::list([]),
+        ("repairableShipMgr", "GetServiceLifeDamage") => Value::Float(0.0),
+        ("monolithTaskTrackerMgr", "UpdateClientAchievmentsAndCounters") => Value::None,
+        // typeID -> expert system state; none installed.
+        ("expertSystemMgr", "GetMyExpertSystems") => Value::Dict(vec![]),
+        // The adaptation tree answers through notifications; there are no trees to send.
+        ("shipAdaptionMgr", "fetch_tree_data") | ("shipAdaptionMgr", "fetch_missions") => Value::None,
+        _ => return None,
+    }))
+}
+
+pub(super) fn station(call: &Call<'_>) -> Option<CallResult> {
+    let int = Value::Int;
+    let empty_dict = || Value::Dict(vec![]);
+    Some(Ok(match (call.service, call.method) {
+        ("seasonManager", "get_season_data_for_character") => Value::None,
+        // (jumpActivation, jumpFatigue, lastUpdated)
+        ("petitioner", "GetUnreadMessages") => Value::list([]),
+        // No external help centre: the help window keeps the in-game petition flow.
+        ("petitioner", "IsZendeskEnabled") | ("petitioner", "IsZendeskSwapEnabled") => Value::Bool(false),
+        ("shipKillCounter", "GetItemKillCountPlayer") => int(0),
+        ("shipCosmeticsMgr", "GetEnabledCosmetics") => empty_dict(),
+        ("keeper", "GetCurrentDungeonForCharacter") => Value::None,
+        ("dogmaIM", "GetTargets") | ("dogmaIM", "GetTargeters") => Value::list([]),
+        ("scanMgr", "SignalTrackerRegister") => Value::None,
+        ("monolithTaskTrackerMgr", "HasEverWarped") => Value::Bool(true),
+        ("essMgr", "GetDataForClientSolarSystem") => Value::None,
+        ("bountyProxy", "GetMyKillRights") => Value::list([]),
+        // (bounties [(targetID, bounty)], killRights)
+        ("bountyProxy", "GetBountiesAndKillRights") => Value::tuple([Value::list([]), Value::list([])]),
+        // (solarSystemID, campaignSnapshot): no insurgency here. The system must match the
+        // session's or the client asks again.
+        ("userSvc", "GetMultiCharactersTrainingSlots") => empty_dict(),
+        ("nonDiminishingInjectionMgr", "GetAvailableNonDiminishingInjections") => int(0),
+        ("securityMgr", "get_modified_systems") => empty_dict(),
+        ("monolithTaskTrackerMgr", "GetCompletedAchievementsAndClientEventCount") => {
+            Value::dict([("completedDict", empty_dict()), ("eventDict", empty_dict())])
+        }
+        // (fightersInTubes, fightersInSpace, abilityStates)
+        ("fighterMgr", "GetFightersForShip") => Value::tuple([Value::list([]), Value::list([]), empty_dict()]),
+        // Placebo-signed CPython code object: (marshalled code, 0)
+        ("charMgr", "GetSettingsInfo") => Value::tuple([Value::str(settings_info_code()), int(0)]),
+        ("charMgr", "LogSettings") => Value::None,
+        ("charMgr", "GetCharacterSettings") => empty_dict(),
+        ("ProjectDiscovery", "initialize_tutorial_status") => Value::Bool(true),
+        // Analysis Kredits (the LP store's Project Discovery currency).
+        ("ProjectDiscovery", "get_player_analysis_kredits") => int(0),
+        // Store telemetry/refresh requests; the live server answers with pushed data we don't model.
+        ("monetizationMgr", "CallUserRequested") | ("exchangeShopMgr", "CallExchangeShopOpened") => Value::None,
+        // Moving ISK into the amplification matrix isn't modelled: refuse rather than let the
+        // client report a deposit that never happened.
+        ("amplificationMatrixSolarsystemMgr", "TransferCash") => {
+            return Some(Err(super::CallError::User {
+                msg: crate::messages::MSG_CUSTOM_NOTIFY.into(),
+                dict: vec![("notify".into(), Value::unicode(crate::messages::AMPLIFICATION_MATRIX_UNAVAILABLE))],
+            }))
+        }
+        ("milestoneMgr", "ProcessCharacterLogon") => Value::None,
+        ("structureDirectory", "GetMyDockableStructures") => Value::list([]),
+        ("activityMgr", "GetActivityBadgeStatuses") => Value::list([]),
+        // The activities window's auto-popup setting (0: open it at login), kept per character.
+        ("activityMgr", "ActivitySeen") => Value::None,
+        ("warRegistry", "GetWars") => empty_dict(),
+        ("operationsManager", "can_character_play_the_tutorial") => Value::Bool(false),
+        ("insurgencySolarsystem", "GetAllVisibleCampaigns") => Value::list([]),
+        ("battlepassSeasonMgr", "CallSeasonDataRequested") => Value::None,
+        ("shipAdaptionMgr", "fetch_missions") => Value::None,
+        ("clientStatLogger", _) => Value::None,
+        // [ownerID, itemID, operationID, stationTypeID]
+        _ => return None,
+    }))
+}
+
+/// Fixed answers that originally preceded feature dispatch.
+pub(super) fn root(call: &Call<'_>) -> Option<CallResult> {
+    let s = Value::str;
+    Some(match (call.service, call.method) {
+        ("machoNet", "GetServiceInfo") => Ok(Value::Dict(vec![])),
+        ("air_npe", "is_air_npe_enabled") => Ok(Value::Bool(false)),
+        // (errorID, logMode): a known error ID means "don't send me the trace".
+        ("alert", "BeanCount") => Ok(Value::tuple([Value::Int(1), s("B")])), // LOGGING_BATCHED
+        ("alert", "SendClientStackTraceAlert") => Ok(Value::tuple([Value::Int(1), s("B")])),
+        // (changes {errorHash: logMode}, flooded)
+        ("alert", "GetLogModeForError") => Ok(Value::tuple([Value::Dict(vec![]), Value::list([])])),
+
+        ("subscriptionMgr", "GetCloneGrade") => Ok(Value::Int(1)), // CLONE_STATE_OMEGA
+        ("subscriptionMgr", "GetSubscriptionTime") => Ok(Value::Int(FAR_FUTURE)),
+
+        // NetEase account/payment gateway; endpoints are never contacted here.
+        ("kiringMgr", "GetKiringConfiguration") => Ok(Value::dict([
+            ("mode", s("release")),
+            ("client_id", s("infinity-emu")),
+            (
+                "endpoints",
+                Value::dict([("mpay", s("http://127.0.0.1/")), ("billing", s("http://127.0.0.1/")), ("redirect_uri", s("http://127.0.0.1/"))]),
+            ),
+            ("channels", Value::dict([("login", s("emu")), ("pay", s("emu")), ("app", s("emu"))])),
+        ])),
+        ("kiringMgr", "IsMonochromeStyleEnabled") => Ok(Value::Bool(false)),
+        // kiring.common.const.ANTI_ADDICTION_PASS_CODE
+        ("kiringMgr", "GetFaceRecognitionCode") => Ok(Value::tuple([Value::Int(ANTI_ADDICTION_PASS_CODE), s("")])),
+        ("kiringMgr", "GetAntiAddictionCode") => Ok(Value::Int(ANTI_ADDICTION_PASS_CODE)),
+        ("kiringMgr", "IsZhStoreEnabled") => Ok(Value::Bool(false)),
+
+        ("pingService", "Ping") => Ok(Value::None),
+        // {solarSystemID: slotKey} of alternative load systems; empty = load where the character is.
+        ("populationCap", "GetCharacterLoadSlot") => Ok(Value::Dict(vec![])),
+        ("eventLog", _) => Ok(Value::None),
+
+        // {raceID: {solarSystemID: population}}; empty = no starter system is capped.
+        ("populationCap", "GetCharacterCreationSystemPopulations") => Ok(Value::Dict(vec![])),
+
+        // Login reward campaigns: none running.
+        ("loginCampaignManager", "get_client_campaign_state") => Ok(Value::None),
+
+        _ => return None,
+    })
+}
+
+/// Fixed replies at the calendar/bookmark position in the dispatch chain.
+pub(super) fn social_early(call: &Call<'_>) -> Option<CallResult> {
+    Some(match (call.service, call.method) {
+        ("notificationMgr", "LogNotificationInteraction") | ("accessGroupBookmarkMgr", "RemoveFromKnownFolders") => Ok(Value::None),
+        ("mailingListsMgr", "Create") => Err(notify_error(crate::messages::MAILING_LISTS_UNSUPPORTED)),
+        ("calendarMgr", "CreateAllianceEvent" | "EditAllianceEvent") => Err(notify_error(crate::messages::ALLIANCE_EVENTS_UNSUPPORTED)),
+        ("accessGroupBookmarkMgr", "AddToKnownFolders" | "UpdateKnownFolderState") => Err(notify_error(crate::messages::SHARED_BOOKMARK_FOLDERS_UNSUPPORTED)),
+        _ => return None,
+    })
+}
+
+/// Fixed replies at the character position in the dispatch chain.
+pub(super) fn social(call: &Call<'_>) -> Option<CallResult> {
+    Some(Ok(match (call.service, call.method) {
+        ("charMgr", "GetPaperdollState") => Value::Int(PAPERDOLL_NO_RECUSTOMIZATION),
+        ("charMgr", "SetActivityStatus") => Value::None,
+        ("charMgr", "GetCharacterDescription") => Value::unicode(""),
+        ("charMgr", "GetContactList") => keyval([("addresses", rowset(&["contactID", "inWatchlist", "relationshipID", "labelMask"], vec![])), ("blocked", rowset(&["senderID"], vec![]))]),
+        ("repairSvc", "RepairItemsInStation" | "RepairItemsInStructure") => Value::None,
+        ("structureAssetSafety", "GetItemsInSafetyForCharacter" | "GetItemsInSafetyForCorp") => Value::list([]),
+        ("bannedwords", "check_words_allowed") => Value::None,
+        ("onlineStatus", "GetInitialState") => rowset(&["contactID", "online"], vec![]),
+        ("corpRegistry", "GetAggressionSettings") | ("accessGroupBookmarkMgr", "AddFolder") | ("corpStationMgr", "DoStandingCheckForStationService") | ("shipAdaptionMgr", "fetch_user_data") => Value::None,
+        ("RWManager", "solarsystem_contains_rw_instances") => Value::Bool(false),
+        ("dynamicBountyMgr", "GetOutputForClientSolarSystem") => Value::tuple([Value::None, Value::Bool(false)]),
+        _ => return None,
+    }))
+}
+
+pub(super) fn fleets(call: &Call<'_>) -> Option<CallResult> {
+    Some(Ok(match (call.service, call.method) {
+        ("fleetProxy", "GetAvailableFleetAds") => Value::Dict(vec![]),
+        ("fleetMgr", "AddToWatchlist" | "RemoveFromWatchlist" | "RegisterForDamageUpdates" | "BroadcastToSystem" | "BroadcastToBubble") => Value::None,
+        ("fleetObjectHandler", "GetFleetMaxSize") => Value::Int(MAX_MEMBERS as i64),
+        ("fleetObjectHandler", "GetJoinRequests") => Value::Dict(vec![]),
+        ("fleetObjectHandler", "GetActiveBridgeForShip" | "UpdateMemberInfo" | "SetOptions" | "SetAutoJoinSquadID" | "SetTakesFleetWarp" | "SetAcceptsRegroupValue" | "SetAcceptsConduitJumpsValue" | "SetFleetMaxSize" | "FinishMove" | "LoadFleetSetup" | "RejectJoinRequest" | "MassMoveMembers" | "ArrangeMembersByShipType" | "ArrangeMembersByPreCount" | "ArrangeMembersByEvenlyDistribute" | "ArrangeMembersByAllToFirst") => Value::None,
+        _ => return None,
+    }))
+}

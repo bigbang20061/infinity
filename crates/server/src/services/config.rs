@@ -19,35 +19,25 @@ const TYPE_ALLIANCE: i64 = 16159;
 /// Client cfg ticker row: remaining optional fields after owner ID and ticker.
 const TICKER_OPTIONAL_FIELDS: usize = 6;
 
+struct StationSystem { solar_system_id: i64 }
+impl StationSystem { fn from_row(r: &tokio_postgres::Row) -> Self { Self { solar_system_id: r.get("solar_system_id") } } }
+
 
 fn header(cols: &[&str]) -> Value {
     Value::list(cols.iter().map(|c| Value::str(*c)))
 }
 
 pub async fn owners(c: &Client, ids: &[i64]) -> Result<Value, CallError> {
-    let rows = c
-        .db
-        .query(
-            "SELECT character_id, name, $2::bigint, gender_id, NULL::bigint FROM game.characters WHERE character_id = ANY($1::bigint[])
-             UNION ALL SELECT corporation_id, name, $3::bigint, 0, NULL FROM sde.crp_npc_corporations WHERE corporation_id = ANY($1::bigint[])
-             UNION ALL SELECT corporation_id, name, $3::bigint, 0, NULL FROM game.corporations WHERE corporation_id = ANY($1::bigint[])
-             UNION ALL SELECT character_id, data->'name'->>'en', $2::bigint, (data->>'gender')::boolean::int, (data->>'nameID')::bigint
-                       FROM sde.npc_characters WHERE character_id = ANY($1::bigint[])
-             UNION ALL SELECT faction_id, name, $4::bigint, 0, NULL FROM sde.chr_factions WHERE faction_id = ANY($1::bigint[])
-             UNION ALL SELECT alliance_id, name, $5::bigint, 0, NULL FROM game.alliances WHERE alliance_id = ANY($1::bigint[])",
-            &[&ids, &(TYPE_CHARACTER as i64), &TYPE_CORPORATION, &TYPE_FACTION, &TYPE_ALLIANCE],
-        )
-        .await
-        .map_err(db_err)?;
+    let rows = crate::dao::characters::social::owners(&c.db, ids, TYPE_CHARACTER as i64, TYPE_CORPORATION, TYPE_FACTION, TYPE_ALLIANCE).await.map_err(db_err)?;
     let data = rows
-        .iter()
+        .into_iter()
         .map(|r| {
             Value::list([
-                Value::Int(r.get::<_, i64>(0)),
-                Value::unicode(r.get::<_, Option<String>>(1).unwrap_or_default()),
-                Value::Int(r.get(2)),
-                Value::Int(r.get::<_, Option<i32>>(3).unwrap_or(0) as i64),
-                r.get::<_, Option<i64>>(4).map(Value::Int).unwrap_or(Value::None),
+                Value::Int(r.id),
+                Value::unicode(r.name.unwrap_or_default()),
+                Value::Int(r.type_id),
+                Value::Int(r.gender.unwrap_or(0) as i64),
+                r.name_id.map(Value::Int).unwrap_or(Value::None),
             ])
         })
         .collect();
@@ -57,26 +47,17 @@ pub async fn owners(c: &Client, ids: &[i64]) -> Result<Value, CallError> {
 async fn locations(c: &Client, ids: &[i64]) -> Result<Value, CallError> {
     // Static map objects resolve locally on the client; the server answers for
     // anything else it knows (stations by name, player items such as ships).
-    let rows = c
-        .db
-        .query(
-            "SELECT item_id, COALESCE(i.name, t.name), NULL::bigint, 0::float8, 0::float8, 0::float8 FROM game.items i
-                 LEFT JOIN sde.inv_types t USING (type_id) WHERE item_id = ANY($1::bigint[])
-             UNION ALL SELECT solar_system_id::bigint, name, solar_system_id::bigint, x, y, z FROM sde.map_solar_systems WHERE solar_system_id = ANY($1::bigint[])",
-            &[&ids],
-        )
-        .await
-        .map_err(db_err)?;
+    let rows = crate::dao::characters::social::locations(&c.db, ids).await.map_err(db_err)?;
     let data = rows
-        .iter()
+        .into_iter()
         .map(|r| {
             Value::list([
-                Value::Int(r.get(0)),
-                Value::unicode(r.get::<_, Option<String>>(1).unwrap_or_default()),
-                r.get::<_, Option<i64>>(2).map(Value::Int).unwrap_or(Value::None),
-                Value::Float(r.get(3)),
-                Value::Float(r.get(4)),
-                Value::Float(r.get(5)),
+                Value::Int(r.id),
+                Value::unicode(r.name.unwrap_or_default()),
+                r.system.map(Value::Int).unwrap_or(Value::None),
+                Value::Float(r.x),
+                Value::Float(r.y),
+                Value::Float(r.z),
                 Value::None,
             ])
         })
@@ -87,19 +68,11 @@ async fn locations(c: &Client, ids: &[i64]) -> Result<Value, CallError> {
 }
 
 async fn tickers(c: &Client, ids: &[i64]) -> Result<Value, CallError> {
-    let rows = c
-        .db
-        .query(
-            "SELECT corporation_id::bigint, ticker FROM sde.crp_npc_corporations WHERE corporation_id = ANY($1::bigint[])
-             UNION ALL SELECT corporation_id, ticker FROM game.corporations WHERE corporation_id = ANY($1::bigint[])",
-            &[&ids],
-        )
-        .await
-        .map_err(db_err)?;
+    let rows = crate::dao::characters::social::tickers(&c.db, ids).await.map_err(db_err)?;
     let data = rows
-        .iter()
+        .into_iter()
         .map(|r| {
-            let mut row = vec![Value::Int(r.get(0)), Value::str(r.get::<_, Option<String>>(1).unwrap_or_default())];
+            let mut row = vec![Value::Int(r.id), Value::str(r.ticker.unwrap_or_default())];
             row.extend(std::iter::repeat_n(Value::None, TICKER_OPTIONAL_FIELDS));
             Value::List(row)
         })
@@ -124,15 +97,11 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
                 .query("SELECT DISTINCT solar_system_id::bigint FROM sde.sta_stations WHERE owner_id::bigint = $1", &[&owner])
                 .await
                 .map_err(db_err)?;
-            Ok(Value::list(rows.iter().map(|r| super::keyval([("solarSystemID", Value::Int(r.get(0)))]))))
+            Ok(Value::list(rows.iter().map(|r| super::keyval([("solarSystemID", Value::Int(StationSystem::from_row(r).solar_system_id))]))))
         }
         "GetMultiAllianceShortNamesEx" | "GetAllianceShortNamesEx" => {
-            let rows = c
-                .db
-                .query("SELECT alliance_id, short_name FROM game.alliances WHERE alliance_id = ANY($1::bigint[])", &[&keys])
-                .await
-                .map_err(db_err)?;
-            let data = rows.iter().map(|r| Value::list([Value::Int(r.get(0)), Value::unicode(r.get::<_, String>(1))])).collect();
+            let rows = crate::dao::characters::social::alliances(&c.db, &keys).await.map_err(db_err)?;
+            let data = rows.into_iter().map(|r| Value::list([Value::Int(r.id), Value::unicode(r.name)])).collect();
             Ok(Value::tuple([header(&["allianceID", "shortName"]), Value::List(data)]))
         }
         _ => {

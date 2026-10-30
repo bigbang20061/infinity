@@ -11,7 +11,8 @@
 //! operations applied in order and stacking penalties on non-stackable attributes.
 
 use super::{db_err, CallError};
-use crate::consts::{ATTR_CAPACITY, ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_RADIUS, ATTR_REQUIRED_SKILL_1, ATTR_SIGNATURE_RADIUS, ATTR_VOLUME, CATEGORY_CHARGE, CATEGORY_SHIP, EFFECT_AFTERBURNER, EFFECT_MICROWARPDRIVE, FLAG_FITTING_FIRST, FLAG_FITTING_LAST, FLAG_RIG_FIRST, FLAG_RIG_LAST, FLAG_SUBSYSTEM_FIRST, FLAG_SUBSYSTEM_LAST, TYPE_CHARACTER};
+use crate::consts::{ATTR_CAPACITY, ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_RADIUS, ATTR_REQUIRED_SKILL_1, ATTR_SIGNATURE_RADIUS, ATTR_VOLUME, CATEGORY_CHARGE, CATEGORY_SHIP, EFFECT_AFTERBURNER, EFFECT_MICROWARPDRIVE, TYPE_CHARACTER};
+use crate::dao::items::fit as fit_dao;
 use crate::db::Db;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -114,15 +115,42 @@ fn attribute_meta() -> &'static Mutex<Option<Arc<HashMap<i32, (f64, bool)>>>> {
     META.get_or_init(Default::default)
 }
 
+struct AttributeMetaRow { attribute_id: i32, default_value: f64, stackable: bool }
+impl AttributeMetaRow {
+    fn from_row(r: &tokio_postgres::Row) -> Self {
+        Self { attribute_id: r.get("attribute_id"), default_value: r.get("default_value"), stackable: r.get("stackable") }
+    }
+}
+struct BaseRow { type_id: i32, group_id: i32, category_id: i32, mass: Option<f64>, capacity: Option<f64>, volume: Option<f64>, radius: Option<f64> }
+impl BaseRow {
+    fn from_row(r: &tokio_postgres::Row) -> Self {
+        Self { type_id: r.get("type_id"), group_id: r.get("group_id"), category_id: r.get("category_id"), mass: r.get("mass"), capacity: r.get("capacity"), volume: r.get("volume"), radius: r.get("radius") }
+    }
+}
+struct TypeAttributeRow { type_id: i32, attribute_id: i32, value: f64 }
+impl TypeAttributeRow {
+    fn from_row(r: &tokio_postgres::Row) -> Self { Self { type_id: r.get("type_id"), attribute_id: r.get("attribute_id"), value: r.get("value") } }
+}
+struct TypeEffectRow { type_id: i32, effect_id: i32 }
+impl TypeEffectRow {
+    fn from_row(r: &tokio_postgres::Row) -> Self { Self { type_id: r.get("type_id"), effect_id: r.get("effect_id") } }
+}
+struct ModifierRow { type_id: i32, category: i32, func: Option<String>, domain: String, op: i32, modified: i32, modifying: i32, group: Option<i32>, skill: Option<i32> }
+impl ModifierRow {
+    fn from_row(r: &tokio_postgres::Row) -> Self {
+        Self { type_id: r.get("type_id"), category: r.get("category"), func: r.get("func"), domain: r.get("domain"), op: r.get("op"), modified: r.get("modified"), modifying: r.get("modifying"), group: r.get("group_id"), skill: r.get("skill_type_id") }
+    }
+}
+
 async fn meta(db: &Db) -> Result<Arc<HashMap<i32, (f64, bool)>>, CallError> {
     if let Some(m) = attribute_meta().lock().unwrap().clone() {
         return Ok(m);
     }
     let rows = db
-        .query("SELECT attribute_id, COALESCE(default_value, 0)::float8, COALESCE(stackable, true) FROM sde.dogma_attributes", &[])
+        .query("SELECT attribute_id, COALESCE(default_value, 0)::float8 AS default_value, COALESCE(stackable, true) AS stackable FROM sde.dogma_attributes", &[])
         .await
         .map_err(db_err)?;
-    let m = Arc::new(rows.iter().map(|r| (r.get::<_, i32>(0), (r.get::<_, f64>(1), r.get::<_, bool>(2)))).collect::<HashMap<_, _>>());
+    let m = Arc::new(rows.iter().map(AttributeMetaRow::from_row).map(|r| (r.attribute_id, (r.default_value, r.stackable))).collect::<HashMap<_, _>>());
     *attribute_meta().lock().unwrap() = Some(m.clone());
     Ok(m)
 }
@@ -148,7 +176,7 @@ async fn types(db: &Db, types: &[i32]) -> Result<HashMap<i32, Arc<TypeData>>, Ca
     }
     let base = db
         .query(
-            "SELECT type_id, COALESCE(group_id, 0), COALESCE(category_id, 0), mass::float8, capacity::float8, volume::float8, radius::float8
+            "SELECT type_id, COALESCE(group_id, 0) AS group_id, COALESCE(category_id, 0) AS category_id, mass::float8, capacity::float8, volume::float8, radius::float8
              FROM sde.inv_types WHERE type_id = ANY($1)",
             &[&missing],
         )
@@ -160,9 +188,9 @@ async fn types(db: &Db, types: &[i32]) -> Result<HashMap<i32, Arc<TypeData>>, Ca
         .map_err(db_err)?;
     let mods = db
         .query(
-            "SELECT te.type_id, COALESCE(e.effect_category, 0), m->>'func', COALESCE(m->>'domain', ''), COALESCE((m->>'operation')::int, $3),
-                    COALESCE((m->>'modifiedAttributeID')::int, 0), COALESCE((m->>'modifyingAttributeID')::int, 0),
-                    (m->>'groupID')::int, (m->>'skillTypeID')::int
+            "SELECT te.type_id, COALESCE(e.effect_category, 0) AS category, m->>'func' AS func, COALESCE(m->>'domain', '') AS domain, COALESCE((m->>'operation')::int, $3) AS op,
+                    COALESCE((m->>'modifiedAttributeID')::int, 0) AS modified, COALESCE((m->>'modifyingAttributeID')::int, 0) AS modifying,
+                    (m->>'groupID')::int AS group_id, (m->>'skillTypeID')::int AS skill_type_id
              FROM sde.type_effects te JOIN sde.dogma_effects e USING (effect_id), jsonb_array_elements(e.modifier_info) m
              WHERE te.type_id = ANY($1) AND e.effect_id <> $2 AND jsonb_typeof(e.modifier_info) = 'array'",
             &[&missing, &EFFECT_SKILL, &MISSING_MODIFIER_OPERATION],
@@ -170,41 +198,42 @@ async fn types(db: &Db, types: &[i32]) -> Result<HashMap<i32, Arc<TypeData>>, Ca
         .await
         .map_err(db_err)?;
     let effects = db.query("SELECT type_id, effect_id FROM sde.type_effects WHERE type_id = ANY($1)", &[&missing]).await.map_err(db_err)?;
+    let base: Vec<_> = base.iter().map(BaseRow::from_row).collect();
     let mut built: HashMap<i32, TypeData> = base
         .iter()
-        .map(|r| (r.get(0), TypeData { group: r.get(1), category: r.get(2), attrs: HashMap::new(), modifiers: vec![], effects: HashSet::new() }))
+        .map(|r| (r.type_id, TypeData { group: r.group_id, category: r.category_id, attrs: HashMap::new(), modifiers: vec![], effects: HashSet::new() }))
         .collect();
-    for r in effects {
-        if let Some(t) = built.get_mut(&r.get::<_, i32>(0)) {
-            t.effects.insert(r.get(1));
+    for r in effects.iter().map(TypeEffectRow::from_row) {
+        if let Some(t) = built.get_mut(&r.type_id) {
+            t.effects.insert(r.effect_id);
         }
     }
-    for r in attrs {
-        if let Some(t) = built.get_mut(&r.get::<_, i32>(0)) {
-            t.attrs.insert(r.get(1), r.get(2));
+    for r in attrs.iter().map(TypeAttributeRow::from_row) {
+        if let Some(t) = built.get_mut(&r.type_id) {
+            t.attrs.insert(r.attribute_id, r.value);
         }
     }
     // mass, capacity, volume and radius are type columns rather than attribute rows.
     for r in &base {
-        if let Some(t) = built.get_mut(&r.get::<_, i32>(0)) {
-            for (i, attr) in [ATTR_MASS, ATTR_CAPACITY, ATTR_VOLUME, ATTR_RADIUS].into_iter().enumerate() {
-                if let Some(v) = r.get::<_, Option<f64>>(3 + i) {
+        if let Some(t) = built.get_mut(&r.type_id) {
+            for (attr, value) in [ATTR_MASS, ATTR_CAPACITY, ATTR_VOLUME, ATTR_RADIUS].into_iter().zip([r.mass, r.capacity, r.volume, r.radius]) {
+                if let Some(v) = value {
                     t.attrs.entry(attr).or_insert(v);
                 }
             }
         }
     }
-    for r in mods {
-        if let Some(t) = built.get_mut(&r.get::<_, i32>(0)) {
+    for r in mods.iter().map(ModifierRow::from_row) {
+        if let Some(t) = built.get_mut(&r.type_id) {
             t.modifiers.push(Modifier {
-                category: r.get(1),
-                func: r.get::<_, Option<String>>(2).unwrap_or_default(),
-                domain: r.get(3),
-                op: r.get(4),
-                modified: r.get(5),
-                modifying: r.get(6),
-                group: r.get(7),
-                skill: r.get(8),
+                category: r.category,
+                func: r.func.unwrap_or_default(),
+                domain: r.domain,
+                op: r.op,
+                modified: r.modified,
+                modifying: r.modifying,
+                group: r.group,
+                skill: r.skill,
             });
         }
     }
@@ -245,26 +274,14 @@ impl Fit {
     /// Load the character, its skills, `ship`, its fitted modules and loaded charges.
     pub async fn load(db: &Db, char_id: i64, ship: i64) -> Result<Fit, CallError> {
         let char_type: i32 = TYPE_CHARACTER;
-        let ship_type: i32 = db
-            .query_opt("SELECT type_id FROM game.items WHERE item_id = $1", &[&ship])
-            .await
-            .map_err(db_err)?
-            .map(|r| r.get(0))
-            .unwrap_or(0);
-        let skills = db.query("SELECT type_id, level FROM game.skills WHERE character_id = $1", &[&char_id]).await.map_err(db_err)?;
-        let modules = db
-            .query(
-                "SELECT item_id, type_id, COALESCE(online, false), flag_id FROM game.items WHERE location_id = $1
-                 AND (flag_id BETWEEN $2 AND $3 OR flag_id BETWEEN $4 AND $5 OR flag_id BETWEEN $6 AND $7)",
-                &[&ship, &FLAG_FITTING_FIRST, &FLAG_FITTING_LAST, &FLAG_RIG_FIRST, &FLAG_RIG_LAST, &FLAG_SUBSYSTEM_FIRST, &FLAG_SUBSYSTEM_LAST],
-            )
-            .await
-            .map_err(db_err)?;
-        let charges = db.query("SELECT flag_id, type_id FROM game.module_charges WHERE ship_id = $1", &[&ship]).await.map_err(db_err)?;
+        let ship_type = crate::dao::items::inventory::type_id(db, ship).await.map_err(db_err)?.unwrap_or(0);
+        let skills = crate::dao::skills::levels::levels(db, char_id).await.map_err(db_err)?;
+        let modules = fit_dao::modules(db, ship).await.map_err(db_err)?;
+        let charges = fit_dao::charges(db, ship).await.map_err(db_err)?;
         let mut all: Vec<i32> = vec![char_type, ship_type];
-        all.extend(skills.iter().map(|r| r.get::<_, i32>(0)));
-        all.extend(modules.iter().map(|r| r.get::<_, i32>(1)));
-        all.extend(charges.iter().map(|r| r.get::<_, i32>(1)));
+        all.extend(skills.iter().map(|r| r.type_id));
+        all.extend(modules.iter().map(|r| r.type_id));
+        all.extend(charges.iter().map(|r| r.type_id));
         let data = types(db, &all).await?;
         let empty = || Arc::new(TypeData { group: 0, category: 0, attrs: HashMap::new(), modifiers: vec![], effects: HashSet::new() });
         let active = super::combat::active_modules();
@@ -273,17 +290,17 @@ impl Fit {
         nodes.insert(Key::Char, Node { type_id: char_type, data: get(char_type), in_ship: false, online: true, active: false, level: None });
         nodes.insert(Key::Ship, Node { type_id: ship_type, data: get(ship_type), in_ship: false, online: true, active: false, level: None });
         for r in &skills {
-            let t: i32 = r.get(0);
-            nodes.insert(Key::Skill(t), Node { type_id: t, data: get(t), in_ship: false, online: true, active: false, level: Some(r.get(1)) });
+            let t = r.type_id;
+            nodes.insert(Key::Skill(t), Node { type_id: t, data: get(t), in_ship: false, online: true, active: false, level: Some(r.level) });
         }
         let mut module_by_flag = HashMap::new();
         for r in &modules {
-            let (id, t, online, flag): (i64, i32, bool, i32) = (r.get(0), r.get(1), r.get(2), r.get(3));
+            let (id, t, online, flag) = (r.item_id, r.type_id, r.online, r.flag_id);
             module_by_flag.insert(flag, id);
             nodes.insert(Key::Module(id), Node { type_id: t, data: get(t), in_ship: true, online, active: online && active.contains(&id), level: None });
         }
         for r in &charges {
-            let (flag, t): (i32, i32) = (r.get(0), r.get(1));
+            let (flag, t) = (r.flag_id, r.type_id);
             if let Some(m) = module_by_flag.get(&flag) {
                 nodes.insert(Key::Charge(*m), Node { type_id: t, data: get(t), in_ship: true, online: true, active: false, level: None });
             }
@@ -450,17 +467,4 @@ fn apply(base: f64, mods: &[(i32, f64, bool)]) -> f64 {
     v
 }
 
-#[cfg(test)]
-mod tests {
-    use super::apply;
-
-    #[test]
-    fn operations_and_stacking() {
-        // 3 x 5% damage skill bonus (PostPercent, unpenalized) on 2.0
-        assert!((apply(2.0, &[(6, 15.0, false)]) - 2.3).abs() < 1e-9);
-        // Two 10% penalized damage mods: 1.1 * (1 + 0.1 * e^-(1/2.67)^2)
-        let two = apply(1.0, &[(4, 1.1, true), (4, 1.1, true)]);
-        assert!((two - 1.1 * (1.0 + 0.1 * (-(1.0f64 / 2.67).powi(2)).exp())).abs() < 1e-9);
-        assert_eq!(apply(5.0, &[(2, 3.0, false), (7, 1.0, false)]), 1.0);
-    }
-}
+#[cfg(test)] mod tests;

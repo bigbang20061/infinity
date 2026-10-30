@@ -439,23 +439,9 @@ pub async fn start(c: &mut Client, module: i64, target: Option<i64>) -> CallResu
     if site.hacked {
         return Err(notify_error(messages::HACK_CONTAINER_ALREADY_HACKED));
     }
-    let r = c
-        .db
-        .query_opt(
-            "SELECT i.type_id,
-                    COALESCE((SELECT value FROM sde.type_attributes WHERE type_id = i.type_id AND attribute_id = $3), 0)::int,
-                    COALESCE((SELECT value FROM sde.type_attributes WHERE type_id = i.type_id AND attribute_id = $4), 6000),
-                    COALESCE((SELECT value FROM sde.type_attributes WHERE type_id = i.type_id AND attribute_id = $5), 5000),
-                    COALESCE((SELECT value FROM sde.type_attributes WHERE type_id = i.type_id AND attribute_id = $6), 40),
-                    COALESCE((SELECT value FROM sde.type_attributes WHERE type_id = i.type_id AND attribute_id = $7), 20),
-                    COALESCE((SELECT value FROM sde.type_attributes WHERE type_id = i.type_id AND attribute_id = $8), 3)
-             FROM game.items i WHERE i.item_id = $1 AND i.location_id = $2",
-            &[&module, &ship, &ATTR_REQUIRED_SKILL_1, &ATTR_MAX_RANGE, &ATTR_DURATION, &ATTR_VIRUS_COHERENCE, &ATTR_VIRUS_STRENGTH, &ATTR_VIRUS_SLOTS],
-        )
-        .await
-        .map_err(db_err)?;
+    let r = crate::dao::items::hacking::analyzer(&c.db, module, ship, [ATTR_REQUIRED_SKILL_1, ATTR_MAX_RANGE, ATTR_DURATION, ATTR_VIRUS_COHERENCE, ATTR_VIRUS_STRENGTH, ATTR_VIRUS_SLOTS]).await.map_err(db_err)?;
     let Some(r) = r else { return Ok(Value::None) };
-    let (module_type, skill, range, duration): (i32, i32, f64, f64) = (r.get(0), r.get(1), r.get(2), r.get(3));
+    let (module_type, skill, range, duration) = (r.type_id, r.skill, r.range, r.duration);
     let needed = if site.relic { SKILL_ARCHAEOLOGY } else { SKILL_HACKING };
     if skill != needed {
         return Err(notify_error(if site.relic { messages::RELIC_CONTAINER_REQUIRES_RELIC_ANALYZER } else { messages::DATA_CONTAINER_REQUIRES_DATA_ANALYZER }));
@@ -469,16 +455,10 @@ pub async fn start(c: &mut Client, module: i64, target: Option<i64>) -> CallResu
     if gap > range {
         return Err(notify_error(&messages::analyzer_range(metres_to_km(gap), metres_to_km(range))));
     }
-    let level: f64 = c
-        .db
-        .query_opt("SELECT level FROM game.skills WHERE character_id = $1 AND type_id = $2", &[&char_id, &needed])
-        .await
-        .map_err(db_err)?
-        .map(|r| r.get::<_, i32>(0) as f64)
-        .unwrap_or(0.0);
-    let coherence = (r.get::<_, f64>(4) + COHERENCE_PER_SKILL_LEVEL * level).round() as i64;
-    let strength = r.get::<_, f64>(5).round() as i64;
-    let slots = r.get::<_, f64>(6).round().clamp(1.0, 6.0) as usize;
+    let level = crate::dao::skills::levels::level(&c.db, char_id, needed).await.map_err(db_err)?.map(|level| level as f64).unwrap_or(0.0);
+    let coherence = (r.coherence + COHERENCE_PER_SKILL_LEVEL * level).round() as i64;
+    let strength = r.strength.round() as i64;
+    let slots = r.slots.round().clamp(1.0, 6.0) as usize;
 
     let mut next_id = 100;
     let (tiles, _) = board(site.tier, || {
@@ -703,35 +683,5 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     Some(Ok(Value::None))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[cfg(test)] mod tests;
 
-    #[test]
-    fn boards_connect_entry_to_core() {
-        for tier in 1..=4 {
-            let mut id = 0;
-            let (tiles, start) = board(tier, || {
-                id += 1;
-                id
-            });
-            let core = tiles.values().filter(|t| t.kind == TYPE_CORE).count();
-            assert_eq!(core, 1);
-            assert!(!tiles[&start].hidden);
-            let g = Game {
-                container: 0,
-                system: 0,
-                tier,
-                tiles,
-                coherence: 100,
-                max_coherence: 100,
-                strength: 30,
-                inventory: vec![],
-                next_id: id,
-                skip_click: None,
-            };
-            assert!(g.distance_to_core(start).is_some_and(|d| d > 0));
-            assert!(neighbours(start).iter().any(|n| g.flippable(*n)));
-        }
-    }
-}

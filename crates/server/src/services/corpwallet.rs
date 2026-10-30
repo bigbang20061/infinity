@@ -7,7 +7,9 @@
 //! (OnAccountChange with the division's 'cash'..'cash7' name). Journals aren't kept.
 
 use super::corps::{ceo_of, is_player_corp, membership};
-use super::{active_corporation_member_ids, db_err, has_role_or_is_ceo, keyval, notify_error, Call, CallError, CallResult};
+use super::{db_err, has_role_or_is_ceo, keyval, notify_error, Call, CallError, CallResult};
+use super::wallets::{corp_balance, corp_credit, corp_debit};
+use crate::dao::wallets::characters;
 use crate::client::Client;
 use crate::consts::{ACCOUNT_CASH, ROLE_ACCOUNTANT, ROLE_DIRECTOR};
 use crate::db::Db;
@@ -28,68 +30,6 @@ fn valid_key(key: i32) -> bool {
     (ACCOUNT_CASH..ACCOUNT_CASH + DIVISIONS).contains(&key)
 }
 
-/// The OnAccountChange name of a division: 'cash', 'cash2' ... 'cash7'.
-fn key_name(key: i32) -> String {
-    match key - ACCOUNT_CASH {
-        0 => "cash".to_string(),
-        n => format!("cash{}", n + 1),
-    }
-}
-
-pub(super) async fn corp_balance(db: &(impl Executor + ?Sized), corp: i64, key: i32) -> Result<f64, CallError> {
-    Ok(db
-        .query_opt("SELECT balance::float8 FROM game.corp_wallets WHERE corporation_id = $1 AND account_key = $2", &[&corp, &key])
-        .await
-        .map_err(db_err)?
-        .map(|r| r.get(0))
-        .unwrap_or(0.0))
-}
-
-/// Tell the corporation's online members a division's new balance.
-async fn announce<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, corp: i64, key: i32, balance: f64) -> Result<(), CallError> {
-    for id in active_corporation_member_ids(db, corp).await? {
-        outbox.notify_pilot(id, "OnAccountChange", vec![Value::str(key_name(key)), Value::Int(corp), Value::Float(balance)]);
-    }
-    Ok(())
-}
-
-pub(super) async fn corp_credit<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, corp: i64, key: i32, amount: f64) -> Result<(), CallError> {
-    if amount <= 0.0 || !is_player_corp(corp) {
-        return Ok(());
-    }
-    let balance: f64 = db
-        .query_one(
-            "INSERT INTO game.corp_wallets (corporation_id, account_key, balance) VALUES ($1, $2, $3::float8::numeric)
-             ON CONFLICT (corporation_id, account_key) DO UPDATE SET balance = game.corp_wallets.balance + $3::float8::numeric
-             RETURNING balance::float8",
-            &[&corp, &key, &amount],
-        )
-        .await
-        .map_err(db_err)?
-        .get(0);
-    announce(db, outbox, corp, key, balance).await
-}
-
-pub(super) async fn corp_debit<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, corp: i64, key: i32, amount: f64) -> Result<(), CallError> {
-    if amount <= 0.0 {
-        return Ok(());
-    }
-    let row = db
-        .query_opt(
-            "UPDATE game.corp_wallets SET balance = balance - $3::float8::numeric
-             WHERE corporation_id = $1 AND account_key = $2 AND balance >= $3::float8::numeric RETURNING balance::float8",
-            &[&corp, &key, &amount],
-        )
-        .await
-        .map_err(db_err)?;
-    match row {
-        Some(r) => announce(db, outbox, corp, key, r.get(0)).await,
-        None => Err(CallError::User {
-            msg: messages::MSG_NOT_ENOUGH_MONEY.into(),
-            dict: vec![("balance".into(), Value::Float(corp_balance(db, corp, key).await?)), ("amount".into(), Value::Float(amount))],
-        }),
-    }
-}
 
 /// Whether `char_id` may pay out of `corp`'s division `key`.
 pub(super) async fn may_take(db: &Db, char_id: i64, corp: i64, key: i32) -> Result<bool, CallError> {
@@ -103,11 +43,11 @@ async fn pay_to<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, 
         let key = to_key.filter(|k| valid_key(*k)).unwrap_or(ACCOUNT_CASH);
         return corp_credit(db, outbox, to, key, amount).await;
     }
-    let exists = db.query_opt("SELECT 1 FROM game.characters WHERE character_id = $1 AND NOT deleted", &[&to]).await.map_err(db_err)?.is_some();
+    let exists = characters::recipient_exists(db, to).await.map_err(db_err)?;
     if !exists {
         return Err(notify_error(messages::TRANSFER_RECIPIENT_NOT_PLAYER));
     }
-    super::market::credit(db, outbox, to, amount).await
+    super::wallets::credit(db, outbox, to, amount).await
 }
 
 fn amount_arg(call: &Call<'_>, i: usize) -> f64 {
@@ -159,7 +99,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             let _trading = super::market::lock().await;
             let result = db.transaction(
                 |tx, outbox: &mut Outbox| Box::pin(async move {
-                    super::market::debit(tx, outbox, me, amount).await?;
+                    super::wallets::debit(tx, outbox, me, amount).await?;
                     pay_to(tx, outbox, to, to_key, amount).await
                 }),
                 |value, outbox| async move { dispatch_world(value, outbox, world) },

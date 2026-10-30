@@ -1,4 +1,5 @@
 use super::*;
+use super::reprocessing_svc::{add_output, output_stack_quantity};
 
 #[test]
 fn regrowth_deadline_rounds_up_to_milliseconds() {

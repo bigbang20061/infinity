@@ -492,8 +492,8 @@ impl World {
         let rows = self
             .db
             .query(
-                "SELECT c.item_id, c.type_id, COALESCE(c.radius, t.radius, $2::float8)::float8, c.x, c.y, c.z,
-                        COALESCE(s.owner_id, 1)::bigint, c.group_id::bigint,
+                "SELECT c.item_id, c.type_id, COALESCE(c.radius, t.radius, $2::float8)::float8 AS radius, c.x, c.y, c.z,
+                        COALESCE(s.owner_id, 1)::bigint AS owner_id, c.group_id::bigint,
                         g.dest_stargate_id::bigint, g.dest_solar_system_id::bigint, gr.category_id
                  FROM sde.map_celestials c JOIN sde.inv_types t USING (type_id)
                  LEFT JOIN sde.inv_groups gr ON gr.group_id = c.group_id
@@ -506,15 +506,15 @@ impl World {
         let tick = now_ms();
         let mut system = System::new(system_id, self.pilots.clone());
         for r in rows {
-            let id: i64 = r.get(0);
-            let pos: V3 = [r.get(3), r.get(4), r.get(5)];
-            let group = r.get::<_, Option<i64>>(7).unwrap_or(0) as i32;
-            let category = r.get::<_, Option<i32>>(10).unwrap_or(0);
-            if let Some(point) = warpin::warp_in_point(id, category, group, pos, r.get(2)) {
+            let id: i64 = r.get("item_id");
+            let pos: V3 = [r.get("x"), r.get("y"), r.get("z")];
+            let group = r.get::<_, Option<i64>>("group_id").unwrap_or(0) as i32;
+            let category = r.get::<_, Option<i32>>("category_id").unwrap_or(0);
+            if let Some(point) = warpin::warp_in_point(id, category, group, pos, r.get("radius")) {
                 system.set_warp_in(id, point);
             }
             let mut slim = Vec::new();
-            if let (Some(dest_gate), Some(dest_sys)) = (r.get::<_, Option<i64>>(8), r.get::<_, Option<i64>>(9)) {
+            if let (Some(dest_gate), Some(dest_sys)) = (r.get::<_, Option<i64>>("dest_stargate_id"), r.get::<_, Option<i64>>("dest_solar_system_id")) {
                 // A row: unpacked as (destGate, destSystem) by subwaySvc.GetPriorityLoads,
                 // read as .toCelestialID / .locationID elsewhere.
                 let jump = DbRowDescriptor::new([("toCelestialID", DbType::I4), ("locationID", DbType::I4)])
@@ -530,14 +530,14 @@ impl World {
             system.insert(
                 Ball {
                     id,
-                    type_id: r.get::<_, Option<i32>>(1).unwrap_or(0),
-                    owner_id: r.get(6),
-                    corp_id: r.get(6),
+                    type_id: r.get::<_, Option<i32>>("type_id").unwrap_or(0),
+                    owner_id: r.get("owner_id"),
+                    corp_id: r.get("owner_id"),
                     alliance_id: -1,
                     char_id: None,
                     signature_radius: None,
                     mode: MODE_RIGID,
-                    radius: r.get::<_, f64>(2) as f32,
+                    radius: r.get::<_, f64>("radius") as f32,
                     mass: CELESTIAL_STATIC_MASS,
                     max_vel: 0.0,
                     agility: 1.0,
@@ -650,23 +650,4 @@ impl World {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn seconds_to_milliseconds_preserves_fractions() {
-        assert_eq!(seconds_to_ms_f64(0.0015), 1.5);
-        assert_eq!(seconds_to_ms_f64(-0.0015), -1.5);
-        assert_eq!(seconds_to_ms(0.0015), 1);
-    }
-
-
-    #[test]
-    fn lock_time_clamps_floors_and_calculates_interior() {
-        assert_eq!(lock_time_ms(1.0, 1.0), 60_000);
-        assert_eq!(lock_time_ms(1e9, 1e9), 500);
-        assert_eq!(lock_time_ms(-10.0, 0.0), lock_time_ms(1.0, 1.0));
-        let expected = (40_000.0 / (200.0 * 50.0_f64.asinh().powi(2)) * 1000.0) as u64;
-        assert_eq!(lock_time_ms(200.0, 50.0), expected);
-    }
-}
+#[cfg(test)] mod tests;

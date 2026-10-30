@@ -9,6 +9,7 @@ mod chat;
 mod client;
 mod conn;
 mod consts;
+mod dao;
 mod db;
 mod framing;
 mod gateway;

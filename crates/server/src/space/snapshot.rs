@@ -58,10 +58,7 @@ async fn write_positions(handle: &SystemHandle, db: &Db) -> Result<u64> {
         .ok_or_else(|| anyhow::anyhow!("system actor stopped during position snapshot"))?;
     if candidates.is_empty() { return Ok(0); }
     let ids: Vec<i64> = candidates.iter().map(|&(id, _)| id).collect();
-    let rows = db.query(
-        "SELECT item_id, xmin::text FROM game.items WHERE item_id = ANY($1::bigint[]) AND location_id = $2",
-        &[&ids, &system]).await?;
-    let tokens: HashMap<i64, String> = rows.into_iter().map(|r| (r.get(0), r.get(1))).collect();
+    let tokens = crate::dao::items::positions::versions(db, &ids, system).await?;
     if tokens.is_empty() { return Ok(0); }
     let candidates: HashMap<i64, u64> = candidates.into_iter().collect();
     let positions = handle.with(move |s| {
@@ -79,13 +76,8 @@ async fn write_positions(handle: &SystemHandle, db: &Db) -> Result<u64> {
     let ys: Vec<f64> = positions.iter().map(|p| p.pos[1]).collect();
     let zs: Vec<f64> = positions.iter().map(|p| p.pos[2]).collect();
     // xmin changes on every row write, so later writers win without coordination or schema changes.
-    let rows = db.query(
-        "UPDATE game.items AS i SET x = v.x, y = v.y, z = v.z
-         FROM unnest($1::bigint[], $2::text[], $3::float8[], $4::float8[], $5::float8[]) AS v(id, version, x, y, z)
-         WHERE i.item_id = v.id AND i.location_id = $6 AND i.xmin::text = v.version RETURNING i.item_id",
-        &[&ids, &versions, &xs, &ys, &zs, &system]).await?;
-    let count = rows.len() as u64;
-    let succeeded: std::collections::HashSet<i64> = rows.into_iter().map(|r| r.get(0)).collect();
+    let succeeded = crate::dao::items::positions::save_snapshot(db, &ids, &versions, &xs, &ys, &zs, system).await?;
+    let count = succeeded.len() as u64;
     handle.with(move |s| acknowledge(s, positions, &succeeded)).await
         .ok_or_else(|| anyhow::anyhow!("system actor stopped acknowledging position snapshot"))?;
     handle.written.fetch_add(count, Ordering::SeqCst);

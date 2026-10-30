@@ -9,6 +9,7 @@
 //! Payout and policy issuance each commit their wallet, policy and notification writes atomically.
 
 use super::{db_err, keyval, notify_error, value_id_list, Call, CallError, CallResult};
+use crate::dao::insurance;
 use crate::client::{filetime_now, Client};
 use crate::consts::{CATEGORY_SHIP, FILETIME_DAY};
 use crate::db::Db;
@@ -39,29 +40,18 @@ const QUOTE_TOLERANCE_ISK: f64 = 1.0;
 
 /// What a ship type is insured for (the payout at fraction 1.0); 0 if it can't be insured.
 async fn value(db: &(impl Executor + ?Sized), type_id: i32) -> Result<f64, CallError> {
-    Ok(db
-        .query_opt(
-            "SELECT COALESCE(NULLIF(r.adjusted, 0), NULLIF(r.average, 0), t.base_price, 0)::float8
-             FROM sde.inv_types t LEFT JOIN game.retail_prices r USING (type_id) WHERE t.type_id = $1 AND t.category_id = $2",
-            &[&type_id, &CATEGORY_SHIP],
-        )
-        .await
-        .map_err(db_err)?
-        .map(|r| r.get(0))
-        .unwrap_or(0.0))
+    Ok(insurance::value(db, type_id, CATEGORY_SHIP).await.map_err(db_err)?.unwrap_or(0.0))
 }
 
-fn contract_row(r: &tokio_postgres::Row) -> Value {
+fn contract_row(r: &insurance::Contract) -> Value {
     keyval([
-        ("shipID", Value::Int(r.get(0))),
-        ("ownerID", Value::Int(r.get(1))),
-        ("fraction", Value::Float(r.get(2))),
-        ("startDate", Value::Int(r.get(3))),
-        ("endDate", Value::Int(r.get(4))),
+        ("shipID", Value::Int(r.ship_id)),
+        ("ownerID", Value::Int(r.owner_id)),
+        ("fraction", Value::Float(r.fraction)),
+        ("startDate", Value::Int(r.start_date)),
+        ("endDate", Value::Int(r.end_date)),
     ])
 }
-
-const CONTRACT_SELECT: &str = "SELECT ship_id, owner_id, fraction, start_date, end_date FROM game.insurance";
 
 /// `InsureShip(itemID, amount, isCorpItem, voidOld=False)`.
 async fn insure(c: &Client, call: &Call<'_>) -> CallResult {
@@ -70,7 +60,7 @@ async fn insure(c: &Client, call: &Call<'_>) -> CallResult {
     let ship = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
     let amount = call.args.get(1).and_then(|v| v.as_float()).unwrap_or(0.0);
     let void_old = call.kwargs.get("voidOld").or(call.args.get(3)).is_some_and(|v| matches!(v, Value::Bool(true)) || v.as_int() == Some(1));
-    let Some(item) = super::dogma::load_items_db(db, "i.item_id = $1", &[&ship]).await?.pop() else {
+    let Some(item) = crate::dao::items::loading::load_items(db, crate::dao::items::loading::ItemQuery::Id(ship)).await.map_err(db_err)?.pop() else {
         return Err(CallError::User { msg: messages::MSG_INS_COULD_NOT_FIND_ITEM.into(), dict: vec![] });
     };
     if item.owner_id != me || !item.singleton || item.category_id != CATEGORY_SHIP as i64 {
@@ -80,7 +70,7 @@ async fn insure(c: &Client, call: &Call<'_>) -> CallResult {
     let Some(fraction) = FRACTIONS.iter().copied().find(|f| (full * (f - BASE_FRACTION) * FRACTION_INCREMENT - amount).abs() < QUOTE_TOLERANCE_ISK) else {
         return Err(notify_error(messages::INSURANCE_QUOTE_EXPIRED));
     };
-    let existing = db.query_opt(&format!("{CONTRACT_SELECT} WHERE ship_id = $1"), &[&ship]).await.map_err(db_err)?;
+    let existing = insurance::contract(db, ship).await.map_err(db_err)?;
     if existing.is_some() && !void_old {
         return Err(CallError::User { msg: messages::MSG_INSURE_SHIP_FAILED_SINGLE_CONTRACT.into(), dict: vec![("ownerID".into(), Value::Int(me))] });
     }
@@ -88,12 +78,8 @@ async fn insure(c: &Client, call: &Call<'_>) -> CallResult {
     let type_id = item.type_id;
     db.transaction(
         |tx, outbox: &mut Outbox| Box::pin(async move {
-            super::market::debit(tx, outbox, me, amount).await?;
-            tx.execute(
-                "INSERT INTO game.insurance (ship_id, owner_id, type_id, fraction, start_date, end_date) VALUES ($1, $2, $3, $4, $5, $6)
-                 ON CONFLICT (ship_id) DO UPDATE SET owner_id = $2, type_id = $3, fraction = $4, start_date = $5, end_date = $6",
-                &[&ship, &me, &type_id, &fraction, &now, &(now + CONTRACT_DAYS * FILETIME_DAY)],
-            ).await.map_err(db_err)?;
+            super::wallets::debit(tx, outbox, me, amount).await?;
+            insurance::insure(tx, ship, me, type_id, fraction, now, now + CONTRACT_DAYS * FILETIME_DAY).await.map_err(db_err)?;
             super::mail::notify(tx, outbox, me, NOTIFICATION_ISSUED, NOTIFICATION_GROUP_INSURANCE, INSURER, &format!("{{itemID: {ship}, typeID: {type_id}}}")).await?;
             outbox.notify_pilot(me, "OnShipInsured", vec![]);
             Ok(())
@@ -109,14 +95,12 @@ pub async fn ship_destroyed(db: &Db, world: &World, ship: i64) -> Result<(), Cal
     let now = filetime_now();
     db.transaction(
         |tx, outbox: &mut Outbox| Box::pin(async move {
-            let Some(r) = tx
-                .query_opt("DELETE FROM game.insurance WHERE ship_id = $1 RETURNING owner_id, type_id, fraction, end_date", &[&ship])
-                .await.map_err(db_err)?
+            let Some(r) = insurance::take_payout(tx, ship).await.map_err(db_err)?
             else { return Ok(None); };
-            let (owner, type_id, fraction, end): (i64, i32, f64, i64) = (r.get(0), r.get(1), r.get(2), r.get(3));
+            let (owner, type_id, fraction, end) = (r.owner_id, r.type_id, r.fraction, r.end_date);
             if end < now { return Ok(None); }
             let payout = super::market::round2(value(tx, type_id).await? * fraction);
-            super::market::credit(tx, outbox, owner, payout).await?;
+            super::wallets::credit(tx, outbox, owner, payout).await?;
             let data = format!("{{amount: {payout}, itemID: {ship}, typeID: {type_id}, payout: 0}}");
             super::mail::notify(tx, outbox, owner, NOTIFICATION_PAYOUT, NOTIFICATION_GROUP_INSURANCE, INSURER, &data).await?;
             Ok(Some((owner, payout)))
@@ -155,14 +139,14 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             if call.args.first().and_then(|v| v.as_int()).unwrap_or(0) != 0 {
                 return Some(Ok(Value::list([])));
             }
-            match db.query(&format!("{CONTRACT_SELECT} WHERE owner_id = $1 AND end_date > $2"), &[&me, &filetime_now()]).await {
+            match insurance::contracts(db, me, filetime_now()).await {
                 Ok(rows) => Ok(Value::list(rows.iter().map(contract_row))),
                 Err(e) => Err(db_err(e)),
             }
         }
         "GetContractForShip" => {
             let ship = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
-            match db.query_opt(&format!("{CONTRACT_SELECT} WHERE ship_id = $1 AND end_date > $2"), &[&ship, &filetime_now()]).await {
+            match insurance::active_contract(db, ship, filetime_now()).await {
                 Ok(r) => Ok(r.map(|r| contract_row(&r)).unwrap_or(Value::None)),
                 Err(e) => Err(db_err(e)),
             }
@@ -170,7 +154,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "InsureShip" => insure(c, call).await,
         "UnInsureShip" => {
             let ship = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
-            match db.execute("DELETE FROM game.insurance WHERE ship_id = $1 AND owner_id = $2", &[&ship, &me]).await {
+            match insurance::uninsure(db, ship, me).await {
                 Ok(_) => {
                     c.world.notify_pilot(me, "OnShipInsured", vec![]);
                     Ok(Value::None)

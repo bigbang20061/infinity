@@ -1,0 +1,116 @@
+//! Combat mechanics; state and routing live in the parent module.
+use super::*;
+
+// ---------------------------------------------------------------- NPCs
+
+/// An NPC's fighting attributes (entity attributes on its type).
+pub(super) struct NpcStats {
+    /// (shield boost, armor repair) amount per repair cycle, and the cycle (ms).
+    pub(super) repairs: (f64, f64, f64),
+    pub(super) scan_resolution: f64,
+    pub(super) fly_range: f64,
+    pub(super) aggro_range: f64,
+    pub(super) rate_of_fire_ms: f64,
+    pub(super) optimal: f64,
+    pub(super) falloff: f64,
+    pub(super) damage: [f64; DAMAGE_TYPE_COUNT],
+    pub(super) missile: Option<(i32, f64, HashMap<i32, f64>)>,
+    pub(super) fx: Option<String>,
+}
+
+pub(super) async fn npc_stats(db: &Db, type_id: i32) -> Result<NpcStats, CallError> {
+    let a = attributes(db, type_id).await?;
+    let multiplier = attr(&a, ATTR_DAMAGE_MULTIPLIER, 1.0);
+    let fx: Option<String> = db
+        .query_opt(
+            "SELECT e.guid FROM sde.type_effects te JOIN sde.dogma_effects e USING (effect_id)
+             WHERE te.type_id = $1 AND e.effect_category = 2 AND e.guid LIKE 'effects.%' AND e.name <> 'missileLaunching' LIMIT 1",
+            &[&type_id],
+        )
+        .await
+        .map_err(db_err)?
+        .as_ref().map(GuidRow::from_row).map(|r| r.guid);
+    let missile_type = attr(&a, ATTR_ENTITY_MISSILE_TYPE, 0.0) as i32;
+    let missile = if missile_type > 0 {
+        let charge = attributes(db, missile_type).await?;
+        Some((missile_type, attr(&a, ATTR_MISSILE_DAMAGE_MULTIPLIER, 1.0), charge))
+    } else {
+        None
+    };
+    let optimal = attr(&a, ATTR_MAX_RANGE, 10_000.0);
+    Ok(NpcStats {
+        scan_resolution: attr(&a, ATTR_SCAN_RESOLUTION, 0.0),
+        repairs: (
+            attr(&a, ATTR_ENTITY_SHIELD_BOOST_AMOUNT, 0.0),
+            attr(&a, ATTR_ENTITY_ARMOR_REPAIR_AMOUNT, 0.0),
+            attr(&a, ATTR_ENTITY_ARMOR_REPAIR_DURATION, 0.0).max(attr(&a, ATTR_ENTITY_SHIELD_BOOST_DURATION, 0.0)).max(5_000.0),
+        ),
+        fly_range: attr(&a, ATTR_ENTITY_FLY_RANGE, 7_500.0).max(1_000.0),
+        aggro_range: attr(&a, ATTR_ENTITY_ATTACK_RANGE, 0.0).max(optimal * 3.0).max(60_000.0),
+        rate_of_fire_ms: attr(&a, ATTR_RATE_OF_FIRE, 4_000.0).max(1_000.0),
+        optimal,
+        falloff: attr(&a, ATTR_FALLOFF, 5_000.0),
+        damage: ATTR_DAMAGE.map(|id| attr(&a, id, 0.0) * multiplier),
+        missile,
+        fx,
+    })
+}
+
+/// Attach a brain to a spawned NPC; its effects run on the system's worker.
+
+
+pub(super) async fn npc_shot(db: &Db, world: &Arc<World>, system: i64, id: i64, type_id: i32, stats: &NpcStats, me: Ball, victim: Ball) -> Result<(), CallError> {
+    let ship = victim.id;
+    let gap = (dist(me.pos, victim.pos) - me.radius as f64 - victim.radius as f64).max(0.0);
+    if let Some((charge, multiplier, c)) = &stats.missile {
+        let (charge, multiplier) = (*charge, *multiplier);
+        let velocity = attr(c, ATTR_MAX_VELOCITY, NPC_MISSILE_VELOCITY_MPS).max(1.0);
+        let flight = velocity * ms_to_seconds(attr(c, ATTR_EXPLOSION_DELAY, NPC_MISSILE_FLIGHT_MS));
+        if gap <= flight {
+            let missile = Missile {
+                charge,
+                raw: ATTR_DAMAGE.map(|a| attr(c, a, 0.0) * multiplier),
+                aoe_cloud: attr(c, ATTR_AOE_CLOUD_SIZE, NPC_MISSILE_EXPLOSION_RADIUS_METRES),
+                velocity,
+                flight_range: flight,
+                weapon: type_id,
+                attacker: None,
+            };
+            launch_missile(db.clone(), world.clone(), system, me.clone(), victim.clone(), me.owner_id, None, missile).await?;
+        }
+    }
+    if stats.damage.iter().any(|d| *d > 0.0) && gap <= stats.optimal + stats.falloff * NPC_TURRET_REACH_FALLOFF_MULTIPLIER {
+        if let Some(guid) = stats.fx.as_deref() {
+            let fx = fire_fx(id, None, guid, Some(ship), None, true, stats.rate_of_fire_ms, 1);
+            world.broadcast(system, id, vec![fx]);
+        }
+        let multiplier = turret_roll(gap, stats.optimal, stats.falloff);
+        let dealt = if multiplier > 0.0 { damage(db, world, system, ship, victim.char_id, stats.damage.map(|d| d * multiplier), None).await? } else { 0.0 };
+        report_hit(world, id, ship, me.char_id, victim.char_id, type_id, dealt, hit_quality(multiplier));
+    }
+    Ok(())
+}
+
+
+
+
+/// A damaged NPC boosts its shield and repairs its armor every repair cycle.
+pub(super) fn npc_repair(world: &World, system: i64, id: i64, stats: &NpcStats) {
+    let (shield, armor, _) = stats.repairs;
+    if shield <= 0.0 && armor <= 0.0 {
+        return;
+    }
+    let health = {
+        let mut st = state();
+        let Some(hp) = st.hp.get_mut(&id) else { return };
+        if hp.now[0] >= hp.max[0] && hp.now[1] >= hp.max[1] {
+            return;
+        }
+        hp.now[0] = (hp.now[0] + shield).min(hp.max[0]);
+        hp.now[1] = (hp.now[1] + armor).min(hp.max[1]);
+        [0, 1, 2].map(|i| if hp.max[i] > 0.0 { (hp.now[i] / hp.max[i]).clamp(0.0, 1.0) } else { 0.0 })
+    };
+    world.set_health(system, id, health);
+}
+
+

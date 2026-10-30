@@ -69,7 +69,7 @@ Any other tag starts nothing.
 | Listeners and startup | `crates/server/src/main.rs` (`Config::from_env`, one task per connection) |
 | Login handshake | `handshake.rs` (GPS, Placebo crypto) |
 | Packet loop, session changes, notifications | `client.rs`, `session.rs`, `macho.rs`, `conn.rs`, `framing.rs` |
-| Remote service dispatch | `services/mod.rs` (`dispatch`) and one module per feature under `services/` |
+| Remote service dispatch | `services/mod.rs` (`dispatch`), one module per feature under `services/`, and `services/fixed.rs` (constant answers for services that are not modelled) |
 | Server-side dogma | `services/fit.rs` (effective attributes), `services/dogma.rs` (dogmaIM) |
 | Space simulation and destiny | `space/mod.rs` (`World` facade, `Ball`, destiny encoding, pilot registry and jump queues), `space/system.rs` (`System`: one system's state, tick, timers), `space/actor.rs` (per-system mailbox and 100 ms tick loop), `space/npc.rs` (NPC brains, spawn groups, effects worker), `space/snapshot.rs` (periodic pilot position saves and the shutdown flush) |
 | Public gateway (gRPC) | `gateway/mod.rs`, `gateway/handlers.rs` |
@@ -77,6 +77,7 @@ Any other tag starts nothing.
 | Image server and content CDN | `images.rs`, `cdn.rs` |
 | Captured retail data | `retail.rs` and `crates/server/retail/` |
 | Database access and schema | `db/mod.rs` (`Db`: pool, statement methods, startup), `db/transaction.rs` (`Db::transaction`), `db/executor.rs` (`Executor`), `db/outbox.rs` (`Outbox`), `crates/server/sql/game_schema.sql` |
+| Game data access (all `game.*` SQL) | `dao/`: one module per kind of data (`accounts`, `characters`, `items`, `wallets`, `skills`, `market`, `contracts`, ...); a feature's statements on shared data live in `dao/<data>/<feature>.rs` |
 | Player-visible text and client message names | `messages.rs` |
 | Wire format | `crates/marshal` |
 
@@ -123,7 +124,7 @@ Any other tag starts nothing.
 2. Handle the call in the matching module's `dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult>` as a `(service, method)` match arm. Return `None` for calls the module does not own, so dispatch falls through to the next module.
 3. If the feature needs a new module, add `mod <name>;` and a `dispatch` call to the fallthrough chain in `services/mod.rs`. A new client service gets its own file (see File layout).
 4. `retail::cached_call` answers first. Do not shadow a captured retail answer unless you replace it on purpose.
-5. If a feature isn't modelled but the client needs an answer, return an empty but well-formed value from `services/station.rs` or `services/universe.rs`, with a comment saying what the client reads from it.
+5. If a feature isn't modelled but the client needs an answer, add an empty but well-formed constant answer to `services/fixed.rs`, in the function for its position in the dispatch chain, with a comment saying what the client reads from it.
 6. Unhandled calls log `UNHANDLED <service>::<method>` and return `None`. Make that line go away by handling the call. Never suppress the warning.
 
 ### Values on the wire
@@ -175,6 +176,7 @@ Helpers and constants used by more than one module, each defined once:
 - `space/mod.rs`: vector math on `V3` (`add`, `sub`, `scale`, `len`, `dist`) and destiny time conversions (simulation milliseconds to destiny stamps).
 - `client.rs`: FILETIME conversions (`filetime_now` and conversions from unix time).
 - `consts.rs`: game-data constants used by more than one module, grouped by source: FILETIME durations, distances, SDE type, group and category IDs, dogma attribute and effect IDs, inventory flags, locations and row columns, corporation roles and wallet account keys. Protocol constants that are part of one module's interface stay in that module, for example `macho::cmd` and the space ball modes and flags.
+- `dao/`: statements used by several features, in the module of their data (see Database).
 - Game formulas used by several callers (such as lock time) are one function in the module that owns the mechanic, called by every user, players and NPCs alike.
 
 ### Database
@@ -182,17 +184,23 @@ Helpers and constants used by more than one module, each defined once:
 - `Db` owns a pool of connections and is the only way to reach the database.
   - For a single statement, call `db.query`, `db.query_one`, `db.query_opt` or `db.execute`. Each borrows one pooled connection for that statement.
   - Never hold a connection outside `Db`.
+- **SQL lives in `dao/`.** No `game.*` statement is written outside `crates/server/src/dao/`; services call dao functions.
+  - A dao function takes `ex: &(impl Executor + ?Sized)` and returns `Result<_, db::Error>`, so the same function runs on `Db` or inside a transaction. It never opens a transaction, notifies a client, touches `World` or the outbox, or builds wire values; the service does those.
+  - Rows are read by column name into a named struct with one `from_row` per row shape, never by position. Give computed columns an alias so they have a name. A presence check is `query_opt(...).await?.is_some()`.
+  - Data used by several features lives in the dao module of that data (`dao/items`, `dao/characters`, `dao/wallets`, `dao/skills`, ...). A feature that adds statements there does so in a file named after the feature. Search the module before adding a statement; never write a second copy.
+  - SQL assembled from fragments lives in `dao/` together with its builder. Services pass typed filter values, never SQL text.
+  - Queries that read only static data (`sde.*`, `sde_native.*`) stay with their service until static data is loaded at startup (#5).
 - **One business operation, one transaction.** An operation that writes more than one row, or more than one table, runs in `db.transaction(operation, dispatch)`.
   - `operation` gets the transaction and an `Outbox`. The runner commits, or rolls back on error.
   - The runner reruns `operation` once on a deadlock or serialization failure, so `operation` must be safe to repeat: capture inputs before the call and rebuild any mutable state inside it.
   - `dispatch` runs after COMMIT and receives the outbox.
-  - Shared helpers take `&impl Executor` and the outbox, so the same helper works inside a transaction and on its own. Helpers never open a transaction themselves.
+  - Dao functions take an `Executor`; service helpers that queue effects also take the outbox. Both work inside a transaction and on their own, and never open a transaction themselves.
 - **Notify after commit.** Inside `operation`:
   - Never notify a client, call `World`, or change memory state directly. Queue the effect in the outbox; a rolled-back operation sends nothing.
   - Never `.await` on `World` or on a client. Read what the operation needs from `World` before the transaction starts.
 - **Guarded writes.** A write that depends on a value read earlier checks it in SQL, for example `UPDATE ... SET quantity = quantity - $2 WHERE item_id = $1 AND quantity >= $2`. The same applies to a status transition (`AND status = $old`) and a balance (`AND balance >= $2`).
-  - Zero affected rows refuses the operation with the player-visible message and rolls the transaction back.
-  - Quantity changes to existing item rows go through the shared plan in `services/item_quantities.rs`.
+  - The guarded write is the dao function that performs it. It returns the affected count, an `Option` or a `bool`; the service turns a miss into the player-visible refusal and rolls the transaction back.
+  - Quantity changes to existing item rows go through the shared plan in `dao/items/quantities.rs`.
 - **Lock order.** An operation that writes several rows of one table writes them in ascending primary key order.
 - **Economy operations** (wallets, market, contracts, industry, corporation and alliance fees, bills, offices, the LP store) take `market::lock()` before opening the transaction and hold it until `dispatch` has run. Do not add row locks on orders or wallets.
 - `game_schema.sql` runs on every server start (`Db::connect`), so every statement must be idempotent and safe on an existing database:

@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn reload_reservations_share_stacks_in_order_without_overdraw() {
-    let item = |id, type_id, quantity| super::super::dogma::Item {
+    let item = |id, type_id, quantity| crate::dao::items::loading::Item {
         item_id: id, type_id, owner_id: 1, location_id: 2, flag_id: FLAG_CARGO,
         quantity, singleton: false, group_id: 0, category_id: 0, custom_info: None,
     };

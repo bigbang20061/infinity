@@ -1,4 +1,4 @@
-use super::plan_skills;
+use super::training::plan_skills;
 
 #[test]
 fn completed_and_banked_skills_are_aggregated_in_type_order() {

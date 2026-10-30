@@ -3,6 +3,7 @@
 
 use super::{message, response_name, Caller, Gateway, UUID_LEN};
 use crate::cdn;
+use crate::dao::{accounts::balances, characters::persistence, skills::plans};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use prost_reflect::{DynamicMessage, MessageDescriptor, ReflectMessage, Value as PV};
@@ -78,15 +79,13 @@ fn stage_thresholds(request: &str) -> Result<DynamicMessage> {
 async fn names_by_user(gw: &Gateway, caller: &Caller) -> Result<DynamicMessage> {
     let mut rsp = response_for("eve_public.character.GetNamesByUserRequest")?;
     let user = caller.user_id.context("no user")?;
-    let rows = db(gw)?
-        .query("SELECT character_id, name FROM game.characters WHERE user_id = $1 AND NOT deleted ORDER BY character_id", &[&user])
-        .await?;
+    let rows = persistence::names(db(gw)?, user).await?;
     let mut out = vec![];
     for r in rows {
         let mut entry = child(&rsp.descriptor(), "characters")?;
-        let id = identifier(&entry.descriptor(), "identifier", PV::U32(r.get::<_, i64>(0) as u32))?;
+        let id = identifier(&entry.descriptor(), "identifier", PV::U32(r.character_id as u32))?;
         set(&mut entry, "identifier", PV::Message(id))?;
-        set(&mut entry, "name", PV::String(r.get(1)))?;
+        set(&mut entry, "name", PV::String(r.name))?;
         out.push(PV::Message(entry));
     }
     set(&mut rsp, "characters", PV::List(out))?;
@@ -97,7 +96,7 @@ async fn names_by_user(gw: &Gateway, caller: &Caller) -> Result<DynamicMessage> 
 async fn plex_balance(gw: &Gateway, caller: &Caller) -> Result<DynamicMessage> {
     let mut rsp = response_for("eve_public.plex.vault.api.BalanceRequest")?;
     let user = caller.user_id.context("no user")?;
-    let plex = db(gw)?.plex_balance(user).await?;
+    let plex = balances::plex_balance(db(gw)?, user).await?;
     let mut balance = child(&rsp.descriptor(), "balance")?;
     set(&mut balance, "total_in_cents", PV::I64(plex * PLEX_HUNDREDTHS))?;
     set(&mut rsp, "balance", PV::Message(balance))?;
@@ -133,13 +132,13 @@ fn requirements(m: &DynamicMessage, field: &str) -> (Vec<i32>, Vec<i32>) {
 }
 
 /// An `eve_public.skill.plan.Attributes` for `desc.field`.
-fn plan_attributes(desc: &MessageDescriptor, field: &str, row: &tokio_postgres::Row) -> Result<DynamicMessage> {
+fn plan_attributes(desc: &MessageDescriptor, field: &str, row: &plans::Plan) -> Result<DynamicMessage> {
     let mut attrs = child(desc, field)?;
-    set(&mut attrs, "name", PV::String(row.get(0)))?;
-    set(&mut attrs, "description", PV::String(row.get(1)))?;
-    let (skills, levels): (Vec<i32>, Vec<i32>) = (row.get(2), row.get(3));
+    set(&mut attrs, "name", PV::String(row.name.clone()))?;
+    set(&mut attrs, "description", PV::String(row.description.clone()))?;
+    let (skills, levels) = (&row.skill_ids, &row.levels);
     let mut reqs = vec![];
-    for (skill, level) in skills.iter().zip(&levels) {
+    for (skill, level) in skills.iter().zip(levels) {
         let mut r = child(&attrs.descriptor(), "skill_requirements")?;
         let id = identifier(&r.descriptor(), "skill_type", PV::U64(*skill as u64))?;
         set(&mut r, "skill_type", PV::Message(id))?;
@@ -156,7 +155,6 @@ fn plan_identifier(desc: &MessageDescriptor, field: &str, id: Vec<u8>) -> Result
     Ok(m)
 }
 
-const PLAN_COLUMNS: &str = "name, description, skill_ids, levels, plan_id";
 
 async fn skill_plan(gw: &Gateway, caller: &Caller, name: &str, req: &DynamicMessage) -> Result<Option<DynamicMessage>> {
     let me = caller.character_id.context("no character")?;
@@ -170,61 +168,44 @@ async fn skill_plan(gw: &Gateway, caller: &Caller, name: &str, req: &DynamicMess
             let plan = msg_field(req, "skill_plan").context("no skill_plan")?;
             let (skills, levels) = requirements(&plan, "skill_requirements");
             let new = new_uuid();
-            db.execute(
-                "INSERT INTO game.skill_plans (plan_id, character_id, name, description, skill_ids, levels) VALUES ($1, $2, $3, $4, $5, $6)",
-                &[&new, &me, &str_field(&plan, "name"), &str_field(&plan, "description"), &skills, &levels],
-            )
-            .await?;
+            plans::create(db, &new, me, &str_field(&plan, "name"), &str_field(&plan, "description"), &skills, &levels).await?;
             set(&mut rsp, "skill_plan", PV::Message(plan_identifier(&desc, "skill_plan", new)?))?;
         }
         "GetAllRequest" => {
-            let rows = db.query("SELECT plan_id FROM game.skill_plans WHERE character_id = $1 ORDER BY created_at", &[&me]).await?;
-            let ids = rows.iter().map(|r| plan_identifier(&desc, "skill_plans", r.get(0)).map(PV::Message)).collect::<Result<Vec<_>>>()?;
+            let rows = plans::all(db, me).await?;
+            let ids = rows.into_iter().map(|id| plan_identifier(&desc, "skill_plans", id).map(PV::Message)).collect::<Result<Vec<_>>>()?;
             set(&mut rsp, "skill_plans", PV::List(ids))?;
         }
         // Shared plans are looked up by id regardless of owner.
         "GetRequest" | "GetSharedRequest" => {
             let owner = if method == "GetRequest" { Some(me) } else { None };
-            let row = db
-                .query_opt(
-                    &format!("SELECT {PLAN_COLUMNS} FROM game.skill_plans WHERE plan_id = $1 AND ($2::bigint IS NULL OR character_id = $2)"),
-                    &[&id.context("no skill_plan")?, &owner],
-                )
-                .await?;
+            let row = plans::get(db, &id.context("no skill_plan")?, owner).await?;
             if let Some(row) = row {
                 set(&mut rsp, "skill_plan", PV::Message(plan_attributes(&desc, "skill_plan", &row)?))?;
             }
         }
         "GetActiveRequest" => {
-            let row = db.query_opt(&format!("SELECT {PLAN_COLUMNS} FROM game.skill_plans WHERE character_id = $1 AND active"), &[&me]).await?;
+            let row = plans::active(db, me).await?;
             // No active plan: the all-zero uuid.
-            let plan = row.as_ref().map(|r| r.get::<_, Vec<u8>>(4)).unwrap_or_else(|| vec![0u8; UUID_LEN]);
+            let plan = row.as_ref().map(|r| r.plan_id.clone()).unwrap_or_else(|| vec![0u8; UUID_LEN]);
             set(&mut rsp, "skill_plan", PV::Message(plan_identifier(&desc, "skill_plan", plan)?))?;
             if let Some(row) = row {
                 set(&mut rsp, "skill_plan_info", PV::Message(plan_attributes(&desc, "skill_plan_info", &row)?))?;
             }
         }
         "SetActiveRequest" => {
-            db.execute("UPDATE game.skill_plans SET active = (plan_id = $2) WHERE character_id = $1", &[&me, &id.unwrap_or_default()]).await?;
+            plans::set_active(db, me, &id.unwrap_or_default()).await?;
         }
         "DeleteRequest" => {
-            db.execute("DELETE FROM game.skill_plans WHERE character_id = $1 AND plan_id = $2", &[&me, &id.context("no skill_plan")?]).await?;
+            plans::delete(db, me, &id.context("no skill_plan")?).await?;
         }
         "SetNameRequest" | "SetDescriptionRequest" => {
-            let column = if method == "SetNameRequest" { "name" } else { "description" };
-            db.execute(
-                &format!("UPDATE game.skill_plans SET {column} = $3 WHERE character_id = $1 AND plan_id = $2"),
-                &[&me, &id.context("no skill_plan")?, &str_field(req, column)],
-            )
-            .await?;
+            let (field, column) = if method == "SetNameRequest" { (plans::Field::Name, "name") } else { (plans::Field::Description, "description") };
+            plans::set_field(db, me, &id.context("no skill_plan")?, field, &str_field(req, column)).await?;
         }
         "SetSkillRequirementsRequest" => {
             let (skills, levels) = requirements(req, "requirements");
-            db.execute(
-                "UPDATE game.skill_plans SET skill_ids = $3, levels = $4 WHERE character_id = $1 AND plan_id = $2",
-                &[&me, &id.context("no skill_plan")?, &skills, &levels],
-            )
-            .await?;
+            plans::set_requirements(db, me, &id.context("no skill_plan")?, &skills, &levels).await?;
         }
         _ => return Ok(None),
     }
@@ -320,44 +301,4 @@ fn career_goal_states() -> Result<DynamicMessage> {
     Ok(rsp)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn checkpoints_and_goals_build() {
-        let gw = Gateway { cdn_url: "http://127.0.0.1".into(), ..Default::default() };
-        for (req, content) in [
-            ("eve_public.achievement.definition.api.cdn.GetLatestRequest", "achievements"),
-            ("eve_public.cosmetic.character.title.definition.api.GetLatestRequest", "titles"),
-            ("eve_public.space.api.cdn.GetUpdateRequest", "maptags"),
-        ] {
-            let m = checkpoint(&gw, req, content).unwrap();
-            assert!(format!("{m}").contains(&format!("http://127.0.0.1/content/{content}")));
-        }
-        assert_eq!(career_goal_definitions().unwrap().get_field_by_name("goals").unwrap().as_list().unwrap().len(), 4);
-        career_goal_states().unwrap();
-        stage_thresholds("eve_public.pirate.corruption.api.GetStageThresholdsRequest").unwrap();
-    }
-
-    #[test]
-    fn defaults_say_absent_and_echo_ids() {
-        let caller = Caller { user_id: Some(1), character_id: Some(90000001) };
-        let mut m = response_for("eve_public.matrix.api.GetEquippedRequest").unwrap();
-        let ids = super::super::known_ids(&m, &caller);
-        super::super::fill_defaults(&mut m, 4, &ids);
-        assert!(format!("{m}").contains("no_equipped:true"), "{m}");
-
-        let mut m = response_for("eve_public.pirate.corruption.api.GetSystemInfoRequest").unwrap();
-        super::super::fill_defaults(&mut m, 4, &Default::default());
-        assert!(format!("{m}").contains("denominator:1"), "{m}");
-
-        let mut req = DynamicMessage::new(message("eve_public.cosmetic.ship.api.GetRequest").unwrap());
-        let ship = identifier(&req.descriptor(), "ship", PV::U64(1000000000001)).unwrap();
-        set(&mut req, "ship", PV::Message(ship)).unwrap();
-        let mut m = response_for("eve_public.cosmetic.ship.api.GetRequest").unwrap();
-        super::super::fill_defaults(&mut m, 4, &super::super::known_ids(&req, &caller));
-        let s = format!("{m}");
-        assert!(s.contains("1000000000001") && s.contains("90000001"), "{s}");
-    }
-}
+#[cfg(test)] mod tests;
