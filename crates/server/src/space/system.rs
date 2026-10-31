@@ -41,7 +41,7 @@ pub struct System {
     pilots: HashMap<i64, i64>,
     observers: HashMap<i64, (i64, DestinyTx)>,
     registry: Arc<Pilots>,
-    positions: HashMap<i64, V3>,
+    target_states: HashMap<i64, TargetState>,
     /// Celestial warp-in points (warpin.rs), by celestial ID.
     warp_ins: HashMap<i64, V3>,
     pending: Option<HashMap<i64, Vec<Value>>>,
@@ -131,7 +131,7 @@ impl System {
         ball.interpolation_anchor_ms = self.ms;
         ball.old_pos = ball.pos;
         ball.old_vel = ball.vel;
-        ball.segment_target = None;
+        ball.segment_acceleration = None;
         ball.segment_warp = None;
         self.take(ball.id);
         if let Some(char_id) = ball.char_id {
@@ -197,12 +197,14 @@ impl System {
             }
             if self.balls.values().any(|b| b.free && b.mode != MODE_MISSILE
                 && (b.mode != MODE_STOP || b.vel != [0.0; 3])) {
-                self.positions.clear();
-                self.positions.extend(self.balls.iter().map(|(&id, b)| (id, b.pos)));
+                self.target_states.clear();
+                self.target_states.extend(self.balls.iter().map(|(&id, b)| (id, TargetState {
+                    pos: b.pos, radius: b.radius,
+                })));
                 let logical_ms = (self.current_time + 1) * MILLISECONDS_PER_SECOND;
                 let anchor_ms = if due > MAX_CATCHUP_STEPS { ms }
                     else { next_tick_ms + step * MILLISECONDS_PER_SECOND };
-                for b in self.balls.values_mut() { b.evolve(logical_ms, anchor_ms, &self.positions); }
+                for b in self.balls.values_mut() { b.evolve(logical_ms, anchor_ms, &self.target_states); }
             }
             self.current_time += 1;
         }
@@ -377,7 +379,7 @@ impl System {
             ball.interpolation_anchor_ms = s.ms;
             ball.old_pos = ball.pos;
             ball.old_vel = ball.vel;
-            ball.segment_target = None;
+            ball.segment_acceleration = None;
             ball.segment_warp = None;
             let visibility = (ball.id, ball.cloak);
             s.balls.insert(ship, ball);

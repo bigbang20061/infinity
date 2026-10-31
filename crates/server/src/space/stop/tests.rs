@@ -8,7 +8,7 @@ fn ball() -> Ball {
         id: 1, type_id: 1, owner_id: 2, corp_id: 3, alliance_id: 4, char_id: None,
         mode: MODE_GOTO, radius: 1.0, signature_radius: None, mass: 1e6, max_vel: 100.0,
         agility: 1.0, speed_fraction: 0.75, pos: [0.0; 3], vel: [10.0, 20.0, 30.0],
-        old_pos: [0.0; 3], old_vel: [0.0; 3], segment_target: None, segment_warp: None,
+        old_pos: [0.0; 3], old_vel: [0.0; 3], segment_acceleration: None, segment_warp: None,
         goto: [1000.0, 0.0, 0.0], follow_id: 5, follow_range: 6.0, free: true,
         global: false, massive: false, interactive: false, warp: None, warp_factor: 3,
         last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 7, cloak: 0, cloak_until: 0,

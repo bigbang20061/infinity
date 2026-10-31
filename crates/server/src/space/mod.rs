@@ -23,8 +23,8 @@
 //! (`Ballpark.cpp:4102-4113`) falls back to GotoPoint for a raw destination
 //! strictly below 100 km, without WarpFX.
 //!
-//! Finite GOTO arrival scaling, follow, orbit, full warp and missile flight
-//! remain approximate; collisions and bumps are not modelled. Orientations, formations, miniballs,
+//! Orbit, full warp and missile flight remain approximate; collisions and bumps
+//! are not modelled. Orientations, formations, miniballs,
 //! AddBalls2 and unsupported ball modes are not implemented.
 //! Shared vector distances are defined here for simulation and service callers.
 
@@ -44,6 +44,8 @@ mod npc;
 mod warpin;
 mod snapshot;
 mod stop;
+mod goto;
+mod follow;
 pub use npc::{HOSTILE_TO_ALL, NpcAction, NpcBrain, NpcConfig, NpcEffects, NpcFuture};
 pub use system::System;
 use actor::SystemHandle;
@@ -72,8 +74,6 @@ const MILLISECONDS_PER_SECOND: i64 = 1000;
 const METRES_PER_KILOMETRE: f64 = 1000.0;
 /// SI mass conversion: kilograms per tonne.
 const KILOGRAMS_PER_TONNE: f64 = 1000.0;
-/// Existing normalization tolerance.
-const VECTOR_LENGTH_EPSILON: f64 = 1e-9;
 /// Carbonengine Ballpark::GotoDirection projection distance.
 const GOTO_DIRECTION_REACH: f64 = 1e17;
 /// Existing missing-warp-state serialization default.
@@ -99,6 +99,12 @@ const WARP_FACTOR_TO_ACCELERATION: f64 = 1.0 / 1000.0;
 const WARP_FACTOR_TO_DECELERATION: f64 = 1.0 / 3000.0;
 
 pub type V3 = [f64; 3];
+#[derive(Clone, Copy)]
+struct TargetState {
+    pos: V3,
+    radius: f32,
+}
+
 
 pub(crate) fn sub(a: V3, b: V3) -> V3 {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
@@ -116,17 +122,8 @@ fn len(a: V3) -> f64 {
 pub fn dist(a: V3, b: V3) -> f64 {
     len(sub(a, b))
 }
-fn norm(a: V3) -> V3 {
-    let l = len(a);
-    if l < VECTOR_LENGTH_EPSILON {
-        [1.0, 0.0, 0.0]
-    } else {
-        scale(a, 1.0 / l)
-    }
-}
-
 /// Carbonengine Vector3d normalization preserves a zero vector.
-fn goto_norm(a: V3) -> V3 {
+fn norm(a: V3) -> V3 {
     let l = len(a);
     if l == 0.0 { a } else { scale(a, 1.0 / l) }
 }
@@ -193,7 +190,7 @@ pub struct Ball {
     /// Start state and frozen inputs of the last completed movement segment.
     pub old_pos: V3,
     pub old_vel: V3,
-    pub segment_target: Option<V3>,
+    pub segment_acceleration: Option<V3>,
     pub segment_warp: Option<Warp>,
     pub goto: V3,
     pub follow_id: i64,
@@ -247,16 +244,10 @@ fn integrate(position: V3, velocity: V3, acceleration: V3, mass: f64, friction: 
 }
 
 impl Ball {
-    /// Set a GOTO point from the raw direction, as in Ballpark::GotoDirection.
-    pub fn goto_direction(&mut self, dir: V3) {
-        self.mode = MODE_GOTO;
-        self.warp = None;
-        self.goto = add(self.pos, scale(goto_norm(dir), GOTO_DIRECTION_REACH));
-    }
 
     /// Stateless view of the most recently completed logical movement segment.
     pub fn position_at(&self, t_ms: i64) -> V3 {
-        if self.segment_target.is_none() && self.segment_warp.is_none() { return self.pos; }
+        if self.segment_acceleration.is_none() && self.segment_warp.is_none() { return self.pos; }
         let elapsed = t_ms.saturating_sub(self.interpolation_anchor_ms).clamp(0, MILLISECONDS_PER_SECOND);
         if elapsed == 0 { return self.old_pos; }
         if elapsed == MILLISECONDS_PER_SECOND { return self.pos; }
@@ -266,7 +257,7 @@ impl Ball {
             return add(w.from, scale(sub(w.to, w.from), fraction));
         }
         let mass = self.mass * self.agility as f64;
-        let acceleration = if mass > 0.0 { scale(self.segment_target.unwrap(), DESTINY_FRICTION / mass) } else { V3::default() };
+        let acceleration = self.segment_acceleration.unwrap();
         integrate(self.old_pos, self.old_vel, acceleration, mass, DESTINY_FRICTION,
             ms_to_seconds(elapsed as f64)).0
     }
@@ -367,8 +358,8 @@ impl Ball {
         Value::instance("eve.common.script.util.slimItem.SlimItem", fields)
     }
 
-    /// Exact integration for a constant target velocity over elapsed milliseconds.
-    fn evolve(&mut self, ms: i64, interpolation_anchor_ms: i64, others: &HashMap<i64, V3>) {
+    /// Integrate the acceleration frozen for this completed segment.
+    fn evolve(&mut self, ms: i64, interpolation_anchor_ms: i64, others: &HashMap<i64, TargetState>) {
         // Missile launch time is also the stream's effectStamp.
         if self.mode == MODE_MISSILE { return; }
         if !self.free || ms <= self.last_ms {
@@ -376,10 +367,11 @@ impl Ball {
             return;
         }
         self.interpolation_anchor_ms = interpolation_anchor_ms;
+        if self.mode == MODE_FOLLOW && !others.contains_key(&self.follow_id) { self.stop(); }
         if self.mode == MODE_STOP { self.evolve_stop(); }
         self.old_pos = self.pos;
         self.old_vel = self.vel;
-        self.segment_target = None;
+        self.segment_acceleration = None;
         self.segment_warp = self.warp.clone();
         if let Some(w) = &self.warp {
             let elapsed = (ms - w.start) as f64;
@@ -397,18 +389,22 @@ impl Ball {
         }
         let dt = ms_to_seconds((ms - self.last_ms) as f64);
         let mass = self.mass * self.agility as f64;
-        let speed = (self.max_vel * self.speed_fraction) as f64;
-        let target = match self.mode {
-            MODE_GOTO => scale(goto_norm(sub(self.goto, self.pos)), speed),
-            MODE_FOLLOW | MODE_ORBIT => others.get(&self.follow_id).map(|&p| {
-                let d = sub(p, self.pos);
-                if len(d) <= self.follow_range as f64 + self.radius as f64 { V3::default() }
-                else { scale(norm(d), speed) }
-            }).unwrap_or_default(),
-            _ => V3::default(),
+        let acceleration = if mass <= 0.0 { V3::default() } else {
+            match self.mode {
+                MODE_GOTO => self.evolve_goto(),
+                MODE_FOLLOW => match others.get(&self.follow_id) {
+                    Some(target) => self.evolve_follow(target),
+                    None => { self.stop(); V3::default() }
+                },
+                MODE_ORBIT => others.get(&self.follow_id).map(|target| {
+                    let d = sub(target.pos, self.pos);
+                    if len(d) <= self.follow_range as f64 + self.radius as f64 { V3::default() }
+                    else { scale(scale(norm(d), (self.max_vel * self.speed_fraction) as f64), DESTINY_FRICTION / mass) }
+                }).unwrap_or_default(),
+                _ => V3::default(),
+            }
         };
-        self.segment_target = Some(target);
-        let acceleration = if mass > 0.0 { scale(target, DESTINY_FRICTION / mass) } else { V3::default() };
+        self.segment_acceleration = Some(acceleration);
         (self.pos, self.vel) = integrate(self.pos, self.vel, acceleration, mass, DESTINY_FRICTION, dt);
         self.last_ms = ms;
     }
@@ -616,7 +612,7 @@ impl World {
                     vel: V3::default(),
                     old_pos: pos,
                     old_vel: V3::default(),
-                    segment_target: None,
+                    segment_acceleration: None,
                     segment_warp: None,
                     goto: V3::default(),
                     follow_id: 0,

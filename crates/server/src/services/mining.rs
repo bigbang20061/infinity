@@ -133,7 +133,7 @@ fn rock_ball(id: i64, type_id: i32, pos: V3, radius: f32) -> Ball {
         speed_fraction: 0.0,
         pos,
         vel: [0.0; 3],
-        old_pos: pos, old_vel: [0.0; 3], segment_target: None, segment_warp: None,
+        old_pos: pos, old_vel: [0.0; 3], segment_acceleration: None, segment_warp: None,
         goto: [0.0; 3],
         follow_id: 0,
         follow_range: 0.0,

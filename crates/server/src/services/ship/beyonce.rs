@@ -7,8 +7,9 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         ("beyonce", "UpdateStateRequest") => send_state(c).await.map(|_| Value::None),
         ("beyonce", "CmdGotoDirection") => {
             let dir = [f(a.first()), f(a.get(1)), f(a.get(2))];
+            if !dir.iter().all(|v| v.is_finite()) { return Some(Ok(Value::None)); }
             movement(c, move |b, t, _| {
-                b.goto_direction(dir);
+                if !b.goto_direction(dir) { return vec![]; }
                 let mut ev = vec![event(t, "GotoDirection", vec![Value::Int(b.id), Value::Float(dir[0]), Value::Float(dir[1]), Value::Float(dir[2])])];
                 ensure_moving(b, t, &mut ev);
                 ev
@@ -19,7 +20,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             movement(c, move |b, t, others| {
                 let Some(tp) = target.and_then(|id| others.ball(id)).map(|o| o.pos) else { return vec![] };
                 let dir = [tp[0] - b.pos[0], tp[1] - b.pos[1], tp[2] - b.pos[2]];
-                b.goto_direction(dir);
+                if !b.goto_direction(dir) { return vec![]; }
                 let mut ev = vec![event(t, "GotoDirection", vec![Value::Int(b.id), Value::Float(dir[0]), Value::Float(dir[1]), Value::Float(dir[2])])];
                 ensure_moving(b, t, &mut ev);
                 ev
@@ -46,10 +47,16 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             let target = a.first().and_then(|v| v.as_int()).unwrap_or(0);
             let range = f(a.get(1)) as f32;
             let orbit = call.method == "CmdOrbit";
-            movement(c, move |b, t, _| {
-                b.mode = if orbit { MODE_ORBIT } else { MODE_FOLLOW };
-                b.follow_id = target;
-                b.follow_range = range;
+            if !orbit && !range.is_finite() { return Some(Ok(Value::None)); }
+            movement(c, move |b, t, others| {
+                if orbit {
+                    b.mode = MODE_ORBIT;
+                    b.follow_id = target;
+                    b.follow_range = range;
+                } else {
+                    let Some(target_ball) = others.ball(target) else { return vec![] };
+                    if !b.follow_ball(target_ball, range) { return vec![]; }
+                }
                 let name = if orbit { "Orbit" } else { "FollowBall" };
                 let mut ev = vec![event(t, name, vec![Value::Int(b.id), Value::Int(target), Value::Float(range as f64)])];
                 ensure_moving(b, t, &mut ev);

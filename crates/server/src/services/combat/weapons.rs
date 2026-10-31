@@ -288,7 +288,7 @@ pub(super) async fn launch_missile(db: Db, world: Arc<World>, system: i64, from:
         speed_fraction: 0.0,
         pos: from.pos,
         vel: [0.0; 3],
-        old_pos: from.pos, old_vel: [0.0; 3], segment_target: None, segment_warp: None,
+        old_pos: from.pos, old_vel: [0.0; 3], segment_acceleration: None, segment_warp: None,
         goto: target.pos,
         follow_id: 0,
         follow_range: 0.0,

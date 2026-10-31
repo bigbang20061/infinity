@@ -44,7 +44,14 @@ fn setup(name: &str) -> Vec<Ball> {
 }
 
 fn follow(system: &mut System, id: i64, target: i64, range: f32, mode: u8) {
-    system.command(id, move |b, _, _| { b.mode = mode; b.follow_id = target; b.follow_range = range; vec![] });
+    system.command(id, move |b, _, others| {
+        if mode == MODE_FOLLOW {
+            if let Some(target) = others.ball(target) { b.follow_ball(target, range); }
+        } else {
+            b.mode = mode; b.follow_id = target; b.follow_range = range;
+        }
+        vec![]
+    });
 }
 
 fn direction(system: &mut System, id: i64, v: V3) {

@@ -22,7 +22,7 @@ use crate::consts::{ATTR_AGILITY, ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_SIGNATURE_R
 use crate::db::outbox::{Effect, Outbox};
 use crate::dao::{characters::{ship as character_dao, selection}, items::{ship as item_dao, creation}};
 use crate::messages;
-use crate::space::{self, event, now_ms, seconds_to_ms_f64, warp_duration, Ball, Warp, V3, CLOAK_RESTORE, MODE_FOLLOW, MODE_GOTO, MODE_ORBIT, MODE_STOP, MODE_WARP};
+use crate::space::{self, event, now_ms, seconds_to_ms_f64, warp_duration, Ball, Warp, V3, CLOAK_RESTORE, MODE_ORBIT, MODE_STOP, MODE_WARP};
 use marshal::Value;
 use tracing::{info, warn};
 
@@ -105,7 +105,7 @@ pub(super) async fn ship_ball(c: &Client, ship_id: i64, pos: [f64; 3]) -> Result
         speed_fraction: 0.0,
         pos,
         vel: [0.0; 3],
-        old_pos: pos, old_vel: [0.0; 3], segment_target: None, segment_warp: None,
+        old_pos: pos, old_vel: [0.0; 3], segment_acceleration: None, segment_warp: None,
         goto: [0.0; 3],
         follow_id: 0,
         follow_range: 0.0,
@@ -486,10 +486,7 @@ pub(super) fn warp_to(c: &mut Client, object: Option<(V3, f64)>, point: V3, min_
 fn warp_command(b: &mut Ball, t: i64, object: Option<(V3, f64)>, point: V3, min_range: f64) -> Vec<Value> {
     let delta = space::sub(point, b.pos);
     if delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2] < MIN_WARP_DISTANCE_SQUARED {
-        b.mode = MODE_GOTO;
-        b.goto = point;
-        b.warp = None;
-        if b.speed_fraction == 0.0 { b.set_speed_fraction(1.0); }
+        if !b.goto_point(point) { return vec![]; }
         return vec![event(t, "GotoPoint", vec![Value::Int(b.id), Value::Float(point[0]), Value::Float(point[1]), Value::Float(point[2])])];
     }
     let (center, stand_off) = match object {

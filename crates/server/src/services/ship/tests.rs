@@ -1,4 +1,5 @@
 use super::*;
+use crate::space::MODE_GOTO;
 
 #[test]
 fn destination_gate_radius_preserves_sql_coalesce_order() {
@@ -14,7 +15,7 @@ fn ship() -> Ball {
         mass: 1_000_000.0, max_vel: 200.0, agility: 3.0, speed_fraction: 0.0,
         pos: [10.0, 20.0, 30.0], vel: [4.0, 5.0, 6.0],
         old_pos: [1.0, 2.0, 3.0], old_vel: [7.0, 8.0, 9.0],
-        segment_target: Some([11.0, 12.0, 13.0]),
+        segment_acceleration: Some([11.0, 12.0, 13.0]),
         segment_warp: Some(Warp { from: [1.0; 3], to: [2.0; 3], start: 10, duration: 20.0, factor: 3 }),
         goto: [0.0; 3], follow_id: 0, follow_range: 0.0,
         free: true, global: false, massive: false, interactive: false,
@@ -43,7 +44,7 @@ fn short_warp_uses_raw_point_and_preserves_motion_state() {
         assert_eq!(b.vel, [4.0, 5.0, 6.0]);
         assert_eq!(b.old_pos, [1.0, 2.0, 3.0]);
         assert_eq!(b.old_vel, [7.0, 8.0, 9.0]);
-        assert_eq!(b.segment_target, Some([11.0, 12.0, 13.0]));
+        assert_eq!(b.segment_acceleration, Some([11.0, 12.0, 13.0]));
         assert_eq!(b.segment_warp.as_ref().unwrap().start, 10);
         assert_eq!(b.last_ms, 1000);
         assert_eq!(b.interpolation_anchor_ms, 500);
