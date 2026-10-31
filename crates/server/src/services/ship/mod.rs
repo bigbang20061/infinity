@@ -284,8 +284,7 @@ pub(super) async fn jump_out_and_arrive(c: &mut Client, system: i64, ship: i64, 
             special_fx(t, b.id, Some(through), other_type, guid, Some(Value::tuple([Value::Int(dest_system)]))),
         ]
     });
-    c.pump().await.map_err(CallError::Internal)?;
-    if !c.world.after(system, JUMP_DELAY_MS).await {
+    if !c.wait_pumping(system, JUMP_DELAY_MS).await.map_err(CallError::Internal)? {
         return Err(CallError::Internal(anyhow::anyhow!("source system actor stopped during jump wait")));
     }
 

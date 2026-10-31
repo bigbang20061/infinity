@@ -53,7 +53,7 @@ fn drain(rx: &mut mpsc::UnboundedReceiver<(String, Vec<Value>)>) -> Vec<String> 
     names
 }
 async fn direct_item_notices(client: &mut Client, peer: &mut tokio::net::TcpStream) -> usize {
-    client.pump().await.unwrap();
+    assert!(!client.wait_pumping(-1, 0).await.unwrap());
     let mut count = 0;
     while let Ok(Ok(Some(frame))) = tokio::time::timeout(std::time::Duration::from_millis(50), crate::framing::read_frame(peer)).await {
         let packet = crate::macho::Packet::from_value(&marshal::loads(&frame.payload).unwrap()).unwrap();

@@ -190,7 +190,7 @@ async fn real_mutations_commit_and_cleanup_fixture_rows() {
         assert!(rollback.is_err());
         assert_eq!(match crate::services::wallets::balance(&test_db, fixture.chars[0]).await { Ok(value) => value, Err(_) => panic!("wallet balance failed") }, 13.0);
         assert!(notifications.try_recv().is_err(), "rolled-back credit must not notify");
-        client.pump().await.unwrap();
+        assert!(!client.wait_pumping(-1, 0).await.unwrap());
         let mut item_notices = 0;
         while let Ok(Ok(Some(frame))) = tokio::time::timeout(std::time::Duration::from_millis(50), crate::framing::read_frame(&mut peer)).await {
             let packet = crate::macho::Packet::from_value(&marshal::loads(&frame.payload).unwrap()).unwrap();
