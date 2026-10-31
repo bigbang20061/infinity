@@ -9,3 +9,4 @@ pub(crate) mod plans;
 pub(crate) mod queue;
 pub(crate) mod selection;
 pub(crate) mod training;
+pub(crate) mod trading;

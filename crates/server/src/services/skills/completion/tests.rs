@@ -77,10 +77,12 @@ async fn real_runner_delivers_due_completion_to_online_pilot_channel() {
     let (c, _peer) = client(db.clone(), f.character).await;
     let (sender, mut receiver) = mpsc::unbounded_channel();
     c.world.register_pilot(f.character, sender);
-    let due = filetime_now() + crate::client::filetime_ticks_from_seconds(5);
-    db.execute("UPDATE game.skill_queue SET start_time = $2, end_time = $3 WHERE character_id = $1", &[&f.character, &filetime_now(), &due]).await.unwrap();
     seed(&db).await.unwrap_or_else(|_| panic!("failed to seed skill completion job for runner"));
     let id = format!("{KIND}:{}", f.character);
+    let start = filetime_now();
+    let due = start + crate::client::filetime_ticks_from_seconds(5);
+    let scheduled = db.query_one("WITH updated_queue AS (UPDATE game.skill_queue SET start_time = $2, end_time = $3 WHERE character_id = $1 RETURNING end_time) UPDATE game.jobs SET due_at = updated_queue.end_time FROM updated_queue WHERE job_id = $4 RETURNING game.jobs.due_at", &[&f.character, &start, &due, &id]).await.unwrap();
+    let due: i64 = scheduled.get("due_at");
     let (shutdown, watch) = watch::channel(false);
     let mut runner = scheduler::runner::start(
         db.clone(), c.world.clone(), vec![scheduler::register(KIND, handle)],

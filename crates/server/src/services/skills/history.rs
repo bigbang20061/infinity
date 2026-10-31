@@ -11,6 +11,12 @@ pub(super) const TRAINING_COMPLETE: i32 = 37;
 pub(super) const GM_GIVE: i32 = 39;
 /// Client appConst.py:1543-1560, skill removed.
 pub(super) const REMOVED: i32 = 177;
+/// Client appConst.py skillbook injection.
+pub(super) const INJECTED: i32 = 56;
+/// Client appConst.py free skill points applied.
+pub(super) const FREE_POINTS_USED: i32 = 307;
+/// Client appConst.py skill extraction.
+pub(super) const EXTRACTED: i32 = 431;
 /// skillHistoryPanel.py default request.
 const DEFAULT_RESULTS: i64 = 50;
 

@@ -122,6 +122,26 @@ pub(in crate::services) fn dispatch_changed<T>(value: T, outbox: Outbox<OnlineCh
     Ok(value)
 }
 
+/// Reconcile all owned online hulls while the caller holds the market lock.
+pub(in crate::services) async fn reconcile_owner<E: From<OnlineChanged> + Send>(
+    ex: &(impl Executor + ?Sized), sde: &Arc<Sde>, outbox: &mut Outbox<E>, owner: i64,
+) -> Result<(), CallError> {
+    let candidates = crate::dao::items::fit::owner_online_ships(ex, owner).await.map_err(db_err)?;
+    let mut ships: Vec<_> = crate::services::items::load_items(ex, sde, crate::dao::items::loading::ItemQuery::Ids(&candidates)).await.map_err(db_err)?
+        .into_iter().filter(|item| item.owner_id == owner && item.singleton && item.category_id == i64::from(crate::consts::CATEGORY_SHIP))
+        .map(|item| item.item_id).collect();
+    ships.sort_unstable();
+    for &ship in &ships {
+        if !crate::dao::items::ship::lock_reload_ship(ex, ship).await.map_err(db_err)? {
+            return Err(CallError::Internal(anyhow::anyhow!("ship disappeared")));
+        }
+    }
+    for ship in ships {
+        reconcile_core(ex, sde, outbox, owner, ship).await?;
+    }
+    Ok(())
+}
+
 
 pub(in crate::services) async fn reconcile_core<E: From<OnlineChanged> + Send>(
     ex: &(impl Executor + ?Sized), sde: &Arc<Sde>, outbox: &mut Outbox<E>, owner: i64, ship: i64,

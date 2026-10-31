@@ -81,7 +81,7 @@ async fn apply_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox, sde: &std:
     if !attributes::save_respec(tx, char_id, bases, &state, free, now, next).await.map_err(db_err)? {
         return Err(notify_error(crate::messages::skills::REMAP_UNAVAILABLE));
     }
-    let finished = training::save_queue_tx(tx, outbox, sde, char_id, entries, active, true, now, finished).await?;
+    let finished = training::save_queue_tx(tx, outbox, sde, char_id, entries, active, true, now, finished, &[]).await?;
     if finished.is_empty() { outbox.notify_pilot(char_id, BRAIN_REFRESH, vec![]); }
     outbox.notify_client("OnRespecInfoChanged", vec![]);
     Ok(Value::None)

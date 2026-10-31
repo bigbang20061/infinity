@@ -14,6 +14,9 @@ mod training;
 pub(crate) mod completion;
 pub(crate) mod gm;
 mod history;
+mod free_points;
+pub(crate) mod books;
+mod trading;
 mod respec;
 #[cfg(test)]
 mod tests;

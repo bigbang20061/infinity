@@ -120,7 +120,7 @@ async fn queue_save_completion_notifies_once_and_rollback_dispatches_nothing() {
         let result: Result<(), CallError> = db.transaction(|tx, outbox: &mut Outbox| {
             let sde = sde.clone();
             Box::pin(async move {
-                save_queue_tx(tx, outbox, &sde, f.character, vec![], false, notify, filetime_now(), vec![]).await?;
+                save_queue_tx(tx, outbox, &sde, f.character, vec![], false, notify, filetime_now(), vec![], &[]).await?;
                 Err(CallError::Internal(anyhow::anyhow!("force rollback")))
             })
         }, |(), _outbox| async move {
@@ -135,7 +135,7 @@ async fn queue_save_completion_notifies_once_and_rollback_dispatches_nothing() {
         let effects = db.transaction(|tx, outbox: &mut Outbox| {
             let sde = sde.clone();
             Box::pin(async move {
-                save_queue_tx(tx, outbox, &sde, f.character, vec![], false, notify, filetime_now(), vec![]).await?;
+                save_queue_tx(tx, outbox, &sde, f.character, vec![], false, notify, filetime_now(), vec![], &[]).await?;
                 Ok(())
             })
         }, |(), outbox| async move { Ok::<_, CallError>(outbox.into_entries()) }).await.unwrap_or_else(|_| panic!("failed to save skill queue and collect effects"));

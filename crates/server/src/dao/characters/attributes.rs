@@ -16,6 +16,11 @@ impl FreePoints { fn from_row(r: &Row) -> Self { Self { points: r.get("free_skil
 pub(crate) async fn free_points(ex: &(impl Executor + ?Sized), char_id: i64) -> Result<i64, Error> {
     Ok(FreePoints::from_row(&ex.query_one("SELECT free_skill_points FROM game.characters WHERE character_id = $1", &[&char_id]).await?).points)
 }
+/// Replace an observed free-point balance, refusing stale or negative updates.
+pub(crate) async fn replace_free_points(ex: &(impl Executor + ?Sized), char_id: i64, expected: i64, points: i64) -> Result<bool, Error> {
+    Ok(ex.execute("UPDATE game.characters SET free_skill_points = $3 WHERE character_id = $1 AND free_skill_points = $2 AND $3::bigint >= 0", &[&char_id, &expected, &points]).await? == 1)
+}
+
 
 const SELECT_RESPEC: &str = "SELECT bases, free_respecs, last_respec_date, next_timed_respec FROM game.character_respec WHERE character_id = $1";
 

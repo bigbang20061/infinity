@@ -126,7 +126,7 @@ async fn refused_saves_roll_back_completion_history_jobs_and_effects() {
                 let sde = sde.clone();
                 let entries = entries.clone();
                 Box::pin(async move {
-                    save_queue_tx(tx, outbox, &sde, f.character, entries, true, true, crate::client::filetime_now(), vec![]).await?;
+                    save_queue_tx(tx, outbox, &sde, f.character, entries, true, true, crate::client::filetime_now(), vec![], &[]).await?;
                     Ok(())
                 })
             }, |(), _outbox| async move { flag.store(true, Ordering::SeqCst); Ok(()) }).await;

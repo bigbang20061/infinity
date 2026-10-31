@@ -24,5 +24,6 @@ pub(crate) mod quantities;
 pub(crate) mod repair;
 pub(crate) mod salvage;
 pub(crate) mod ship;
+pub(crate) mod skills;
 pub(crate) mod social;
 pub(crate) mod transfers;

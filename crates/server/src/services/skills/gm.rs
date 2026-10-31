@@ -5,7 +5,7 @@
 //! Skill reductions reconcile the owner's online fitted ships after the batch.
 use super::{db_err, CallError};
 use super::{formulas::sp_for_level, starting::starting_levels, training::{complete_tx, queue_list_db, skill_info, skill_type}};
-use crate::{client::{Client, filetime_now, BRAIN_REFRESH}, consts::CATEGORY_SKILL, dao::{items::{fit, ship}, skills::{queue, training}}, db::{executor::Executor, outbox::Outbox}, sde::Sde};
+use crate::{client::{Client, filetime_now, BRAIN_REFRESH}, consts::CATEGORY_SKILL, dao::skills::{queue, training}, db::{executor::Executor, outbox::Outbox}, sde::Sde};
 use crate::services::effects::online::{self, OnlineChanged};
 use marshal::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -138,14 +138,6 @@ pub(crate) async fn apply(c: &mut Client, char_id: i64, change: Change) -> Resul
             Change::RemoveAll => Change::RemoveAll, Change::Starters => Change::Starters,
         };
         Box::pin(async move {
-            let candidates = fit::owner_online_ships(tx, char_id).await.map_err(db_err)?;
-            let ships: Vec<_> = crate::services::items::load_items(tx, &sde, crate::dao::items::loading::ItemQuery::Ids(&candidates)).await.map_err(db_err)?
-                .into_iter().filter(|item| item.singleton && item.category_id == i64::from(crate::consts::CATEGORY_SHIP)).map(|item| item.item_id).collect();
-            for &hull in &ships {
-                if !ship::lock_reload_ship(tx, hull).await.map_err(db_err)? {
-                    return Err(CallError::Internal(anyhow::anyhow!("ship disappeared")));
-                }
-            }
             match change {
                 Change::Set(levels) => set_levels(tx, outbox, &sde, char_id, &levels).await,
                 Change::Remove(types) => remove(tx, outbox, &sde, char_id, &types).await,
@@ -158,9 +150,7 @@ pub(crate) async fn apply(c: &mut Client, char_id: i64, change: Change) -> Resul
                 }
                 Change::Starters => grant_starters(tx, outbox, &sde, char_id).await,
             }?;
-            for hull in ships {
-                online::reconcile_core(tx, &sde, outbox, char_id, hull).await?;
-            }
+            online::reconcile_owner(tx, &sde, outbox, char_id).await?;
             Ok(())
         })
     }, |(), outbox| async move { let result = online::dispatch_changed((), outbox, c); crate::scheduler::wake(); result }).await

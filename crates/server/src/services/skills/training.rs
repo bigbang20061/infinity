@@ -227,7 +227,7 @@ pub(super) async fn queue_list_db(db: &(impl Executor + ?Sized), char_id: i64) -
     ))
 }
 
-pub(super) async fn save_queue_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox, sde: &std::sync::Arc<crate::sde::Sde>, char_id: i64, entries: Vec<(i64, i64, i64)>, activate: bool, notify: bool, now: i64, mut finished: Vec<(i32, i32)>) -> Result<Vec<(i32, i32)>, CallError> {
+pub(super) async fn save_queue_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox, sde: &std::sync::Arc<crate::sde::Sde>, char_id: i64, entries: Vec<(i64, i64, i64)>, activate: bool, notify: bool, now: i64, mut finished: Vec<(i32, i32)>, additional: &[i32]) -> Result<Vec<(i32, i32)>, CallError> {
     crate::dao::characters::selection::lock_character(tx, char_id).await.map_err(db_err)?;
     finished.extend(complete_tx(tx, outbox, char_id, now).await?);
     let training = in_training_sp(tx, char_id, now).await?;
@@ -257,7 +257,7 @@ pub(super) async fn save_queue_tx(tx: &(impl Executor + ?Sized), outbox: &mut Ou
         finished.extend(complete_tx(tx, outbox, char_id, now).await?);
     }
     super::completion::reschedule(tx, char_id).await?;
-    super::completion::notify_completed(tx, outbox, sde, char_id, now, &finished).await?;
+    super::completion::notify_changes(tx, outbox, sde, char_id, now, &finished, additional).await?;
     if notify {
         outbox.notify_client("OnNewSkillQueueSaved", vec![queue_list_db(tx, char_id).await?]);
     }
@@ -274,7 +274,7 @@ pub(super) async fn save_queue(c: &mut Client, char_id: i64, queue: &Value, acti
             let entries = entries.clone();
             let sde = sde.clone();
             Box::pin(async move {
-                save_queue_tx(tx, outbox, &sde, char_id, entries, activate, notify, now, vec![]).await
+                save_queue_tx(tx, outbox, &sde, char_id, entries, activate, notify, now, vec![], &[]).await
             })
         },
         |finished, outbox| async move {

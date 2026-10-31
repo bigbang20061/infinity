@@ -82,6 +82,12 @@ pub const CATEGORY_SUBSYSTEM: i32 = 32;
 pub const SKILL_HACKING: i32 = 21718;
 /// SDE invTypes: Archaeology skill.
 pub const SKILL_ARCHAEOLOGY: i32 = 13278;
+/// Client inventorycommon/const.py: typeInfomorphPsychology.
+pub const SKILL_INFOMORPH_PSYCHOLOGY: i32 = 24242;
+/// Client inventorycommon/const.py: typeAdvancedInfomorphPsychology.
+pub const SKILL_ADVANCED_INFOMORPH_PSYCHOLOGY: i32 = 33407;
+/// Client inventorycommon/const.py: typeEliteInfomorphPsychology.
+pub const SKILL_ELITE_INFOMORPH_PSYCHOLOGY: i32 = 73910;
 
 // SDE faction IDs.
 /// SDE chrFactions: Caldari State.

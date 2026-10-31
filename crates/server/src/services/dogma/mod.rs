@@ -336,6 +336,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
             Ok(ch)
         }
         "CheckSendLocationInfo" | "LogAttribute" => Ok(Value::None),
+        "InjectSkillIntoBrain" => skills::books::inject(c, call.args).await,
         "LaunchProbes" => exploration::launch_probes(c, call).await,
         // Both RPCs use the lifecycle's fitted-subject authorization and notifications.
         "SetModuleOnline" | "TakeModuleOffline" => {

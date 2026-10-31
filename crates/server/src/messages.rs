@@ -637,6 +637,10 @@ pub(crate) const MSG_CHARACTER_NOT_FOUND: &str = "CharacterNotFound";
 pub(crate) const MSG_CHARACTER_NOT_READY_FOR_DELETION: &str = "CharacterNotReadyForDeletion";
 /// Client message `CharNameInvalid`.
 pub(crate) const MSG_CHAR_NAME_INVALID: &str = "CharNameInvalid";
+/// Client `eve/client/script/ui/services/skillsvc.py:1028-1029` combine validation.
+pub(crate) const MSG_COMBINE_SKILL_INJECTOR_TOO_FEW_INJECTORS: &str = "CombineSkillInjectorTooFewInjectors";
+/// Client `eve/client/script/ui/services/skillsvc.py:774-776` skillbook validation.
+pub(crate) const MSG_ITEM_NOT_A_SKILL: &str = "ItemNotASkill";
 /// Client message `ConContractNotFound`.
 pub(crate) const MSG_CON_CONTRACT_NOT_FOUND: &str = "ConContractNotFound";
 /// Client message `ConContractNotOutstanding`.
@@ -711,6 +715,12 @@ pub(crate) const MSG_QUEUE_ALREADY_PRESENT: &str = "QueueSkillAlreadyPresent";
 pub(crate) const MSG_QUEUE_TOO_MANY: &str = "QueueTooManySkills";
 /// Client message `RepackageBeforeSelling`.
 pub(crate) const MSG_REPACKAGE_BEFORE_SELLING: &str = "RepackageBeforeSelling";
+/// Client `eve/client/script/ui/services/skillsvc.py:1004-1005` extraction validation.
+pub(crate) const MSG_SKILL_EXTRACTION_NOT_ENOUGH_SP: &str = "SkillExtractionNotEnoughSP";
+/// Client `eve/client/script/ui/services/skillsvc.py:1006-1009` extraction token validation.
+pub(crate) const MSG_TOKEN_REQUIRED_FOR_SKILL_EXTRACTION: &str = "TokenRequiredForSkillExtraction";
+/// Client `eve/client/script/ui/services/skillsvc.py:1000-1001` docking validation.
+pub(crate) const MSG_SKILL_EXTRACTOR_NOT_DOCKED_IN_STATION: &str = "SkillExtractorNotDockedInStation";
 /// Client message `ShipNotFound`.
 pub(crate) const MSG_SHIP_NOT_FOUND: &str = "ShipNotFound";
 /// Client message `SlashError`.
