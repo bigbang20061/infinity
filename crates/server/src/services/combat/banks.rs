@@ -1,11 +1,69 @@
 //! Weapon bank RPC policy mirrored from `eve/client/script/dogma/clientDogmaLocation.py`.
 //! Membership, charges and pending reloads come from `game.weapon_banks`,
 //! `game.module_charges` and `game.pending_reloads`; fitting and online state use items.
-//! Requested changes return their map without notifications. Offline/unfit reconciliation,
-//! cycle stopping and slave activation redirection are not implemented here.
+//! Requested changes return their map without notifications. Offlining any member
+//! destroys its whole bank; unfit removes a slave or destroys a master's bank.
+//! Committed changes stop affected cycles after their current cycle and notify the
+//! initiating client for offline/unfit. Slave weapon activation resolves to the master.
+//! Membership persists; runtime cycles are not persisted or resumed after restart.
+//! Bank mutation and activation are serialized by the single live session in one server process.
 use super::*;
 use crate::consts::{CATEGORY_MODULE, CATEGORY_SHIP, GROUPABLE_GROUP_IDS};
 use crate::dao::items::{charges, combat, dogma, pending_reloads, ship as ship_dao};
+
+/// A captured activation generation, stopped only after the transaction commits.
+pub(in crate::services) struct BankStop(Arc<AtomicBool>);
+
+pub(in crate::services) fn apply_stop(stop: BankStop) {
+    crate::services::effects::lifecycle::stop_generation(&stop.0);
+}
+
+pub(in crate::services) fn capture_stop(item: i64) -> Option<BankStop> {
+    state().active.get(&item).map(|active| BankStop(active.stop.clone()))
+}
+
+pub(in crate::services) struct BankSnapshot {
+    rows: Vec<(i64, i64)>,
+    active: HashMap<i64, Arc<AtomicBool>>,
+}
+
+pub(in crate::services) async fn snapshot(ex: &(impl Executor + ?Sized), ship: i64, extra: &[i64]) -> Result<BankSnapshot, CallError> {
+    let rows: Vec<_> = charges::banks(ex, ship).await.map_err(db_err)?.into_iter().map(|r| (r.master_id, r.slave_id)).collect();
+    let st = state();
+    let active = rows.iter().flat_map(|&(m, s)| [m, s]).chain(extra.iter().copied())
+        .filter_map(|id| st.active.get(&id).map(|a| (id, a.stop.clone()))).collect();
+    Ok(BankSnapshot { rows, active })
+}
+
+pub(in crate::services) async fn changes(ex: &(impl Executor + ?Sized), ship: i64, before: BankSnapshot) -> Result<Vec<BankStop>, CallError> {
+    let after: Vec<_> = charges::banks(ex, ship).await.map_err(db_err)?.into_iter().map(|r| (r.master_id, r.slave_id)).collect();
+    let old: HashSet<_> = before.rows.iter().copied().collect();
+    let new: HashSet<_> = after.iter().copied().collect();
+    let mut affected = HashSet::new();
+    for &(master, slave) in old.symmetric_difference(&new) {
+        let old_master = before.rows.iter().find(|&&(_, s)| s == slave).map_or(slave, |&(m, _)| m);
+        affected.insert(old_master);
+        affected.insert(master);
+    }
+    Ok(affected.into_iter().filter_map(|id| before.active.get(&id).cloned().map(BankStop)).collect())
+}
+
+pub(in crate::services) async fn remove_member(ex: &(impl Executor + ?Sized), ship: i64, item: i64, master: i64, whole: bool) -> Result<bool, CallError> {
+    let count = if whole || item == master { combat::destroy(ex, ship, master).await } else { combat::remove_slave(ex, ship, item).await };
+    Ok(count.map_err(db_err)? != 0)
+}
+
+pub(in crate::services) fn dispatch<T>(value: T, outbox: Outbox<BankStop>, c: &mut Client) -> Result<T, CallError> {
+    let world = c.world.clone();
+    for entry in outbox.into_entries() {
+        match entry {
+            crate::db::outbox::Effect::Operation(stop) => apply_stop(stop),
+            crate::db::outbox::Effect::Notification(n) => n.dispatch(&world, Some(&mut *c))?,
+            crate::db::outbox::Effect::Event(e) => crate::lua::on_event(e),
+        }
+    }
+    Ok(value)
+}
 
 #[derive(Clone)]
 struct Module {
@@ -69,14 +127,18 @@ fn grouped(items: &[Module], rows: &[charges::Bank]) -> Result<Vec<(i64, Vec<i64
     }).collect())
 }
 
-async fn operation(ex: &(impl Executor + ?Sized), sde: &Sde, ship: i64, owner: i64, method: &str, first: i64, second: i64) -> CallResult {
+async fn operation(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<BankStop>, ship: i64, owner: i64, method: &str, first: i64, second: i64) -> CallResult {
     if !ship_dao::lock_reload_ship(ex, ship).await.map_err(db_err)? { return Err(notify_error(messages::combat::NOT_YOUR_SHIP)); }
     let hull = load_items(ex, sde, ItemQuery::Id(ship)).await.map_err(db_err)?.into_iter().next();
     if !hull.is_some_and(|h| h.owner_id == owner && h.category_id == i64::from(CATEGORY_SHIP)) {
         return Err(notify_error(messages::combat::NOT_YOUR_SHIP));
     }
-    match method {
-        "GetWeaponBankInfoForShip" => banks(ex, ship).await,
+    if method == "GetWeaponBankInfoForShip" { return banks(ex, ship).await; }
+    let extra: Vec<_> = if method == "LinkAllWeapons" {
+        load_items(ex, sde, ItemQuery::LocationOwner(ship, owner)).await.map_err(db_err)?.into_iter().map(|i| i.item_id).collect()
+    } else { vec![first, second] };
+    let before = snapshot(ex, ship, &extra).await?;
+    let result = match method {
         "UnlinkAllModules" => { combat::clear_banks(ex, ship).await.map_err(db_err)?; Ok(Value::None) }
         "DestroyWeaponBank" => {
             let master = charges::bank_of(ex, ship, first).await.map_err(db_err)?;
@@ -121,7 +183,9 @@ async fn operation(ex: &(impl Executor + ?Sized), sde: &Sde, ship: i64, owner: i
             banks(ex, ship).await
         }
         _ => unreachable!(),
-    }
+    }?;
+    for stop in changes(ex, ship, before).await? { outbox.operation(stop); }
+    Ok(result)
 }
 
 fn authorize_ship(requested: Option<i64>, active: Option<i64>) -> Result<i64, CallError> {
@@ -136,11 +200,11 @@ pub(super) async fn weapon_groups(c: &mut Client, call: &Call<'_>) -> CallResult
     let method = call.method.to_owned();
     let sde = c.sde.clone();
     let db = c.db.clone();
-    db.transaction(|tx, _: &mut Outbox| {
+    db.transaction(|tx, outbox: &mut Outbox<BankStop>| {
         let sde = sde.clone();
         let method = method.clone();
-        Box::pin(async move { operation(tx, &sde, ship, owner, &method, first, second).await })
-    }, |value, outbox| async move { dispatch_client(value, outbox, c) }).await
+        Box::pin(async move { operation(tx, &sde, outbox, ship, owner, &method, first, second).await })
+    }, |value, outbox| async move { dispatch(value, outbox, c) }).await
 }
 
 #[cfg(test)] mod tests;

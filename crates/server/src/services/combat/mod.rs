@@ -194,7 +194,7 @@ mod reload_recovery;
 pub(crate) use reload_recovery::recover_pending_reloads;
 pub(crate) mod targeting_charges;
 use targeting_charges::*;
-mod banks;
+pub(in crate::services) mod banks;
 use banks::weapon_groups;
 pub(crate) mod groups_health;
 use groups_health::*;

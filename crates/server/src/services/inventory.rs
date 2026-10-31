@@ -9,6 +9,8 @@
 //! Loot rights and suspect flags are not implemented.
 //! Item capacity and contents are read from one game-item statement snapshot.
 //! Successful inventory moves queue item-move events after their writes.
+//! Departing fitted weapons reconcile persisted banks after the guarded move commits;
+//! running cycles stop after commit and finish their current cycle normally.
 
 use crate::dao::items::loading::{Item, ItemQuery};
 use super::items::load_items;
@@ -287,19 +289,36 @@ pub(crate) async fn move_item(c: &mut Client, container: &Container, item_id: i6
     let db = c.db.clone();
     let sde = c.sde.clone();
     db.transaction(
-        move |tx, outbox: &mut Outbox| {
+        move |tx, outbox: &mut Outbox<super::combat::banks::BankStop>| {
             let item = item.clone();
             let sde = sde.clone();
             Box::pin(async move {
-                let flag = if flag == FLAG_AUTOFIT || is_fitting_flag(flag) {
-                    if !crate::dao::items::ship::lock_reload_ship(tx, location).await.map_err(db_err)? {
+                let destination_fitting = flag == FLAG_AUTOFIT || is_fitting_flag(flag);
+                let source_fitting = is_fitting_flag(item.flag_id);
+                let mut locks = Vec::new();
+                if source_fitting { locks.push(item.location_id); }
+                if destination_fitting { locks.push(location); }
+                locks.sort_unstable();
+                locks.dedup();
+                for ship in locks {
+                    let exists = crate::dao::items::ship::lock_reload_ship(tx, ship).await.map_err(db_err)?;
+                    if ship == location && destination_fitting && !exists {
                         return Err(notify_error(messages::INSUFFICIENT_ITEM_QUANTITY));
                     }
-                    if flag == FLAG_AUTOFIT { free_slot_core(tx, &sde, location, item.type_id).await?.unwrap_or(FLAG_CARGO) } else { flag }
-                } else { flag };
+                }
+                let flag = if flag == FLAG_AUTOFIT { free_slot_core(tx, &sde, location, item.type_id).await?.unwrap_or(FLAG_CARGO) } else { flag };
                 let take = if is_fitting_flag(flag) { Some(1) } else { qty }
                     .filter(|q| *q > 0 && !item.singleton && (*q as i32) < item.quantity);
+                let departure = source_fitting && take.is_none() && (item.location_id != location || item.flag_id != flag || item.owner_id != owner);
+                let before = if departure { Some(super::combat::banks::snapshot(tx, item.location_id, &[item.item_id]).await?) } else { None };
+                let master = if departure { super::combat::targeting_charges::master_for_member(tx, item.location_id, item.item_id).await? } else { item.item_id };
                 let moved_id = move_core(tx, &sde, outbox, &item, owner, location, flag, take).await?;
+                if let Some(before) = before {
+                    if super::combat::banks::remove_member(tx, item.location_id, item.item_id, master, false).await? {
+                        for stop in super::combat::banks::changes(tx, item.location_id, before).await? { outbox.operation(stop); }
+                        outbox.notify_client("OnWeaponBanksChanged", vec![Value::Int(item.location_id), super::combat::banks(tx, item.location_id).await?]);
+                    }
+                }
                 if take.is_some() || item.location_id != location || item.flag_id != flag || item.owner_id != owner || (is_fitting_flag(flag) && !item.singleton) {
                     outbox.event(crate::lua::events::GameEvent::ItemsMoved {
                         char_id, item_id: moved_id, from_location_id: item.location_id,
@@ -309,7 +328,7 @@ pub(crate) async fn move_item(c: &mut Client, container: &Container, item_id: i6
                 Ok(Some(moved_id))
             })
         },
-        |value, outbox| async move { dispatch_client(value, outbox, c) },
+        |value, outbox| async move { super::combat::banks::dispatch(value, outbox, c) },
     ).await
 }
 

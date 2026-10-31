@@ -1,6 +1,8 @@
 use super::*;
 use crate::{conn::Conn, handshake::Login};
 
+mod integration;
+
 fn fixture_module(id: i64, flag: i32, kind: i32, group: i64, charge: Option<(i32, i64)>) -> Module {
     Module { item: Item { item_id: id, type_id: kind, owner_id: 1, location_id: 1, flag_id: flag,
         quantity: 1, singleton: true, group_id: group, category_id: i64::from(CATEGORY_MODULE), custom_info: None }, online: true, charge }
@@ -79,7 +81,7 @@ async fn real_bank_rpcs_and_transactional_rules() {
     crate::tests::init_config();
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let sde = Arc::new(Sde::load(&db).await.unwrap());
-    let gun = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_MODULE) && t.group_id.is_some_and(|g| GROUPABLE_GROUP_IDS.contains(&i64::from(g)))).expect("groupable module in SDE").type_id;
+    let gun = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_MODULE) && t.group_id.is_some_and(|g| GROUPABLE_GROUP_IDS.contains(&i64::from(g))) && sde.types.effects(t.type_id).iter().any(|e| e.effect_id == crate::consts::EFFECT_ONLINE as i32)).expect("groupable online module in SDE").type_id;
     let hull = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_SHIP)).expect("ship in SDE").type_id;
     let ammo: Vec<i32> = sde.types.iter().filter(|t| t.category_id == Some(CATEGORY_CHARGE)).take(2).map(|t| t.type_id).collect();
     assert_eq!(ammo.len(), 2);
@@ -99,6 +101,11 @@ async fn real_bank_rpcs_and_transactional_rules() {
         guns.push(id);
     }
     guns.reverse();
+    let scenario_db = db.clone();
+    let scenario_guns = guns.clone();
+    let scenario = tokio::spawn(async move {
+    let db = scenario_db;
+    let guns = scenario_guns;
     let world = World::new(db.clone(), sde.clone(), 0);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
@@ -107,7 +114,8 @@ async fn real_bank_rpcs_and_transactional_rules() {
         crate::chat::Hub::new("localhost"), world.clone(), Login { user_id: account, user_name: name, role: 0, client_id: 1, session_id: 1, language_id: "EN".into() });
     client.session.apply(vec![("charid", Value::Int(owner)), ("shipid", Value::Int(ship))]);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    world.register_pilot(owner, tx);
+    world.register_pilot(owner, tx.clone());
+    client.notify_tx = tx;
     let methods = ["LinkWeapons", "MergeModuleGroups", "PeelAndLink", "UnlinkModule", "UnlinkAllModules", "DestroyWeaponBank", "LinkAllWeapons", "GetWeaponBankInfoForShip"];
     for method in methods { assert!(rpc(&mut client, method, ship + 1, guns[0], guns[1]).await.is_err()); }
     assert!(rpc(&mut client, "GetWeaponBankInfoForShip", ship, 0, 0).await.is_ok());
@@ -173,6 +181,9 @@ async fn real_bank_rpcs_and_transactional_rules() {
     assert!(rpc(&mut client, "LinkAllWeapons", ship, 0, 0).await.is_err());
     assert_eq!(rows(&db, ship).await, before);
     while let Ok((name, _)) = rx.try_recv() { assert_ne!(name, "OnWeaponBanksChanged"); }
+    integration::exercise(&db, &mut client, ship, owner, &guns, &mut rx).await;
+    }).await;
+    for id in &guns { state().active.remove(id); }
     db.execute("DELETE FROM game.weapon_banks WHERE ship_id=$1", &[&ship]).await.unwrap();
     db.execute("DELETE FROM game.module_charges WHERE ship_id=$1", &[&ship]).await.unwrap();
     db.execute("DELETE FROM game.pending_reloads WHERE ship_id=$1", &[&ship]).await.unwrap();
@@ -180,4 +191,5 @@ async fn real_bank_rpcs_and_transactional_rules() {
     db.execute("DELETE FROM game.items WHERE item_id=$1", &[&ship]).await.unwrap();
     db.execute("DELETE FROM game.characters WHERE character_id=$1", &[&owner]).await.unwrap();
     db.execute("DELETE FROM game.accounts WHERE user_id=$1", &[&account]).await.unwrap();
+    scenario.unwrap();
 }
