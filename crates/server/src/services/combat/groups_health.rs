@@ -450,6 +450,7 @@ fn loot_category(published: Option<bool>, category: Option<i32>) -> Option<i32> 
 }
 
 #[cfg(test)] mod loot_tests;
+#[cfg(test)] mod tests;
 
 
 
