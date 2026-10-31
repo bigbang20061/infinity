@@ -12,7 +12,7 @@
 //! destiny boundary applies the queued uncloak (under one second); gameplay is unaffected.
 use super::{EffectKind, registry, unsupported, repair, mining, capacitor, projected, range};
 use super::registry::{Effect, EffectAttribute, EffectFlag};
-use super::notify::{attribute_change, fire_fx, ship_effect};
+use super::notify::{fire_fx, ship_effect};
 use super::propulsion::apply_propulsion;
 use super::weapons::{consume_charge, empty_charge, fire_missile, fire_turret};
 use crate::services::combat::{ctx, state, ActiveModule, Ctx};
@@ -23,7 +23,7 @@ use crate::services::items::load_items;
 use crate::services::{db_err, notify_error, user_error, Call, CallError, CallResult};
 use crate::dao::items::loading::{Item, ItemQuery};
 use crate::client::{filetime_now, Client};
-use crate::consts::{ATTR_ACTIVATION_BLOCKED, ATTR_CAPACITOR_NEED, ATTR_IS_ONLINE, CATEGORY_MODULE, CATEGORY_SHIP, EFFECT_MICROWARPDRIVE, EFFECT_ONLINE, FLAG_HANGAR};
+use crate::consts::{ATTR_ACTIVATION_BLOCKED, ATTR_CAPACITOR_NEED, CATEGORY_MODULE, CATEGORY_SHIP, EFFECT_MICROWARPDRIVE, EFFECT_ONLINE, FLAG_HANGAR};
 use crate::consts::{EFFECT_ANCILLARY_REMOTE_ARMOR_REPAIRER, EFFECT_ANCILLARY_REMOTE_SHIELD_BOOSTER, EFFECT_MUTADAPTIVE_REMOTE_ARMOR_REPAIRER, ATTR_CHARGED_ARMOR_DAMAGE_MULTIPLIER};
 use crate::messages;
 use crate::space::{ms_to_seconds, seconds_to_ms, System, World, MODE_WARP};
@@ -31,79 +31,10 @@ use marshal::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use tracing::{debug, info, warn};
-use crate::db::{executor::Executor, outbox::{Effect as OutboxEffect, Outbox}};
+use crate::db::executor::Executor;
 use crate::sde::Sde;
-use crate::space::NotifyTx;
+use super::online::OnlinePolicy;
 
-#[derive(Clone)]
-pub(in crate::services) struct OnlinePolicy {
-    pub owner: i64,
-    pub active_ship: Option<i64>,
-    pub station: Option<i64>,
-    pub notify: NotifyTx,
-}
-
-pub(in crate::services) struct OnlineChanged {
-    pub module: i64,
-    pub online: bool,
-    pub char_id: i64,
-    pub ship_id: i64,
-    pub notify: NotifyTx,
-    pub bank_stops: Vec<crate::services::combat::banks::BankStop>,
-    pub notify_online: bool,
-}
-
-impl OnlinePolicy {
-    pub(in crate::services) fn from_client(c: &Client) -> Result<Self, CallError> {
-        Ok(Self {
-            owner: c.session.int("charid").ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?,
-            active_ship: c.session.int("shipid"),
-            station: c.session.int("stationid"),
-            notify: c.notify_tx.clone(),
-        })
-    }
-}
-
-pub(in crate::services) async fn set_online_core<E: From<OnlineChanged> + Send>(
-    ex: &(impl Executor + ?Sized), sde: &Sde, policy: &OnlinePolicy, outbox: &mut Outbox<E>,
-    ship: i64, item: i64, online: bool,
-) -> Result<bool, CallError> {
-    let refuse = || notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION);
-    if !crate::dao::items::ship::lock_reload_ship(ex, ship).await.map_err(db_err)? { return Err(refuse()); }
-    let (hull, module) = subject_core(ex, sde, policy, ship, item, EFFECT_ONLINE as i32, false).await?;
-    let was_online = crate::dao::items::dogma::online(ex, ship).await.map_err(db_err)?.iter().any(|entry| entry.item_id == item);
-    if was_online == online && online { return Ok(false); }
-    let before = if online { None } else { Some(crate::services::combat::banks::snapshot(ex, ship, &[item]).await?) };
-    let master = if online { item } else { crate::services::combat::targeting_charges::master_for_member(ex, ship, item).await? };
-    let item_stop = if online { None } else { crate::services::combat::banks::capture_stop(item) };
-    let changed = was_online != online;
-    if changed && crate::dao::items::combat::set_online(ex, item, ship, policy.owner, module.flag_id, module.type_id, hull.type_id, hull.location_id, hull.flag_id, hull.singleton, online).await.map_err(db_err)? == 0 { return Err(refuse()); }
-    let mut bank_stops = Vec::new();
-    let mut bank_changed = false;
-    if let Some(before) = before {
-        if crate::services::combat::banks::remove_member(ex, ship, item, master, true).await? {
-            bank_changed = true;
-            bank_stops = crate::services::combat::banks::changes(ex, ship, before).await?;
-            outbox.notify_sender(policy.notify.clone(), "OnWeaponBanksChanged", vec![Value::Int(ship), crate::services::combat::banks(ex, ship).await?]);
-        }
-    }
-    if changed || bank_changed {
-        bank_stops.extend(item_stop);
-        outbox.operation(OnlineChanged { module: item, online, char_id: policy.owner, ship_id: ship, notify: policy.notify.clone(), bank_stops, notify_online: changed }.into());
-    }
-    Ok(changed)
-}
-
-pub(in crate::services) fn apply_online_changed(change: OnlineChanged) {
-    for stop in change.bank_stops { crate::services::combat::banks::apply_stop(stop); }
-    if !change.notify_online { return; }
-    let now = filetime_now();
-    let environment = super::environment::build(change.module, change.char_id, change.ship_id, None, None, EFFECT_ONLINE);
-    let effect = super::notify::ship_effect_args(change.module, EFFECT_ONLINE, environment, change.online, now, -1.0, -1, now);
-    let attr = attribute_change(change.char_id, Value::Int(change.module), ATTR_IS_ONLINE, Value::Int(change.online as i64), Value::Int(!change.online as i64));
-    let _ = change.notify.send(("OnGodmaShipEffect".into(), effect));
-    let _ = change.notify.send(("OnModuleAttributeChanges".into(), vec![Value::list([attr])]));
-}
 
 pub(in crate::services) fn stop_generation(stop: &AtomicBool) {
     stop.store(true, Ordering::Relaxed);
@@ -652,7 +583,7 @@ pub(super) fn valid_subject(hull: &Item, module: &Item, owner: i64, ship: i64, a
         && (!require_online || online)
 }
 
-async fn subject_core(ex: &(impl Executor + ?Sized), sde: &Sde, policy: &OnlinePolicy, ship: i64, item_id: i64, effect: i32, require_online: bool) -> Result<(Item, Item), CallError> {
+pub(super) async fn subject_core(ex: &(impl Executor + ?Sized), sde: &Sde, policy: &OnlinePolicy, ship: i64, item_id: i64, effect: i32, require_online: bool) -> Result<(Item, Item), CallError> {
     let refuse = || notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION);
     let hull = load_items(ex, sde, ItemQuery::Id(ship)).await.map_err(db_err)?.into_iter().next().ok_or_else(refuse)?;
     let module = load_items(ex, sde, ItemQuery::Id(item_id)).await.map_err(db_err)?.into_iter().next().ok_or_else(refuse)?;
@@ -706,7 +637,7 @@ pub(crate) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
     }
     match kind {
         EffectKind::Hacking => return super::super::hacking::start(c, item_id, target).await,
-        EffectKind::Online => return set_online(c, cx.ship_id, item_id, true).await,
+        EffectKind::Online => return super::online::set_online(c, cx.ship_id, item_id, true).await,
         EffectKind::Modifiers | EffectKind::Turret | EffectKind::Missile |
         EffectKind::LocalRepair { .. } | EffectKind::FueledLocalRepair { .. } |
         EffectKind::Propulsion | EffectKind::Mining | EffectKind::Projected { .. } | EffectKind::CapTransfer |
@@ -771,30 +702,6 @@ pub(crate) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
     Ok(Value::None)
 }
 
-/// Change online state for an authorized fitted module, including docked hangar ships.
-pub(crate) async fn set_online(c: &mut Client, ship: i64, item_id: i64, online: bool) -> CallResult {
-    let policy = OnlinePolicy::from_client(c)?;
-    let db = c.db.clone();
-    let sde = c.sde.clone();
-    db.transaction(
-        move |tx, outbox: &mut Outbox<OnlineChanged>| {
-            let policy = policy.clone();
-            let sde = sde.clone();
-            Box::pin(async move { set_online_core(tx, &sde, &policy, outbox, ship, item_id, online).await })
-        },
-        |changed, outbox| async move {
-            for entry in outbox.into_entries() {
-                match entry {
-                    OutboxEffect::Operation(change) => apply_online_changed(change),
-                    OutboxEffect::Notification(notification) => notification.dispatch(&c.world, None)?,
-                    OutboxEffect::Event(event) => crate::lua::on_event(event),
-                }
-            }
-            if changed { info!(user = c.login.user_id, "module {item_id} {}", if online { "online" } else { "offline" }); }
-            Ok(Value::None)
-        },
-    ).await
-}
 
 /// Deactivate(itemID, effectName): stop after the current cycle.
 pub(crate) async fn deactivate(c: &mut Client, call: &Call<'_>) -> CallResult {
@@ -813,7 +720,7 @@ pub(crate) async fn deactivate(c: &mut Client, call: &Call<'_>) -> CallResult {
         || !registry::activation_in_scope(module.category_id, module.group_id, kind) {
         return Err(unsupported::refusal(Some(id), &name, module.type_id));
     }
-    if kind == EffectKind::Online { return set_online(c, cx.ship_id, item_id, false).await; }
+    if kind == EffectKind::Online { return super::online::set_online(c, cx.ship_id, item_id, false).await; }
     if let Some(stop) = state().active.get(&item_id) {
         stop_generation(&stop.stop);
     }

@@ -84,7 +84,7 @@ fn dispatch_target<T>(value: T, outbox: Outbox, c: &mut Client, target: i64) -> 
 
 /// Unload selected modules and their bank's charges in one transaction.
 pub(in crate::services) async fn gm_unload(c: &mut Client, ship: i64, owner: i64, mut ids: Vec<i64>, destination: i64, flag: i32) -> Result<usize, CallError> {
-    use super::super::effects::lifecycle::{apply_online_changed, set_online_core, OnlineChanged, OnlinePolicy};
+    use super::super::effects::online::{apply_online_changed, set_online_core, OnlineChanged, OnlinePolicy};
     let _lock = super::super::market::lock().await;
     let policy = OnlinePolicy::from_client(c)?;
     if policy.owner != owner { return Err(notify_error(messages::gm::GM_FIT_REFUSED)); }

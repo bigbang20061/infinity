@@ -1,5 +1,6 @@
 //! Real actor regression: activating a bank by a slave and offlining a member.
 use super::*;
+use crate::services::effects::online::set_online;
 use crate::{
     consts::{ATTR_CAPACITOR_CAPACITY, ATTR_RECHARGE_RATE, ATTR_SCAN_RESOLUTION, CATEGORY_CHARGE, CATEGORY_MODULE, CATEGORY_SHIP, FLAG_HI_SLOT_FIRST, GROUPABLE_GROUP_IDS},
     dao::items::{charges, combat as item_combat, dogma},

@@ -1,5 +1,5 @@
 use super::*;
-use crate::services::{effects::lifecycle, inventory::{self, Container}};
+use crate::services::{effects::online, inventory::{self, Container}};
 use crate::db::outbox::Outbox;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -84,15 +84,15 @@ pub(super) async fn exercise(db: &Db, client: &mut Client, ship: i64, owner: i64
     assert!(bank_pushes(rx).is_empty());
     assert!(direct_bank_pushes(client).is_empty());
     // A failed transaction discards both the DB mutation and queued side effects.
-    let policy = lifecycle::OnlinePolicy::from_client(client).ok().expect("online policy");
+    let policy = online::OnlinePolicy::from_client(client).ok().expect("online policy");
     let sde = client.sde.clone();
     let rollback: Result<(), CallError> = db.transaction(
-        |tx, outbox: &mut Outbox<lifecycle::OnlineChanged>| {
+        |tx, outbox: &mut Outbox<online::OnlineChanged>| {
             let policy = policy.clone();
             let sde = sde.clone();
             let replacement = replacement.clone();
             Box::pin(async move {
-                assert!(lifecycle::set_online_core(tx, &sde, &policy, outbox, ship, b, false).await?);
+                assert!(online::set_online_core(tx, &sde, &policy, outbox, ship, b, false).await?);
                 assert!(!stopped(&replacement));
                 Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))
             })
@@ -106,22 +106,22 @@ pub(super) async fn exercise(db: &Db, client: &mut Client, ship: i64, owner: i64
 
     // Docked clients still receive the bank map through their own sender.
     client.world.unregister_pilot(owner);
-    assert!(lifecycle::set_online(client, ship, b, false).await.is_ok());
+    assert!(online::set_online(client, ship, b, false).await.is_ok());
     assert!(stopped(&replacement));
     assert!(rows(db, ship).await.is_empty());
     assert!(!db.query_one("SELECT online FROM game.items WHERE item_id=$1", &[&b]).await.unwrap().get::<_, bool>("online"));
     assert_eq!(bank_pushes(rx), vec![vec![Value::Int(ship), Value::Dict(vec![])]]);
-    assert!(lifecycle::set_online(client, ship, b, false).await.is_ok());
+    assert!(online::set_online(client, ship, b, false).await.is_ok());
     assert!(bank_pushes(rx).is_empty());
-    assert!(lifecycle::set_online(client, ship, b, true).await.is_ok());
+    assert!(online::set_online(client, ship, b, true).await.is_ok());
     assert!(rpc(client, "LinkWeapons", ship, a, b).await.is_ok());
     assert!(rpc(client, "LinkWeapons", ship, a, c).await.is_ok());
     let master = active(a, owner);
-    assert!(lifecycle::set_online(client, ship, a, false).await.is_ok());
+    assert!(online::set_online(client, ship, a, false).await.is_ok());
     assert!(stopped(&master));
     assert!(rows(db, ship).await.is_empty());
     assert_eq!(bank_pushes(rx), vec![vec![Value::Int(ship), Value::Dict(vec![])]]);
-    assert!(lifecycle::set_online(client, ship, a, true).await.is_ok());
+    assert!(online::set_online(client, ship, a, true).await.is_ok());
 
     assert!(rpc(client, "LinkWeapons", ship, a, b).await.is_ok());
     assert!(rpc(client, "LinkWeapons", ship, a, c).await.is_ok());
