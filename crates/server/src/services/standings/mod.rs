@@ -45,6 +45,20 @@ pub async fn standing(db: &(impl Executor + ?Sized), char_id: i64, from: i64) ->
     Ok(crate::dao::characters::standings::standing(db, char_id, from).await.map_err(db_err)?.unwrap_or(0.0))
 }
 
+/// Set an absolute NPC standing within the client standing range.
+pub(crate) async fn set(db: &(impl Executor + ?Sized), char_id: i64, from: i64, value: f64) -> Result<(), CallError> {
+    if !value.is_finite() || !(-STANDING_LIMIT..=STANDING_LIMIT).contains(&value) {
+        return Err(notify_error(messages::standings::STANDING_OUT_OF_RANGE));
+    }
+    crate::dao::characters::standings::set(db, char_id, from, value).await.map_err(db_err)?;
+    Ok(())
+}
+
+/// Queue the client notification for an absolute standing change.
+pub(crate) fn notify_set<X: Send>(outbox: &mut Outbox<X>, char_id: i64, from: i64, value: f64) {
+    outbox.notify_pilot(char_id, "OnStandingSet", vec![Value::Int(from), Value::Int(char_id), Value::Float(value)]);
+}
+
 /// Move `from`'s standing toward the character `change` of the way to +10 (or -10 if negative).
 async fn modify(db: &(impl Executor + ?Sized), char_id: i64, from: i64, change: f64) -> Result<Option<f64>, CallError> {
     if from == 0 || change == 0.0 {
@@ -52,7 +66,7 @@ async fn modify(db: &(impl Executor + ?Sized), char_id: i64, from: i64, change: 
     }
     let old = standing(db, char_id, from).await?;
     let new = if change > 0.0 { old + (STANDING_LIMIT - old) * change } else { old + (STANDING_LIMIT + old) * change }.clamp(-STANDING_LIMIT, STANDING_LIMIT);
-    crate::dao::characters::standings::set(db, char_id, from, new).await.map_err(db_err)?;
+    set(db, char_id, from, new).await?;
     Ok(Some(new))
 }
 
@@ -98,7 +112,7 @@ async fn apply_mission_standings<X: Send, const N: usize>(db: &(impl Executor + 
     }
     for (i, value) in values.into_iter().enumerate() {
         if let Some(new) = value {
-            outbox.notify_pilot(char_id, "OnStandingSet", vec![Value::Int(changes[i].0), Value::Int(char_id), Value::Float(new)]);
+            notify_set(outbox, char_id, changes[i].0, new);
         }
     }
     Ok(())
@@ -132,3 +146,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests;
