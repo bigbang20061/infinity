@@ -95,6 +95,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("setalliance", messages::gm::GM_HELP_SETALLIANCE),
     ("joinalliance", messages::gm::GM_HELP_JOINALLIANCE),
     ("session", messages::gm::GM_HELP_SESSION),
+    ("setstanding", messages::gm::GM_HELP_SETSTANDING),
     ("help", messages::gm::GM_HELP_HELP),
 ];
 
@@ -337,6 +338,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "dmg" => combat::command(c, &command, args).await,
         "lp" | "addlp" | "setlp" | "missioncomplete" | "corpcreate" | "setalliance" | "joinalliance" => social::command(c, &command, args).await,
         "secstatus" | "session" => info::command(c, &command, args).await,
+        "setstanding" => social::command(c, &command, args).await,
         "help" => Ok(help()),
         other => Err(slash_error(messages::gm::gm_unknown_command(other, &help()))),
     };

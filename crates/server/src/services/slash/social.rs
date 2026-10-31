@@ -35,6 +35,26 @@ pub(super) async fn command(c: &mut Client, command: &str, args: &[String]) -> R
             let count = crate::services::missions::force_complete(c, agent).await?;
             Ok(messages::gm::gm_missioncomplete(count))
         }
+        "setstanding" => {
+            if !(3..=4).contains(&args.len()) { return Err(slash_error(messages::gm::GM_SETSTANDING_USAGE.into())); }
+            parsed.required(0).map_err(|_| slash_error(messages::gm::GM_SETSTANDING_USAGE.into()))?;
+            parsed.required(1).map_err(|_| slash_error(messages::gm::GM_SETSTANDING_USAGE.into()))?;
+            let owner = parsed.owner(c, 0).await?;
+            let character = parsed.target(c, 1).await?;
+            let value = parsed.f64(2).ok().filter(|v| (-10.0..=10.0).contains(v))
+                .ok_or_else(|| slash_error(messages::gm::GM_SETSTANDING_USAGE.into()))?;
+            let world = &*c.world;
+            c.db.transaction(
+                |tx, outbox| Box::pin(async move {
+                    standings::set(tx, character, owner, value).await?;
+                    standings::notify_set(outbox, character, owner, value);
+                    Ok(())
+                }),
+                |value, outbox| async move { dispatch_world(value, outbox, world) },
+            ).await?;
+            tracing::info!(gm = me, character, owner, value, reason = args.get(3).map(String::as_str).unwrap_or(""), "GM standing set");
+            Ok(messages::gm::gm_setstanding(owner, character, value))
+        }
         "lp" => {
             if args.len() > 1 { return Err(slash_error(messages::gm::GM_LP_USAGE.into())); }
             if !args.is_empty() { parsed.required(0).map_err(|_| slash_error(messages::gm::GM_LP_USAGE.into()))?; }

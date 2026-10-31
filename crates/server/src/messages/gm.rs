@@ -244,3 +244,6 @@ pub(crate) fn gm_wh_status_row(target: &str, type_id: i32, dest_system: i64, des
 }
 pub(crate) fn gm_wh_created(count: usize) -> String { format!("已创建 {count} 个虫洞连接。") }
 pub(crate) fn gm_wh_cleared(count: usize) -> String { format!("已清除 {count} 个虫洞连接。") }
+pub(crate) const GM_HELP_SETSTANDING: &str = "/setstanding <所属方> <角色> <声望值> [原因] — 设置声望";
+pub(crate) const GM_SETSTANDING_USAGE: &str = "用法：/setstanding 所属方 角色 声望值 [原因]（范围 -10 至 10）";
+pub(crate) fn gm_setstanding(owner: i64, character: i64, value: f64) -> String { format!("已设置 {owner} 对 {character} 的声望为 {value}") }
