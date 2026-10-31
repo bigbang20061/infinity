@@ -3,11 +3,16 @@
 //! missing ranks and attributes use server fallbacks.
 //! Finished levels are committed by the durable completion scheduler or mutations;
 //! training rates use effective character attributes computed by Fit.
+//! SaveNewQueue validates whole queues against skillQueueSvc.py:186-234,259-263.
+//! Malformed maps use QueueInvalidPosition; levels must be consecutive (server
+//! policy preventing skipped levels). For a dependency found later in the saved
+//! queue, the whole-queue check reports QueueCannotPlaceSkillAfterDependentSkills.
+//! Clone-grade restrictions and the client queue time limit are not enforced.
 use super::*;
 use super::attributes::{character_attributes_db, CHAR_ATTRIBUTES};
 use super::formulas::sp_for_level;
 use crate::client::filetime_now;
-use crate::consts::FILETIME_MINUTE;
+use crate::consts::{CATEGORY_SKILL, FILETIME_MINUTE, MAX_SKILL_LEVEL};
 use crate::db::executor::Executor;
 use crate::db::outbox::{dispatch_client, Outbox};
 use crate::dao::skills::{queue as queue_dao, training as training_dao};
@@ -27,6 +32,69 @@ const FALLBACK_SKILL_RANK: f64 = 1.0;
 const FALLBACK_TRAINING_ATTRIBUTE: f64 = 20.0;
 /// Client characterskills/util.py secondary attribute divisor.
 const SECONDARY_ATTRIBUTE_DIVISOR: f64 = 2.0;
+/// Client characterskills/queue.py: SKILLQUEUE_MAX_NUM_SKILLS.
+const MAX_QUEUE_ENTRIES: usize = 150;
+/// Client const.UE_TYPEID UserError substitution tag.
+const UE_TYPEID: i64 = 4;
+
+fn refusal(msg: &'static str) -> CallError {
+    CallError::User { msg: msg.into(), dict: vec![] }
+}
+
+fn parse_queue(queue: &Value) -> Result<Vec<(i64, i64, i64)>, CallError> {
+    let Value::Dict(pairs) = queue else { return Err(refusal(crate::messages::MSG_QUEUE_INVALID_POSITION)) };
+    if pairs.len() > MAX_QUEUE_ENTRIES {
+        return Err(CallError::User { msg: crate::messages::MSG_QUEUE_TOO_MANY.into(), dict: vec![("num".into(), Value::Int(MAX_QUEUE_ENTRIES as i64))] });
+    }
+    let mut entries = Vec::with_capacity(pairs.len());
+    for (key, value) in pairs {
+        let Value::Int(position) = key else { return Err(refusal(crate::messages::MSG_QUEUE_INVALID_POSITION)) };
+        let (Value::Tuple(values) | Value::List(values)) = value else { return Err(refusal(crate::messages::MSG_QUEUE_INVALID_POSITION)) };
+        let [Value::Int(type_id), Value::Int(level)] = values.as_slice() else { return Err(refusal(crate::messages::MSG_QUEUE_INVALID_POSITION)) };
+        if *position < 0 { return Err(refusal(crate::messages::MSG_QUEUE_INVALID_POSITION)); }
+        entries.push((*position, *type_id, *level));
+    }
+    entries.sort_unstable_by_key(|entry| entry.0);
+    if entries.iter().enumerate().any(|(index, entry)| entry.0 != index as i64) {
+        return Err(refusal(crate::messages::MSG_QUEUE_INVALID_POSITION));
+    }
+    Ok(entries)
+}
+
+fn validate_queue(sde: &crate::sde::Sde, entries: &[(i64, i64, i64)], current: &HashMap<i32, (i32, i64)>) -> Result<(), CallError> {
+    use crate::messages as m;
+    if entries.len() > MAX_QUEUE_ENTRIES {
+        return Err(CallError::User { msg: m::MSG_QUEUE_TOO_MANY.into(), dict: vec![("num".into(), Value::Int(MAX_QUEUE_ENTRIES as i64))] });
+    }
+    let mut levels = HashMap::new();
+    for (index, &(position, raw_type, raw_level)) in entries.iter().enumerate() {
+        if position != index as i64 { return Err(refusal(m::MSG_QUEUE_INVALID_POSITION)); }
+        let type_id = i32::try_from(raw_type).map_err(|_| refusal(m::MSG_QUEUE_SKILL_NOT_UPLOADED))?;
+        if !sde.types.get(type_id).is_some_and(|t| t.category_id == Some(CATEGORY_SKILL)) {
+            return Err(refusal(m::MSG_QUEUE_SKILL_NOT_UPLOADED));
+        }
+        let &(trained, points) = current.get(&type_id).ok_or_else(|| refusal(m::MSG_QUEUE_SKILL_NOT_UPLOADED))?;
+        if raw_level <= i64::from(trained) { return Err(refusal(m::MSG_QUEUE_PREVIOUSLY_TRAINED)); }
+        if raw_level > i64::from(MAX_SKILL_LEVEL) {
+            return Err(CallError::User { msg: m::MSG_QUEUE_PAST_MAXIMUM.into(), dict: vec![("typeName".into(), Value::tuple([Value::Int(UE_TYPEID), Value::Int(raw_type)]))] });
+        }
+        let level = raw_level as i32;
+        let previous = levels.get(&type_id).copied().unwrap_or(trained);
+        if level <= previous { return Err(refusal(m::MSG_QUEUE_ALREADY_PRESENT)); }
+        if level != previous + 1 { return Err(refusal(m::MSG_QUEUE_LEVELS_OUT_OF_ORDER)); }
+        if points == 0 {
+            for (required, required_level) in super::requirements::requirements(sde, type_id) {
+                let Some(&(trained_required, _)) = current.get(&required) else { return Err(refusal(m::MSG_QUEUE_BEFORE_REQUIREMENTS)) };
+                if trained_required.max(levels.get(&required).copied().unwrap_or(0)) < required_level {
+                    let later = entries[index + 1..].iter().any(|&(_, t, l)| t == i64::from(required) && l == i64::from(required_level));
+                    return Err(refusal(if later { m::MSG_QUEUE_AFTER_DEPENDENTS } else { m::MSG_QUEUE_BEFORE_REQUIREMENTS }));
+                }
+            }
+        }
+        levels.insert(type_id, level);
+    }
+    Ok(())
+}
 
 pub(super) struct SkillType {
     pub(super) rank: f64,
@@ -164,8 +232,9 @@ pub(super) async fn save_queue_tx(tx: &(impl Executor + ?Sized), outbox: &mut Ou
     finished.extend(complete_tx(tx, outbox, char_id, now).await?);
     let training = in_training_sp(tx, char_id, now).await?;
     training_dao::write_skills(tx, char_id, &plan_skills(&[], training)).await.map_err(db_err)?;
-    let attrs = character_attributes_db(tx, sde, char_id).await?;
     let current: HashMap<i32, (i32, i64)> = training_dao::current(tx, char_id).await.map_err(db_err)?.into_iter().map(|r| (r.type_id, (r.level, r.skill_points))).collect();
+    validate_queue(sde, &entries, &current)?;
+    let attrs = character_attributes_db(tx, sde, char_id).await?;
     queue_dao::clear(tx, char_id).await.map_err(db_err)?;
     let mut t = now;
     for (pos, (_, type_id, to_level)) in entries.into_iter().enumerate() {
@@ -197,17 +266,7 @@ pub(super) async fn save_queue_tx(tx: &(impl Executor + ?Sized), outbox: &mut Ou
 /// `SaveNewQueue({idx: (typeID, toLevel)}, activate=bool)`: rebuild the queue with timings.
 pub(super) async fn save_queue(c: &mut Client, char_id: i64, queue: &Value, activate: bool, notify: bool) -> Result<(), CallError> {
     let now = filetime_now();
-    let mut entries: Vec<(i64, i64, i64)> = match queue {
-        Value::Dict(pairs) => pairs
-            .iter()
-            .filter_map(|(k, v)| {
-                let t = v.items()?;
-                Some((k.as_int()?, t.first()?.as_int()?, t.get(1)?.as_int()?))
-            })
-            .collect(),
-        _ => vec![],
-    };
-    entries.sort();
+    let entries = parse_queue(queue)?;
     let db = c.db.clone();
     let sde = c.sde.clone();
     db.transaction(

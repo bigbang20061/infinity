@@ -699,6 +699,16 @@ pub(crate) const MSG_RESPEC_ATTRIBUTES_TOO_HIGH: &str = "RespecAttributesTooHigh
 pub(crate) const MSG_RESPEC_ATTRIBUTES_MISALLOCATED: &str = "RespecAttributesMisallocated";
 /// Client `eve/client/script/ui/shared/neocom/attributes.py:267` entitlement refusal.
 pub(crate) const MSG_RESPEC_TOO_SOON: &str = "RespecTooSoon";
+/// Client skillQueueSvc.py queue validation refusals.
+pub(crate) const MSG_QUEUE_INVALID_POSITION: &str = "QueueInvalidPosition";
+pub(crate) const MSG_QUEUE_SKILL_NOT_UPLOADED: &str = "QueueSkillNotUploaded";
+pub(crate) const MSG_QUEUE_PREVIOUSLY_TRAINED: &str = "QueueCannotTrainPreviouslyTrainedSkills";
+pub(crate) const MSG_QUEUE_PAST_MAXIMUM: &str = "QueueCannotTrainPastMaximumLevel";
+pub(crate) const MSG_QUEUE_LEVELS_OUT_OF_ORDER: &str = "QueueCannotPlaceSkillLevelsOutOfOrder";
+pub(crate) const MSG_QUEUE_BEFORE_REQUIREMENTS: &str = "QueueCannotPlaceSkillBeforeRequirements";
+pub(crate) const MSG_QUEUE_AFTER_DEPENDENTS: &str = "QueueCannotPlaceSkillAfterDependentSkills";
+pub(crate) const MSG_QUEUE_ALREADY_PRESENT: &str = "QueueSkillAlreadyPresent";
+pub(crate) const MSG_QUEUE_TOO_MANY: &str = "QueueTooManySkills";
 /// Client message `RepackageBeforeSelling`.
 pub(crate) const MSG_REPACKAGE_BEFORE_SELLING: &str = "RepackageBeforeSelling";
 /// Client message `ShipNotFound`.

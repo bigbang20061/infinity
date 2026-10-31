@@ -215,6 +215,8 @@ pub const ATTR_ARMOR_DAMAGE: i32 = 266;
 pub const ATTR_HULL_DAMAGE: i32 = 3;
 /// SDE dgmAttributeTypes: requiredSkill1.
 pub const ATTR_REQUIRED_SKILL_1: i32 = 182;
+/// Client skills/skillConst.py: skill_max_level.
+pub const MAX_SKILL_LEVEL: i32 = 5;
 /// SDE dgmEffects: online; an effect ID, not an effect category.
 pub const EFFECT_ONLINE: i64 = 16;
 /// SDE dgmEffects: moduleBonusMicrowarpdrive.

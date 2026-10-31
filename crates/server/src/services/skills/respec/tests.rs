@@ -4,6 +4,12 @@ use super::super::completion;
 fn values(values: [i64; 5]) -> Value {
     Value::Dict(CHAR_ATTRIBUTES.into_iter().zip(values).map(|(id, value)| (Value::Int(id), Value::Int(value))).collect())
 }
+async fn use_real_skill(db: &crate::db::Db, character: i64, sde: &crate::sde::Sde) -> i32 {
+    let type_id = sde.types.iter().find(|t| t.category_id == Some(crate::consts::CATEGORY_SKILL) && super::super::requirements::requirements(sde, t.type_id).next().is_none()).expect("SDE must contain a skill without prerequisites").type_id;
+    db.execute("UPDATE game.skills SET type_id=$2 WHERE character_id=$1", &[&character, &type_id]).await.unwrap();
+    db.execute("UPDATE game.skill_queue SET type_id=$2 WHERE character_id=$1", &[&character, &type_id]).await.unwrap();
+    type_id
+}
 
 #[test]
 fn exact_integer_attributes_and_total_are_required() {
@@ -35,6 +41,7 @@ async fn entitlement_persists_and_paused_queue_remains_paused() {
     fixture::seed_skill(&db, f.character).await.unwrap();
     db.execute("UPDATE game.skill_queue SET start_time=NULL, end_time=NULL WHERE character_id=$1", &[&f.character]).await.unwrap();
     let (mut c, _peer) = client(db.clone(), f.character).await;
+    use_real_skill(&db, f.character, &c.sde).await;
     assert!(apply(&mut c, f.character, &values([17, 17, 17, 20, 27])).await.is_err());
     assert!(attributes::respec(&db, f.character).await.unwrap().is_none());
     get(&mut c, f.character).await.unwrap_or_else(|_| panic!("initialize remap"));
@@ -82,6 +89,7 @@ async fn active_queue_banks_progress_and_reschedules() {
     let now = filetime_now();
     db.execute("UPDATE game.skill_queue SET start_time=$2, end_time=$3 WHERE character_id=$1", &[&f.character, &(now - FILETIME_DAY), &(now + FILETIME_DAY)]).await.unwrap();
     let (mut c, _peer) = client(db.clone(), f.character).await;
+    use_real_skill(&db, f.character, &c.sde).await;
     apply(&mut c, f.character, &values([17, 17, 17, 21, 27])).await.unwrap_or_else(|_| panic!("remap active queue"));
     let skill = skill_dao::current(&db, f.character).await.unwrap();
     assert!(skill[0].skill_points >= 50);
@@ -105,6 +113,8 @@ async fn remap_rolls_back_on_queue_failure_and_batches_overdue_completion() {
     fixture::seed_skill(&db, f.character).await.unwrap();
     let now = filetime_now();
     db.execute("INSERT INTO game.skill_queue (character_id, position, type_id, to_level, start_sp, dest_sp, start_time, end_time) VALUES ($1, 1, 1, 2, 100, 1415, $2, $3)", &[&f.character, &(now - FILETIME_DAY), &(now + FILETIME_DAY)]).await.unwrap();
+    let (c, _peer) = client(db.clone(), f.character).await;
+    let type_id = use_real_skill(&db, f.character, &c.sde).await;
     attributes::initialize_respec(&db, f.character, 1).await.unwrap();
     let id = format!("{}:{}", completion::KIND, f.character);
     completion::reschedule(&db, f.character).await.unwrap_or_else(|_| panic!("seed completion job"));
@@ -113,7 +123,6 @@ async fn remap_rolls_back_on_queue_failure_and_batches_overdue_completion() {
     let function = format!("atomicity_remap_{}", f.character);
     db.execute(&format!("CREATE FUNCTION game.{function}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.character_id = {} THEN RAISE EXCEPTION 'remap fixture'; END IF; RETURN NEW; END $$", f.character), &[]).await.unwrap();
     db.execute(&format!("CREATE TRIGGER {function} BEFORE INSERT ON game.skill_queue FOR EACH ROW EXECUTE FUNCTION game.{function}()"), &[]).await.unwrap();
-    let (c, _peer) = client(db.clone(), f.character).await;
     let sde = c.sde.clone();
     let dispatched = Arc::new(AtomicBool::new(false));
     let flag = dispatched.clone();
@@ -138,7 +147,7 @@ async fn remap_rolls_back_on_queue_failure_and_batches_overdue_completion() {
                 if event == "OnServerSkillsChanged" { changed += 1; }
                 if event == BRAIN_REFRESH { brains += 1; }
             }
-            Effect::Event(GameEvent::SkillTrained { char_id, type_id: 1, level: 1 }) if char_id == f.character => trained += 1,
+            Effect::Event(GameEvent::SkillTrained { char_id, type_id: trained_type, level: 1 }) if char_id == f.character && trained_type == type_id => trained += 1,
             _ => {}
         }
     }

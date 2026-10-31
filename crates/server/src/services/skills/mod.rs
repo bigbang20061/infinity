@@ -6,6 +6,7 @@ use super::{db_err, keyval, Call, CallError, CallResult};
 use crate::client::Client;
 pub(crate) mod attributes;
 pub(crate) mod formulas;
+pub(crate) mod requirements;
 pub(crate) mod starting;
 mod skill_mgr2;
 mod skill_handler;
