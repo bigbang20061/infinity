@@ -5,6 +5,10 @@
 //! Selecting a character registers process-local presence; appearance editing is not interpreted here.
 //! Selection restores the active ship's persisted condition before entering the game.
 //! Successful selection and logoff hand off lifecycle events after session changes.
+//! First selection serializes rookie ship grants on the character row and grants a
+//! persistent server-selected civilian fit without charges; existing ships are not retroactively refitted.
+
+mod rookie_fit;
 
 use crate::dao::{accounts, characters, items, skills};
 use super::{db_err, keyval, trimmed_arg_text, Call, CallError, CallResult};
@@ -169,13 +173,22 @@ async fn own_character(c: &Client, call: &Call<'_>) -> Result<i64, CallError> {
 
 /// Give the character a rookie ship in their station hangar if they have none.
 async fn ensure_ship(c: &Client, char_id: i64, race_id: i32, station_id: i64) -> Result<i64, CallError> {
-    if let Some(ship_id) = characters::selection::ship_id(&c.db, char_id).await.map_err(db_err)? {
-        return Ok(ship_id);
-    }
     let ship_type = c.sde.characters.race(race_id as i64).and_then(|race| race.ship_type_id).unwrap_or(FALLBACK_ROOKIE_SHIP);
-    let ship_id = items::creation::rookie_ship(&c.db, ship_type, char_id, station_id, FLAG_HANGAR).await.map_err(db_err)?;
-    characters::selection::set_ship(&c.db, char_id, ship_id).await.map_err(db_err)?;
-    info!(user = c.login.user_id, "issued rookie ship {ship_id} (type {ship_type}) to character {char_id}");
+    let ship_id = c.db.transaction(
+        |tx, _: &mut Outbox| Box::pin(async move {
+            characters::selection::lock_for_ship_grant(tx, char_id).await?;
+            if let Some(ship_id) = characters::selection::ship_id(tx, char_id).await? {
+                return Ok::<i64, CallError>(ship_id);
+            }
+            let fit = rookie_fit::for_ship(ship_type)
+                .ok_or_else(|| CallError::Internal(anyhow::anyhow!("no rookie fit for ship type {ship_type}")))?;
+            let ship_id = items::creation::rookie_ship(tx, fit.ship, char_id, station_id, FLAG_HANGAR).await?;
+            items::creation::fitted_items(tx, ship_id, char_id, fit.items).await?;
+            characters::selection::set_ship(tx, char_id, ship_id).await?;
+            Ok(ship_id)
+        }),
+        |value, _| async move { Ok(value) },
+    ).await?;
     Ok(ship_id)
 }
 

@@ -539,6 +539,10 @@ pub const FLAG_HANGAR: i32 = 4;
 pub const FLAG_CARGO: i32 = 5;
 /// Client inventorycommon.const.flagLoSlot0.
 pub const FLAG_FITTING_FIRST: i32 = 11;
+/// Client inventorycommon.const.flagMedSlot0.
+pub const FLAG_MED_SLOT_FIRST: i32 = 19;
+/// Client inventorycommon.const.flagHiSlot0.
+pub const FLAG_HI_SLOT_FIRST: i32 = 27;
 /// Client inventorycommon.const.flagHiSlot7.
 pub const FLAG_FITTING_LAST: i32 = 34;
 /// Client inventorycommon.const.flagRigSlot0.
