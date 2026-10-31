@@ -99,6 +99,34 @@ async fn instruction_budgets_are_isolated_across_awaits() -> mlua::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn async_invocation_budgets_are_isolated_across_awaits() -> mlua::Result<()> {
+    let lua = Lua::new();
+    let (sender, receiver) = tokio::sync::oneshot::channel::<()>();
+    let receiver = Arc::new(tokio::sync::Mutex::new(Some(receiver)));
+    lua.globals().set("wait", lua.create_async_function(move |_, ()| {
+        let receiver = receiver.clone();
+        async move { receiver.lock().await.take().unwrap().await.map_err(mlua::Error::external) }
+    })?)?;
+    let config = LuaConfig { call_budget_instructions: 1000, instruction_hook_interval: 100, call_budget_ms: 60_000, ..LuaConfig::default() };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let pending = budgeted_invocation(&lua, lua.load("wait(); return 42").into_function()?, &config, deadline)?;
+    let call = pending.function.call_async::<i64>(());
+    tokio::pin!(call);
+    let _guard = super::super::HookGuard(pending.hook_thread);
+    tokio::select! { biased; _ = &mut call => panic!("completed before release"), _ = tokio::task::yield_now() => {} }
+    {
+        let excessive = budgeted_invocation(&lua, lua.load("while true do end").into_function()?, &config, deadline)?;
+        let loop_call = excessive.function.call_async::<()>(());
+        tokio::pin!(loop_call);
+        let _guard = super::super::HookGuard(excessive.hook_thread);
+        assert!(loop_call.await.unwrap_err().to_string().contains("Lua execution budget exceeded"));
+    }
+    sender.send(()).unwrap();
+    assert_eq!(call.await?, 42);
+    Ok(())
+}
+
 #[test]
 fn bundled_reference_scripts_return_expected_wire_values() -> mlua::Result<()> {
     use marshal::Value as Wire;

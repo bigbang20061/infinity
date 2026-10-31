@@ -118,3 +118,15 @@ pub async fn ballpark_bound(c: &mut Client) -> Result<(), CallError> {
     for handler in &registry.claims.events { invoke(c, &registry, handler, Vec::new()).await?; }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+struct HookGuard(std::sync::Arc<std::sync::Mutex<Option<mlua::Thread>>>);
+#[cfg(test)]
+impl Drop for HookGuard {
+    fn drop(&mut self) {
+        if let Some(thread) = self.0.lock().unwrap_or_else(|e| e.into_inner()).take() { thread.remove_hook(); }
+    }
+}

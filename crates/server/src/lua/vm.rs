@@ -35,14 +35,16 @@ pub fn budgeted_invocation(lua: &Lua, handler: Function, config: &LuaConfig, dea
     let installed = hook_thread.clone();
     let maximum = config.call_budget_instructions;
     let interval = u64::from(config.instruction_hook_interval).min(maximum);
-    let setup = lua.create_function(move |lua, ()| {
-        let thread = lua.current_thread();
+    let setup = lua.create_function(move |_, thread: Thread| {
         install_budget(&thread, maximum, interval, deadline)?;
         *installed.lock().map_err(|e| mlua::Error::runtime(e.to_string()))? = Some(thread);
         Ok(())
     })?;
-    let factory: Function = lua.load("return function(setup, handler) return function(...) setup(); return handler(...) end end").eval()?;
-    Ok(Invocation { function: factory.call((setup, handler))?, hook_thread })
+    // mlua's current_thread() maps implicit call_async coroutines to their owner.
+    // Lua's coroutine.running() returns the actual coroutine that needs the hook.
+    let factory: Function = lua.load("return function(setup, handler, running) return function(...) setup(running()); return handler(...) end end").eval()?;
+    let running: Function = lua.globals().get::<Table>("coroutine")?.get("running")?;
+    Ok(Invocation { function: factory.call((setup, handler, running))?, hook_thread })
 }
 
 fn environment(lua: &Lua, root: &Path) -> mlua::Result<Table> {
