@@ -34,6 +34,7 @@ pub struct Config {
     pub characters: game::economy::CharactersConfig,
     pub market: game::economy::MarketConfig,
     pub trade: game::economy::TradeConfig,
+    pub repair: game::economy::RepairConfig,
     pub store: game::economy::StoreConfig,
     pub missions: game::world::MissionsConfig,
     pub standings: game::world::StandingsConfig,
@@ -73,6 +74,7 @@ impl PartialEq for Config {
             && self.market == other.market
             && self.trade == other.trade
             && self.store == other.store
+            && self.repair == other.repair
             && self.missions == other.missions
             && self.standings == other.standings
             && self.combat == other.combat
@@ -212,6 +214,7 @@ impl Config {
             market: self.market.clone(),
             trade: self.trade.clone(),
             store: self.store.clone(),
+            repair: self.repair.clone(),
             missions: self.missions.clone(),
             standings: self.standings.clone(),
             combat: self.combat.clone(),

@@ -8,6 +8,7 @@ pub(crate) mod bounty;
 pub(crate) mod contacts;
 pub(crate) mod effects;
 pub(crate) mod gm;
+pub(crate) mod repair;
 pub(crate) mod scheduler;
 pub(crate) mod lua;
 pub(crate) mod loyalty;

@@ -104,6 +104,9 @@ order_history_days = 90             # server closed-order history retention
 transaction_history_days = 30       # server default transaction-history period
 price_history_days = 365            # server market price-history retention
 
+[repair]
+cost_multiplier = 1.0               # station repair: multiplier on computed base price per hitpoint; finite and positive
+
 [trade]
 idle_timeout_secs = 1800            # durable idle trade cancellation, in seconds
 

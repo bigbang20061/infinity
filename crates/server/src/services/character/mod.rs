@@ -1,7 +1,7 @@
 //! Character-scoped services once in game, including paperdolls, assets, repairs and private notes.
 //! Client paths include `charMgr`, `paperDollServer`, `repairSvc` and related services.
 //! Data comes from character and item DAOs and the SDE; unmodelled systems return empty answers.
-use super::{db_err, keyval, rowset, value_id_list, Call, CallError, CallResult};
+use super::{db_err, keyval, rowset, Call, CallError, CallResult};
 use crate::client::Client;
 use crate::consts::{ATTR_STRUCTURE_HP, FILETIME_SECOND, FILETIME_UNIX_EPOCH, TYPE_CHARACTER};
 use marshal::Value;

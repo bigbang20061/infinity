@@ -1,6 +1,6 @@
-//! Asset and repair lookups for `charMgr` and `repairSvc`, and positions for
-//! the GM `slash` service. Uses `game.items`, `game.characters` and
-//! `game.market_orders`; services enrich station and repair data from SDE.
+//! Asset lookups for `charMgr`, and positions for the GM `slash` service.
+//! Uses `game.items`, `game.characters` and `game.market_orders`; services
+//! enrich station data from SDE.
 //! Wire values, policy, transactions and notifications remain with services.
 use crate::db::{executor::Executor, Error};
 use tokio_postgres::Row;
@@ -33,22 +33,6 @@ pub(crate) async fn stations(ex: &impl Executor, owner: i64) -> Result<Vec<Stati
         &[&owner],
     ).await?;
     Ok(rows.iter().map(Station::from_row).collect())
-}
-pub(crate) struct RepairQuote {
-    pub item_id: i64,
-    pub type_id: i64,
-}
-impl RepairQuote {
-    fn from_row(r: &Row) -> Self {
-        Self { item_id: r.get("item_id"), type_id: r.get("type_id") }
-    }
-}
-pub(crate) async fn repair_quotes(ex: &impl Executor, ids: &[i64], owner: i64) -> Result<Vec<RepairQuote>, Error> {
-    let rows = ex.query(
-        "SELECT i.item_id, i.type_id::bigint FROM game.items i WHERE i.item_id = ANY($1) AND i.owner_id = $2",
-        &[&ids, &owner],
-    ).await?;
-    Ok(rows.iter().map(RepairQuote::from_row).collect())
 }
 pub(crate) struct Position {
     pub location_id: i64,
