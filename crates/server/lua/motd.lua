@@ -1,4 +1,4 @@
--- The MOTD is persistent per script and is sent when a ballpark is bound.
+-- The MOTD is persistent per script and is sent when a character is selected.
 register.command{
     name = "motd",
     help = messages.motd_help,
@@ -15,9 +15,9 @@ register.command{
     end,
 }
 
-register.event("BallparkBound", function(ctx)
+register.event("CharacterSelected", function(ev)
     local text = store.get("motd")
     if text and text ~= "" then
-        ctx:notify("OnRemoteMessage", eve.str(messages.custom_notify), eve.dict{notify = eve.unicode(text)})
+        world.notify_pilot(ev.char_id, "OnRemoteMessage", {eve.str(messages.custom_notify), eve.dict{notify = eve.unicode(text)}})
     end
 end)

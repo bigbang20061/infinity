@@ -287,7 +287,11 @@ async fn bind_object(c: &mut Client, call: &Call<'_>) -> CallResult {
     // Binding the remote ballpark is the client's signal that it is ready for destiny state.
     if call.service == "beyonce" {
         ship::send_state(c).await?;
-        if crate::lua::enabled() { crate::lua::ballpark_bound(c).await?; }
+        if let (Some(char_id), Some(system_id)) = (c.session.int("charid"), c.session.int("solarsystemid")) {
+            let mut outbox = crate::db::outbox::Outbox::default();
+            outbox.event(crate::lua::events::GameEvent::BallparkBound { char_id, system_id });
+            crate::db::outbox::dispatch_client((), outbox, c)?;
+        }
     }
     Ok(Value::tuple([object, ret]))
 }

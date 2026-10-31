@@ -134,6 +134,7 @@ Any other tag starts nothing.
 ### Lua scripts
 
 - Scripts in `crates/server/lua/` can claim remote calls, GM commands and events. A claimed call is answered after `retail::cached_call` and before every Rust module, and the claims are logged when the scripts load. `docs/lua.md` documents the script API.
+- Event handlers receive a plain table of scalar values, never a live context: an event is delivered after the change that caused it has committed, in the order the changes were made. Interceptors claim one exact service and method; they run after `retail::cached_call` and before Lua call claims and every Rust module, and a refusal reaches the client as a `UserError`.
 - Host functions under `lua/host/` call the same service functions as the Rust handlers, with their transactions, outbox notifications and `World` operations. A new host function calls an existing service function; never write a second version of a game rule for scripts.
 - Scripts get no SQL. A script's own persistent data goes through the `store` host functions, which keep typed values per script in `game.lua_store` (`dao/lua_store.rs`).
 - Lua is compiled from source by `mlua` (`vendored`). Do not add a dependency on a system Lua or on any other system library.

@@ -35,14 +35,16 @@ pub fn budgeted_invocation(lua: &Lua, handler: Function, config: &LuaConfig, dea
     let installed = hook_thread.clone();
     let maximum = config.call_budget_instructions;
     let interval = u64::from(config.instruction_hook_interval).min(maximum);
-    let setup = lua.create_function(move |lua, ()| {
-        let thread = lua.current_thread();
+    let setup = lua.create_function(move |_, thread: Thread| {
         install_budget(&thread, maximum, interval, deadline)?;
         *installed.lock().map_err(|e| mlua::Error::runtime(e.to_string()))? = Some(thread);
         Ok(())
     })?;
-    let factory: Function = lua.load("return function(setup, handler) return function(...) setup(); return handler(...) end end").eval()?;
-    Ok(Invocation { function: factory.call((setup, handler))?, hook_thread })
+    // mlua's current_thread() maps implicit call_async coroutines to their owner.
+    // Lua's coroutine.running() returns the actual coroutine that needs the hook.
+    let factory: Function = lua.load("return function(setup, handler, running) return function(...) setup(running()); return handler(...) end end").eval()?;
+    let running: Function = lua.globals().get::<Table>("coroutine")?.get("running")?;
+    Ok(Invocation { function: factory.call((setup, handler, running))?, hook_thread })
 }
 
 fn environment(lua: &Lua, root: &Path) -> mlua::Result<Table> {
@@ -110,6 +112,20 @@ fn register_claims(lua: &Lua, env: &Table, claims: Arc<Mutex<Claims>>, script: S
         claims.rpc.insert(key, Handler { script: rpc_script.clone(), function });
         Ok(())
     })?)?;
+    let intercept_claims = claims.clone();
+    let intercept_script = script.clone();
+    let intercept_open = open.clone();
+    register.set("intercept", lua.create_function(move |_, (service, method, function): (String, String, Function)| {
+        if !intercept_open.load(Ordering::Acquire) { return Err(mlua::Error::runtime("registration is closed")); }
+        if service.is_empty() || method.is_empty() || service.contains('*') || method.contains('*') {
+            return Err(mlua::Error::runtime("intercept requires an exact service and method"));
+        }
+        let mut claims = intercept_claims.lock().map_err(|e| mlua::Error::runtime(e.to_string()))?;
+        let key = (service, method);
+        if let Some(previous) = claims.intercepts.get(&key) { return Err(mlua::Error::runtime(format!("duplicate intercept {}::{} in {} and {}", key.0, key.1, previous.script, intercept_script))); }
+        claims.intercepts.insert(key, Handler { script: intercept_script.clone(), function });
+        Ok(())
+    })?)?;
     let cmd_claims = claims.clone();
     let cmd_script = script.clone();
     let cmd_open = open.clone();
@@ -125,8 +141,8 @@ fn register_claims(lua: &Lua, env: &Table, claims: Arc<Mutex<Claims>>, script: S
     })?)?;
     register.set("event", lua.create_function(move |_, (name, function): (String, Function)| {
         if !open.load(Ordering::Acquire) { return Err(mlua::Error::runtime("registration is closed")); }
-        if name != "BallparkBound" { return Err(mlua::Error::runtime("unsupported event")); }
-        claims.lock().map_err(|e| mlua::Error::runtime(e.to_string()))?.events.push(Handler { script: script.clone(), function });
+        if !super::events::known_kind(&name) { return Err(mlua::Error::runtime(format!("unsupported event {name}"))); }
+        claims.lock().map_err(|e| mlua::Error::runtime(e.to_string()))?.events.entry(name).or_default().push(Handler { script: script.clone(), function });
         Ok(())
     })?)?;
     env.set("register", register)
@@ -172,8 +188,11 @@ pub fn build(config: &LuaConfig, resources: &host::Resources) -> Result<Registry
     for (name, command) in &claims.commands {
         tracing::info!(script = %command.handler.script, command = %name, "Lua command claim");
     }
-    for handler in &claims.events {
-        tracing::info!(script = %handler.script, event = "BallparkBound", "Lua event claim");
+    for ((service, method), handler) in &claims.intercepts {
+        tracing::info!(script = %handler.script, service, method, "Lua intercept claim");
+    }
+    for (event, handlers) in &claims.events {
+        for handler in handlers { tracing::info!(script = %handler.script, event, "Lua event claim"); }
     }
     Ok(Registry { lua, claims, overrides: Mutex::new(Default::default()) })
 }

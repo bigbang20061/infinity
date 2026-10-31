@@ -61,6 +61,10 @@ async fn invocation_deadline_invalidates_context_and_vm_remains_usable() {
     let saved_session: mlua::AnyUserData = lua.globals().get("saved_session").unwrap();
     lua.globals().set("saved_session", saved_session).unwrap();
     assert!(lua.load("return saved_session:get('charid')").exec_async().await.is_err());
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    let config = crate::config::lua::LuaConfig { call_budget_instructions: 1000, instruction_hook_interval: 100, ..Default::default() };
+    let invocation = crate::lua::vm::budgeted_invocation(&lua, lua.load("while true do end").into_function().unwrap(), &config, deadline.into_std()).unwrap();
+    assert!(invoke(&mut client, &lua, invocation, vec![], deadline).await.is_err());
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
     let invocation = crate::lua::vm::budgeted_invocation(&lua, lua.load("local ctx = ...; return ctx.user_id").into_function().unwrap(), &crate::config::lua::LuaConfig::default(), deadline.into_std()).unwrap();
     let result = match invoke(&mut client, &lua, invocation, vec![], deadline).await { Ok(value) => value, Err(_) => panic!("later invocation failed") };

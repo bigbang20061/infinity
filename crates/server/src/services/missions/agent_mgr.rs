@@ -1,4 +1,5 @@
 //! Agent manager service and dialogue.
+//! Successful acceptance queues an event after the existing state and cargo writes.
 use super::*;
 // ---------------------------------------------------------------- client shapes
 
@@ -330,19 +331,38 @@ async fn do_action(c: &mut Client, agent: &Agent, action: Option<i64>) -> CallRe
             conversation(s, actions(&[(ACT_REQUEST, BTN_REQUEST)]), last_action(true, false, false))
         }
         (Some(ACT_ACCEPT), Some(m)) if m.state == STATE_OFFERED => {
-            set_state(c, agent.id, STATE_ACCEPTED).await?;
-            if let Some(arc) = m.arc_id {
-                set_arc_state(c, arc, m.mission_id, "accepted").await?;
-            }
-            // Courier cargo waits in the pilot's hangar at the agent's station.
-            if let (Kind::Courier, Some((type_id, qty))) = (m.kind, m.cargo) {
-                let me = c.session.int("charid").unwrap_or(0);
-                let mut outbox = crate::db::outbox::Outbox::default();
-                super::items::deposit(&c.db, &c.sde, &mut outbox, me, agent.station_id, FLAG_HANGAR, type_id, qty, 0).await?;
-                crate::db::outbox::dispatch_client((), outbox, c)?;
-            }
+            let me = c.session.int("charid").unwrap_or(0);
+            let (agent_id, station, mission_id, arc) = (agent.id, agent.station_id, m.mission_id, m.arc_id);
+            let cargo = if m.kind == Kind::Courier { m.cargo } else { None };
+            let stamp = filetime_now();
+            let _lock = super::super::market::lock().await;
+            let db = c.db.clone();
+            let sde = c.sde.clone();
+            db.transaction(
+                move |tx, outbox: &mut crate::db::outbox::Outbox| {
+                    let sde = sde.clone();
+                    Box::pin(async move {
+                        if crate::dao::missions::accept_offered(tx, me, agent_id, mission_id, STATE_OFFERED, STATE_ACCEPTED, stamp).await.map_err(db_err)? == 0 {
+                            return Err(super::super::notify_error(messages::MISSION_DELIVER_TO_STATION_HANGAR));
+                        }
+                        if let Some(arc) = arc {
+                            crate::dao::missions::set_arc_state(tx, me, arc, mission_id, "accepted", Some(stamp)).await.map_err(db_err)?;
+                        }
+                        if let Some((type_id, qty)) = cargo {
+                            super::items::deposit(tx, &sde, outbox, me, station, FLAG_HANGAR, type_id, qty, 0).await?;
+                        }
+                        outbox.event(crate::lua::events::GameEvent::MissionAccepted { char_id: me, agent_id, mission_id });
+                        outbox.notify_client("OnAgentMissionChange", vec![Value::str("accepted"), Value::Int(agent_id)]);
+                        Ok(())
+                    })
+                },
+                |value, outbox| {
+                    let client = &mut *c;
+                    async move { crate::db::outbox::dispatch_client(value, outbox, client) }
+                },
+            ).await?;
+            drop(_lock);
             info!(user = c.login.user_id, "agent {}: mission {} accepted", agent.id, m.mission_id);
-            c.notify("OnAgentMissionChange", vec![Value::str("accepted"), Value::Int(agent.id)]);
             let s = says(c, &m, "messages.mission.accepted.agentsays", messages::MISSION_ACCEPTED_DESTINATION_LOGGED).await?;
             conversation(s, actions(&[(ACT_QUIT, BTN_QUIT)]), none())
         }

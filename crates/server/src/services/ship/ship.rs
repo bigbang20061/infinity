@@ -1,4 +1,5 @@
 //! The ship client service, mirroring the client ship service; uses SDE celestials and game locations. Space movement is handled by beyonce.
+//! Successful undocking hands off a lifecycle event after the session changes.
 use super::*;
 
 async fn undock(c: &mut Client) -> CallResult {
@@ -21,6 +22,11 @@ async fn undock(c: &mut Client) -> CallResult {
     c.world.add_ship(system, ball).await.map_err(CallError::Internal)?;
     info!(user = c.login.user_id, "ship {ship} undocked from {station} into {system}");
     c.change_session(vec![("stationid", Value::None), ("solarsystemid", Value::Int(system))]);
+    if let Some(char_id) = c.session.int("charid") {
+        let mut outbox = Outbox::default();
+        outbox.event(GameEvent::Undocked { char_id, ship_id: ship, station_id: station, system_id: system });
+        dispatch_client((), outbox, c)?;
+    }
     Ok(Value::None)
 }
 

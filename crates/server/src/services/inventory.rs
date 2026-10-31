@@ -6,6 +6,7 @@
 //! descendants cannot be moved, split, merged, trashed, renamed or accessed here.
 //! Supplied station-hangar sources require matching location and owner.
 //! Item capacity and contents are read from one game-item statement snapshot.
+//! Successful inventory moves queue item-move events after their writes.
 
 use crate::dao::items::loading::{Item, ItemQuery};
 use super::items::load_items;
@@ -270,7 +271,14 @@ pub(crate) async fn move_item(c: &mut Client, container: &Container, item_id: i6
                 } else { flag };
                 let take = if is_fitting_flag(flag) { Some(1) } else { qty }
                     .filter(|q| *q > 0 && !item.singleton && (*q as i32) < item.quantity);
-                move_core(tx, &sde, outbox, &item, owner, location, flag, take).await.map(Some)
+                let moved_id = move_core(tx, &sde, outbox, &item, owner, location, flag, take).await?;
+                if take.is_some() || item.location_id != location || item.flag_id != flag || item.owner_id != owner || (is_fitting_flag(flag) && !item.singleton) {
+                    outbox.event(crate::lua::events::GameEvent::ItemsMoved {
+                        char_id, item_id: moved_id, from_location_id: item.location_id,
+                        to_location_id: location, quantity: take.map_or(item.quantity, |q| q as i32),
+                    });
+                }
+                Ok(Some(moved_id))
             })
         },
         |value, outbox| async move { dispatch_client(value, outbox, c) },

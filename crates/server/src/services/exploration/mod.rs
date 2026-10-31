@@ -418,6 +418,7 @@ pub async fn launch_probes(c: &mut Client, call: &Call<'_>) -> CallResult {
             for effect in outbox.into_entries() {
                 match effect {
                     Effect::Notification(notification) => notification.dispatch(&world, Some(&mut *c))?,
+                    Effect::Event(event) => crate::lua::on_event(event),
                     Effect::Operation(Launch::Probes) => for _ in 0..take {
                         let id = NEXT_PROBE_ID.fetch_add(1, Ordering::Relaxed);
                         let probe = Probe { char_id, system, type_id, pos, expiry, strength: base * skill };
@@ -566,6 +567,7 @@ pub(super) async fn container_hacked(db: &Db, world: &Arc<World>, container: i64
             for effect in outbox.into_entries() {
                 match effect {
                     Effect::Notification(notification) => notification.dispatch(world, None)?,
+                    Effect::Event(event) => crate::lua::on_event(event),
                     Effect::Operation(Completion::Open(site)) => {
                         let site_id = site.id;
                         state().sites.insert(site_id, site.clone());

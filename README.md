@@ -34,7 +34,7 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
   - Seven wallet divisions with ISK transfers between characters and corporations. Offices rented per station, with corporation hangars and rent bills that can be paid automatically.
   - Alliances: founding, applications, member removal, executor support, and bulletins and contacts.
 - **Store.** New Eden Store catalogue, PLEX vault, redeeming queue and seasonal login rewards.
-- **Lua scripts.** Scripts in `crates/server/lua/` can answer remote calls and add GM commands without changes to the server's routing. The bundled scripts keep a message of the day that a GM sets, sent when a pilot's ballpark is bound, and answer five client calls that only need fixed answers. See [Lua scripts](docs/lua.md).
+- **Lua scripts.** Scripts in `crates/server/lua/` can answer remote calls and add GM commands without changes to the server's routing. A script can also intercept one exact remote call before the server answers it, for example to refuse a buy order with a message, and react to game events such as a character being selected, a ship being lost, a market order being filled or a mission being accepted. Events reach scripts in order, after the change that caused them has been saved. The bundled scripts keep a message of the day that a GM sets, sent when a character is selected, and answer five client calls that only need fixed answers. See [Lua scripts](docs/lua.md).
 - **GM slash commands** (see [GM commands](#gm-commands)).
 
 ## Known limitations
@@ -48,7 +48,6 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
   - shared bookmark folders
   - plugging in implants and consuming boosters; implants and boosters already in a character's slots do apply
   - modules whose effect is not implemented yet, among them capacitor warfare and transfer, remote repair, ECM, smartbombs, micro jump drives, salvagers, tractor beams and bombs. Activating one is refused with a message, and `/effects unsupported` lists the effects tried since the server started.
-  - game events for Lua scripts other than the ballpark being bound, and vetoes from scripts
   - in direct trades: items from cargo, from inside a container or from a corporation hangar, the active ship, fitted modules and charges, and PLEX; types that cannot be traded are refused anywhere in an offered container or ship
   - the GM bounty reimbursement and bounty cache calls
   - labels for personal contacts

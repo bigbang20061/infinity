@@ -420,6 +420,7 @@ async fn apply_loads(db: &Db, world: &World, notify: &NotifyTx, ship: i64, mut l
             for entry in outbox.into_entries() {
                 match entry {
                     crate::db::outbox::Effect::Notification(n) => n.dispatch_sender(world, notify)?,
+                    crate::db::outbox::Effect::Event(event) => crate::lua::on_event(event),
                     crate::db::outbox::Effect::Operation(never) => match never {},
                 }
             }

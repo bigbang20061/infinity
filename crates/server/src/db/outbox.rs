@@ -18,6 +18,7 @@ impl<E> Default for Outbox<E> {
 pub enum Effect<E> {
     Notification(Notification),
     Operation(E),
+    Event(crate::lua::events::GameEvent),
 }
 
 pub enum Notification {
@@ -36,6 +37,7 @@ impl<E> Outbox<E> {
     pub fn notify_sender(&mut self, sender: NotifyTx, event: &str, args: Vec<Value>) {
         self.entries.push(Effect::Notification(Notification::Sender { sender, event: event.into(), args }));
     }
+    pub fn event(&mut self, event: crate::lua::events::GameEvent) { self.entries.push(Effect::Event(event)); }
     pub fn operation(&mut self, operation: E) { self.entries.push(Effect::Operation(operation)); }
     pub fn into_entries(self) -> Vec<Effect<E>> { self.entries }
 }
@@ -70,6 +72,7 @@ pub fn dispatch_world<T>(value: T, outbox: Outbox, world: &World) -> Result<T, C
     for entry in outbox.into_entries() {
         match entry {
             Effect::Notification(notification) => notification.dispatch(world, None)?,
+            Effect::Event(event) => crate::lua::on_event(event),
             Effect::Operation(never) => match never {},
         }
     }
@@ -81,6 +84,7 @@ pub fn dispatch_client<T>(value: T, outbox: Outbox, client: &mut Client) -> Resu
     for entry in outbox.into_entries() {
         match entry {
             Effect::Notification(notification) => notification.dispatch(&world, Some(&mut *client))?,
+            Effect::Event(event) => crate::lua::on_event(event),
             Effect::Operation(never) => match never {},
         }
     }

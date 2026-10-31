@@ -1,8 +1,9 @@
-//! Sandboxed Lua RPC and slash extensions for client service calls. Scripts use
-//! the existing client, world and DAO facades; a typed store holds persistent
-//! script state. General game-event subscriptions are not supported here.
+//! Sandboxed Lua RPC, intercept, command and post-commit event extensions.
+//! Scripts use client, world and DAO facades and a typed persistent store.
+//! Events carry scalar facts without a client context or synchronous reply.
 
 pub mod host;
+pub mod events;
 pub mod value;
 mod registry;
 mod reload;
@@ -16,6 +17,7 @@ use value::WireValue;
 
 static HOST: OnceLock<reload::Host> = OnceLock::new();
 static ENABLED: AtomicBool = AtomicBool::new(false);
+static EVENTS: OnceLock<tokio::sync::mpsc::UnboundedSender<events::GameEvent>> = OnceLock::new();
 
 pub fn enabled() -> bool { ENABLED.load(Ordering::Acquire) }
 
@@ -24,6 +26,15 @@ pub async fn start(config: &Config, db: &Db, sde: &Arc<Sde>, world: &Arc<World>)
     let resources = host::Resources { db: db.clone(), sde: sde.clone(), world: world.clone(), store_value_limit_bytes: config.lua.store_value_limit_bytes };
     let host = reload::Host::new(config.lua.clone(), resources).await?;
     HOST.set(host).map_err(|_| anyhow::anyhow!("Lua host already initialized"))?;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    EVENTS.set(tx).map_err(|_| anyhow::anyhow!("Lua event runner already initialized"))?;
+    tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            let host = HOST.get().expect("initialized Lua host");
+            let registry = host.snapshot();
+            invoke_event(&registry, &host.config, &event).await;
+        }
+    });
     ENABLED.store(true, Ordering::Release);
     Ok(())
 }
@@ -51,6 +62,16 @@ async fn invoke(c: &mut Client, registry: &Registry, handler: &Handler, args: Ve
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     let host = HOST.get()?;
     let registry = host.snapshot();
+    if let Some(handler) = registry.claims.intercepts.get(&(call.service.to_owned(), call.method.to_owned())) {
+        let args = match (registry.lua.pack(WireValue(marshal::Value::Tuple(call.args.to_vec()))), registry.lua.pack(WireValue(call.kwargs.clone()))) {
+            (Ok(args), Ok(kwargs)) => vec![args, kwargs],
+            (Err(error), _) | (_, Err(error)) => return Some(Err(CallError::Internal(error.into()))),
+        };
+        match invoke(c, &registry, handler, args).await.and_then(intercept_result) {
+            Ok(()) => {}
+            Err(error) => return Some(Err(error)),
+        }
+    }
     let exact = (call.service.to_owned(), call.method.to_owned());
     let wildcard = (call.service.to_owned(), "*".to_owned());
     let (handler, is_wildcard) = match registry.claims.rpc.get(&exact) {
@@ -75,6 +96,17 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     }
 }
 
+fn intercept_result(mut values: mlua::MultiValue) -> Result<(), CallError> {
+    match (values.pop_front(), values.pop_front(), values.is_empty()) {
+        (Some(mlua::Value::Boolean(true)), None, true) => Ok(()),
+        (Some(mlua::Value::Boolean(false)), Some(mlua::Value::String(message)), true) => {
+            let message = message.to_str().map_err(|error| CallError::Internal(error.into()))?;
+            Err(CallError::User { msg: message.to_owned(), dict: Vec::new() })
+        }
+        _ => Err(CallError::Internal(anyhow::anyhow!("invalid Lua intercept result"))),
+    }
+}
+
 pub async fn command(c: &mut Client, name: &str, args: &[String]) -> Option<Result<String, CallError>> {
     let host = HOST.get()?;
     if name == "lua" {
@@ -85,6 +117,8 @@ pub async fn command(c: &mut Client, name: &str, args: &[String]) -> Option<Resu
                 let registry = host.snapshot();
                 let mut entries: Vec<_> = registry.claims.rpc.iter().map(|((svc, method), h)| format!("{}: {}::{}", h.script, svc, method)).collect();
                 entries.extend(registry.claims.commands.iter().map(|(name, cmd)| format!("{}: /{}", cmd.handler.script, name)));
+                entries.extend(registry.claims.intercepts.iter().map(|((svc, method), h)| format!("{}: intercept {}::{}", h.script, svc, method)));
+                entries.extend(registry.claims.events.iter().flat_map(|(event, handlers)| handlers.iter().map(move |h| format!("{}: event {}", h.script, event))));
                 entries.extend(registry.claims.scripts.iter().map(|name| format!("script: {name}")));
                 entries.sort();
                 entries.push(format!("memory={} MiB, time={} ms, instructions={}, interval={}", host.config.memory_limit_mb, host.config.call_budget_ms, host.config.call_budget_instructions, host.config.instruction_hook_interval));
@@ -112,9 +146,43 @@ pub fn command_help() -> Vec<(String, String)> {
     result
 }
 
-pub async fn ballpark_bound(c: &mut Client) -> Result<(), CallError> {
-    let Some(host) = HOST.get() else { return Ok(()) };
-    let registry = host.snapshot();
-    for handler in &registry.claims.events { invoke(c, &registry, handler, Vec::new()).await?; }
-    Ok(())
+pub fn on_event(event: events::GameEvent) {
+    if let Some(sender) = EVENTS.get() {
+        if sender.send(event).is_err() { tracing::warn!("Lua event runner stopped"); }
+    }
 }
+
+struct HookGuard(std::sync::Arc<std::sync::Mutex<Option<mlua::Thread>>>);
+impl Drop for HookGuard {
+    fn drop(&mut self) {
+        if let Some(thread) = self.0.lock().unwrap_or_else(|e| e.into_inner()).take() { thread.remove_hook(); }
+    }
+}
+
+async fn invoke_event(registry: &Registry, config: &crate::config::lua::LuaConfig, event: &events::GameEvent) {
+    let Some(handlers) = registry.claims.events.get(event.kind()) else { return };
+    for handler in handlers {
+        let future = async {
+            let deadline = Instant::now() + Duration::from_millis(config.call_budget_ms);
+            let invocation = vm::budgeted_invocation(&registry.lua, handler.function.clone(), config, deadline)?;
+            let payload = event.to_lua(&registry.lua)?;
+            let call = invocation.function.call_async::<()>(payload);
+            tokio::pin!(call);
+            let _guard = HookGuard(invocation.hook_thread);
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => Err(mlua::Error::runtime("Lua execution budget exceeded")),
+                result = &mut call => result,
+            }
+        };
+        let mut future = std::pin::pin!(future);
+        let result = std::future::poll_fn(|cx| match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| future.as_mut().poll(cx))) {
+            Ok(result) => result,
+            Err(_) => std::task::Poll::Ready(Err(mlua::Error::runtime("Lua runtime panic"))),
+        }).await;
+        if let Err(error) = result { tracing::warn!(script = %handler.script, event = event.kind(), "Lua event handler failed: {error}"); }
+    }
+}
+
+#[cfg(test)]
+mod tests;

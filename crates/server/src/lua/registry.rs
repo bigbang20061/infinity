@@ -21,7 +21,8 @@ pub struct Command {
 pub struct Claims {
     pub rpc: HashMap<(String, String), Handler>,
     pub commands: HashMap<String, Command>,
-    pub events: Vec<Handler>,
+    pub events: HashMap<String, Vec<Handler>>,
+    pub intercepts: HashMap<(String, String), Handler>,
     pub scripts: Vec<String>,
 }
 

@@ -1,4 +1,5 @@
 //! Station reprocessing service using canonical SDE materials and game prices.
+//! Successful reprocessing tax debits emit wallet events after transaction commit.
 use super::*;
 use crate::services::inventory;
 
@@ -170,6 +171,7 @@ pub(super) async fn reprocessing(c: &mut Client, call: &Call<'_>) -> CallResult 
                     if tax > 0.0 {
                         let balance = crate::dao::wallets::characters::debit(tx, char_id, tax).await.map_err(db_err)?.ok_or_else(|| notify_error(messages::INSUFFICIENT_ISK_FOR_REPROCESSING_TAX))?;
                         outbox.notify_client("OnAccountChange", vec![Value::str("cash"), Value::Int(char_id), Value::Float(balance)]);
+                        outbox.event(crate::lua::events::GameEvent::WalletChanged { owner_id: char_id, account_key: crate::consts::ACCOUNT_CASH, balance, delta: -tax });
                     }
                     Ok::<_, CallError>(Arc::clone(&plan))
                 })

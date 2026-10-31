@@ -16,11 +16,13 @@
 //! Local-chat invites use an outside-space delay for session settlement.
 //! Ship loss commits before its independently best-effort killmail and insurance
 //! operations. NPC workers are outside this module's scope.
+//! Completed dock, undock, jump and committed ship loss hand off lifecycle events.
 
 use super::{db_err, Call, CallError, CallResult};
 use crate::client::{short, Client};
 use crate::consts::{ATTR_AGILITY, ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_SIGNATURE_RADIUS, FILETIME_SECOND, FLAG_HANGAR, TYPE_CAPSULE};
-use crate::db::outbox::{Effect, Outbox};
+use crate::db::outbox::{dispatch_client, Effect, Outbox};
+use crate::lua::events::GameEvent;
 use crate::dao::{characters::{ship as character_dao, selection}, items::{ship as item_dao, creation}};
 use crate::messages;
 use crate::space::{self, event, now_ms, Ball, V3, CLOAK_RESTORE, MODE_STOP};
@@ -168,6 +170,11 @@ async fn dock(c: &mut Client, station: i64) -> CallResult {
     character_dao::dock(&c.db, c.session.int("charid").unwrap_or(0), station, system).await.map_err(db_err)?;
     info!(user = c.login.user_id, "ship {ship} docked at {station}");
     c.change_session(vec![("solarsystemid", Value::None), ("stationid", Value::Int(station))]);
+    if let Some(char_id) = c.session.int("charid") {
+        let mut outbox = Outbox::default();
+        outbox.event(GameEvent::Docked { char_id, ship_id: ship, station_id: station, system_id: system });
+        dispatch_client((), outbox, c)?;
+    }
     Ok(Value::None)
 }
 
@@ -318,6 +325,9 @@ pub(super) async fn jump_out_and_arrive(c: &mut Client, system: i64, ship: i64, 
             );
         });
     }
+    let mut outbox = Outbox::default();
+    outbox.event(GameEvent::Jumped { char_id, ship_id: ship, from_system_id: system, to_system_id: dest_system });
+    dispatch_client((), outbox, c)?;
     Ok(())
 }
 
@@ -416,6 +426,9 @@ pub async fn lose_ship(c: &mut Client, ship: i64, pos: [f64; 3]) -> Result<(), C
                 selection::set_ship(tx, char_id, capsule).await.map_err(db_err)?;
             }
             outbox.operation(());
+            if let Some(type_id) = lost_type {
+                outbox.event(GameEvent::ShipLost { char_id, ship_id: ship, type_id, system_id: system });
+            }
             Ok(Some((capsule, home, lost_type, lost)))
             })
         },
@@ -424,6 +437,7 @@ pub async fn lose_ship(c: &mut Client, ship: i64, pos: [f64; 3]) -> Result<(), C
             for entry in outbox.into_entries() {
                 match entry {
                     Effect::Notification(notification) => notification.dispatch(&c.world.clone(), Some(&mut *c))?,
+                    Effect::Event(event) => crate::lua::on_event(event),
                     Effect::Operation(()) => {
                         super::combat::reset(c);
                         super::combat::forget_ship(ship);

@@ -65,10 +65,6 @@ pub(crate) async fn offer_arc(ex: &(impl Executor + ?Sized), a: &ArcOffer) -> Re
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
              ON CONFLICT (character_id, agent_id) DO NOTHING", &[&o.character_id, &o.agent_id, &o.mission_id, &o.dungeon_id, &o.faction_id, &o.state, &o.system_id, &o.pos[0], &o.pos[1], &o.pos[2], &o.reward_isk, &o.reward_lp, &o.offered_at, &a.kind, &a.arc_id, &a.dest_agent, &a.cargo_type, &a.cargo_qty]).await
 }
-pub(crate) async fn set_state(ex: &(impl Executor + ?Sized), character_id: i64, agent_id: i64, state: i32, stamp: i64) -> Result<u64, db::Error> {
-    ex.execute("UPDATE game.agent_missions SET state = $3, accepted_at = CASE WHEN $3 = 2 THEN $4 ELSE accepted_at END
-             WHERE character_id = $1 AND agent_id = $2", &[&character_id, &agent_id, &state, &stamp]).await
-}
 pub(crate) async fn accept_offered(ex: &(impl Executor + ?Sized), character_id: i64, agent_id: i64, mission_id: i32, offered: i32, accepted: i32, stamp: i64) -> Result<u64, db::Error> {
     ex.execute("UPDATE game.agent_missions SET state = $5, accepted_at = $6 WHERE character_id = $1 AND agent_id = $2 AND mission_id = $3 AND state = $4",
         &[&character_id, &agent_id, &mission_id, &offered, &accepted, &stamp]).await

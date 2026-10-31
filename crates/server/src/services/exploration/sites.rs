@@ -157,6 +157,7 @@ pub(super) async fn replace_site(db: &Db, world: &World, site_id: i64) -> Result
             for effect in outbox.into_entries() {
                 match effect {
                     Effect::Notification(notification) => notification.dispatch(world, None)?,
+                    Effect::Event(event) => crate::lua::on_event(event),
                     Effect::Operation(Replacement::Apply(old, new)) => {
                         info!("site {} in {system} done", old.target);
                         state().sites.remove(&old.id);
@@ -361,6 +362,7 @@ pub(super) async fn collapse(db: &Db, world: &World, site_id: i64) -> Result<(),
             for effect in outbox.into_entries() {
                 match effect {
                     Effect::Notification(notification) => notification.dispatch(world, None)?,
+                    Effect::Event(event) => crate::lua::on_event(event),
                     Effect::Operation(Collapse::Remove(sites)) => for s in sites {
                         state().sites.remove(&s.id);
                         info!("wormhole {} in {} collapsed", s.target, s.system);

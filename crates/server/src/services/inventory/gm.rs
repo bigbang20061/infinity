@@ -76,6 +76,7 @@ fn dispatch_target<T>(value: T, outbox: Outbox, c: &mut Client, target: i64) -> 
         match entry {
             Effect::Notification(notification) => route_target(notification, target, c.session.int("charid")).dispatch(&world, Some(&mut *c))?,
             Effect::Operation(never) => match never {},
+            Effect::Event(event) => crate::lua::on_event(event),
         }
     }
     Ok(value)
@@ -146,6 +147,7 @@ pub(in crate::services) async fn gm_unload(c: &mut Client, ship: i64, owner: i64
                 match entry {
                     Effect::Operation(change) => apply_online_changed(change),
                     Effect::Notification(notification) => route_target(notification, owner, c.session.int("charid")).dispatch(&world, Some(&mut *c))?,
+                    Effect::Event(event) => crate::lua::on_event(event),
                 }
             }
             Ok(value)

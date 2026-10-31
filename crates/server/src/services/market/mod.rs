@@ -15,6 +15,7 @@
 //! Order expiry scans run as durable periodic jobs registered through the services scheduler
 //! and persisted in game.jobs, not detached maintenance sleeps. Internal scan errors warn
 //! but the scan still completes.
+//! Committed fills and newly resting orders queue Lua events.
 
 use crate::dao::items::loading::ItemQuery;
 use super::items::load_items;
@@ -76,6 +77,7 @@ fn dispatch_market<T>(value: T, outbox: Outbox<MarketEffect>, world: &World) -> 
     for effect in outbox.into_entries() {
         match effect {
             Effect::Notification(notification) => notification.dispatch(world, None)?,
+            Effect::Event(event) => crate::lua::on_event(event),
             Effect::Operation(MarketEffect::Bought { buyer, quantity, type_id, station, value, order }) =>
                 info!("market: {buyer} bought {quantity} x {type_id} at {station} for {value} ISK (order {order})"),
             Effect::Operation(MarketEffect::Sold { seller, quantity, type_id, station, value, order }) =>
@@ -321,6 +323,7 @@ async fn hit_bids(db: &(impl Executor + ?Sized), outbox: &mut Outbox<MarketEffec
         }
         record(db, type_id, q, bid.price, bid.char_id.unwrap_or(bid.at.owner), seller, at, now).await?;
         consume(db, outbox, &mut bid, q, now).await?;
+        outbox.event(crate::lua::events::GameEvent::MarketOrderFilled { order_id: bid.id, buyer_id: bid.char_id.unwrap_or(bid.at.owner), seller_id: seller, type_id, quantity: q, price: bid.price });
         outbox.operation(MarketEffect::Sold { seller, quantity: q, type_id, station: at.id, value, order: bid.id });
         left -= q;
     }
@@ -359,6 +362,7 @@ async fn lift_asks(db: &(impl Executor + ?Sized), outbox: &mut Outbox<MarketEffe
         deliver(db, sde, outbox, buyer, ask.at.id, type_id, q).await?;
         record(db, type_id, q, ask.price, buyer, ask.char_id.unwrap_or(ask.at.owner), &ask.at, now).await?;
         consume(db, outbox, &mut ask, q, now).await?;
+        outbox.event(crate::lua::events::GameEvent::MarketOrderFilled { order_id: ask.id, buyer_id: buyer, seller_id: ask.char_id.unwrap_or(ask.at.owner), type_id, quantity: q, price: ask.price });
         outbox.operation(MarketEffect::Bought { buyer, quantity: q, type_id, station: ask.at.id, value, order: ask.id });
         left -= q;
         spent += value;
@@ -419,6 +423,7 @@ async fn place_buy(c: &Client, station_id: i64, type_id: i64, price: f64, quanti
     order.escrow = round2(price * order.vol_remaining as f64);
     debit(db, outbox, me, order.escrow + broker_fee(skills.broker_fee, order.escrow)).await?;
     insert_order(db, &mut order).await?;
+    outbox.event(crate::lua::events::GameEvent::MarketOrderPlaced { char_id: me, order_id: order.id, type_id, quantity: order.vol_remaining, price, is_buy: true });
     outbox.operation(MarketEffect::Placed { buyer: true, owner: me, order: order.id, quantity: order.vol_remaining, type_id, price });
     tell_owner(outbox, &order, "Add");
     Ok(order_keyval(&order))
@@ -499,6 +504,7 @@ async fn place_sell(c: &Client, item_id: i64, station_id: i64, type_id: i64, pri
     }
     debit(db, outbox, me, broker_fee(skills.broker_fee, price * order.vol_remaining as f64)).await?;
     insert_order(db, &mut order).await?;
+    outbox.event(crate::lua::events::GameEvent::MarketOrderPlaced { char_id: me, order_id: order.id, type_id, quantity: order.vol_remaining, price, is_buy: false });
     outbox.operation(MarketEffect::Placed { buyer: false, owner: me, order: order.id, quantity: order.vol_remaining, type_id, price });
     tell_owner(outbox, &order, "Add");
     Ok(true)

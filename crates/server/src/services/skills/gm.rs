@@ -3,7 +3,7 @@
 //! Skill queues for changed skills are removed; unrelated entries retain their order.
 //! Completed training and GM grants share one skills-changed notification per batch.
 use super::{db_err, keyval, CallError};
-use super::{formulas::sp_for_level, starting::starting_levels, training::{advance_training, queue_list_db, skill_type}};
+use super::{formulas::sp_for_level, starting::starting_levels, training::{advance_training, queue_list_db, queue_training_events, skill_type}};
 use crate::{client::{Client, filetime_now, BRAIN_REFRESH}, consts::CATEGORY_SKILL, dao::skills::{queue, training}, db::{executor::Executor, outbox::{dispatch_client, Outbox}}, sde::Sde};
 use marshal::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -77,6 +77,7 @@ fn retain_queue(rows: Vec<queue::QueueEntry>, types: &BTreeSet<i32>, now: i64) -
 pub(crate) async fn set_levels(tx: &(impl Executor + ?Sized), outbox: &mut Outbox, sde: &Sde, char_id: i64, levels: &[(i32, i32)]) -> Result<(), CallError> {
     let now = filetime_now();
     let finished = advance_training(tx, char_id, now).await?;
+    queue_training_events(outbox, char_id, &finished);
     write_levels(tx, outbox, sde, char_id, levels, now, &finished).await
 }
 
@@ -100,6 +101,7 @@ pub(crate) async fn remove(tx: &(impl Executor + ?Sized), outbox: &mut Outbox, s
     let now = filetime_now();
     let types: BTreeSet<_> = type_ids.iter().copied().collect();
     let finished = advance_training(tx, char_id, now).await?;
+    queue_training_events(outbox, char_id, &finished);
     let changed = clean_queue(tx, outbox, sde, char_id, &types, now, &finished).await?;
     if !changed.is_empty() {
         outbox.notify_pilot(char_id, "OnServerSkillsChanged", vec![Value::Dict(changed), Value::None, Value::Int(now)]);
@@ -117,6 +119,7 @@ pub(crate) async fn remove(tx: &(impl Executor + ?Sized), outbox: &mut Outbox, s
 async fn grant_starters(tx: &(impl Executor + ?Sized), outbox: &mut Outbox, sde: &Sde, char_id: i64) -> Result<(), CallError> {
     let now = filetime_now();
     let finished = advance_training(tx, char_id, now).await?;
+    queue_training_events(outbox, char_id, &finished);
     let race = training::race(tx, char_id).await.map_err(db_err)?.ok_or_else(|| CallError::Internal(anyhow::anyhow!("character disappeared")))?;
     let existing: BTreeSet<_> = training::current(tx, char_id).await.map_err(db_err)?.into_iter().map(|s| s.type_id).collect();
     let seed: Vec<_> = starting_levels(sde, race).filter(|(type_id, _)| !existing.contains(type_id)).collect();

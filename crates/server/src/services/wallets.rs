@@ -1,6 +1,7 @@
 //! Shared character and corporation wallet operations, not a direct client module mirror.
 //! Uses game.characters and game.corp_wallets through the DAOs.
 //! This helper does not keep journals; callers own transactions.
+//! Successful nonzero mutations queue one wallet event alongside notifications.
 
 use super::{db_err, user_error, CallError};
 use super::corps::is_player_corp;
@@ -22,6 +23,7 @@ pub(crate) async fn credit<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut 
     if amount <= 0.0 { return Ok(()); }
     let balance = characters::credit(db, char_id, amount).await.map_err(db_err)?;
     outbox.notify_pilot(char_id, "OnAccountChange", vec![Value::str("cash"), Value::Int(char_id), Value::Float(balance)]);
+    outbox.event(crate::lua::events::GameEvent::WalletChanged { owner_id: char_id, account_key: ACCOUNT_CASH, balance, delta: amount });
     Ok(())
 }
 
@@ -30,6 +32,7 @@ pub(crate) async fn debit<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut O
     match characters::debit(db, char_id, amount).await.map_err(db_err)? {
         Some(balance) => {
             outbox.notify_pilot(char_id, "OnAccountChange", vec![Value::str("cash"), Value::Int(char_id), Value::Float(balance)]);
+            outbox.event(crate::lua::events::GameEvent::WalletChanged { owner_id: char_id, account_key: ACCOUNT_CASH, balance, delta: -amount });
             Ok(())
         }
         None => Err(not_enough_money(balance(db, char_id).await?, amount)),
@@ -58,13 +61,19 @@ async fn announce<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>
 pub(super) async fn corp_credit<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, corp: i64, key: i32, amount: f64) -> Result<(), CallError> {
     if amount <= 0.0 || !is_player_corp(corp) { return Ok(()); }
     let balance = corporations::credit(db, corp, key, amount).await.map_err(db_err)?;
-    announce(db, outbox, corp, key, balance).await
+    announce(db, outbox, corp, key, balance).await?;
+    outbox.event(crate::lua::events::GameEvent::WalletChanged { owner_id: corp, account_key: key, balance, delta: amount });
+    Ok(())
 }
 
 pub(super) async fn corp_debit<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, corp: i64, key: i32, amount: f64) -> Result<(), CallError> {
     if amount <= 0.0 { return Ok(()); }
     match corporations::debit(db, corp, key, amount).await.map_err(db_err)? {
-        Some(balance) => announce(db, outbox, corp, key, balance).await,
+        Some(balance) => {
+            announce(db, outbox, corp, key, balance).await?;
+            outbox.event(crate::lua::events::GameEvent::WalletChanged { owner_id: corp, account_key: key, balance, delta: -amount });
+            Ok(())
+        }
         None => Err(CallError::User {
             msg: messages::MSG_NOT_ENOUGH_MONEY.into(),
             dict: vec![("balance".into(), Value::Float(corp_balance(db, corp, key).await?)), ("amount".into(), Value::Float(amount))],

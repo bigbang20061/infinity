@@ -178,6 +178,7 @@ pub(super) async fn gm_online(c: &mut Client, ship: i64) -> Result<usize, CallEr
                 match entry {
                     Effect::Operation(change) => apply_online_changed(change),
                     Effect::Notification(notification) => notification.dispatch(&world, Some(&mut *c))?,
+                    Effect::Event(event) => crate::lua::on_event(event),
                 }
             }
             Ok(count)

@@ -1,5 +1,7 @@
 use super::*;
 
+mod atomicity;
+
 #[test]
 fn retail_agents_load() {
     let a = agent(3009965).expect("Luminaire security agent");
