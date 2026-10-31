@@ -13,8 +13,9 @@ pub(crate) async fn delete_charge(ex: &(impl Executor + ?Sized), ship: i64, flag
 pub(crate) async fn consume_charge(ex: &(impl Executor + ?Sized), ship: i64, flag: i32) -> Result<Option<Loaded>, Error> {
     Ok(ex.query_opt("UPDATE game.module_charges SET quantity = quantity - 1 WHERE ship_id = $1 AND flag_id = $2 AND quantity > 0 RETURNING type_id, quantity", &[&ship, &flag]).await?.as_ref().map(Loaded::from_row))
 }
-pub(crate) async fn set_online(ex: &(impl Executor + ?Sized), item: i64, ship: i64, online: bool) -> Result<u64, Error> {
-    ex.execute("UPDATE game.items SET online = $3 WHERE item_id = $1 AND location_id = $2 AND online <> $3", &[&item, &ship, &online]).await
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn set_online(ex: &(impl Executor + ?Sized), item: i64, ship: i64, owner: i64, flag: i32, item_type: i32, hull_type: i32, hull_location: i64, hull_flag: i32, hull_singleton: bool, online: bool) -> Result<u64, Error> {
+    ex.execute("UPDATE game.items SET online = $10 WHERE item_id = $1 AND location_id = $2 AND owner_id = $3 AND flag_id = $4 AND type_id = $5 AND singleton AND online <> $10 AND EXISTS (SELECT 1 FROM game.items hull WHERE hull.item_id = $2 AND hull.owner_id = $3 AND hull.type_id = $6 AND hull.location_id = $7 AND hull.flag_id = $8 AND hull.singleton = $9)", &[&item, &ship, &owner, &flag, &item_type, &hull_type, &hull_location, &hull_flag, &hull_singleton, &online]).await
 }
 pub(crate) async fn loot(ex: &(impl Executor + ?Sized), bounty: f64) -> Result<Vec<Loot>, Error> {
     Ok(ex.query("SELECT type_id FROM game.retail_prices WHERE average BETWEEN 1000 AND GREATEST($1::float8, 50000)", &[&bounty]).await?.iter().map(Loot::from_row).collect())

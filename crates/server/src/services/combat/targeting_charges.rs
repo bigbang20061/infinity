@@ -5,7 +5,7 @@ use super::*;
 
 // ---------------------------------------------------------------- targeting
 
-pub(super) fn targets_of(char_id: i64) -> Vec<i64> {
+pub(crate) fn targets_of(char_id: i64) -> Vec<i64> {
     state().targets.get(&char_id).map(|t| t.iter().copied().collect()).unwrap_or_default()
 }
 
@@ -85,7 +85,7 @@ pub(super) fn forget_target(world: &World, target: i64) {
 // ---------------------------------------------------------------- charges
 
 /// The charge sublocation key `(shipID, flagID, typeID)`.
-pub(super) fn charge_key(ship: i64, flag: i32, type_id: i32) -> Value {
+pub(crate) fn charge_key(ship: i64, flag: i32, type_id: i32) -> Value {
     Value::tuple([Value::Int(ship), Value::Int(flag as i64), Value::Int(type_id as i64)])
 }
 
@@ -96,7 +96,7 @@ pub(super) fn charge_key(ship: i64, flag: i32, type_id: i32) -> Value {
 /// `{shipID: {flagID: row(locationID, flagID, typeID, quantity)}}` for the ship state.
 
 
-pub(super) async fn loaded(db: &(impl Executor + ?Sized), ship: i64, flag: i32) -> Result<Option<(i32, i32)>, CallError> {
+pub(crate) async fn loaded(db: &(impl Executor + ?Sized), ship: i64, flag: i32) -> Result<Option<(i32, i32)>, CallError> {
     Ok(crate::dao::items::charges::loaded(db, ship, flag)
         .await
         .map_err(db_err)?
@@ -106,7 +106,7 @@ pub(super) async fn loaded(db: &(impl Executor + ?Sized), ship: i64, flag: i32) 
 use super::super::items::deposit;
 
 /// Modules of a weapon group, master first.
-pub(super) async fn bank(db: &(impl Executor + ?Sized), ship: i64, master: i64) -> Result<Vec<i64>, CallError> {
+pub(crate) async fn bank(db: &(impl Executor + ?Sized), ship: i64, master: i64) -> Result<Vec<i64>, CallError> {
     let rows = crate::dao::items::charges::slaves(db, ship, master).await.map_err(db_err)?;
     Ok(std::iter::once(master).chain(rows.iter().map(|r| r.slave_id)).collect())
 }

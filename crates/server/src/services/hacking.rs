@@ -67,7 +67,6 @@ const EVENT_HONEYPOT_STRENGTH: i64 = 306;
 const EVENT_HONEYPOT_HEALING: i64 = 307;
 const EVENT_DISTANCEINDICATOR: i64 = 308;
 
-const EFFECT_DO_HACKING: i64 = 1738;
 const ATTR_DURATION: i32 = 73;
 const ATTR_VIRUS_COHERENCE: i32 = 1909;
 const ATTR_VIRUS_STRENGTH: i32 = 1910;
@@ -495,8 +494,8 @@ pub async fn start(c: &mut Client, module: i64, target: Option<i64>) -> CallResu
     virus.push((Value::str("inventory"), Value::List(game.inventory.iter().map(Ue::created_value).collect())));
     ev.push(event(EVENT_VIRUS_CREATED, Value::Dict(virus)));
     ev.push(event(EVENT_GAME_START, Value::dict([("moduleTypeID", Value::Int(module_type as i64))])));
+    super::effects::hacking::start_effect(c, module, container, duration).await?;
     games().insert(char_id, game);
-    super::combat::pulse_effect(c, module, EFFECT_DO_HACKING, Some(container), duration);
     super::exploration::set_container_state(&c.world, system, container, 1).await;
     info!(user = c.login.user_id, "hacking {container} (tier {}, virus {coherence}/{strength}, {slots} slots)", site.tier);
     c.notify("OnHackingTurnComplete", vec![Value::List(ev)]);

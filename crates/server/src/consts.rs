@@ -104,6 +104,8 @@ pub const ATTR_VOLUME: i32 = 161;
 pub const ATTR_RADIUS: i32 = 162;
 /// SDE dgmAttributeTypes: maxVelocity (also used for missiles).
 pub const ATTR_MAX_VELOCITY: i32 = 37;
+/// SDE dgmAttributeTypes: speedFactor.
+pub const ATTR_SPEED_FACTOR: i32 = 20;
 /// SDE dgmAttributeTypes: agility.
 pub const ATTR_AGILITY: i32 = 70;
 /// SDE dgmAttributeTypes: signatureRadius.
@@ -136,6 +138,361 @@ pub const EFFECT_ONLINE: i64 = 16;
 pub const EFFECT_MICROWARPDRIVE: i32 = 6730;
 /// SDE dgmEffects: moduleBonusAfterburner.
 pub const EFFECT_AFTERBURNER: i32 = 6731;
+/// SDE dgmEffects: surveyScan; fittingScreen/pythonEffects.py: FakeSurveyScan.
+pub const EFFECT_SURVEY_SCAN: i32 = 81;
+
+/// SDE dgmEffects: targetAttack.
+pub const EFFECT_TARGET_ATTACK: i32 = 10;
+/// SDE dgmEffects: projectileFired.
+pub const EFFECT_PROJECTILE_FIRED: i32 = 34;
+/// SDE dgmEffects: targetDisintegratorAttack.
+pub const EFFECT_TARGET_DISINTEGRATOR_ATTACK: i32 = 6995;
+/// SDE dgmEffects: useMissiles.
+pub const EFFECT_USE_MISSILES: i32 = 101;
+/// SDE dgmEffects: shieldBoosting.
+pub const EFFECT_SHIELD_BOOSTING: i32 = 4;
+/// SDE dgmEffects: armorRepair.
+pub const EFFECT_ARMOR_REPAIR: i32 = 27;
+/// SDE dgmEffects: structureRepair.
+pub const EFFECT_STRUCTURE_REPAIR: i32 = 26;
+/// SDE dgmEffects: miningLaser.
+pub const EFFECT_MINING_LASER: i32 = 67;
+/// SDE dgmEffects: miningClouds.
+pub const EFFECT_MINING_CLOUDS: i32 = 2726;
+/// SDE dgmEffects: mining.
+pub const EFFECT_MINING: i32 = 17;
+/// SDE dgmEffects: doHacking.
+pub const EFFECT_HACKING: i32 = 1738;
+/// SDE dgmEffects: probeLaunching.
+pub const EFFECT_PROBE_LAUNCHING: i32 = 3793;
+/// SDE dgmEffects: empWave.
+pub const EFFECT_EMP_WAVE: i32 = 38;
+/// SDE dgmEffects: ChainLightning.
+pub const EFFECT_CHAIN_LIGHTNING: i32 = 8037;
+/// SDE dgmEffects: fueledArmorRepair.
+pub const EFFECT_FUELED_ARMOR_REPAIR: i32 = 5275;
+/// SDE dgmEffects: fueledShieldBoosting.
+pub const EFFECT_FUELED_SHIELD_BOOSTING: i32 = 4936;
+/// SDE dgmEffects: powerBooster.
+pub const EFFECT_POWER_BOOSTER: i32 = 48;
+/// SDE dgmEffects: energyNeutralizerFalloff.
+pub const EFFECT_ENERGY_NEUTRALIZER_FALLOFF: i32 = 6187;
+/// SDE dgmEffects: entityEnergyNeutralizerFalloff.
+pub const EFFECT_ENTITY_ENERGY_NEUTRALIZER_FALLOFF: i32 = 6691;
+/// SDE dgmEffects: energyNosferatuFalloff.
+pub const EFFECT_ENERGY_NOSFERATU_FALLOFF: i32 = 6197;
+/// SDE dgmEffects: shipModuleRemoteCapacitorTransmitter.
+pub const EFFECT_REMOTE_CAPACITOR_TRANSMITTER: i32 = 6184;
+/// SDE dgmEffects: shipModuleRemoteArmorRepairer.
+pub const EFFECT_REMOTE_ARMOR_REPAIRER: i32 = 6188;
+/// SDE dgmEffects: shipModuleRemoteHullRepairer.
+pub const EFFECT_REMOTE_HULL_REPAIRER: i32 = 6185;
+/// SDE dgmEffects: shipModuleRemoteShieldBooster.
+pub const EFFECT_REMOTE_SHIELD_BOOSTER: i32 = 6186;
+/// SDE dgmEffects: npcEntityRemoteArmorRepairer.
+pub const EFFECT_NPC_REMOTE_ARMOR_REPAIRER: i32 = 6687;
+/// SDE dgmEffects: npcEntityRemoteHullRepairer.
+pub const EFFECT_NPC_REMOTE_HULL_REPAIRER: i32 = 6689;
+/// SDE dgmEffects: npcEntityRemoteShieldBooster.
+pub const EFFECT_NPC_REMOTE_SHIELD_BOOSTER: i32 = 6688;
+/// SDE dgmEffects: shipModuleAncillaryRemoteArmorRepairer.
+pub const EFFECT_ANCILLARY_REMOTE_ARMOR_REPAIRER: i32 = 6651;
+/// SDE dgmEffects: shipModuleAncillaryRemoteShieldBooster.
+pub const EFFECT_ANCILLARY_REMOTE_SHIELD_BOOSTER: i32 = 6652;
+/// SDE dgmEffects: ShipModuleRemoteArmorMutadaptiveRepairer.
+pub const EFFECT_MUTADAPTIVE_REMOTE_ARMOR_REPAIRER: i32 = 7166;
+/// SDE dgmEffects: remoteECMFalloff.
+pub const EFFECT_REMOTE_ECM_FALLOFF: i32 = 6470;
+/// SDE dgmEffects: entityECMFalloff.
+pub const EFFECT_ENTITY_ECM_FALLOFF: i32 = 6695;
+/// SDE dgmEffects: ECMBurstJammer.
+pub const EFFECT_ECM_BURST_JAMMER: i32 = 6714;
+/// SDE dgmEffects: cloaking.
+pub const EFFECT_CLOAKING: i32 = 607;
+/// SDE dgmEffects: cloakingPrototype.
+pub const EFFECT_CLOAKING_PROTOTYPE: i32 = 5945;
+/// SDE dgmEffects: cloakingWarpSafe.
+pub const EFFECT_CLOAKING_WARP_SAFE: i32 = 980;
+/// SDE dgmEffects: microJumpDrive.
+pub const EFFECT_MICRO_JUMP_DRIVE: i32 = 4921;
+/// SDE dgmEffects: salvaging.
+pub const EFFECT_SALVAGING: i32 = 2757;
+/// SDE dgmEffects: salvageDroneEffect.
+pub const EFFECT_SALVAGE_DRONE: i32 = 5163;
+/// SDE dgmEffects: tractorBeamCan.
+pub const EFFECT_TRACTOR_BEAM: i32 = 2255;
+/// SDE dgmEffects: cargoScan.
+pub const EFFECT_CARGO_SCAN: i32 = 47;
+/// SDE dgmEffects: shipScan.
+pub const EFFECT_SHIP_SCAN: i32 = 46;
+/// SDE dgmEffects: targetHostiles.
+pub const EFFECT_TARGET_HOSTILES: i32 = 55;
+/// SDE dgmEffects: targetPassively.
+pub const EFFECT_TARGET_PASSIVELY: i32 = 54;
+/// SDE dgmEffects: bombLaunching.
+pub const EFFECT_BOMB_LAUNCHING: i32 = 2971;
+/// SDE dgmEffects: remoteWebifierFalloff.
+pub const EFFECT_REMOTE_WEBIFIER_FALLOFF: i32 = 6426;
+/// SDE dgmEffects: remoteWebifierEntity.
+pub const EFFECT_REMOTE_WEBIFIER_ENTITY: i32 = 6690;
+/// SDE dgmEffects: warpDisrupt.
+pub const EFFECT_WARP_DISRUPT: i32 = 39;
+/// SDE dgmEffects: warpScrambleBlockMWDWithNPCEffect.
+pub const EFFECT_WARP_SCRAMBLE: i32 = 5934;
+/// SDE dgmEffects: remoteTargetPaintFalloff.
+pub const EFFECT_REMOTE_TARGET_PAINT_FALLOFF: i32 = 6425;
+/// SDE dgmEffects: remoteTargetPaintEntity.
+pub const EFFECT_REMOTE_TARGET_PAINT_ENTITY: i32 = 6692;
+/// SDE dgmEffects: remoteSensorDampFalloff.
+pub const EFFECT_REMOTE_SENSOR_DAMP_FALLOFF: i32 = 6422;
+/// SDE dgmEffects: remoteSensorDampEntity.
+pub const EFFECT_REMOTE_SENSOR_DAMP_ENTITY: i32 = 6693;
+/// SDE dgmEffects: shipModuleTrackingDisruptor.
+pub const EFFECT_TRACKING_DISRUPTOR: i32 = 6424;
+/// SDE dgmEffects: npcEntityWeaponDisruptor.
+pub const EFFECT_NPC_WEAPON_DISRUPTOR: i32 = 6694;
+/// SDE dgmEffects: shipModuleGuidanceDisruptor.
+pub const EFFECT_GUIDANCE_DISRUPTOR: i32 = 6423;
+/// SDE dgmEffects: remoteSensorBoostFalloff.
+pub const EFFECT_REMOTE_SENSOR_BOOST: i32 = 6427;
+/// SDE dgmEffects: shipModuleRemoteTrackingComputer.
+pub const EFFECT_REMOTE_TRACKING_COMPUTER: i32 = 6428;
+/// SDE dgmEffects: cynosuralGeneration.
+pub const EFFECT_CYNO_GENERATION: i32 = 2857;
+/// SDE dgmEffects: cloneJumpAccepting.
+pub const EFFECT_CLONE_JUMP_ACCEPTING: i32 = 2858;
+/// SDE dgmEffects: industrialCompactCoreEffect2.
+pub const EFFECT_INDUSTRIAL_COMPACT_CORE: i32 = 8119;
+/// SDE dgmEffects: industrialCoreEffect2.
+pub const EFFECT_INDUSTRIAL_CORE: i32 = 4575;
+/// SDE dgmEffects: jumpPortalGeneration.
+pub const EFFECT_JUMP_PORTAL: i32 = 2152;
+/// SDE dgmEffects: jumpPortalGenerationBO.
+pub const EFFECT_JUMP_PORTAL_BO: i32 = 3674;
+/// SDE dgmEffects: moduleBonusBastionModule.
+pub const EFFECT_BASTION: i32 = 6658;
+/// SDE dgmEffects: moduleBonusSacribisBastion.
+pub const EFFECT_SACRIBIS_BASTION: i32 = 11692;
+/// SDE dgmEffects: moduleBonusSiegeModule.
+pub const EFFECT_SIEGE: i32 = 6582;
+/// SDE dgmEffects: moduleBonusTriageModule.
+pub const EFFECT_TRIAGE: i32 = 6581;
+/// SDE dgmEffects: moduleBonusStellianTriageModule.
+pub const EFFECT_STELLIAN_TRIAGE: i32 = 12248;
+/// SDE dgmEffects: shipModuleFocusedWarpDisruptionScript.
+pub const EFFECT_FOCUSED_WARP_DISRUPTION_SCRIPT: i32 = 6849;
+/// SDE dgmEffects: shipModuleFocusedWarpScramblingScript.
+pub const EFFECT_FOCUSED_WARP_SCRAMBLING_SCRIPT: i32 = 6848;
+/// SDE dgmAttributeTypes: falloff.
+pub const ATTR_FALLOFF: i32 = 158;
+/// SDE dgmAttributeTypes: armor_hp.
+pub const ATTR_ARMOR_HP: i32 = 265;
+/// SDE dgmAttributeTypes: shield_em_damage_resonance.
+pub const ATTR_SHIELD_EM_DAMAGE_RESONANCE: i32 = 271;
+/// SDE dgmAttributeTypes: shield_thermal_damage_resonance.
+pub const ATTR_SHIELD_THERMAL_DAMAGE_RESONANCE: i32 = 274;
+/// SDE dgmAttributeTypes: shield_kinetic_damage_resonance.
+pub const ATTR_SHIELD_KINETIC_DAMAGE_RESONANCE: i32 = 273;
+/// SDE dgmAttributeTypes: shield_explosive_damage_resonance.
+pub const ATTR_SHIELD_EXPLOSIVE_DAMAGE_RESONANCE: i32 = 272;
+/// SDE dgmAttributeTypes: armor_em_damage_resonance.
+pub const ATTR_ARMOR_EM_DAMAGE_RESONANCE: i32 = 267;
+/// SDE dgmAttributeTypes: armor_thermal_damage_resonance.
+pub const ATTR_ARMOR_THERMAL_DAMAGE_RESONANCE: i32 = 270;
+/// SDE dgmAttributeTypes: armor_kinetic_damage_resonance.
+pub const ATTR_ARMOR_KINETIC_DAMAGE_RESONANCE: i32 = 269;
+/// SDE dgmAttributeTypes: armor_explosive_damage_resonance.
+pub const ATTR_ARMOR_EXPLOSIVE_DAMAGE_RESONANCE: i32 = 268;
+/// SDE dgmAttributeTypes: structure_em_damage_resonance.
+pub const ATTR_STRUCTURE_EM_DAMAGE_RESONANCE: i32 = 113;
+/// SDE dgmAttributeTypes: structure_thermal_damage_resonance.
+pub const ATTR_STRUCTURE_THERMAL_DAMAGE_RESONANCE: i32 = 110;
+/// SDE dgmAttributeTypes: structure_kinetic_damage_resonance.
+pub const ATTR_STRUCTURE_KINETIC_DAMAGE_RESONANCE: i32 = 109;
+/// SDE dgmAttributeTypes: structure_explosive_damage_resonance.
+pub const ATTR_STRUCTURE_EXPLOSIVE_DAMAGE_RESONANCE: i32 = 111;
+/// SDE dgmAttributeTypes: scan_resolution.
+pub const ATTR_SCAN_RESOLUTION: i32 = 564;
+/// SDE dgmAttributeTypes: max_target_range.
+pub const ATTR_MAX_TARGET_RANGE: i32 = 76;
+/// SDE dgmAttributeTypes: max_locked_targets.
+pub const ATTR_MAX_LOCKED_TARGETS: i32 = 192;
+/// SDE dgmAttributeTypes: aoe_cloud_size.
+pub const ATTR_AOE_CLOUD_SIZE: i32 = 654;
+/// SDE dgmAttributeTypes: recharge_rate.
+pub const ATTR_RECHARGE_RATE: i32 = 55;
+/// SDE dgmAttributeTypes: capacitor_need.
+pub const ATTR_CAPACITOR_NEED: i32 = 6;
+/// SDE dgmAttributeTypes: shield_recharge_rate.
+pub const ATTR_SHIELD_RECHARGE_RATE: i32 = 479;
+/// SDE dgmAttributeTypes: reload_time.
+pub const ATTR_RELOAD_TIME: i32 = 1795;
+/// SDE dgmAttributeTypes: next_activation_time.
+pub const ATTR_NEXT_ACTIVATION_TIME: i32 = 2729;
+/// SDE dgmAttributeTypes: missile_damage_multiplier.
+pub const ATTR_MISSILE_DAMAGE_MULTIPLIER: i32 = 212;
+/// SDE dgmAttributeTypes: entity_fly_range.
+pub const ATTR_ENTITY_FLY_RANGE: i32 = 416;
+/// SDE dgmAttributeTypes: entity_attack_range.
+pub const ATTR_ENTITY_ATTACK_RANGE: i32 = 247;
+/// SDE dgmAttributeTypes: entity_missile_type.
+pub const ATTR_ENTITY_MISSILE_TYPE: i32 = 507;
+/// SDE dgmAttributeTypes: entity_kill_bounty.
+pub const ATTR_ENTITY_KILL_BOUNTY: i32 = 481;
+/// SDE dgmAttributeTypes: entity_shield_boost_amount.
+pub const ATTR_ENTITY_SHIELD_BOOST_AMOUNT: i32 = 637;
+/// SDE dgmAttributeTypes: entity_shield_boost_duration.
+pub const ATTR_ENTITY_SHIELD_BOOST_DURATION: i32 = 636;
+/// SDE dgmAttributeTypes: entity_armor_repair_amount.
+pub const ATTR_ENTITY_ARMOR_REPAIR_AMOUNT: i32 = 631;
+/// SDE dgmAttributeTypes: entity_armor_repair_duration.
+pub const ATTR_ENTITY_ARMOR_REPAIR_DURATION: i32 = 630;
+/// SDE dgmAttributeTypes: shield_bonus.
+pub const ATTR_SHIELD_BONUS: i32 = 68;
+/// SDE dgmAttributeTypes: armor_damage_amount.
+pub const ATTR_ARMOR_DAMAGE_AMOUNT: i32 = 84;
+/// SDE dgmAttributeTypes: structure_damage_amount.
+pub const ATTR_STRUCTURE_DAMAGE_AMOUNT: i32 = 83;
+/// SDE dgmAttributeTypes: charged_armor_damage_multiplier.
+pub const ATTR_CHARGED_ARMOR_DAMAGE_MULTIPLIER: i32 = 1886;
+/// SDE dgmEffects: npcBehaviorRemoteArmorRepairer.
+pub const EFFECT_NPC_BEHAVIOR_REMOTE_ARMOR: i32 = 6741;
+/// SDE dgmEffects: npcBehaviorRemoteShieldBooster.
+pub const EFFECT_NPC_BEHAVIOR_REMOTE_SHIELD: i32 = 6742;
+/// SDE dgmEffects: npcBehaviorRemoteCapacitorTransmitter.
+pub const EFFECT_NPC_BEHAVIOR_REMOTE_CAPACITOR: i32 = 12073;
+/// SDE dgmEffects: npcBehaviorEnergyNeutralizer.
+pub const EFFECT_NPC_BEHAVIOR_NEUTRALIZER: i32 = 6756;
+/// SDE dgmEffects: npcBehaviorEnergyNosferatu.
+pub const EFFECT_NPC_BEHAVIOR_NOSFERATU: i32 = 6882;
+/// SDE dgmEffects: behaviorECM.
+pub const EFFECT_NPC_BEHAVIOR_ECM: i32 = 6757;
+/// SDE dgmEffects: npcBehaviorMicroWarpDrive.
+pub const EFFECT_NPC_BEHAVIOR_MWD: i32 = 6864;
+/// SDE dgmEffects: npcBehaviorMiningLaser.
+pub const EFFECT_NPC_BEHAVIOR_MINING: i32 = 6901;
+/// SDE dgmEffects: npcBehaviorSmartBomb.
+pub const EFFECT_NPC_BEHAVIOR_SMARTBOMB: i32 = 7188;
+/// SDE dgmEffects: npcBehaviorArmorRepairer.
+pub const EFFECT_NPC_BEHAVIOR_ARMOR_REPAIR: i32 = 6884;
+/// SDE dgmEffects: npcBehaviorShieldBooster.
+pub const EFFECT_NPC_BEHAVIOR_SHIELD_BOOST: i32 = 6990;
+/// SDE dgmEffects: npcBehaviorWebifier.
+pub const EFFECT_NPC_BEHAVIOR_WEB: i32 = 6743;
+/// SDE dgmEffects: npcBehaviorGuidanceDisruptor.
+pub const EFFECT_NPC_BEHAVIOR_GUIDANCE_DISRUPTOR: i32 = 6746;
+/// SDE dgmEffects: npcBehaviorTrackingDisruptor.
+pub const EFFECT_NPC_BEHAVIOR_TRACKING_DISRUPTOR: i32 = 6747;
+/// SDE dgmEffects: npcEntityTrackingDisruptor.
+pub const EFFECT_NPC_ENTITY_TRACKING_DISRUPTOR: i32 = 6846;
+/// SDE dgmEffects: behaviorWarpDisrupt.
+pub const EFFECT_NPC_BEHAVIOR_WARP_DISRUPT: i32 = 6744;
+/// SDE dgmEffects: behaviorWarpScramble.
+pub const EFFECT_NPC_BEHAVIOR_WARP_SCRAMBLE: i32 = 6745;
+/// SDE dgmEffects: behaviorTargetPainter.
+pub const EFFECT_NPC_BEHAVIOR_PAINTER: i32 = 6754;
+/// SDE dgmEffects: behaviorSensorDampener.
+pub const EFFECT_NPC_BEHAVIOR_DAMP: i32 = 6755;
+/// SDE dgmEffects: warpScrambleForEntity.
+pub const EFFECT_NPC_WARP_SCRAMBLE: i32 = 563;
+/// SDE dgmEffects: warpScrambleTargetMWDBlockActivationForEntity.
+pub const EFFECT_NPC_WARP_SCRAMBLE_MWD: i32 = 5928;
+/// SDE dgmEffects: warpDisruptSphere.
+pub const EFFECT_WARP_DISRUPT_SPHERE: i32 = 3380;
+/// SDE dgmEffects: entosisLink.
+pub const EFFECT_ENTOSIS_LINK: i32 = 6063;
+/// SDE dgmEffects: snowBallLaunching.
+pub const EFFECT_SNOWBALL_LAUNCHING: i32 = 2413;
+/// SDE dgmEffects: industrialItemCompression.
+pub const EFFECT_INDUSTRIAL_ITEM_COMPRESSION: i32 = 8364;
+/// SDE dgmEffects: cloneRespawnBay.
+pub const EFFECT_CLONE_RESPAWN_BAY: i32 = 8093;
+/// SDE dgmEffects: microJumpPortalDrive.
+pub const EFFECT_MICRO_JUMP_PORTAL: i32 = 6208;
+/// SDE dgmEffects: microJumpPortalDriveCapital.
+pub const EFFECT_MICRO_JUMP_PORTAL_CAPITAL: i32 = 12126;
+/// SDE dgmEffects: moduleBonusWarfareLinkArmor.
+pub const EFFECT_COMMAND_BURST_ARMOR: i32 = 6732;
+/// SDE dgmEffects: moduleBonusWarfareLinkShield.
+pub const EFFECT_COMMAND_BURST_SHIELD: i32 = 6733;
+/// SDE dgmEffects: moduleBonusWarfareLinkSkirmish.
+pub const EFFECT_COMMAND_BURST_SKIRMISH: i32 = 6734;
+/// SDE dgmEffects: moduleBonusWarfareLinkInfo.
+pub const EFFECT_COMMAND_BURST_INFO: i32 = 6735;
+/// SDE dgmEffects: moduleBonusWarfareLinkMining.
+pub const EFFECT_COMMAND_BURST_MINING: i32 = 6736;
+/// SDE dgmEffects: moduleTitanEffectGenerator.
+pub const EFFECT_TITAN_EFFECT_GENERATOR: i32 = 6753;
+/// SDE dgmEffects: siegeModeEffect.
+pub const EFFECT_SIEGE_MODE: i32 = 4877;
+/// SDE dgmEffects: triageMode.
+pub const EFFECT_TRIAGE_MODE: i32 = 4839;
+/// SDE dgmEffects: triageMode7.
+pub const EFFECT_TRIAGE_MODE_7: i32 = 4893;
+/// SDE dgmEffects: anchorDrop.
+pub const EFFECT_EXCLUDED_649: i32 = 649;
+/// SDE dgmEffects: anchorLift.
+pub const EFFECT_EXCLUDED_650: i32 = 650;
+/// SDE dgmEffects: debuffLance.
+pub const EFFECT_EXCLUDED_11691: i32 = 11691;
+/// SDE dgmEffects: doomsdayAOEBubble.
+pub const EFFECT_EXCLUDED_6482: i32 = 6482;
+/// SDE dgmEffects: doomsdayAOEDamp.
+pub const EFFECT_EXCLUDED_6481: i32 = 6481;
+/// SDE dgmEffects: doomsdayAOEECM.
+pub const EFFECT_EXCLUDED_6513: i32 = 6513;
+/// SDE dgmEffects: doomsdayAOENeut.
+pub const EFFECT_EXCLUDED_6477: i32 = 6477;
+/// SDE dgmEffects: doomsdayAOEPaint.
+pub const EFFECT_EXCLUDED_6478: i32 = 6478;
+/// SDE dgmEffects: doomsdayAOETrack.
+pub const EFFECT_EXCLUDED_6479: i32 = 6479;
+/// SDE dgmEffects: doomsdayAOEWeb.
+pub const EFFECT_EXCLUDED_6476: i32 = 6476;
+/// SDE dgmEffects: doomsdayBeamDOT.
+pub const EFFECT_EXCLUDED_6472: i32 = 6472;
+/// SDE dgmEffects: doomsdayConeDOT.
+pub const EFFECT_EXCLUDED_6473: i32 = 6473;
+/// SDE dgmEffects: doomsdayHOG.
+pub const EFFECT_EXCLUDED_6474: i32 = 6474;
+/// SDE dgmEffects: doomsdaySlash.
+pub const EFFECT_EXCLUDED_6201: i32 = 6201;
+/// SDE dgmEffects: fighterAbilityAfterburner.
+pub const EFFECT_EXCLUDED_6440: i32 = 6440;
+/// SDE dgmEffects: fighterAbilityEvasiveManeuvers.
+pub const EFFECT_EXCLUDED_6439: i32 = 6439;
+/// SDE dgmEffects: fighterAbilityLaunchBomb.
+pub const EFFECT_EXCLUDED_6485: i32 = 6485;
+/// SDE dgmEffects: fighterAbilityMicroJumpDrive.
+pub const EFFECT_EXCLUDED_6442: i32 = 6442;
+/// SDE dgmEffects: fighterAbilityMicroWarpDrive.
+pub const EFFECT_EXCLUDED_6441: i32 = 6441;
+/// SDE dgmEffects: moduleBonusIndustrialInvulnerability.
+pub const EFFECT_EXCLUDED_6719: i32 = 6719;
+/// SDE dgmEffects: fighterAbilityAttackM.
+pub const EFFECT_EXCLUDED_6465: i32 = 6465;
+/// SDE dgmEffects: fighterAbilityECM.
+pub const EFFECT_EXCLUDED_6437: i32 = 6437;
+/// SDE dgmEffects: fighterAbilityEnergyNeutralizer.
+pub const EFFECT_EXCLUDED_6434: i32 = 6434;
+/// SDE dgmEffects: fighterAbilityKamikaze.
+pub const EFFECT_EXCLUDED_6554: i32 = 6554;
+/// SDE dgmEffects: fighterAbilityMissiles.
+pub const EFFECT_EXCLUDED_6431: i32 = 6431;
+/// SDE dgmEffects: fighterAbilityStasisWebifier.
+pub const EFFECT_EXCLUDED_6435: i32 = 6435;
+/// SDE dgmEffects: fighterAbilityTackle.
+pub const EFFECT_EXCLUDED_6464: i32 = 6464;
+/// SDE dgmEffects: fighterAbilityWarpDisruption.
+pub const EFFECT_EXCLUDED_6436: i32 = 6436;
+/// SDE dgmEffects: superWeaponAmarr.
+pub const EFFECT_EXCLUDED_4489: i32 = 4489;
+/// SDE dgmEffects: superWeaponCaldari.
+pub const EFFECT_EXCLUDED_4490: i32 = 4490;
+/// SDE dgmEffects: superWeaponGallente.
+pub const EFFECT_EXCLUDED_4491: i32 = 4491;
+/// SDE dgmEffects: superWeaponMinmatar.
+pub const EFFECT_EXCLUDED_4492: i32 = 4492;
 
 // Client inventory flags, locations and row-change keys.
 /// Client inventorycommon.const.flagHangar.

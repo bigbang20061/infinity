@@ -10,7 +10,7 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
 
 - **Login and characters.** GPS handshake with the Placebo crypto pack. An account is created the first time a new user name logs in. Character selection and creation. Every account is treated as Omega.
 - **Stations and items.** Inventory and hangars, and the assets window with asset search. Boarding, assembling and repackaging ships. Saved fittings, ship insurance, jump clones and reprocessing. Private notes in the info window.
-- **Dogma.** Effective attributes are computed on the server from skills, hull, modules and charges, including stacking penalties. Passive skill bonuses are also sent to the client as its character brain, so the fitting window and the HUD show them; the brain is sent again when finished skill training is recorded.
+- **Dogma.** Effective attributes are computed on the server from skills, hull, modules and charges, including stacking penalties. Passive skill bonuses are also sent to the client as its character brain, so the fitting window and the HUD show them; the brain is sent again when finished skill training is recorded. Module activation goes through one registry of SDE effect IDs and one activation cycle, shared by weapons, local repairs, propulsion and mining. Modifiers the client defines only in Python are added at start to effects whose SDE modifier list is empty. See [Effects](docs/effects.md) for the registry, what is supported, and how to add an effect family.
 - **Space.** Undock and dock, approach, align, orbit and follow, warp, and stargate jumps. Each solar system runs as its own actor, so systems advance independently and never block each other. Ships move on the client's one-second destiny tick: a command is stamped with the tick the system is on and takes effect before the next step, as on the client. Go-to and align, the slow-down on arrival, approach, follow, orbit, stop, missile flight, and warp alignment and flight use carbonengine destiny's mechanics and integration, so other pilots see the same course. Ships bump off each other and off stations, gates and asteroids with destiny's sphere collision, and undocking, gate arrival and GM teleports place a ship outside the collision sphere the client is sent. Belt rats and the contents of a scan site appear when the ship actually lands from warp. Timers and NPCs run every 100 ms and read positions interpolated between ticks, as the client draws them. A per-system pilot cap with a jump queue is optional.
 - **Combat.**
   - Targeting, ammunition, weapon groups, turrets and missiles, and capacitor.
@@ -42,6 +42,7 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
   - fleet warps, boosts and the fleet finder
   - shared bookmark folders
   - implants
+  - modules whose effect is not implemented yet, among them electronic warfare, capacitor warfare and transfer, remote repair, smartbombs, micro jump drives, salvagers, tractor beams and bombs. Activating one is refused with a message, and `/effects unsupported` lists the effects tried since the server started.
 - Some runtime state lives only in memory and is lost when the server restarts:
   - fleets, combat and Crimewatch timers, ship damage, and in-progress hacking;
   - everything spawned into space (NPCs, wrecks, scheduled effects);
@@ -223,6 +224,7 @@ UPDATE game.accounts SET role = role | 27021597764489216 WHERE lower(user_name) 
 | `/heal` | Repair the ship in space |
 | `/dogma <ship\|itemID\|flag:N> <attribute> [value\|reset]` | Show, set or clear a per-item base value of a dogma attribute (by ID or exact name). Skills and modules still apply on top. Targets are single items only: the active ship, a module fitted at flag `N`, or any singleton item by ID. Runtime state (shield, armor and hull damage, online, charge, quantity, skills) is refused; use `/heal` or the module controls. |
 | `/dogma <target> list` | List the overrides of an item; for `ship`, of the ship and every fitted module |
+| `/effects unsupported` | List the module effects pilots tried to activate that the server refused, by effect and item type, since the server started |
 | `/jobs` | Count scheduled jobs by kind and state, and list the next ten |
 | `/jobs retry <id>` | Run a job now; a stopped job gets a fresh set of attempts |
 | `/jobs cancel <id>` | Delete a job. A job already running finishes but is not rescheduled. The periodic jobs come back at the next start. |

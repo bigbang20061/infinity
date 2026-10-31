@@ -11,19 +11,18 @@
 //! penalties. Other modifier functions and operations, including PostPercentUnNerfed
 //! and the special skill relationship, are not evaluated; this is not full client
 //! dogma parity. Passive, online and running activation effects are considered;
-//! audited migrated Python skill effects without SDE modifier rows are included.
-//! Skill traversal excludes implants and boosters; propulsion uses a server formula.
+//! audited Python modifiers are supplemented in the SDE at startup.
+//! Skill traversal excludes implants and boosters; propulsion speed uses a server formula.
 //! ponytail: the audited SDE has no skill effect whose fittingUsageChance attribute
 //! exists on its skill type; if that changes, load that field and filter such effects.
 
 use super::{db_err, CallError};
-use crate::consts::{ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_REQUIRED_SKILL_1, ATTR_SIGNATURE_RADIUS, CATEGORY_CHARGE, CATEGORY_SHIP, EFFECT_AFTERBURNER, EFFECT_MICROWARPDRIVE, EFFECT_SKILL, TYPE_CHARACTER};
-use crate::consts::{ATTR_DAMAGE_MULTIPLIER, ATTR_RATE_OF_FIRE, ATTR_EM_DAMAGE, ATTR_THERMAL_DAMAGE, ATTR_KINETIC_DAMAGE, ATTR_EXPLOSIVE_DAMAGE};
+use crate::consts::{ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_REQUIRED_SKILL_1, ATTR_SPEED_FACTOR, CATEGORY_CHARGE, CATEGORY_SHIP, EFFECT_AFTERBURNER, EFFECT_MICROWARPDRIVE, EFFECT_SKILL, TYPE_CHARACTER};
 use crate::dao::items::fit as fit_dao;
 use crate::db::Db;
 use crate::sde::{dogma::{Attribute, Modifier}, types::TypeData, Sde};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 /// SDE dgmAttributeTypes: skillLevel.
 pub(super) const ATTR_SKILL_LEVEL: i32 = 280;
@@ -41,14 +40,8 @@ const EFFECT_CATEGORY_PASSIVE: i32 = 0;
 const EFFECT_CATEGORY_ACTIVE: i32 = 1;
 /// SDE dogma effect category: online.
 const EFFECT_CATEGORY_ONLINE: i32 = 4;
-/// SDE dgmAttributeTypes: speedFactor.
-const ATTR_SPEED_FACTOR: i32 = 20;
 /// SDE dgmAttributeTypes: speedBoostFactor.
 const ATTR_SPEED_BOOST_FACTOR: i32 = 567;
-/// SDE dgmAttributeTypes: massAddition.
-const ATTR_MASS_ADDITION: i32 = 796;
-/// SDE dgmAttributeTypes: signatureRadiusBonus.
-const ATTR_SIGNATURE_RADIUS_BONUS: i32 = 554;
 /// SDE dogma modifier operation: PreAssign.
 pub(crate) const OP_PRE_ASSIGN: i32 = -1;
 /// SDE dogma modifier operation: PreMul.
@@ -75,30 +68,6 @@ const STACKING_PENALTY_EXPONENT: i32 = 2;
 pub(crate) const PERCENT_SCALE: f64 = 100.0;
 /// SDE modifier skillTypeID sentinel selecting the source item's type.
 const MODIFIER_SOURCE_ITEM_TYPE: i32 = -1;
-/// Client dogma/const.py attribute damageMultiplierBonus.
-const ATTR_DAMAGE_MULTIPLIER_BONUS: i32 = 292;
-/// Client dogma/const.py attribute cloakingTargetingDelay.
-const ATTR_CLOAKING_TARGETING_DELAY: i32 = 560;
-/// Client dogma/const.py attribute cloakingTargetingDelayBonus.
-const ATTR_CLOAKING_TARGETING_DELAY_BONUS: i32 = 619;
-/// Client dogma/const.py attribute rofBonus.
-const ATTR_ROF_BONUS: i32 = 293;
-
-/// Python effects without SDE modifier rows, from dogma/pythonEffects/migratedeffects.py.
-fn migrated_skill_modifiers() -> &'static HashMap<&'static str, Modifier> {
-    static MODIFIERS: OnceLock<HashMap<&'static str, Modifier>> = OnceLock::new();
-    MODIFIERS.get_or_init(|| [
-        ("missileEMDmgBonus", "OwnerRequiredSkillModifier", "charID", ATTR_EM_DAMAGE, ATTR_DAMAGE_MULTIPLIER_BONUS),
-        ("missileExplosiveDmgBonus", "OwnerRequiredSkillModifier", "charID", ATTR_EXPLOSIVE_DAMAGE, ATTR_DAMAGE_MULTIPLIER_BONUS),
-        ("missileKineticDmgBonus2", "OwnerRequiredSkillModifier", "charID", ATTR_KINETIC_DAMAGE, ATTR_DAMAGE_MULTIPLIER_BONUS),
-        ("missileThermalDmgBonus", "OwnerRequiredSkillModifier", "charID", ATTR_THERMAL_DAMAGE, ATTR_DAMAGE_MULTIPLIER_BONUS),
-        ("droneDmgBonus", "OwnerRequiredSkillModifier", "charID", ATTR_DAMAGE_MULTIPLIER, ATTR_DAMAGE_MULTIPLIER_BONUS),
-        ("cloakingTargetingDelayBonusPostPercentCloakingTargetingDelayBonusForShipModulesRequiringCloaking", "LocationRequiredSkillModifier", "shipID", ATTR_CLOAKING_TARGETING_DELAY, ATTR_CLOAKING_TARGETING_DELAY_BONUS),
-        ("selfRof", "LocationRequiredSkillModifier", "shipID", ATTR_RATE_OF_FIRE, ATTR_ROF_BONUS),
-    ].into_iter().map(|(name, func, domain, modified, modifying)| {
-        (name, Modifier { func: func.into(), domain: domain.into(), op: OP_POST_PERCENT, modified, modifying, group: None, skill: Some(MODIFIER_SOURCE_ITEM_TYPE) })
-    }).collect())
-}
 
 
 /// An item in the fit.
@@ -143,16 +112,12 @@ impl Node {
 }
 
 
-// SDE positions remain stable in the immutable Arc<Sde>; fallbacks are static.
-enum PassiveModifier {
-    Sde { effect_id: i32, position: usize },
-    Fallback(&'static Modifier),
-}
+// SDE positions remain stable in the immutable Arc<Sde>.
 
 /// A character's active ship with everything that modifies it.
 pub struct Fit {
     nodes: HashMap<Key, Node>,
-    passive_modifiers: Vec<(Key, PassiveModifier)>,
+    passive_modifiers: Vec<(Key, i32, usize)>,
     passive_by_attribute: HashMap<i32, Vec<usize>>,
     sde: Arc<Sde>,
     memo: Mutex<HashMap<(Key, i32), f64>>,
@@ -210,13 +175,7 @@ impl Fit {
             let Some(effect) = sde.dogma.effect(effect_id) else { continue };
             for (position, modifier) in effect.modifiers().iter().enumerate() {
                 passive_by_attribute.entry(modifier.modified).or_default().push(passive_modifiers.len());
-                passive_modifiers.push((Key::Skill(id), PassiveModifier::Sde { effect_id, position }));
-            }
-            if effect.modifiers().is_empty() {
-                if let Some(modifier) = effect.name.as_deref().and_then(|name| migrated_skill_modifiers().get(name)) {
-                    passive_by_attribute.entry(modifier.modified).or_default().push(passive_modifiers.len());
-                    passive_modifiers.push((Key::Skill(id), PassiveModifier::Fallback(modifier)));
-                }
+                passive_modifiers.push((Key::Skill(id), effect_id, position));
             }
         }
         Ok(Fit { nodes, passive_modifiers, passive_by_attribute, sde, memo: Mutex::new(HashMap::new()) })
@@ -230,12 +189,9 @@ impl Fit {
 
     fn visit_passive_modifiers(&self, indices: impl IntoIterator<Item = usize>, mut visit: impl FnMut(Key, &Modifier)) {
         for index in indices {
-            let (source, handle) = &self.passive_modifiers[index];
-            let modifier = match handle {
-                PassiveModifier::Sde { effect_id, position } => &self.sde.dogma.effect(*effect_id).expect("indexed skill effect").modifiers()[*position],
-                PassiveModifier::Fallback(modifier) => modifier,
-            };
-            visit(*source, modifier);
+            let (source, effect_id, position) = self.passive_modifiers[index];
+            let modifier = &self.sde.dogma.effect(effect_id).expect("indexed skill effect").modifiers()[position];
+            visit(source, modifier);
         }
     }
 
@@ -344,10 +300,10 @@ impl Fit {
 }
 
 impl Fit {
-    /// Running afterburners and microwarpdrives: mass + massAddition, maxVelocity x
-    /// (1 + speedFactor% x thrust / mass), and for microwarpdrives the signature bloom.
+    /// Running propulsion's computed max-velocity multiplier; mass and signature
+    /// modifiers come from the ordinary SDE modifier index.
     fn propulsion(&self, attr: i32, visiting: &mut HashSet<(Key, i32)>) -> Vec<(i32, f64, bool)> {
-        if !matches!(attr, ATTR_MASS | ATTR_MAX_VELOCITY | ATTR_SIGNATURE_RADIUS) {
+        if attr != ATTR_MAX_VELOCITY {
             return vec![];
         }
         let mut mods = vec![];
@@ -357,17 +313,10 @@ impl Fit {
             if !node.active || !(mwd || effects.iter().any(|effect| effect.effect_id == EFFECT_AFTERBURNER)) {
                 continue;
             }
-            match attr {
-                ATTR_MASS => mods.push((OP_MOD_ADD, self.value_guarded(key, ATTR_MASS_ADDITION, visiting), false)),
-                ATTR_MAX_VELOCITY => {
-                    let mass = self.value_guarded(Key::Ship, ATTR_MASS, visiting).max(1.0);
-                    let factor = self.value_guarded(key, ATTR_SPEED_FACTOR, visiting) / PERCENT_SCALE;
-                    let thrust = self.value_guarded(key, ATTR_SPEED_BOOST_FACTOR, visiting);
-                    mods.push((OP_POST_MUL, 1.0 + factor * thrust / mass, false));
-                }
-                _ if mwd => mods.push((OP_POST_PERCENT, self.value_guarded(key, ATTR_SIGNATURE_RADIUS_BONUS, visiting), false)),
-                _ => {}
-            }
+            let mass = self.value_guarded(Key::Ship, ATTR_MASS, visiting).max(1.0);
+            let factor = self.value_guarded(key, ATTR_SPEED_FACTOR, visiting) / PERCENT_SCALE;
+            let thrust = self.value_guarded(key, ATTR_SPEED_BOOST_FACTOR, visiting);
+            mods.push((OP_POST_MUL, 1.0 + factor * thrust / mass, false));
         }
         mods
     }

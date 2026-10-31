@@ -1,5 +1,6 @@
 //! Combat mechanics; state and routing live in the parent module.
 use super::*;
+use crate::services::effects::{notify::fire_fx, weapons::{hit_quality, launch_missile, report_hit, turret_roll, Missile}};
 use crate::consts::ATTR_AGILITY;
 use crate::sde::types::TypeData;
 use crate::space::{MODE_STOP, V3};
@@ -129,7 +130,7 @@ pub(super) async fn npc_shot(db: &Db, world: &Arc<World>, system: i64, id: i64, 
         if let Some(guid) = stats.fx.as_deref() {
             let guid = guid.to_owned();
             let duration = stats.rate_of_fire_ms;
-            world.broadcast(system, id, move |stamp| vec![fire_fx(stamp, id, None, &guid, Some(ship), None, true, duration, 1)]);
+            world.broadcast(system, id, move |stamp| vec![fire_fx(stamp, id, None, &guid, Some(ship), None, true, true, duration, 1)]);
         }
         let multiplier = turret_roll(gap, stats.optimal, stats.falloff);
         let dealt = if multiplier > 0.0 { damage(db, world, system, ship, victim_char_id, stats.damage.map(|d| d * multiplier), None).await? } else { 0.0 };

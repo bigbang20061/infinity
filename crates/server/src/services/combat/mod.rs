@@ -45,17 +45,18 @@ use crate::dao::items::quantities::{self, QuantityChange};
 use super::fit::{Fit, Key};
 use super::{db_err, notify_error, rand01, user_error, value_id_list, Call, CallError, CallResult};
 use crate::client::{filetime_now, filetime_ticks_from_ms, Client};
-use crate::consts::{ACCOUNT_CASH, ATTR_ARMOR_DAMAGE, ATTR_CAPACITOR_CAPACITY, ATTR_CAPACITY, ATTR_CHARGE, ATTR_EXPLOSION_DELAY, ATTR_HULL_DAMAGE, ATTR_IS_ONLINE, ATTR_MASS, ATTR_MAX_RANGE, ATTR_MAX_VELOCITY, ATTR_QUANTITY, ATTR_SHIELD_CAPACITY, ATTR_SHIELD_CHARGE, ATTR_SIGNATURE_RADIUS, ATTR_STRUCTURE_HP, CATEGORY_CHARGE, DAMAGE_TYPE_COUNT, EFFECT_AFTERBURNER, EFFECT_MICROWARPDRIVE, EFFECT_ONLINE, FILETIME_SECOND, FLAG_CARGO, FLAG_HANGAR, IX_FLAG, IX_LOCATION_ID, IX_STACK_SIZE};
+use crate::consts::{ACCOUNT_CASH, ATTR_ARMOR_DAMAGE, ATTR_CAPACITOR_CAPACITY, ATTR_CAPACITY, ATTR_CHARGE, ATTR_EXPLOSION_DELAY, ATTR_HULL_DAMAGE, ATTR_MAX_RANGE, ATTR_MAX_VELOCITY, ATTR_QUANTITY, ATTR_SHIELD_CAPACITY, ATTR_SHIELD_CHARGE, ATTR_SIGNATURE_RADIUS, ATTR_STRUCTURE_HP, ATTR_FALLOFF, ATTR_AOE_CLOUD_SIZE, ATTR_MISSILE_DAMAGE_MULTIPLIER, CATEGORY_CHARGE, DAMAGE_TYPE_COUNT, FILETIME_SECOND, FLAG_CARGO, FLAG_HANGAR, IX_FLAG, IX_LOCATION_ID, IX_STACK_SIZE};
 use crate::consts::{ATTR_DAMAGE_MULTIPLIER, ATTR_RATE_OF_FIRE, ATTR_EM_DAMAGE, ATTR_THERMAL_DAMAGE, ATTR_KINETIC_DAMAGE, ATTR_EXPLOSIVE_DAMAGE};
+use crate::consts::{ATTR_ARMOR_HP, ATTR_SHIELD_EM_DAMAGE_RESONANCE, ATTR_SHIELD_THERMAL_DAMAGE_RESONANCE, ATTR_SHIELD_KINETIC_DAMAGE_RESONANCE, ATTR_SHIELD_EXPLOSIVE_DAMAGE_RESONANCE, ATTR_ARMOR_EM_DAMAGE_RESONANCE, ATTR_ARMOR_THERMAL_DAMAGE_RESONANCE, ATTR_ARMOR_KINETIC_DAMAGE_RESONANCE, ATTR_ARMOR_EXPLOSIVE_DAMAGE_RESONANCE, ATTR_STRUCTURE_EM_DAMAGE_RESONANCE, ATTR_STRUCTURE_THERMAL_DAMAGE_RESONANCE, ATTR_STRUCTURE_KINETIC_DAMAGE_RESONANCE, ATTR_STRUCTURE_EXPLOSIVE_DAMAGE_RESONANCE, ATTR_SCAN_RESOLUTION, ATTR_MAX_TARGET_RANGE, ATTR_MAX_LOCKED_TARGETS, ATTR_RECHARGE_RATE, ATTR_SHIELD_RECHARGE_RATE, ATTR_RELOAD_TIME, ATTR_NEXT_ACTIVATION_TIME, ATTR_ENTITY_FLY_RANGE, ATTR_ENTITY_ATTACK_RANGE, ATTR_ENTITY_MISSILE_TYPE, ATTR_ENTITY_KILL_BOUNTY, ATTR_ENTITY_SHIELD_BOOST_AMOUNT, ATTR_ENTITY_SHIELD_BOOST_DURATION, ATTR_ENTITY_ARMOR_REPAIR_AMOUNT, ATTR_ENTITY_ARMOR_REPAIR_DURATION};
 use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::{Outbox, dispatch_client, dispatch_world};
 use crate::messages;
 use crate::sde::Sde;
-use crate::space::{dist, event, lock_time_ms, metres_to_km, ms_to_seconds, seconds_to_ms, now_ms, Ball, NotifyTx, NpcAction, NpcBrain, NpcConfig, NpcEffects, NpcFuture, System, World, MODE_WARP};
+use crate::space::{dist, lock_time_ms, metres_to_km, ms_to_seconds, seconds_to_ms, now_ms, Ball, NotifyTx, NpcAction, NpcBrain, NpcConfig, NpcEffects, NpcFuture, World};
 use marshal::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use tracing::{debug, info, warn};
 
@@ -64,45 +65,16 @@ const HI_SLOTS: std::ops::RangeInclusive<i32> = 27..=34;
 const FLAG_AMMO_HOLD: i32 = 143;
 /// inventorycommon/const.py:189, flagFleetHangar.
 const FLAG_FLEET_HANGAR: i32 = 155;
-const ATTR_FALLOFF: i32 = 158;
-const ATTR_DAMAGE: [i32; 4] = [ATTR_EM_DAMAGE, ATTR_THERMAL_DAMAGE, ATTR_KINETIC_DAMAGE, ATTR_EXPLOSIVE_DAMAGE];
-const ATTR_HP: [i32; 3] = [ATTR_SHIELD_CAPACITY, 265, ATTR_STRUCTURE_HP]; // shield, armor, structure
-const ATTR_RESONANCE: [[i32; 4]; 3] = [[271, 274, 273, 272], [267, 270, 269, 268], [113, 110, 109, 111]];
-const ATTR_SCAN_RESOLUTION: i32 = 564;
-const ATTR_MAX_TARGET_RANGE: i32 = 76;
-const ATTR_MAX_LOCKED_TARGETS: i32 = 192;
-const ATTR_AOE_CLOUD_SIZE: i32 = 654;
-const ATTR_RECHARGE_RATE: i32 = 55;
-const ATTR_CAPACITOR_NEED: i32 = 6;
-const ATTR_SHIELD_RECHARGE_RATE: i32 = 479;
-const ATTR_RELOAD_TIME: i32 = 1795;
-const ATTR_NEXT_ACTIVATION_TIME: i32 = 2729;
-const ATTR_MISSILE_DAMAGE_MULTIPLIER: i32 = 212;
-const ATTR_ENTITY_FLY_RANGE: i32 = 416;
-const ATTR_ENTITY_ATTACK_RANGE: i32 = 247;
-const ATTR_ENTITY_MISSILE_TYPE: i32 = 507;
-const ATTR_ENTITY_KILL_BOUNTY: i32 = 481;
-const ATTR_ENTITY_SHIELD_BOOST_AMOUNT: i32 = 637;
-const ATTR_ENTITY_SHIELD_BOOST_DURATION: i32 = 636;
-const ATTR_ENTITY_ARMOR_REPAIR_AMOUNT: i32 = 631;
-const ATTR_ENTITY_ARMOR_REPAIR_DURATION: i32 = 630;
-const ATTR_SHIELD_BONUS: i32 = 68;
-const ATTR_ARMOR_DAMAGE_AMOUNT: i32 = 84;
-const ATTR_STRUCTURE_DAMAGE_AMOUNT: i32 = 83;
-const UE_TYPEID: i64 = 4;
+pub(super) const ATTR_DAMAGE: [i32; 4] = [ATTR_EM_DAMAGE, ATTR_THERMAL_DAMAGE, ATTR_KINETIC_DAMAGE, ATTR_EXPLOSIVE_DAMAGE];
+const ATTR_HP: [i32; 3] = [ATTR_SHIELD_CAPACITY, ATTR_ARMOR_HP, ATTR_STRUCTURE_HP];
+const ATTR_RESONANCE: [[i32; 4]; 3] = [
+    [ATTR_SHIELD_EM_DAMAGE_RESONANCE, ATTR_SHIELD_THERMAL_DAMAGE_RESONANCE, ATTR_SHIELD_KINETIC_DAMAGE_RESONANCE, ATTR_SHIELD_EXPLOSIVE_DAMAGE_RESONANCE],
+    [ATTR_ARMOR_EM_DAMAGE_RESONANCE, ATTR_ARMOR_THERMAL_DAMAGE_RESONANCE, ATTR_ARMOR_KINETIC_DAMAGE_RESONANCE, ATTR_ARMOR_EXPLOSIVE_DAMAGE_RESONANCE],
+    [ATTR_STRUCTURE_EM_DAMAGE_RESONANCE, ATTR_STRUCTURE_THERMAL_DAMAGE_RESONANCE, ATTR_STRUCTURE_KINETIC_DAMAGE_RESONANCE, ATTR_STRUCTURE_EXPLOSIVE_DAMAGE_RESONANCE],
+];
 
 /// Existing server reload fallback when dogma has no reload time.
 const DEFAULT_RELOAD_MS: f64 = 10_000.0;
-/// Existing server module-duration fallback.
-const DEFAULT_MODULE_DURATION_MS: f64 = 1000.0;
-/// Existing server minimum module cycle duration.
-const MIN_MODULE_DURATION_MS: f64 = 250.0;
-/// Existing missile flight-time clamp.
-const MIN_MISSILE_FLIGHT_SECONDS: f64 = 0.5;
-/// Existing missile flight-time clamp.
-const MAX_MISSILE_FLIGHT_SECONDS: f64 = 30.0;
-/// Existing missile reach tolerance.
-const MISSILE_REACH_ALLOWANCE_METRES: f64 = 2000.0;
 /// Server fallback missile velocity in metres per second when NPC charge dogma is missing it.
 const NPC_MISSILE_VELOCITY_MPS: f64 = 3_000.0;
 /// Server fallback missile flight time in milliseconds when NPC charge dogma is missing it.
@@ -111,43 +83,6 @@ const NPC_MISSILE_FLIGHT_MS: f64 = 5_000.0;
 const NPC_MISSILE_EXPLOSION_RADIUS_METRES: f64 = 40.0;
 /// Server policy for NPC turret reach beyond optimal, in multiples of falloff.
 const NPC_TURRET_REACH_FALLOFF_MULTIPLIER: f64 = 3.0;
-/// Existing turret falloff hit-chance formula.
-const TURRET_FALLOFF_CHANCE: f64 = 0.5;
-/// Existing turret wrecking-hit probability.
-const WRECKING_CHANCE: f64 = 0.01;
-/// Existing turret wrecking-hit damage multiplier.
-const WRECKING_DAMAGE_MULTIPLIER: f64 = 3.0;
-/// Existing turret normal-hit damage formula.
-const NORMAL_HIT_MULTIPLIER_OFFSET: f64 = 0.49;
-/// Existing combat-log quality IDs and thresholds.
-const HIT_MISS: i64 = 0;
-/// Existing combat-log grazing quality.
-const HIT_GRAZING: i64 = 1;
-/// Existing combat-log glancing quality.
-const HIT_GLANCING: i64 = 2;
-/// Existing combat-log normal quality.
-const HIT_NORMAL: i64 = 3;
-/// Existing combat-log good quality.
-const HIT_GOOD: i64 = 4;
-/// Existing combat-log excellent quality.
-const HIT_EXCELLENT: i64 = 5;
-/// Existing combat-log wrecking quality.
-const HIT_WRECKING: i64 = 6;
-/// Existing combat-log wrecking threshold.
-const HIT_WRECKING_THRESHOLD: f64 = 2.9;
-/// Existing combat-log grazing threshold.
-const HIT_GRAZING_THRESHOLD: f64 = 0.6;
-/// Existing combat-log glancing threshold.
-const HIT_GLANCING_THRESHOLD: f64 = 0.8;
-/// Existing combat-log normal threshold.
-const HIT_NORMAL_THRESHOLD: f64 = 1.0;
-/// Existing combat-log good threshold.
-const HIT_GOOD_THRESHOLD: f64 = 1.2;
-
-/// Server design decision: missile IDs clear NPCs (9.0e12), exploration sites (9.5e12), probes (9.6e12), and asteroids (9.7e12).
-const MISSILE_ID_START: i64 = 9_800_000_000_000;
-/// Temporary item IDs for missiles in flight.
-static NEXT_MISSILE_ID: AtomicI64 = AtomicI64::new(MISSILE_ID_START);
 static NEXT_LOCK: AtomicU64 = AtomicU64::new(1);
 
 // ---------------------------------------------------------------- state
@@ -159,21 +94,21 @@ struct Hp {
     resonance: [[f64; 4]; 3],
 }
 
-struct ActiveModule {
-    char_id: i64,
-    stop: Arc<AtomicBool>,
+pub(super) struct ActiveModule {
+    pub(super) char_id: i64,
+    pub(super) stop: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
-struct State {
+pub(super) struct State {
     /// charID -> locked targets
     targets: HashMap<i64, HashSet<i64>>,
     /// (charID, targetID) -> lock attempt in progress
     locking: HashMap<(i64, i64), u64>,
     /// moduleID -> owner and stop flag of its running cycle
-    active: HashMap<i64, ActiveModule>,
+    pub(super) active: HashMap<i64, ActiveModule>,
     /// Most recent activation, retained to invalidate deferred propulsion updates.
-    activation_generation: HashMap<i64, Arc<AtomicBool>>,
+    pub(super) activation_generation: HashMap<i64, Arc<AtomicBool>>,
     /// ballID -> hit points left (NPCs)
     hp: HashMap<i64, Hp>,
     /// shipID -> (capacitor level, FILETIME it was measured)
@@ -181,7 +116,7 @@ struct State {
     /// shipID -> a player ship's damage
     condition: HashMap<i64, Condition>,
     /// moduleID -> FILETIME its reload finishes
-    reloading: HashMap<i64, i64>,
+    pub(super) reloading: HashMap<i64, i64>,
 }
 
 impl State {
@@ -199,29 +134,29 @@ pub fn active_modules() -> HashSet<i64> {
     state().active.keys().copied().collect()
 }
 
-fn state() -> MutexGuard<'static, State> {
+pub(super) fn state() -> MutexGuard<'static, State> {
     static STATE: OnceLock<Mutex<State>> = OnceLock::new();
     STATE.get_or_init(Default::default).lock().unwrap()
 }
 
 /// What a cycle task needs once the call that started it has returned.
 #[derive(Clone)]
-struct Ctx {
-    db: Db,
-    world: Arc<World>,
-    notify: NotifyTx,
-    char_id: i64,
-    ship_id: i64,
-    system_id: i64,
+pub(super) struct Ctx {
+    pub(super) db: Db,
+    pub(super) world: Arc<World>,
+    pub(super) notify: NotifyTx,
+    pub(super) char_id: i64,
+    pub(super) ship_id: i64,
+    pub(super) system_id: i64,
 }
 
 impl Ctx {
-    fn notify(&self, event: &str, args: Vec<Value>) {
+    pub(super) fn notify(&self, event: &str, args: Vec<Value>) {
         let _ = self.notify.send((event.to_string(), args));
     }
 }
 
-fn ctx(c: &Client) -> Option<Ctx> {
+pub(super) fn ctx(c: &Client) -> Option<Ctx> {
     Some(Ctx {
         db: c.db.clone(),
         world: c.world.clone(),
@@ -233,7 +168,7 @@ fn ctx(c: &Client) -> Option<Ctx> {
 }
 
 
-fn attr(sde: &Sde, type_id: i32, id: i32, default: f64) -> f64 {
+pub(super) fn attr(sde: &Sde, type_id: i32, id: i32, default: f64) -> f64 {
     sde.types.attribute(type_id, id).unwrap_or(default)
 }
 
@@ -246,26 +181,17 @@ pub fn reset(c: &Client) {
 
 mod reload_recovery;
 pub(crate) use reload_recovery::recover_pending_reloads;
-mod targeting_charges;
+pub(super) mod targeting_charges;
 use targeting_charges::*;
 pub(crate) mod groups_health;
 use groups_health::*;
-pub(crate) mod weapons;
-use weapons::*;
+use super::effects::notify::attribute_change;
+use super::effects::lifecycle;
 pub(super) mod npc;
 use npc::*;
 
 pub(super) fn quantity_change(owner: i64, ship: i64, flag: i32, type_id: i32, new: i64, old: i64) -> Value {
-    Value::list([Value::tuple([
-        Value::str("OnModuleAttributeChange"),
-        Value::Int(owner),
-        charge_key(ship, flag, type_id),
-        Value::Int(ATTR_QUANTITY as i64),
-        Value::Int(filetime_now()),
-        Value::Int(new),
-        Value::Int(old),
-        Value::None,
-    ])])
+    Value::list([attribute_change(owner, charge_key(ship, flag, type_id), ATTR_QUANTITY, Value::Int(new), Value::Int(old))])
 }
 
 pub async fn flag_quantities(c: &Client, ship: i64) -> Result<(Value, Vec<Value>), CallError> {
@@ -334,16 +260,6 @@ pub(super) async fn destroy_player_ship(world: &World, system: i64, ship: i64, c
     }
 }
 
-pub(super) fn pulse_effect(c: &mut Client, module: i64, effect_id: i64, target: Option<i64>, duration_ms: f64) {
-    let Some(cx) = ctx(c) else { return };
-    let effect = Effect { id: effect_id, guid: None, duration_attribute: None, weapon: None, repair: None, propulsion: false, mining: None };
-    let started = filetime_now();
-    ship_effect(&cx, module, &effect, target, true, started, duration_ms, 0);
-    let world = cx.world.clone();
-    world.schedule(cx.system_id, seconds_to_ms(ms_to_seconds(duration_ms.max(0.0))), move |s| {
-        s.defer(async move { ship_effect(&cx, module, &effect, target, false, started, duration_ms, 0); });
-    });
-}
 
 pub async fn spawn_npc(db: Db, world: Arc<World>, system: i64, id: i64, type_id: i32, owner: Option<i64>) -> Result<(), CallError> {
     let stats = match npc_stats(&db, world.sde(), type_id).await {
@@ -419,17 +335,8 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "LinkWeapons" | "LinkAllWeapons" | "UnlinkModule" | "UnlinkAllModules" | "MergeModuleGroups" | "PeelAndLink" | "GetWeaponBankInfoForShip" => {
             weapon_groups(c, call).await
         }
-        // Data and relic analyzers open the hacking minigame on their target.
-        "Activate" if call.args.get(1).and_then(|v| v.as_text()).as_deref() == Some("doHacking") => {
-            let module = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
-            super::hacking::start(c, module, call.args.get(2).and_then(|v| v.as_int())).await
-        }
-        // godma runs onlining in space through Activate/Deactivate(moduleID, 'online').
-        "Activate" | "Deactivate" if call.args.get(1).and_then(|v| v.as_text()).as_deref() == Some("online") => {
-            set_online(c, call.args.first().and_then(|v| v.as_int()).unwrap_or(0), call.method == "Activate").await
-        }
-        "Activate" => activate(c, call).await,
-        "Deactivate" => deactivate(call),
+        "Activate" => lifecycle::activate(c, call).await,
+        "Deactivate" => lifecycle::deactivate(c, call).await,
         _ => return None,
     })
 }

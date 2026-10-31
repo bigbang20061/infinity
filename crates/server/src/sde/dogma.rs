@@ -1,9 +1,10 @@
 //! Immutable dogma attributes, effects and ordered modifiers loaded from typed `sde` at startup.
 //! The dataset has no direct client mirror; fitting consumers include
 //! `dogma/effects/modifiers.py:8-140` and `dogma/const.py:7-51`.
-//! Runtime dogma calculations and unsupported effect fields are not included.
+//! Python-only modifier rows are supplemented at load time; runtime calculations are elsewhere.
 use std::collections::HashMap;
 use crate::{dao::sde::dogma as dao, db::Db};
+mod python_effects;
 
 pub(crate) struct Attribute {
     pub(crate) attribute_id: i32,
@@ -16,6 +17,10 @@ pub(crate) struct Effect {
     pub(crate) guid: Option<String>,
     pub(crate) effect_category: Option<i32>,
     pub(crate) duration_attribute_id: Option<i32>,
+    pub(crate) is_offensive: bool, pub(crate) is_assistance: bool,
+    pub(crate) disallow_auto_repeat: bool, pub(crate) electronic_chance: bool, pub(crate) propulsion_chance: bool,
+    pub(crate) discharge_attribute_id: Option<i32>, pub(crate) range_attribute_id: Option<i32>,
+    pub(crate) falloff_attribute_id: Option<i32>, pub(crate) tracking_attribute_id: Option<i32>,
     modifiers: Vec<Modifier>
 }
 impl Effect {
@@ -34,12 +39,15 @@ impl Dogma {
         for r in effects {
             let pos = result.effects.len(); result.effect_ids.insert(r.effect_id, pos);
             if let Some(name) = &r.name { result.effect_names.entry(name.clone()).or_default().push(pos); }
-            result.effects.push(Effect { effect_id: r.effect_id, name: r.name, guid: r.guid, effect_category: r.effect_category, duration_attribute_id: r.duration_attribute_id, modifiers: Vec::new() });
+            result.effects.push(Effect { effect_id: r.effect_id, name: r.name, guid: r.guid, effect_category: r.effect_category, duration_attribute_id: r.duration_attribute_id, is_offensive: r.is_offensive, is_assistance: r.is_assistance, disallow_auto_repeat: r.disallow_auto_repeat, electronic_chance: r.electronic_chance, propulsion_chance: r.propulsion_chance, discharge_attribute_id: r.discharge_attribute_id, range_attribute_id: r.range_attribute_id, falloff_attribute_id: r.falloff_attribute_id, tracking_attribute_id: r.tracking_attribute_id, modifiers: Vec::new() });
         }
         for r in modifiers {
             if let Some(&i) = result.effect_ids.get(&r.effect_id) {
                 result.effects[i].modifiers.push(Modifier { func: r.func, domain: r.domain, op: r.op, modified: r.modified, modifying: r.modifying, group: r.group, skill: r.skill });
             }
+        }
+        for effect in &mut result.effects {
+            python_effects::supplement(effect);
         }
         Ok(result)
     }
