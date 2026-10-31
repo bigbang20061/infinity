@@ -10,6 +10,7 @@ pub(crate) mod effects;
 pub(crate) mod gm;
 pub(crate) mod scheduler;
 pub(crate) mod lua;
+pub(crate) mod loyalty;
 pub(crate) mod standings;
 pub(crate) mod trade;
 
@@ -551,10 +552,6 @@ pub(crate) const WEAPONS_TIMER_JUMP: &str = "跳跃";
 pub(crate) const STATION_DOCK_REQUIRED_FOR_LP_STORE: &str = "你必须停靠在空间站内才能使用忠诚点商店。";
 /// Loyalty-point offer is unavailable.
 pub(crate) const LP_OFFER_UNAVAILABLE: &str = "该兑换项已不可用。";
-/// Insufficient loyalty points for the purchase.
-pub(crate) const INSUFFICIENT_LOYALTY_POINTS: &str = "你的忠诚点不足。";
-/// Corporation loyalty point wallets are unavailable.
-pub(crate) const CORPORATION_LP_WALLET_UNSUPPORTED: &str = "暂不支持军团忠诚点钱包。";
 /// Available loyalty point balance.
 pub(crate) fn loyalty_balance_message(before: i64) -> String { format!("你在该军团只有 {before} 忠诚点。") }
 

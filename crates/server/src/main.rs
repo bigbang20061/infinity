@@ -51,6 +51,7 @@ async fn main() -> Result<()> {
     info!(source = cfg.source(), "configuration loaded");
     config::init_game(cfg.game_config())?;
     let db = db::Db::connect(&cfg.database).await?;
+    services::standings::initialize(&db).await?;
     let sde = Arc::new(sde::Sde::load(&db).await?);
     let types = sde.types.len();
     info!(target: "infinity_server::db", "database ready ({types} types in SDE)");

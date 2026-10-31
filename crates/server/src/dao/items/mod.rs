@@ -16,6 +16,7 @@ pub(crate) mod fitting;
 pub(crate) mod hacking;
 pub(crate) mod inventory;
 pub(crate) mod loading;
+pub(crate) mod loyalty;
 pub(crate) mod mining;
 pub(crate) mod pending_reloads;
 pub(crate) mod positions;

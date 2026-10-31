@@ -24,6 +24,7 @@ pub(crate) mod jobs;
 pub(crate) mod kill_rights;
 pub(crate) mod killmails;
 pub(crate) mod lua_store;
+pub(crate) mod lp_offers;
 pub(crate) mod mail;
 pub(crate) mod market;
 pub(crate) mod missions;

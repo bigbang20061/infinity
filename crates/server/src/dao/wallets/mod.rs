@@ -1,8 +1,8 @@
 //! Character and corporation wallet balances, credits and debits, and loyalty points.
 //! Uses `game.characters`, `game.corp_wallets` and `game.lp_balances`.
 //! This DAO has no direct client mirror or wire contract; owning services supply those.
-//! Corporation loyalty point wallets are unsupported by these queries; economy policy,
-//! transactions, refusals, notifications and World are caller concerns.
+//! Character and corporation loyalty balances share the owner-keyed LP table;
+//! economy policy, transactions, refusals, notifications and World are caller concerns.
 //! ISK storage is exact numeric; client balances are lossy doubles clamped by wallet type.
 //! Corporation GM writes are unsupported; overflowing non-GM credits are database errors.
 //! No decimal dependency is required for exact storage.
