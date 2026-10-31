@@ -72,6 +72,8 @@ CREATE TABLE IF NOT EXISTS game.item_attributes (
     value double precision NOT NULL,
     PRIMARY KEY (item_id, attribute_id)
 );
+-- dao/items/dogma: FILETIME of the persisted shield charge.
+ALTER TABLE game.item_attributes ADD COLUMN IF NOT EXISTS updated_at bigint NOT NULL DEFAULT 0;
 -- idCheckers.IsPlayerItem: >= 100,000,000; start far above character IDs.
 SELECT setval('game.items_item_id_seq', GREATEST((SELECT max(item_id) FROM game.items), 1000000000000), true);
 

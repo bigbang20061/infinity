@@ -1,7 +1,7 @@
-//! Periodic pilot position persistence for destiny's ballpark (michelle.py).
-//! Uses game.items with guarded writes on the system worker, including shutdown flushes;
-//! the snapshot interval is operator-configured. Other ball state and persistent
-//! timers are not supported.
+//! Periodic pilot position and condition persistence for destiny's ballpark (michelle.py).
+//! Uses game.items and item_attributes on the system worker, including stationary pilots
+//! and shutdown flushes; the snapshot interval is operator-configured.
+//! Other ball state and persistent timers are not supported.
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -24,7 +24,6 @@ fn candidates(s: &System) -> impl Iterator<Item = (i64, u64)> + '_ {
 }
 
 pub(super) fn schedule(s: &System) {
-    if candidates(s).next().is_none() { return; }
     let Some(ctx) = &s.snapshot_context else { return };
     let Ok(guard) = ctx.gate.clone().try_lock_owned() else { return };
     let Some(tx) = ctx.tx.upgrade() else { return };
@@ -32,6 +31,9 @@ pub(super) fn schedule(s: &System) {
     let db = ctx.db.clone();
     s.defer(async move {
         let _guard = guard;
+        if let Err(error) = write_conditions(&handle, &db).await {
+            tracing::warn!(%error, "condition snapshot failed");
+        }
         if let Err(error) = write_positions(&handle, &db).await {
             tracing::warn!(%error, "position snapshot failed");
         }
@@ -44,11 +46,30 @@ pub(super) async fn flush(handle: SystemHandle, db: Db) -> Result<u64> {
     let worker_handle = handle.clone();
     handle.send(Box::new(move |s| s.defer(async move {
         let _guard = worker_handle.gate.lock().await;
-        let result = write_positions(&worker_handle, &db).await
-            .map(|_| worker_handle.written.load(Ordering::SeqCst) - before);
+        let result = match (write_positions(&worker_handle, &db).await, write_conditions(&worker_handle, &db).await) {
+            (Ok(_), Ok(())) => Ok(worker_handle.written.load(Ordering::SeqCst) - before),
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        };
         let _ = tx.send(result);
     }))).map_err(|_| anyhow::anyhow!("system actor stopped before position flush"))?;
     rx.await.map_err(|_| anyhow::anyhow!("position flush worker unavailable"))?
+}
+
+async fn write_conditions(handle: &SystemHandle, db: &Db) -> Result<()> {
+    let ids = handle.with(|s| s.pilots().map(|ball| ball.id).collect::<Vec<_>>()).await
+        .ok_or_else(|| anyhow::anyhow!("system actor stopped during condition snapshot"))?;
+    let mut failure = None;
+    for ship in ids {
+        if let Err(error) = crate::services::combat::save_condition(db, ship).await {
+            let error = match error {
+                crate::services::CallError::Internal(error) => error,
+                crate::services::CallError::User { msg, .. } => anyhow::anyhow!(msg),
+            };
+            tracing::warn!(ship, %error, "saving ship condition failed");
+            failure = Some(error);
+        }
+    }
+    failure.map_or(Ok(()), Err)
 }
 
 async fn write_positions(handle: &SystemHandle, db: &Db) -> Result<u64> {

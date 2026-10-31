@@ -30,6 +30,10 @@
 //! Dropped cycle owners release their own in-memory activation markers without notifications.
 //! Reset clears a pilot's targets and pending locks and stops only that pilot's modules.
 //! Explicit lock removal also removes the matching outgoing projected effects.
+//! Ship condition is persisted in game.item_attributes, with shield recharge time on
+//! the shield override; capacitor and in-flight effects remain runtime-only.
+//! Space damage, repair and GM condition changes serialize with final condition saves;
+//! removed balls reject queued effects from their former system.
 //! Missiles in flight use a temporary, nonpersistent ID namespace.
 //! LoadAmmo accepts an owned active or assembled docked fitting ship and owned charge
 //! stacks in its holds, the current hangar, or a directly held singleton container.
@@ -242,10 +246,59 @@ pub fn ship_condition(ship: i64) -> Option<(f64, f64, f64)> {
     Some((shield, c.stats.max[1] - c.now[1], c.stats.max[2] - c.now[2]))
 }
 
-pub fn repair(ship: i64) {
-    let mut st = state();
-    st.condition.remove(&ship);
-    st.capacitor.remove(&ship);
+/// Persist the current runtime condition; serialize capture with paid repair.
+pub(crate) async fn save_condition(db: &Db, ship: i64) -> Result<(), CallError> {
+    let _lock = super::market::lock().await;
+    let Some(cond) = state().condition.get(&ship).cloned() else { return Ok(()) };
+    save_condition_locked(db, ship, &cond).await
+}
+
+/// Persist all layers and their shield timestamp while the market lock is held.
+async fn save_condition_locked(db: &Db, ship: i64, cond: &Condition) -> Result<(), CallError> {
+    let now = filetime_now();
+    let shield = recharge(cond.now[0], cond.stats.max[0], cond.stats.shield_tau_ms, now.saturating_sub(cond.shield_at) as f64 / FILETIME_SECOND as f64);
+    crate::dao::items::dogma::save_condition(db, ship, &[ATTR_SHIELD_CHARGE, ATTR_ARMOR_DAMAGE, ATTR_HULL_DAMAGE], &[shield, cond.stats.max[1] - cond.now[1], cond.stats.max[2] - cond.now[2]], ATTR_SHIELD_CHARGE, now).await.map_err(db_err)
+}
+
+/// Reload a docked ship's durable condition and advance shield recharge while offline.
+/// In-space ships must use `load_condition_with_fit` with a fit loaded in space.
+pub(crate) async fn load_docked_condition(db: &Db, world: &World, char_id: i64, ship: i64) -> Result<[f64; 3], CallError> {
+    let fit = Fit::load(db, world.sde().clone(), char_id, ship).await?;
+    load_condition_with_fit(db, ship, &fit).await
+}
+
+pub(super) async fn load_condition_with_fit(db: &Db, ship: i64, fit: &Fit) -> Result<[f64; 3], CallError> {
+    let stats = ShipStats::from_fit(fit);
+    let rows = crate::dao::items::dogma::overrides(db, ship).await.map_err(db_err)?;
+    let at = rows.iter().find(|r| r.attribute_id == ATTR_SHIELD_CHARGE).map(|r| r.updated_at).unwrap_or(0);
+    let value = |id| rows.iter().find(|r| r.attribute_id == id).map(|r| r.value);
+    let now = filetime_now();
+    let (levels, health) = restored_condition(&stats, [value(ATTR_SHIELD_CHARGE), value(ATTR_ARMOR_DAMAGE), value(ATTR_HULL_DAMAGE)], at, now);
+    state().condition.insert(ship, Condition { stats, now: levels, shield_at: now });
+    Ok(health)
+}
+
+fn restored_condition(stats: &ShipStats, values: [Option<f64>; 3], at: i64, now: i64) -> ([f64; 3], [f64; 3]) {
+    let shield = values[0].unwrap_or(stats.max[0]).clamp(0.0, stats.max[0].max(0.0));
+    let shield = if at > 0 { recharge(shield, stats.max[0], stats.shield_tau_ms, now.saturating_sub(at).max(0) as f64 / FILETIME_SECOND as f64) } else { shield };
+    let levels = [shield, (stats.max[1] - values[1].unwrap_or(0.0)).clamp(0.0, stats.max[1].max(0.0)), (stats.max[2] - values[2].unwrap_or(0.0)).clamp(0.0, stats.max[2].max(0.0))];
+    let health = [0, 1, 2].map(|i| if stats.max[i] > 0.0 { levels[i] / stats.max[i] } else { 0.0 });
+    (levels, health)
+}
+
+/// Drop only runtime condition after a committed repair.
+pub(crate) fn invalidate_condition(ship: i64) {
+    state().condition.remove(&ship);
+}
+
+/// Persist a GM's full ship repair before exposing it to the client.
+pub(crate) async fn gm_repair(db: &Db, world: &World, system: i64, char_id: i64, ship: i64) -> Result<(), CallError> {
+    let _lock = super::market::lock().await;
+    let stats = ship_stats(db, world, system, char_id, ship).await?;
+    let cond = Condition { now: stats.max, stats, shield_at: filetime_now() };
+    save_condition_locked(db, ship, &cond).await?;
+    invalidate_condition(ship);
+    Ok(())
 }
 
 pub fn refill_capacitor(ship: i64) {

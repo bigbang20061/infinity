@@ -3,6 +3,7 @@
 //! Uses character, account, item and skill DAOs and SDE starting data; appearance is stored without interpretation.
 //! Slot counts, name limits, starting ISK and deletion delay are operator policies.
 //! Selecting a character registers process-local presence; appearance editing is not interpreted here.
+//! Selection restores the active ship's persisted condition before entering the game.
 
 use crate::dao::{accounts, characters, items, skills};
 use super::{db_err, keyval, trimmed_arg_text, Call, CallError, CallResult};
@@ -191,6 +192,9 @@ async fn select_character(c: &mut Client, char_id: i64) -> Result<(), CallError>
         super::skills::starting::grant_starting_skills(c, char_id, race).await?;
     }
     characters::selection::logoff(&c.db, char_id).await.map_err(db_err)?;
+    if station.is_some() {
+        super::combat::load_docked_condition(&c.db, &c.world, char_id, ship).await?;
+    }
     let int = Value::Int;
     let opt = |v: Option<i64>| v.map(Value::Int).unwrap_or(Value::None);
     let corp = r.corporation_id;

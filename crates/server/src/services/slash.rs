@@ -286,7 +286,7 @@ async fn wallet(c: &mut Client, args: &[String], command: &str) -> Result<String
 
 async fn heal(c: &mut Client) -> Result<String, CallError> {
     let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) else { return Ok(messages::gm::GM_DOCKED_SHIP_REPAIRS.into()) };
-    super::combat::repair(ship);
+    super::combat::gm_repair(&c.db, &c.world, system, c.session.int("charid").unwrap_or(0), ship).await?;
     c.world.set_health(system, ship, [1.0; 3]);
     super::ship::send_state(c).await?;
     Ok(messages::gm::GM_REPAIRED.into())
