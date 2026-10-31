@@ -60,7 +60,7 @@ use crate::db::executor::Executor;
 use crate::db::outbox::{Outbox, dispatch_client, dispatch_world};
 use crate::messages;
 use crate::sde::Sde;
-use crate::space::{dist, lock_time_ms, metres_to_km, ms_to_seconds, seconds_to_ms, now_ms, Ball, NotifyTx, NpcAction, NpcBrain, NpcConfig, NpcEffects, NpcFuture, World};
+use crate::space::{dist, lock_time_ms, metres_to_km, ms_to_seconds, now_ms, Ball, NotifyTx, NpcAction, NpcBrain, NpcConfig, NpcEffects, NpcFuture, World};
 use marshal::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -302,10 +302,6 @@ pub(crate) async fn gm_repair(db: &Db, world: &World, system: i64, char_id: i64,
     Ok(())
 }
 
-pub fn refill_capacitor(ship: i64) {
-    state().capacitor.remove(&ship);
-}
-
 pub fn forget_ship(ship: i64) {
     let mut st = state();
     st.condition.remove(&ship);
@@ -361,10 +357,22 @@ pub async fn spawn_npc(db: Db, world: Arc<World>, system: i64, id: i64, type_id:
                     }
                     NpcAction::Effect { me, victim, effect_id, source_module, duration_ms, generation } => {
                         if let Some(effect) = super::effects::registry::resolve(world.sde(), effect_id) {
-                            if let Err(CallError::Internal(error)) = super::effects::projected::apply_npc(
-                                &db, &world, system, source_module, &me, &victim, &effect, duration_ms, generation,
-                            ).await {
-                                warn!("npc {id} projected effect {effect_id}: {error:#}");
+                            let result = match effect.kind {
+                                super::effects::EffectKind::Projected { .. } =>
+                                    super::effects::projected::apply_npc(
+                                        &db, &world, system, source_module, &me, &victim, &effect, duration_ms, generation,
+                                    ).await,
+                                super::effects::EffectKind::Neutralizer | super::effects::EffectKind::Nosferatu | super::effects::EffectKind::CapTransfer =>
+                                    super::effects::npc_capacitor::apply_npc(
+                                        &db, &world, system, source_module, &me, &victim, &effect, duration_ms, generation,
+                                    ).await,
+                                _ => return,
+                            };
+                            match result {
+                                Err(CallError::Internal(error)) => warn!("npc {id} effect {effect_id}: {error:#}"),
+                                Err(CallError::User { msg, .. }) if !matches!(effect.kind, super::effects::EffectKind::Projected { .. }) =>
+                                    warn!("npc {id} capacitor effect {effect_id}: {msg}"),
+                                _ => {}
                             }
                         }
                     }
@@ -378,7 +386,7 @@ pub async fn spawn_npc(db: Db, world: Arc<World>, system: i64, id: i64, type_id:
         .or_else(|| world.sde().dogma.attribute(ATTR_MAX_TARGET_RANGE).and_then(|a| a.default_value).filter(|value| *value > 0.0));
     for entry in world.sde().types.effects(type_id) {
         let Some(effect) = super::effects::registry::resolve(world.sde(), entry.effect_id) else { continue };
-        if !matches!(effect.kind, super::effects::EffectKind::Projected { .. }) { continue; }
+        if !matches!(effect.kind, super::effects::EffectKind::Projected { .. } | super::effects::EffectKind::Neutralizer | super::effects::EffectKind::Nosferatu | super::effects::EffectKind::CapTransfer) { continue; }
         let duration = match effect.attribute(super::effects::registry::EffectAttribute::Duration) {
             Some(id) => match world.sde().types.attribute(type_id, id) {
                 Some(duration) => duration,

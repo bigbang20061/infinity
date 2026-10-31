@@ -140,6 +140,14 @@ pub const ATTR_IS_ONLINE: i32 = 2;
 pub const ATTR_EXPLOSION_DELAY: i32 = 281;
 /// SDE dgmAttributeTypes: capacitorCapacity.
 pub const ATTR_CAPACITOR_CAPACITY: i32 = 482;
+/// Client dogma/const.py: attributeCapacitorBonus.
+pub const ATTR_CAPACITOR_BONUS: i32 = 67;
+/// Client dogma/const.py: attributeEnergyNeutralizerAmount.
+pub const ATTR_ENERGY_NEUTRALIZER_AMOUNT: i32 = 97;
+/// Client dogma/const.py: attributePowerTransferAmount.
+pub const ATTR_POWER_TRANSFER_AMOUNT: i32 = 90;
+/// Client dogma/const.py: attributeNosOverride.
+pub const ATTR_NOS_OVERRIDE: i32 = 1945;
 /// SDE dgmAttributeTypes: shieldCapacity.
 pub const ATTR_SHIELD_CAPACITY: i32 = 263;
 /// SDE dgmAttributeTypes: charge.

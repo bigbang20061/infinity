@@ -28,10 +28,11 @@ inventory of every unsupported SDE effect.
 | Kind or family | Status |
 |---|---|
 | Turret, missile, local shield/armour/hull repair, propulsion, mining | Existing behaviour uses the shared lifecycle. |
+| Capacitor boosters, neutralizers, nosferatu, capacitor transfer and fueled local repair | Supported through the shared lifecycle. Charged ancillary shield boosters bypass capacitor discharge without an amount multiplier; fueled ancillary armor repair pays normal capacitor and uses its fitted charge multiplier. Uncharged ancillary repairs use their normal capacitor cost and base amount. |
 | Modifier-only and online effects | Supported through the modifier and online paths, subject to validation and scope. |
 | Hacking and probe launch | Classified for existing exploration paths; classification alone does not guarantee every item or call path. |
 | Projected web, warp disruption and scrambling, target painting, sensor damping, tracking and guidance disruption, remote sensor and tracking enhancement | Runtime projections use the shared Fit evaluator and actor-owned lifetimes. Warp scramble status refuses warp entry; a scram that blocks propulsion stops a running microwarpdrive and refuses a new activation, without stopping afterburners. |
-| ECM, capacitor warfare and transfer, fueled and remote repair | Classified separately; classification alone does not imply projected modifier support. |
+| ECM and remote repair | Known later families, visibly refused until their behaviour is implemented. |
 | Smartbomb, Vorton, cloak, micro jump drive, salvage, tractor, scans, target assistance and bombs | Known later families, visibly refused until implemented. |
 | Explicitly excluded capital, industrial, structure and other out-of-scope groups | Refused even when an effect has modifiers. |
 
@@ -133,6 +134,11 @@ expiry and source or target departure remove the relevant contribution.
 Finite cycles expire after their duration plus exactly one destiny tick of
 grace; an indefinite duration has no expiry. Refreshes reevaluate Fit outside
 the actor and queue kinematics through destiny. Runtime state is lost on restart.
+
+A scram-blocked microwarpdrive is removed from the active Fit input immediately,
+while its running cycle remains owned until the normal stop publishes the real
+stop notification and performs its teardown. Ordinary deactivation continues
+to affect Fit until the cycle ends.
 
 The deterministic D7 range multiplier uses sampled surface distance: strength
 is 1 through inclusive optimal, then `0.5^(((distance - optimal) / falloff)^2)`.

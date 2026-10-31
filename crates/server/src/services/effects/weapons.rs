@@ -7,6 +7,7 @@ use crate::services::fit::{Fit, Key};
 use crate::services::{db_err, rand01, CallError};
 use crate::consts::{ATTR_AOE_CLOUD_SIZE, ATTR_DAMAGE_MULTIPLIER, ATTR_EXPLOSION_DELAY, ATTR_FALLOFF, ATTR_MAX_RANGE, ATTR_MAX_VELOCITY, ATTR_MISSILE_DAMAGE_MULTIPLIER, ATTR_SIGNATURE_RADIUS};
 use crate::db::Db;
+use crate::db::outbox::{dispatch_world, Outbox};
 use crate::space::{dist, ms_to_seconds, now_ms, seconds_to_ms, Ball, World};
 use marshal::Value;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -57,15 +58,47 @@ const MISSILE_ID_START: i64 = 9_800_000_000_000;
 static NEXT_MISSILE_ID: AtomicI64 = AtomicI64::new(MISSILE_ID_START);
 
 /// Use one charge from a module; `None` when it is empty.
-pub(super) async fn consume_charge(cx: &Ctx, module: &Module) -> Result<Option<i32>, CallError> {
-    let row = crate::dao::items::combat::consume_charge(&cx.db, cx.ship_id, module.flag).await.map_err(db_err)?;
-    let Some(r) = row else { return Ok(None) };
-    let (type_id, left) = (r.type_id, r.quantity);
-    if left == 0 {
-        crate::dao::items::combat::delete_charge(&cx.db, cx.ship_id, module.flag).await.map_err(db_err)?;
-    }
-    cx.notify("OnModuleAttributeChanges", vec![quantity_change(cx.char_id, cx.ship_id, module.flag, type_id, left as i64, left as i64 + 1)]);
-    Ok(Some(type_id))
+pub(super) async fn consume_charge(cx: &Ctx, module: &Module, expected: Option<i32>) -> Result<Option<i32>, CallError> {
+    let (ship, flag, char_id) = (cx.ship_id, module.flag, cx.char_id);
+    let notify = cx.notify.clone();
+    cx.db.transaction(
+        |tx, outbox: &mut Outbox| {
+            let notify = notify.clone();
+            Box::pin(async move {
+            if !crate::dao::items::ship::lock_reload_ship(tx, ship).await.map_err(db_err)?
+                || !crate::dao::items::pending_reloads::for_flags(tx, ship, &[flag]).await.map_err(db_err)?.is_empty() {
+                return Ok(None);
+            }
+            if let Some(expected) = expected {
+                if crate::services::combat::targeting_charges::loaded(tx, ship, flag).await?.is_none_or(|(kind, quantity)| kind != expected || quantity <= 0) {
+                    return Ok(None);
+                }
+            }
+            let Some(r) = crate::dao::items::combat::consume_charge(tx, ship, flag).await.map_err(db_err)? else { return Ok(None) };
+            if r.quantity == 0 {
+                crate::dao::items::combat::delete_empty_charge(tx, ship, flag).await.map_err(db_err)?;
+            }
+            outbox.notify_sender(notify, "OnModuleAttributeChanges", vec![quantity_change(char_id, ship, flag, r.type_id, r.quantity as i64, r.quantity as i64 + 1)]);
+            Ok(Some(r.type_id))
+            })
+        },
+        |value, outbox| async move { dispatch_world(value, outbox, &cx.world) },
+    ).await
+}
+
+/// Confirm an uncharged ancillary cycle did not race a reload or a new charge.
+pub(super) async fn empty_charge(cx: &Ctx, module: &Module) -> Result<bool, CallError> {
+    let (ship, flag) = (cx.ship_id, module.flag);
+    cx.db.transaction(
+        |tx, _: &mut Outbox| Box::pin(async move {
+            if !crate::dao::items::ship::lock_reload_ship(tx, ship).await.map_err(db_err)?
+                || !crate::dao::items::pending_reloads::for_flags(tx, ship, &[flag]).await.map_err(db_err)?.is_empty() {
+                return Ok(false);
+            }
+            Ok(crate::services::combat::targeting_charges::loaded(tx, ship, flag).await?.is_none_or(|(_, quantity)| quantity <= 0))
+        }),
+        |value, outbox| async move { dispatch_world(value, outbox, &cx.world) },
+    ).await
 }
 
 /// The game's hit quality for the combat log: 0 miss .. 6 wrecking.

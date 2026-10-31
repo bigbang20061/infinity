@@ -29,6 +29,57 @@ fn setup(owner: Option<i64>) -> (System, mpsc::UnboundedReceiver<EffectJob>, mps
     }, Arc::new(|_| panic!("effects must run outside the actor"))));
     (s, rx, notifications)
 }
+fn add_assist_npc(s: &mut System, id: i64, owner: i64, x: f64) {
+    let mut b = ball(id, None, x);
+    b.owner_id = owner;
+    s.insert(b);
+    s.add_npc(id, NpcBrain::new(None, NpcConfig {
+        fly_range: 20.0, aggro_range: 100.0, rate_of_fire_ms: 2500.0,
+        scan_resolution: 17_163.0, repairs: (0.0, 0.0, 5000.0),
+    }, Arc::new(|_| panic!("effects must run outside the actor"))));
+}
+
+#[test]
+fn assistance_selects_lowest_fraction_then_id_and_respects_groups_and_range() {
+    let (mut s, _, _) = setup(None);
+    add_assist_npc(&mut s, 2, 1, 10.0);
+    add_assist_npc(&mut s, 3, 1, 10.0);
+    add_assist_npc(&mut s, 4, 1, 100.0);
+    add_assist_npc(&mut s, 5, 2, 10.0);
+    s.insert(ball(1, Some(10), 0.0));
+    let select = |s: &System| s.assist_target(1000, |_, target| {
+        if target.id == 4 { return None; }
+        let fraction = match target.id { 2 | 3 => 0.2, _ => 0.1 };
+        (fraction < 1.0).then_some(fraction)
+    }).map(|ball| ball.id);
+    assert_eq!(select(&s), Some(2));
+    s.spawn_group([1000, 3, 4], |_| {});
+    assert_eq!(select(&s), Some(3));
+    s.remove_ball(3);
+    assert_eq!(select(&s), None);
+    assert!(s.assist_target(1000, |_, _| None).is_none());
+}
+
+#[test]
+fn assistance_guard_rejects_hostile_confusion_and_stale_generation() {
+    use crate::services::combat::groups_health::NpcCapacitorGuard;
+    let (mut s, _, _) = setup(Some(HOSTILE_TO_ALL));
+    add_assist_npc(&mut s, 2, 1, 10.0);
+    s.insert(ball(1, Some(10), 50.0));
+    s.tick(0);
+    let deadline = lock_time_ms(17_163.0, 1.0) as i64;
+    s.tick(deadline);
+    let generation = s.brains[&1000].target_generation;
+    let guard = NpcCapacitorGuard::Assistance { source: 1000, hostile: 1, target: 2, generation, optimal: 20.0, falloff: 0.0 };
+    assert!(guard.valid(&s));
+    assert!(!NpcCapacitorGuard::Hostile { source: 1000, target: 2, generation }.valid(&s));
+    assert!(!NpcCapacitorGuard::Assistance { source: 1000, hostile: 1, target: 1, generation, optimal: 100.0, falloff: 0.0 }.valid(&s));
+    let mut brain = s.brains.remove(&1000).unwrap();
+    s.lose_npc_target(1000, &mut brain);
+    s.brains.insert(1000, brain);
+    assert!(!guard.valid(&s));
+}
+
 #[test]
 fn npc_acquires_only_on_configured_think_interval() {
     let (mut s, _, _) = setup(Some(10));
@@ -182,6 +233,42 @@ fn departing_npc_removes_its_projections_and_invalidates_jobs() {
     s.remove_ball(1000);
     assert!(s.projections_on(1).is_empty());
     assert!(!s.npc_projection_valid(1000, 1, generation));
+}
+
+#[test]
+fn effect_timers_stop_on_target_generation_change() {
+    let (mut s, mut jobs, _) = setup(Some(HOSTILE_TO_ALL));
+    s.brains.get_mut(&1000).unwrap().add_effect(42, 1000.0);
+    s.insert(ball(1, Some(10), 50.0));
+    s.tick(0);
+    let deadline = lock_time_ms(17_163.0, 1.0) as i64;
+    s.tick(deadline);
+    assert!(matches!(jobs.try_recv().unwrap(), EffectJob::Npc { action: NpcAction::Shot { .. }, .. }));
+    let generation = match jobs.try_recv().unwrap() {
+        EffectJob::Npc { action: NpcAction::Effect { generation, .. }, .. } => generation,
+        _ => panic!("expected NPC effect"),
+    };
+    assert!(s.npc_projection_valid(1000, 1, generation));
+    s.tick(deadline + 1000);
+    assert!(matches!(jobs.try_recv().unwrap(), EffectJob::Npc { action: NpcAction::Effect { generation: g, .. }, .. } if g == generation));
+    let mut brain = s.brains.remove(&1000).unwrap();
+    s.lose_npc_target(1000, &mut brain);
+    s.brains.insert(1000, brain);
+    assert!(!s.npc_projection_valid(1000, 1, generation));
+    s.tick(deadline + 2000);
+    assert!(jobs.try_recv().is_err());
+}
+
+#[test]
+fn effect_registration_rejects_invalid_cycle_lengths() {
+    let (mut s, _, _) = setup(None);
+    let brain = s.brains.get_mut(&1000).unwrap();
+    for duration in [0.0, -2.0, f64::NAN, f64::INFINITY] { brain.add_effect(42, duration); }
+    assert!(brain.modules.is_empty());
+    brain.add_effect(42, -1.0);
+    brain.add_effect(42, 1.0);
+    assert_eq!(brain.modules.len(), 2);
+    assert_ne!(brain.modules[0].source_module, brain.modules[1].source_module);
 }
 
 #[test]
