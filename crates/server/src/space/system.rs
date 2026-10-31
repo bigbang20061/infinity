@@ -10,6 +10,8 @@
 //! `current_time` starts at load-time Unix seconds and advances once per fixed
 //! one-second evolution, independently of the wall clock. Timers and NPC
 //! decisions run on 100 ms housekeeping ticks; snapshots follow motion.
+//! Explicit pilot actions cancel jump cloak once; expiry uses the raw uncloak queue.
+//! Uncloak batches restore the ball and clear its client shader for every observer.
 //! After more than five due steps, catchup clamps to one logical step and the
 //! next deadline is the next whole wall second, an intentional departure from
 //! native cadence. The clamped interpolation anchor is actual execution time;
@@ -33,6 +35,8 @@ const DESTRUCTION_EFFECT_EXPLOSION: i64 = 3;
 const MISSILE_AIMED_LAUNCH: bool = true;
 /// Server policy for ordinary missiles; destiny/src/Thunkers.cpp sets ball massiveness from this flag.
 const MISSILE_MASSIVE: bool = false;
+/// brawl/client/war_fog_svc.py:58 uncloak effect duration in milliseconds.
+const UNCLOAK_FX_DURATION_MS: i64 = 5;
 pub(crate) type Timer = Box<dyn FnOnce(&mut System) + Send>;
 type Action = Box<dyn FnOnce(&mut System, i64) + Send>;
 
@@ -393,6 +397,14 @@ impl System {
         self.actions.push_back((self.current_time, Box::new(move |s, stamp| s.apply_uncloak(ship, stamp))));
         true
     }
+    pub(crate) fn drop_jump_cloak(&mut self, ship: i64) -> bool {
+        let pilot = self.balls.get(&ship).and_then(|ball| ball.char_id);
+        if !self.uncloak(ship) { return false; }
+        if let Some(pilot) = pilot {
+            self.notify_pilot(pilot, "OnJumpCloakCancelled", vec![Value::Int(ship)]);
+        }
+        true
+    }
     fn apply_uncloak(&mut self, ship: i64, stamp: i64) {
         self.pending_uncloak.remove(&ship);
         let Some(ball) = self.balls.get_mut(&ship) else { return };
@@ -401,13 +413,14 @@ impl System {
         ball.cloak_until = 0;
         let add = add_balls_event(stamp, ball);
         let own = event(stamp, "UncloakBall", vec![Value::Int(ship)]);
+        let fx = special_fx(stamp, ship, None, None, "effects.Uncloak", 1, 0, UNCLOAK_FX_DURATION_MS, None);
         self.observers.retain(|&client, (ego, tx)| {
             if tx.is_closed() { return false; }
             let update = if *ego == ship { own.clone() } else { add.clone() };
             if let Some(pending) = &mut self.pending {
-                pending.entry(client).or_default().push(update);
+                pending.entry(client).or_default().extend([update, fx.clone()]);
                 true
-            } else { tx.send(vec![update]).is_ok() }
+            } else { tx.send(vec![update, fx.clone()]).is_ok() }
         });
     }
     pub fn observe(&mut self, client_id: i64, ego: i64, tx: DestinyTx) -> Value {

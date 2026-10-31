@@ -30,6 +30,7 @@
 //! are authoritative; bump events, orientations, formations, miniballs, AddBalls2
 //! and unsupported ball modes are not implemented.
 //! Shared vector distances are defined here for simulation and service callers.
+//! Shared special effects follow fxSequencer.OnSpecialFX's 14-field protocol.
 
 use crate::consts::{AU, DAMAGE_LAYER_COUNT, FILETIME_SECOND, SECONDS_PER_MINUTE};
 use crate::db::Db;
@@ -436,6 +437,21 @@ pub fn event(tick: i64, name: &str, args: Vec<Value>) -> Value {
     Value::tuple([Value::Int(tick), Value::tuple([Value::str(name), Value::Tuple(args)])])
 }
 
+/// Existing server wire policy for an unspecified travel effect duration.
+pub(crate) const SPECIAL_FX_UNSPECIFIED_DURATION: i64 = -1;
+
+/// Encode the 14 arguments consumed by spaceMgr/fxSequencer.OnSpecialFX.
+pub(crate) fn special_fx(tick: i64, ship: i64, target: Option<i64>, other: Option<i64>,
+    guid: &str, start: i64, active: i64, duration: i64, graphic_info: Option<Value>) -> Value {
+    event(tick, "OnSpecialFX", vec![
+        Value::Int(ship), Value::None, Value::None,
+        target.map(Value::Int).unwrap_or(Value::None),
+        other.map(Value::Int).unwrap_or(Value::None), Value::str(guid),
+        Value::Bool(false), Value::Int(start), Value::Int(active), Value::Int(duration),
+        Value::Int(0), Value::None, Value::Int(0), graphic_info.unwrap_or(Value::None),
+    ])
+}
+
 /// Shared notification registry and admission queues, safe to use inside an actor.
 #[derive(Default)]
 pub struct Pilots {
@@ -691,7 +707,7 @@ impl World {
         self.with(system, move |s| s.destroy_ball(id)).await.flatten()
     }
     pub async fn uncloak(&self, system: i64, id: i64) -> bool {
-        self.with(system, move |s| s.uncloak(id)).await.unwrap_or(false)
+        self.with(system, move |s| s.drop_jump_cloak(id)).await.unwrap_or(false)
     }
     pub async fn request_entry(&self, system: i64, pilot: i64) -> Result<(), i64> {
         self.with(system, move |s| s.request_entry(pilot)).await.unwrap_or(Err(1))

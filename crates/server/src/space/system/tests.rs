@@ -1,4 +1,5 @@
 use super::*;
+mod jump_cloak;
 
 fn ball(id: i64, pilot: Option<i64>, x: f64) -> Ball {
     crate::tests::init_config();
@@ -561,7 +562,7 @@ fn membership_and_uncloak_are_fifo_and_captured() {
     assert!(rx.try_recv().is_err());
     s.tick(6_000);
     let events = rx.try_recv().unwrap();
-    assert_eq!(events.iter().map(name).collect::<Vec<_>>(), vec![b"AddBalls".as_slice(), b"RemoveBalls", b"AddBalls"]);
+    assert_eq!(events.iter().map(name).collect::<Vec<_>>(), vec![b"AddBalls".as_slice(), b"RemoveBalls", b"AddBalls", b"OnSpecialFX"]);
     for event in events {
         let Value::Tuple(parts) = event else { panic!("event") };
         assert_eq!(parts[0].as_int(), Some(5));

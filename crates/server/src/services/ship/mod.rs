@@ -13,6 +13,7 @@
 //! live warp targets, use positions sampled at the system actor's time. GOTO stores an
 //! absolute point; direction commands project a point from the current position and send
 //! the raw direction.
+//! Movement, stop, accepted warp, docking and jumping cancel arrival cloak through the system actor.
 //! Carbonengine `Ballpark::WarpTo` (`Ballpark.cpp:4102-4113`) falls back to
 //! GotoPoint with no WarpFX when the raw destination is strictly below 100 km;
 //! exactly 100 km takes the full-warp path. Exit callbacks are transient and
@@ -29,7 +30,7 @@ use crate::db::outbox::{dispatch_client, Effect, Outbox};
 use crate::lua::events::GameEvent;
 use crate::dao::{characters::{ship as character_dao, selection}, items::{ship as item_dao, creation}};
 use crate::messages;
-use crate::space::{self, event, now_ms, Ball, V3, CLOAK_RESTORE, MODE_STOP};
+use crate::space::{self, event, now_ms, special_fx, Ball, V3, CLOAK_RESTORE, MODE_STOP, SPECIAL_FX_UNSPECIFIED_DURATION};
 use crate::space::system::Timer;
 use marshal::Value;
 use tracing::{info, warn};
@@ -208,31 +209,6 @@ async fn dock(c: &mut Client, station: i64) -> CallResult {
 /// Jump range: ship and gate surfaces within this distance (m).
 const JUMP_RANGE: f64 = 2500.0;
 
-/// `effects.*` special effect on `ship` aimed at `target` (spaceMgr/fxSequencer.OnSpecialFX).
-/// Travel effects carry `graphicInfo = (destinationSystemID,)`: subwaySvc.StartJump preloads
-/// that system's scene for the jump tunnel; `other` is a wormhole jump's destination class.
-fn special_fx(tick: i64, ship: i64, target: Option<i64>, other: Option<i64>, guid: &str, graphic_info: Option<Value>) -> Value {
-    let target = target.map(Value::Int).unwrap_or(Value::None);
-    // (shipID, moduleID, moduleTypeID, targetID, otherTypeID, guid, isOffensive, start, active,
-    //  duration, repeat, startTime, timeFromStart, graphicInfo)
-    let args = vec![
-        Value::Int(ship),
-        Value::None,
-        Value::None,
-        target,
-        other.map(Value::Int).unwrap_or(Value::None),
-        Value::str(guid),
-        Value::Bool(false),
-        Value::Int(1),
-        Value::Int(0),
-        Value::Int(-1),
-        Value::Int(0),
-        Value::None,
-        Value::Int(0),
-        graphic_info.unwrap_or(Value::None),
-    ];
-    event(tick, "OnSpecialFX", args)
-}
 
 /// Stargate jump delay (ballparkCommon/jumpdelay.py: appConst.invulnerabilityJumping, ms):
 /// the gate animation plays this long before the session moves to the next system.
@@ -308,7 +284,7 @@ pub(super) async fn jump_out_and_arrive(c: &mut Client, system: i64, ship: i64, 
         b.stop();
         vec![
             event(t, "Stop", vec![Value::Int(b.id)]),
-            special_fx(t, b.id, Some(through), other_type, guid, Some(Value::tuple([Value::Int(dest_system)]))),
+            special_fx(t, b.id, Some(through), other_type, guid, 1, 0, SPECIAL_FX_UNSPECIFIED_DURATION, Some(Value::tuple([Value::Int(dest_system)]))),
         ]
     });
     if !c.wait_pumping(system, JUMP_DELAY_MS).await.map_err(CallError::Internal)? {
@@ -347,7 +323,7 @@ pub(super) async fn jump_out_and_arrive(c: &mut Client, system: i64, ship: i64, 
         c.world.schedule(dest_system, WORMHOLE_EFFECT_STOP_DELAY_MS, move |s| {
             s.broadcast(
                 ship,
-                vec![special_fx_stop(s.current_time(), ship, "effects.CloakRegardless")],
+                vec![special_fx(s.current_time(), ship, None, None, "effects.CloakRegardless", 0, 0, SPECIAL_FX_UNSPECIFIED_DURATION, None)],
             );
         });
     }
@@ -357,26 +333,6 @@ pub(super) async fn jump_out_and_arrive(c: &mut Client, system: i64, ship: i64, 
     Ok(())
 }
 
-/// Stop a repeating special effect on `ship` (OnSpecialFX with start = 0).
-fn special_fx_stop(tick: i64, ship: i64, guid: &str) -> Value {
-    let args = vec![
-        Value::Int(ship),
-        Value::None,
-        Value::None,
-        Value::None,
-        Value::None,
-        Value::str(guid),
-        Value::Bool(false),
-        Value::Int(0),
-        Value::Int(0),
-        Value::Int(-1),
-        Value::Int(0),
-        Value::None,
-        Value::Int(0),
-        Value::None,
-    ];
-    event(tick, "OnSpecialFX", args)
-}
 
 /// GM teleport (/tr): put the ship at `pos` in `dest_system` at once. Within the system
 /// the client gets a fresh ballpark; elsewhere the session moves as on a jump.
@@ -513,16 +469,11 @@ pub async fn send_state(c: &mut Client) -> Result<(), CallError> {
     Ok(())
 }
 
-/// Steer the ship. Any movement but stopping drops a jump cloak.
+/// Steer or stop the ship, dropping a jump cloak.
 fn movement(c: &mut Client, f: impl FnOnce(&mut Ball, i64, &space::System) -> Vec<Value> + Send + 'static) -> CallResult {
     let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) else { return Ok(Value::None) };
-    let pilot = c.session.int("charid");
     c.world.post(system, move |s| {
-        if s.uncloak(ship) {
-            if let Some(pilot) = pilot {
-                s.notify_pilot(pilot, "OnJumpCloakCancelled", vec![Value::Int(ship)]);
-            }
-        }
+        s.drop_jump_cloak(ship);
         s.command(ship, f);
     });
     Ok(Value::None)
@@ -539,14 +490,13 @@ pub(super) async fn warp_to(c: &mut Client, object: Option<(V3, f64)>, point: V3
     }
     let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) else { return Ok(Value::None) };
     let char_id = c.session.int("charid").unwrap_or(0);
-    let pilot = c.session.int("charid");
     let mut on_exit = on_exit;
     loop {
         let fit = super::fit::Fit::load_in_space(&c.db, &c.world, system, char_id, ship).await?;
         let Some(revision) = fit.projection_revision() else { return Ok(Value::None) };
         let scrambled = fit.value(super::fit::Key::Ship, crate::consts::ATTR_WARP_SCRAMBLE_STATUS) > 0.0;
         let result = c.world.with(system, move |s| {
-            commit_warp(s, ship, pilot, revision, scrambled, object, point, min_range, on_exit)
+            commit_warp(s, ship, revision, scrambled, object, point, min_range, on_exit)
         }).await;
         let Some((current, callback)) = result else { return Ok(Value::None) };
         if !current {
@@ -561,16 +511,12 @@ pub(super) async fn warp_to(c: &mut Client, object: Option<(V3, f64)>, point: V3
     Ok(Value::None)
 }
 
-fn commit_warp(s: &mut space::System, ship: i64, pilot: Option<i64>, revision: u64, scrambled: bool,
+fn commit_warp(s: &mut space::System, ship: i64, revision: u64, scrambled: bool,
     object: Option<(V3, f64)>, point: V3, min_range: f64, on_exit: Option<Timer>) -> (bool, Option<Timer>) {
     if s.projection_revision(ship) != revision || scrambled {
         return (s.projection_revision(ship) == revision, on_exit);
     }
-    if s.uncloak(ship) {
-        if let Some(pilot) = pilot {
-            s.notify_pilot(pilot, "OnJumpCloakCancelled", vec![Value::Int(ship)]);
-        }
-    }
+    s.drop_jump_cloak(ship);
     s.clear_warp_exit(ship);
     s.command(ship, move |b, t, _| warp_command(b, t, object, point, min_range));
     if let Some(callback) = on_exit {
@@ -593,7 +539,7 @@ fn warp_command(b: &mut Ball, t: i64, object: Option<(V3, f64)>, point: V3, min_
             vec![
                 event(t, "WarpTo", vec![Value::Int(b.id), Value::Float(point[0]), Value::Float(point[1]), Value::Float(point[2]), Value::Float(stand_off), Value::Int(factor)]),
                 event(t, "SetSpeedFraction", vec![Value::Int(b.id), Value::Float(1.0)]),
-                special_fx(t, b.id, None, None, "effects.Warping", None),
+                special_fx(t, b.id, None, None, "effects.Warping", 1, 0, SPECIAL_FX_UNSPECIFIED_DURATION, None),
             ]
         }
     }

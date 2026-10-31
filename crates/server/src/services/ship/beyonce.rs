@@ -1,5 +1,6 @@
 //! The beyonce remote ballpark service uses the space actor and SDE gate data.
 //! Belt rats spawn after actual warp exit; pending callbacks do not survive cancellation or restart.
+//! Explicit stop and movement commands cancel an arrival jump cloak.
 use super::*;
 
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
@@ -28,13 +29,10 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             })
         }
         ("beyonce", "CmdStop") => {
-            if let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) {
-                c.world.command(system, ship, |b, t, _| {
-                    b.stop();
-                    vec![event(t, "Stop", vec![Value::Int(b.id)])]
-                });
-            }
-            Ok(Value::None)
+            movement(c, |b, t, _| {
+                b.stop();
+                vec![event(t, "Stop", vec![Value::Int(b.id)])]
+            })
         }
         ("beyonce", "CmdSetSpeedFraction") => {
             let frac = f(a.first()) as f32;

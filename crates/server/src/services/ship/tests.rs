@@ -76,7 +76,7 @@ fn warp_threshold_uses_unadjusted_distance_and_keeps_long_warp_events() {
         assert_eq!(events, vec![
             event(77, "WarpTo", vec![Value::Int(123), Value::Float(point[0]), Value::Float(point[1]), Value::Float(point[2]), Value::Float(min_range), Value::Int(3000)]),
             event(77, "SetSpeedFraction", vec![Value::Int(123), Value::Float(1.0)]),
-            special_fx(77, 123, None, None, "effects.Warping", None),
+            special_fx(77, 123, None, None, "effects.Warping", 1, 0, SPECIAL_FX_UNSPECIFIED_DURATION, None),
         ]);
     }
 }
@@ -90,17 +90,17 @@ fn stale_warp_snapshot_has_no_side_effects_and_can_retry() {
     let old = s.projection_revision(123);
     s.refresh_projection_target(123);
     let point = [200_000.0, 20.0, 30.0];
-    assert!(!commit_warp(&mut s, 123, None, old, false, None, point, 0.0, None).0);
+    assert!(!commit_warp(&mut s, 123, old, false, None, point, 0.0, None).0);
     assert_eq!(s.ball(123).unwrap().cloak, 1);
     s.tick(13_000);
     assert_ne!(s.ball(123).unwrap().mode, MODE_WARP);
     let current = s.projection_revision(123);
-    assert!(commit_warp(&mut s, 123, None, current, true, None, point, 0.0, None).0);
+    assert!(commit_warp(&mut s, 123, current, true, None, point, 0.0, None).0);
     assert_eq!(s.ball(123).unwrap().cloak, 1);
     s.refresh_projection_target(123);
-    assert!(!commit_warp(&mut s, 123, None, current, true, None, point, 0.0, None).0);
+    assert!(!commit_warp(&mut s, 123, current, true, None, point, 0.0, None).0);
     let current = s.projection_revision(123);
-    assert!(commit_warp(&mut s, 123, None, current, false, None, point, 0.0, None).0);
+    assert!(commit_warp(&mut s, 123, current, false, None, point, 0.0, None).0);
     s.tick(14_000);
     assert_eq!(s.ball(123).unwrap().mode, MODE_WARP);
 }
