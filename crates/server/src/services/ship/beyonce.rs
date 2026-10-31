@@ -47,16 +47,10 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             let target = a.first().and_then(|v| v.as_int()).unwrap_or(0);
             let range = f(a.get(1)) as f32;
             let orbit = call.method == "CmdOrbit";
-            if !orbit && !range.is_finite() { return Some(Ok(Value::None)); }
+            if !range.is_finite() { return Some(Ok(Value::None)); }
             movement(c, move |b, t, others| {
-                if orbit {
-                    b.mode = MODE_ORBIT;
-                    b.follow_id = target;
-                    b.follow_range = range;
-                } else {
-                    let Some(target_ball) = others.ball(target) else { return vec![] };
-                    if !b.follow_ball(target_ball, range) { return vec![]; }
-                }
+                let Some(target_ball) = others.ball(target) else { return vec![] };
+                if !(if orbit { b.orbit(target_ball, range) } else { b.follow_ball(target_ball, range) }) { return vec![]; }
                 let name = if orbit { "Orbit" } else { "FollowBall" };
                 let mut ev = vec![event(t, name, vec![Value::Int(b.id), Value::Int(target), Value::Float(range as f64)])];
                 ensure_moving(b, t, &mut ev);

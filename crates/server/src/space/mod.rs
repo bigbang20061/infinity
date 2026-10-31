@@ -23,7 +23,7 @@
 //! (`Ballpark.cpp:4102-4113`) falls back to GotoPoint for a raw destination
 //! strictly below 100 km, without WarpFX.
 //!
-//! Orbit, full warp and missile flight remain approximate; collisions and bumps
+//! Full warp and missile flight remain approximate; collisions and bumps
 //! are not modelled. Orientations, formations, miniballs,
 //! AddBalls2 and unsupported ball modes are not implemented.
 //! Shared vector distances are defined here for simulation and service callers.
@@ -46,6 +46,7 @@ mod snapshot;
 mod stop;
 mod goto;
 mod follow;
+mod orbit;
 pub use npc::{HOSTILE_TO_ALL, NpcAction, NpcBrain, NpcConfig, NpcEffects, NpcFuture};
 pub use system::System;
 use actor::SystemHandle;
@@ -358,21 +359,33 @@ impl Ball {
         Value::instance("eve.common.script.util.slimItem.SlimItem", fields)
     }
 
-    /// Integrate the acceleration frozen for this completed segment.
-    fn evolve(&mut self, ms: i64, interpolation_anchor_ms: i64, others: &HashMap<i64, TargetState>) {
-        // Missile launch time is also the stream's effectStamp.
+    fn evolve(&mut self, ms: i64, anchor: i64, others: &HashMap<i64, TargetState>, current_time: i64) {
         if self.mode == MODE_MISSILE { return; }
         if !self.free || ms <= self.last_ms {
             self.last_ms = self.last_ms.max(ms);
             return;
         }
-        self.interpolation_anchor_ms = interpolation_anchor_ms;
-        if self.mode == MODE_FOLLOW && !others.contains_key(&self.follow_id) { self.stop(); }
+        self.interpolation_anchor_ms = anchor;
+        if matches!(self.mode, MODE_FOLLOW | MODE_ORBIT) && !others.contains_key(&self.follow_id) {
+            if self.mode == MODE_ORBIT && self.interactive { self.goto_direction(self.vel); } else { self.stop(); }
+        }
         if self.mode == MODE_STOP { self.evolve_stop(); }
         self.old_pos = self.pos;
         self.old_vel = self.vel;
         self.segment_acceleration = None;
         self.segment_warp = self.warp.clone();
+        if self.warp.is_none() {
+            let mass = self.mass * self.agility as f64;
+            let acceleration = if mass <= 0.0 { V3::default() } else {
+                match self.mode {
+                    MODE_GOTO => self.evolve_goto(),
+                    MODE_FOLLOW => self.evolve_follow(&others[&self.follow_id]),
+                    MODE_ORBIT => self.evolve_old_style_orbit(&others[&self.follow_id], current_time),
+                    _ => V3::default(),
+                }
+            };
+            self.segment_acceleration = Some(acceleration);
+        }
         if let Some(w) = &self.warp {
             let elapsed = (ms - w.start) as f64;
             if elapsed >= w.duration {
@@ -384,28 +397,11 @@ impl Ball {
             } else {
                 self.pos = add(w.from, scale(sub(w.to, w.from), (elapsed / w.duration.max(1.0)).clamp(0.0, 1.0)));
             }
-            self.last_ms = ms;
-            return;
+        } else if let Some(acceleration) = self.segment_acceleration {
+            let dt = ms_to_seconds((ms - self.last_ms) as f64);
+            let mass = self.mass * self.agility as f64;
+            (self.pos, self.vel) = integrate(self.pos, self.vel, acceleration, mass, DESTINY_FRICTION, dt);
         }
-        let dt = ms_to_seconds((ms - self.last_ms) as f64);
-        let mass = self.mass * self.agility as f64;
-        let acceleration = if mass <= 0.0 { V3::default() } else {
-            match self.mode {
-                MODE_GOTO => self.evolve_goto(),
-                MODE_FOLLOW => match others.get(&self.follow_id) {
-                    Some(target) => self.evolve_follow(target),
-                    None => { self.stop(); V3::default() }
-                },
-                MODE_ORBIT => others.get(&self.follow_id).map(|target| {
-                    let d = sub(target.pos, self.pos);
-                    if len(d) <= self.follow_range as f64 + self.radius as f64 { V3::default() }
-                    else { scale(scale(norm(d), (self.max_vel * self.speed_fraction) as f64), DESTINY_FRICTION / mass) }
-                }).unwrap_or_default(),
-                _ => V3::default(),
-            }
-        };
-        self.segment_acceleration = Some(acceleration);
-        (self.pos, self.vel) = integrate(self.pos, self.vel, acceleration, mass, DESTINY_FRICTION, dt);
         self.last_ms = ms;
     }
 }

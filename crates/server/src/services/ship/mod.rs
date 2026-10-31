@@ -10,8 +10,8 @@
 //! commands project a point from the current position and send the raw direction.
 //! Carbonengine `Ballpark::WarpTo` (`Ballpark.cpp:4102-4113`) falls back to
 //! GotoPoint with no WarpFX when the raw destination is strictly below 100 km;
-//! exactly 100 km takes the full-warp path. Full warp timing and landing remain
-//! approximate, as do follow and orbit; collision and bump physics are absent.
+//! exactly 100 km takes the full-warp path. Full warp and missile flight remain
+//! approximate; collision and bump physics are absent.
 //! Local-chat invites use an outside-space delay for session settlement.
 //! Ship loss commits before its independently best-effort killmail and insurance
 //! operations. NPC workers are outside this module's scope.
@@ -22,7 +22,7 @@ use crate::consts::{ATTR_AGILITY, ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_SIGNATURE_R
 use crate::db::outbox::{Effect, Outbox};
 use crate::dao::{characters::{ship as character_dao, selection}, items::{ship as item_dao, creation}};
 use crate::messages;
-use crate::space::{self, event, now_ms, seconds_to_ms_f64, warp_duration, Ball, Warp, V3, CLOAK_RESTORE, MODE_ORBIT, MODE_STOP, MODE_WARP};
+use crate::space::{self, event, now_ms, seconds_to_ms_f64, warp_duration, Ball, Warp, V3, CLOAK_RESTORE, MODE_STOP, MODE_WARP};
 use marshal::Value;
 use tracing::{info, warn};
 

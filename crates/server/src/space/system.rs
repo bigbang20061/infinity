@@ -147,6 +147,7 @@ impl System {
 
     pub fn take(&mut self, id: i64) -> Option<Ball> {
         let ball = self.balls.remove(&id)?;
+        self.stop_all_followers(id);
         self.snapshot_positions.remove(&id);
         if let Some(char_id) = ball.char_id {
             if self.pilots.get(&char_id) == Some(&id) {
@@ -155,6 +156,13 @@ impl System {
         }
         self.npc_removed(id);
         Some(ball)
+    }
+
+    /// Ballpark::StopAllFollowers, for followers of a removed target.
+    fn stop_all_followers(&mut self, id: i64) {
+        for ball in self.balls.values_mut().filter(|b| b.follow_id == id && matches!(b.mode, MODE_FOLLOW | MODE_ORBIT)) {
+            if ball.mode == MODE_ORBIT && ball.interactive { ball.goto_direction(ball.vel); } else { ball.stop(); }
+        }
     }
 
     pub fn notify_pilot(&self, char_id: i64, name: &str, args: Vec<Value>) {
@@ -204,7 +212,9 @@ impl System {
                 let logical_ms = (self.current_time + 1) * MILLISECONDS_PER_SECOND;
                 let anchor_ms = if due > MAX_CATCHUP_STEPS { ms }
                     else { next_tick_ms + step * MILLISECONDS_PER_SECOND };
-                for b in self.balls.values_mut() { b.evolve(logical_ms, anchor_ms, &self.target_states); }
+                for b in self.balls.values_mut().filter(|b| b.free) {
+                    b.evolve(logical_ms, anchor_ms, &self.target_states, self.current_time);
+                }
             }
             self.current_time += 1;
         }

@@ -119,7 +119,8 @@ fn goto_tick_steers_toward_absolute_point_and_zero_has_no_thrust() {
     ball.pos = [1e16, 2e16, 3e16];
     ball.vel = [0.0; 3];
     ball.goto_direction([0.0, -2.0, 0.0]);
-    ball.evolve(ball.last_ms + 1000, 1000, &HashMap::new());
+    let ms = ball.last_ms + 1000;
+    ball.evolve(ms, 1000, &HashMap::new(), 0);
     let target = ball.segment_acceleration.unwrap();
     assert_eq!(target[0], 0.0);
     assert!((target[1] + 3_000_000.0).abs() < 1e-9);
@@ -127,7 +128,8 @@ fn goto_tick_steers_toward_absolute_point_and_zero_has_no_thrust() {
 
     ball.vel = [0.0; 3];
     ball.goto_direction([0.0; 3]);
-    ball.evolve(ball.last_ms + 1000, 2000, &HashMap::new());
+    let ms = ball.last_ms + 1000;
+    ball.evolve(ms, 2000, &HashMap::new(), 1);
     assert_eq!(ball.segment_acceleration, Some([0.0; 3]));
     assert_eq!(ball.vel, [0.0; 3]);
 }
@@ -165,13 +167,14 @@ fn missing_follow_target_stops_and_clears_follow_state() {
     b.mode = MODE_FOLLOW;
     b.follow_id = 9;
     b.follow_range = 12.0;
-    b.evolve(b.last_ms + 1000, 1000, &HashMap::new());
+    let ms = b.last_ms + 1000;
+    b.evolve(ms, 1000, &HashMap::new(), 0);
     assert_eq!(b.mode, MODE_STOP);
     assert_eq!(b.follow_id, 0);
     assert_eq!(b.follow_range, 0.0);
     assert_eq!(b.segment_acceleration, Some([0.0; 3]));
 }
 
-mod destiny_reference;
+pub(super) mod destiny_reference;
 mod pr2_reference;
 

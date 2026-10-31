@@ -187,10 +187,9 @@ impl System {
                 .map(|(b, _)| (b.id, b.char_id.unwrap(), b.signature_radius.unwrap()));
             if let Some((ship, pilot, signature)) = nearest {
                 let orbit = brain.config.fly_range;
-                self.command(id, move |b, stamp, _| {
-                    b.mode = MODE_ORBIT;
-                    b.follow_id = ship;
-                    b.follow_range = orbit as f32;
+                self.command(id, move |b, stamp, others| {
+                    let Some(target) = others.ball(ship) else { return vec![] };
+                    if !b.orbit(target, orbit as f32) { return vec![]; }
                     b.set_speed_fraction(1.0);
                     vec![event(stamp, "Orbit", vec![Value::Int(id), Value::Int(ship), Value::Float(orbit)]),
                         event(stamp, "SetSpeedFraction", vec![Value::Int(id), Value::Float(1.0)])]

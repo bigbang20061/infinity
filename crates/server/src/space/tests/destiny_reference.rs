@@ -25,7 +25,7 @@ const ALIGN: Scenario = Scenario {
     velocity: [0.0, 200.0, 0.0],
 };
 
-pub(super) fn ship(id: i64, pos: V3, velocity: V3) -> Ball {
+pub(in crate::space) fn ship(id: i64, pos: V3, velocity: V3) -> Ball {
     Ball {
         id, type_id: 0, owner_id: 0, corp_id: -1, alliance_id: -1,
         char_id: None, mode: MODE_STOP, radius: 10.0, signature_radius: None,

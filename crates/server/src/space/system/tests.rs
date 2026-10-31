@@ -62,10 +62,10 @@ fn warp_segment_survives_landing_and_static_modes_stay_fixed() {
     b.mode = MODE_WARP;
     b.warp = Some(Warp { from: [0.0; 3], to: [120.0, 0.0, 0.0], start: 0, duration: 1500.0, factor: 1 });
     let positions = HashMap::new();
-    b.evolve(1000, 30_000, &positions);
+    b.evolve(1000, 30_000, &positions, 0);
     assert_eq!(b.position_at(30_000), [0.0; 3]);
     assert_eq!(b.position_at(30_500), [40.0, 0.0, 0.0]);
-    b.evolve(2000, 2000, &positions);
+    b.evolve(2000, 2000, &positions, 1);
     assert!(b.warp.is_none());
     assert_eq!(b.position_at(2000), [80.0, 0.0, 0.0]);
     assert_eq!(b.position_at(2500), [120.0, 0.0, 0.0]);
@@ -74,7 +74,7 @@ fn warp_segment_survives_landing_and_static_modes_stay_fixed() {
         let mut fixed = ball(2, None, 7.0);
         fixed.mode = mode;
         fixed.free = mode != MODE_RIGID;
-        fixed.evolve(1000, 1000, &positions);
+        fixed.evolve(1000, 1000, &positions, 0);
         assert_eq!(fixed.position_at(1500), [7.0, 0.0, 0.0]);
     }
 }
@@ -354,8 +354,10 @@ fn constant_target_integration_is_step_size_independent() {
     one.vel = [-3.0, 4.0, 2.0];
     let mut ten = one.clone();
     let positions = HashMap::new();
-    one.evolve(1000, 1000, &positions);
-    for ms in (100..=1000).step_by(100) { ten.evolve(ms, ms, &positions); }
+    one.evolve(1000, 1000, &positions, 0);
+    for ms in (100..=1000).step_by(100) {
+        ten.evolve(ms, ms, &positions, 0);
+    }
     for (a, b) in one.pos.into_iter().zip(ten.pos).chain(one.vel.into_iter().zip(ten.vel)) {
         assert!((a - b).abs() <= 1e-6 * a.abs().max(1.0));
     }
