@@ -35,6 +35,8 @@ mod skills;
 mod items;
 mod npc;
 mod combat;
+mod social;
+mod info;
 mod wormholes;
 
 /// Server design: clearance in metres when teleporting to an item.
@@ -84,6 +86,15 @@ const COMMANDS: &[(&str, &str)] = &[
     ("wreck", messages::gm::GM_HELP_WRECK),
     ("container", messages::gm::GM_HELP_CONTAINER),
     ("dmg", messages::gm::GM_HELP_DMG),
+    ("lp", messages::gm::GM_HELP_LP),
+    ("addlp", messages::gm::GM_HELP_ADDLP),
+    ("setlp", messages::gm::GM_HELP_SETLP),
+    ("secstatus", messages::gm::GM_HELP_SECSTATUS),
+    ("missioncomplete", messages::gm::GM_HELP_MISSIONCOMPLETE),
+    ("corpcreate", messages::gm::GM_HELP_CORPCREATE),
+    ("setalliance", messages::gm::GM_HELP_SETALLIANCE),
+    ("joinalliance", messages::gm::GM_HELP_JOINALLIANCE),
+    ("session", messages::gm::GM_HELP_SESSION),
     ("help", messages::gm::GM_HELP_HELP),
 ];
 
@@ -324,6 +335,8 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "ship" | "fit" | "unload" | "load" | "online" | "iteminfo" | "typeinfo" => items::command(c, &command, args).await,
         "entity" | "npc" | "npcclear" | "wreck" | "container" => npc::command(c, &command, args).await,
         "dmg" => combat::command(c, &command, args).await,
+        "lp" | "addlp" | "setlp" | "missioncomplete" | "corpcreate" | "setalliance" | "joinalliance" => social::command(c, &command, args).await,
+        "secstatus" | "session" => info::command(c, &command, args).await,
         "help" => Ok(help()),
         other => Err(slash_error(messages::gm::gm_unknown_command(other, &help()))),
     };

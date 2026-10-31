@@ -210,7 +210,7 @@ pub async fn corporation_line(db: &Db, corp: i64) -> Result<Option<Vec<Value>>, 
 }
 
 
-mod corp_registry;
+pub(crate) mod corp_registry;
 mod roles;
 use roles::{delete_title, execute_actions, info_window_data, potential_ceos, resign_ceo, rowset_lines, titles, update_member, update_titles};
 

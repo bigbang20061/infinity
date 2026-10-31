@@ -124,6 +124,12 @@ pub async fn lp_balance(db: &(impl Executor + ?Sized), char_id: i64, corp: i64) 
     Ok(crate::dao::wallets::loyalty::balance(db, char_id, corp).await.map_err(db_err)?.unwrap_or(0))
 }
 
+/// Positive loyalty balances held by a character.
+pub(crate) async fn lp_balances(db: &Db, char_id: i64) -> Result<Vec<(i64, i64)>, CallError> {
+    Ok(crate::dao::wallets::loyalty::list(db, char_id).await.map_err(db_err)?
+        .into_iter().map(|row| (row.corp_id, row.amount)).collect())
+}
+
 /// Add (or, negative, take) loyalty points with `corp`; taking more than there is fails.
 pub async fn add_lp<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, char_id: i64, corp: i64, amount: i64) -> Result<(), CallError> {
     if amount == 0 || corp == 0 {

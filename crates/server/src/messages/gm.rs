@@ -10,6 +10,7 @@ pub(crate) fn gm_args_missing(index: usize) -> String { format!("缺少第 {inde
 pub(crate) fn gm_args_integer(text: &str) -> String { format!("无效的整数：{text}") }
 pub(crate) fn gm_args_number(text: &str) -> String { format!("无效的数值：{text}") }
 pub(crate) fn gm_args_unknown_target(text: &str) -> String { format!("找不到角色：{text}") }
+pub(crate) fn gm_args_unknown_owner(text: &str) -> String { format!("找不到所有者：{text}") }
 pub(crate) fn gm_rows_truncated(count: usize) -> String { format!("另有 {count} 行未显示。") }
 
 // GM slash commands (services/slash.rs)
@@ -203,6 +204,37 @@ pub(crate) const GM_DAMAGE_SET: &str = "舰船损伤已设置。";
 pub(crate) fn gm_npc_spawned(count: usize) -> String { format!("已生成 {count} 个NPC。") }
 pub(crate) fn gm_npc_cleared(count: usize) -> String { format!("已移除 {count} 个GM生成的NPC。") }
 pub(crate) fn gm_debris_spawned(id: i64) -> String { format!("已生成太空物体 {id}。") }
+// Social, progress and session commands.
+pub(crate) const GM_HELP_LP: &str = "/lp [角色] — 查看忠诚点";
+pub(crate) const GM_HELP_ADDLP: &str = "/addlp <军团> <数量> — 增减忠诚点";
+pub(crate) const GM_HELP_SETLP: &str = "/setlp <军团> <数量> — 设置忠诚点";
+pub(crate) const GM_SOCIAL_USAGE: &str = "无效的社会指令";
+pub(crate) const GM_LP_USAGE: &str = "用法：/lp [角色]";
+pub(crate) const GM_LP_CHANGE_USAGE: &str = "用法：/addlp 或 /setlp 军团 数量";
+pub(crate) const GM_LP_CORPORATION_REQUIRED: &str = "必须指定军团";
+pub(crate) const GM_LP_BALANCE_INVALID: &str = "忠诚点余额不能为负数或超出范围";
+pub(crate) fn gm_lp_list(target: i64, rows: &[(i64, i64)]) -> String { let mut s = format!("角色 {target} 的忠诚点："); for (corp, amount) in rows { s.push_str(&format!("\n{corp}: {amount}")); } s }
+pub(crate) fn gm_lp_changed(corp: i64, amount: i64) -> String { format!("军团 {corp} 的忠诚点余额：{amount}") }
+pub(crate) const GM_HELP_SECSTATUS: &str = "/secstatus [安全等级] [角色] — 查看或设置安全等级";
+pub(crate) const GM_HELP_SESSION: &str = "/session — 查看会话属性";
+pub(crate) const GM_INFO_USAGE: &str = "无效的信息指令";
+pub(crate) const GM_SESSION_USAGE: &str = "用法：/session";
+pub(crate) const GM_SECSTATUS_USAGE: &str = "用法：/secstatus [安全等级] [角色]（范围 -10 至 10）；其他玩家的总览将在球体重建时更新";
+pub(crate) fn gm_secstatus(character: i64, value: f64) -> String { format!("角色 {character} 的安全等级：{value}") }
+pub(crate) fn gm_session(sid: i64, rows: &[(&str, String)]) -> String { let mut s = format!("会话 {sid}："); for (key, value) in rows { s.push_str(&format!("\n{key}: {value}")); } s }
+pub(crate) fn gm_site_row_strength(target: &str, kind: &str, what: &str, name: &str, strength: Option<f64>) -> String { match strength { Some(v) => format!("{target} {kind} {what} {name} 信号强度 {v:.1}%"), None => format!("{target} {kind} {what} {name}") } }
+pub(crate) const GM_HELP_CORPCREATE: &str = "/corpcreate <名称> <简称> — 创建军团";
+pub(crate) const GM_HELP_SETALLIANCE: &str = "/setalliance <名称> <简称> — 创建联盟";
+pub(crate) const GM_HELP_JOINALLIANCE: &str = "/joinalliance <联盟> — 加入联盟";
+pub(crate) const GM_ORG_CREATE_USAGE: &str = "用法：/corpcreate 或 /setalliance 名称 简称";
+pub(crate) const GM_JOINALLIANCE_USAGE: &str = "用法：/joinalliance 联盟";
+pub(crate) fn gm_org_created(id: i64) -> String { format!("已创建组织 {id}") }
+pub(crate) fn gm_joinalliance(id: i64) -> String { format!("已加入联盟 {id}") }
+// Mission administration.
+pub(crate) const GM_HELP_MISSIONCOMPLETE: &str = "/missioncomplete [代理人ID|all] — 完成任务目标（分支交互任务除外）";
+pub(crate) const GM_MISSIONCOMPLETE_USAGE: &str = "用法：/missioncomplete [代理人ID|all]；all 跳过分支交互任务";
+pub(crate) fn gm_missioncomplete(count: usize) -> String { format!("已完成 {count} 个任务目标（不含分支交互任务）") }
+pub(crate) const GM_MISSION_INTERACTION_UNSUPPORTED: &str = "分支交互任务需要手动选择，无法通过此命令完成。";
 // Wormhole administration.
 pub(crate) const GM_WH_USAGE: &str = "用法：/wh status|ensure|clear [here] 或 /wh random [数量] [here]";
 pub(crate) const GM_WH_NONE: &str = "当前星系没有可用虫洞。";

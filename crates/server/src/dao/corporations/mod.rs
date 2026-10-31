@@ -8,6 +8,7 @@
 //! corporation shares are not supported.
 
 pub(crate) mod enlistment;
+pub(crate) mod lookup;
 pub(crate) mod registry;
 pub(crate) mod dispatch;
 pub(crate) mod roles;

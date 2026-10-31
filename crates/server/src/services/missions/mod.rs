@@ -24,11 +24,13 @@
 //! Operators configure basic mission rewards, site placement and NPC spawn distances.
 //! Epic arc rewards continue to come from mission data.
 mod agent_mgr;
+mod gm;
 mod mechanics;
 mod mission_tracker_mgr;
 mod sites;
 
 use mechanics::*;
+pub(crate) use gm::force_complete;
 use sites::{despawn, ensure_site, objective_done};
 #[cfg(test)]
 use sites::{group_has_class, spawn_classes};

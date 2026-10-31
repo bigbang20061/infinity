@@ -46,6 +46,9 @@ impl<'a> Args<'a> {
     pub(super) async fn target(&self, c: &Client, index: usize) -> Result<i64, CallError> {
         target(c, self.required(index)?).await
     }
+    pub(super) async fn owner(&self, c: &Client, index: usize) -> Result<i64, CallError> {
+        owner(c, self.required(index)?).await
+    }
 }
 
 pub(super) async fn target(c: &Client, text: &str) -> Result<i64, CallError> {
@@ -56,7 +59,17 @@ pub(super) async fn target(c: &Client, text: &str) -> Result<i64, CallError> {
         .ok_or_else(|| slash_error(messages::gm::gm_args_unknown_target(text)))
 }
 
-
+pub(super) async fn owner(c: &Client, text: &str) -> Result<i64, CallError> {
+    if text.eq_ignore_ascii_case("me") { return target(c, text).await; }
+    let id = text.parse::<i64>().ok();
+    if let Some(found) = dao::characters::lookup::find(&c.db, text, id).await.map_err(db_err)? { return Ok(found); }
+    if let Some(found) = dao::corporations::lookup::find(&c.db, text, id).await.map_err(db_err)? { return Ok(found); }
+    if let Some(found) = dao::alliances::lookup::find(&c.db, text, id).await.map_err(db_err)? { return Ok(found); }
+    let lower = if id.is_none() { Some(dao::slash::lower_pattern(&c.db, text).await.map_err(db_err)?) } else { None };
+    if let Some(row) = c.sde.npc_corporations.iter().find(|row| id.map_or_else(|| row.lower_name.as_deref() == lower.as_deref(), |id| row.corporation_id == id)) { return Ok(row.corporation_id); }
+    if let Some(row) = c.sde.factions.iter().find(|row| id.map_or_else(|| row.lower_name.as_deref() == lower.as_deref(), |id| row.faction_id == id)) { return Ok(row.faction_id); }
+    Err(slash_error(messages::gm::gm_args_unknown_owner(text)))
+}
 
 #[cfg(test)]
 mod tests;

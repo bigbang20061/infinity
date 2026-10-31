@@ -122,6 +122,34 @@ pub(super) fn despawn(c: &Client, char_id: i64, agent_id: i64) {
     }
 }
 
+/// Load the actor before the transaction; it can still stop after commit.
+pub(super) async fn preflight_clear(c: &Client, m: &Mission) -> Result<(i64, i64), CallError> {
+    let me = c.session.int("charid").unwrap_or(0);
+    let system = sites().lock().unwrap().get(&(me, m.agent_id))
+        .map_or(m.system_id, |site| site.system);
+    c.world.system(system).await.map_err(CallError::Internal)?;
+    c.world.with(system, |_| ()).await
+        .ok_or_else(|| CallError::Internal(anyhow::anyhow!("system actor stopped")))?;
+    Ok((m.agent_id, system))
+}
+
+/// Clear the existing spawn group, or register an empty group for an unvisited site.
+pub(super) async fn force_clear(c: &Client, agent_id: i64, system: i64) -> Result<(), CallError> {
+    let me = c.session.int("charid").unwrap_or(0);
+    let key = (me, agent_id);
+    let existing = sites().lock().unwrap().get(&key).map(|site| (site.system, site.npcs.clone()));
+    if existing.as_ref().is_some_and(|site| site.0 != system) {
+        return Err(CallError::Internal(anyhow::anyhow!("mission site changed system")));
+    }
+    let npcs = existing.map_or_else(Vec::new, |site| site.1);
+    let group = c.world.with(system, move |s| {
+        for id in npcs { s.remove_ball(id); }
+        s.spawn_group([], |_| {})
+    }).await.ok_or_else(|| CallError::Internal(anyhow::anyhow!("system actor stopped")))?;
+    sites().lock().unwrap().insert(key, MissionSite { system, npcs: Vec::new(), group });
+    Ok(())
+}
+
 /// Is the accepted mission's spawned NPC group cleared?
 pub(super) async fn objective_done(c: &Client, m: &Mission) -> bool {
     if m.state != STATE_ACCEPTED { return false; }

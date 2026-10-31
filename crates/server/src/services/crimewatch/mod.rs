@@ -124,6 +124,13 @@ async fn shift_security<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Out
     Ok(new)
 }
 
+/// Set a pilot's security status and queue the normal client notification.
+pub(crate) async fn set_security<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, char_id: i64, value: f64) -> Result<f64, CallError> {
+    let new = crate::dao::characters::crimewatch::set_security(db, char_id, value).await.map_err(db_err)?;
+    outbox.notify_pilot(char_id, "OnSecurityStatusUpdate", vec![Value::Float(new)]);
+    Ok(new)
+}
+
 /// Pilots in space in a system.
 async fn pilots_in(world: &World, system: i64) -> Vec<i64> {
     world.with(system, move |s| s.pilots().filter_map(|b| b.char_id).collect()).await.unwrap_or_default()

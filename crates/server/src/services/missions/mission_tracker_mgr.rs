@@ -19,7 +19,7 @@ fn tracker_objectives(m: &Mission) -> [Vec<String>; 3] {
 }
 
 /// The step the pilot is on, or None before the mission is accepted.
-async fn tracker_current(c: &Client, m: &Mission) -> Option<Vec<String>> {
+pub(super) async fn tracker_current(c: &Client, m: &Mission) -> Option<Vec<String>> {
     // Only kill missions have a site to steer to; the rest show "read the journal".
     if m.state != STATE_ACCEPTED || m.kind != Kind::Kill {
         return None;
@@ -34,7 +34,7 @@ async fn tracker_current(c: &Client, m: &Mission) -> Option<Vec<String>> {
     })
 }
 
-fn strings(items: Vec<String>) -> Value {
+pub(super) fn strings(items: Vec<String>) -> Value {
     Value::list(items.into_iter().map(Value::str))
 }
 
