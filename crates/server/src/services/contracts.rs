@@ -284,7 +284,8 @@ async fn escrowed_ids(db: &(impl Executor + ?Sized), contract_id: i64) -> Result
 /// Give the escrowed items (and whatever they hold) to `owner` at `location`/`flag`.
 async fn hand_over<X: Send>(db: &(impl Executor + ?Sized), sde: &crate::sde::Sde, outbox: &mut Outbox<X>, contract_id: i64, owner: i64, location: i64, flag: i32) -> Result<(), CallError> {
     let ids = escrowed_ids(db, contract_id).await?;
-    transfers::hand_over(db, &ids, owner, location, flag).await.map_err(db_err)?;
+    let plan: Vec<_> = ids.iter().map(|&item_id| transfers::Transfer { item_id, owner, location, flag }).collect();
+    transfers::hand_over(db, &plan).await.map_err(db_err)?;
     show_items(db, sde, outbox, owner, location, &ids, -contract_id).await
 }
 

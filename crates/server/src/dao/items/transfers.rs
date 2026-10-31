@@ -14,4 +14,24 @@ pub(crate) async fn stack(ex: &(impl Executor + ?Sized), location: i64, flag: i3
 pub(crate) async fn add(ex: &(impl Executor + ?Sized), id: i64, quantity: i32) -> Result<(), Error> { ex.execute("UPDATE game.items SET quantity = quantity + $2 WHERE item_id = $1", &[&id, &quantity]).await?; Ok(()) }
 pub(crate) async fn insert(ex: &(impl Executor + ?Sized), type_id: i32, owner: i64, location: i64, flag: i32, quantity: i32) -> Result<i64, Error> { let r = ex.query_one("INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity) VALUES ($1, $2, $3, $4, $5) RETURNING item_id", &[&type_id, &owner, &location, &flag, &quantity]).await?; Ok(ItemId::from_row(&r).item_id) }
 pub(crate) async fn docked(ex: &(impl Executor + ?Sized), owner: i64) -> Result<Option<i64>, Error> { Ok(ex.query_opt("SELECT station_id FROM game.characters WHERE character_id = $1", &[&owner]).await?.as_ref().and_then(|r| Station::from_row(r).station_id)) }
-pub(crate) async fn hand_over(ex: &(impl Executor + ?Sized), ids: &[i64], owner: i64, location: i64, flag: i32) -> Result<(), Error> { ex.execute("UPDATE game.items SET owner_id = $2, location_id = $3, flag_id = $4 WHERE item_id = ANY($1)", &[&ids, &owner, &location, &flag]).await?; ex.execute("UPDATE game.items SET owner_id = $2 WHERE location_id = ANY($1)", &[&ids, &owner]).await?; Ok(()) }
+/// One root and the owner and location it receives; descendants keep their parent.
+pub(crate) struct Transfer {
+    pub(crate) item_id: i64,
+    pub(crate) owner: i64,
+    pub(crate) location: i64,
+    pub(crate) flag: i32,
+}
+
+/// Acquire item locks in ID order, then hand over all roots and descendants.
+pub(crate) async fn hand_over(ex: &(impl Executor + ?Sized), transfers: &[Transfer]) -> Result<(), Error> {
+    let ids: Vec<_> = transfers.iter().map(|item| item.item_id).collect();
+    let owners: Vec<_> = transfers.iter().map(|item| item.owner).collect();
+    let locations: Vec<_> = transfers.iter().map(|item| item.location).collect();
+    let flags: Vec<_> = transfers.iter().map(|item| item.flag).collect();
+    let tree = "WITH RECURSIVE roots(root, owner, location, flag) AS (SELECT * FROM unnest($1::int8[], $2::int8[], $3::int8[], $4::int4[])), tree(root, id, owner, location, flag) AS (SELECT root, root, owner, location, flag FROM roots UNION SELECT t.root, i.item_id, t.owner, t.location, t.flag FROM tree t JOIN game.items i ON i.location_id = t.id)";
+    ex.query(&format!("{tree} SELECT i.item_id FROM game.items i JOIN tree t ON t.id = i.item_id ORDER BY i.item_id FOR UPDATE OF i"), &[&ids, &owners, &locations, &flags]).await?;
+    ex.execute(&format!("{tree} UPDATE game.items i SET owner_id = t.owner, location_id = CASE WHEN t.id = t.root THEN t.location ELSE i.location_id END, flag_id = CASE WHEN t.id = t.root THEN t.flag ELSE i.flag_id END FROM tree t WHERE i.item_id = t.id"), &[&ids, &owners, &locations, &flags]).await?;
+    Ok(())
+}
+
+#[cfg(test)] mod tests;
