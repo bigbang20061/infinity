@@ -50,3 +50,5 @@ fn missile_and_warp_wire_bytes_remain_unchanged() {
     }
 }
 
+mod destiny_reference;
+
