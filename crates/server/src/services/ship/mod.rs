@@ -13,7 +13,7 @@ use crate::consts::{ATTR_AGILITY, ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_SIGNATURE_R
 use crate::db::outbox::{Effect, Outbox};
 use crate::dao::{characters::{ship as character_dao, selection}, items::{ship as item_dao, creation}};
 use crate::messages;
-use crate::space::{self, event, now_ms, seconds_to_ms_f64, warp_duration, Ball, Warp, V3, CLOAK_RESTORE, MODE_FOLLOW, MODE_GOTO, MODE_ORBIT, MODE_STOP, MODE_WARP};
+use crate::space::{self, event, now_ms, seconds_to_ms_f64, warp_duration, Ball, Warp, V3, CLOAK_RESTORE, MODE_FOLLOW, MODE_ORBIT, MODE_STOP, MODE_WARP};
 use marshal::Value;
 use tracing::{info, warn};
 

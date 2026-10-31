@@ -348,8 +348,7 @@ fn set_state_contains_visible_balls_ego_damage_and_system() {
 #[test]
 fn constant_target_integration_is_step_size_independent() {
     let mut one = ball(1, None, 7.0);
-    one.mode = MODE_GOTO;
-    one.goto = [1.0, 2.0, 3.0];
+    one.goto_direction([1.0, 2.0, 3.0]);
     one.speed_fraction = 0.75;
     one.vel = [-3.0, 4.0, 2.0];
     let mut ten = one.clone();

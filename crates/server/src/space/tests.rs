@@ -51,5 +51,43 @@ fn missile_and_warp_wire_bytes_remain_unchanged() {
     }
 }
 
+#[test]
+fn goto_direction_stores_absolute_point_and_serializes_it() {
+    let (_, mut ball) = effect_stamp_balls();
+    ball.pos = [1e16, 2e16, 3e16];
+    ball.goto_direction([0.0, 3.0, 0.0]);
+    assert_eq!(ball.mode, MODE_GOTO);
+    assert!(ball.warp.is_none());
+    assert_eq!(ball.goto, [1e16, 1.2e17, 3e16]);
+    let mut bytes = Vec::new();
+    ball.write(&mut bytes);
+    let expected: Vec<u8> = ball.goto.iter().flat_map(|c| c.to_le_bytes()).collect();
+    assert_eq!(&bytes[bytes.len() - expected.len()..], expected);
+
+    ball.goto_direction([0.0, 1e-10, 0.0]);
+    assert_eq!(ball.goto, [1e16, 1.2e17, 3e16]);
+    ball.goto_direction([0.0; 3]);
+    assert_eq!(ball.goto, ball.pos);
+}
+
+#[test]
+fn goto_tick_steers_toward_absolute_point_and_zero_has_no_thrust() {
+    let (_, mut ball) = effect_stamp_balls();
+    ball.pos = [1e16, 2e16, 3e16];
+    ball.vel = [0.0; 3];
+    ball.goto_direction([0.0, -2.0, 0.0]);
+    ball.evolve(ball.last_ms + 1000, 1000, &HashMap::new());
+    let target = ball.segment_target.unwrap();
+    assert_eq!(target[0], 0.0);
+    assert!((target[1] + 15.0).abs() < 1e-12);
+    assert_eq!(target[2], 0.0);
+
+    ball.vel = [0.0; 3];
+    ball.goto_direction([0.0; 3]);
+    ball.evolve(ball.last_ms + 1000, 2000, &HashMap::new());
+    assert_eq!(ball.segment_target, Some([0.0; 3]));
+    assert_eq!(ball.vel, [0.0; 3]);
+}
+
 mod destiny_reference;
 

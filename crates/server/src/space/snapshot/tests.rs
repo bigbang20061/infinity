@@ -85,8 +85,7 @@ fn candidates_follow_boundary_motion_not_mailbox_time() {
     let mut s = System::default();
     s.insert(ball(1, Some(10), 0.0));
     s.command(1, |b, _, _| {
-        b.mode = MODE_GOTO;
-        b.goto = [1.0, 0.0, 0.0];
+        b.goto_direction([1.0, 0.0, 0.0]);
         b.speed_fraction = 1.0;
         Vec::new()
     });

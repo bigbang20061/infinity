@@ -64,8 +64,7 @@ fn fixture(scenario: &Scenario) -> BTreeMap<i64, serde_json::Value> {
 
 fn start_direction(system: &mut System) {
     system.command(1, |ball, _, _| {
-        ball.mode = MODE_GOTO;
-        ball.goto = [1.0, 0.0, 0.0];
+        ball.goto_direction([1.0, 0.0, 0.0]);
         vec![]
     });
 }

@@ -14,6 +14,7 @@
 //! destiny `Ball.cpp` CalculateBallPositionVelocity and retain the old/new
 //! state described by `Ballpark.cpp`'s old/new swap.
 //! Interpolation uses the wall-clock segment anchor independently of logical integration time.
+//! GOTO stores an absolute point; direction commands project from the current position.
 //!
 //! Celestials come from the SDE; dynamic balls stay in memory. Each system
 //! owns an actor with 100 ms timers and NPC decisions. Destiny actions retain the
@@ -70,6 +71,8 @@ const METRES_PER_KILOMETRE: f64 = 1000.0;
 const KILOGRAMS_PER_TONNE: f64 = 1000.0;
 /// Existing normalization tolerance.
 const VECTOR_LENGTH_EPSILON: f64 = 1e-9;
+/// Carbonengine Ballpark::GotoDirection projection distance.
+const GOTO_DIRECTION_REACH: f64 = 1e17;
 /// Existing player targeting formula, preserved by D17.
 const LOCK_TIME_FACTOR_SECONDS: f64 = 40_000.0;
 /// Existing player targeting minimum.
@@ -123,6 +126,12 @@ fn norm(a: V3) -> V3 {
     } else {
         scale(a, 1.0 / l)
     }
+}
+
+/// Carbonengine Vector3d normalization preserves a zero vector.
+fn goto_norm(a: V3) -> V3 {
+    let l = len(a);
+    if l == 0.0 { a } else { scale(a, 1.0 / l) }
 }
 
 /// Convert milliseconds to seconds.
@@ -220,6 +229,13 @@ fn calculate_position_velocity(pos: V3, vel: V3, target: V3, tau: f64, dt: f64) 
 }
 
 impl Ball {
+    /// Set a GOTO point from the raw direction, as in Ballpark::GotoDirection.
+    pub fn goto_direction(&mut self, dir: V3) {
+        self.mode = MODE_GOTO;
+        self.warp = None;
+        self.goto = add(self.pos, scale(goto_norm(dir), GOTO_DIRECTION_REACH));
+    }
+
     /// Stateless view of the most recently completed logical movement segment.
     pub fn position_at(&self, t_ms: i64) -> V3 {
         if self.segment_target.is_none() && self.segment_warp.is_none() { return self.pos; }
@@ -363,7 +379,7 @@ impl Ball {
         let tau = (self.mass * self.agility as f64 / MASS_AGILITY_SCALE).max(MIN_MOVEMENT_TAU_SECONDS);
         let speed = (self.max_vel * self.speed_fraction) as f64;
         let target = match self.mode {
-            MODE_GOTO => scale(norm(self.goto), speed),
+            MODE_GOTO => scale(goto_norm(sub(self.goto, self.pos)), speed),
             MODE_FOLLOW | MODE_ORBIT => others.get(&self.follow_id).map(|&p| {
                 let d = sub(p, self.pos);
                 if len(d) <= self.follow_range as f64 + self.radius as f64 { V3::default() }
