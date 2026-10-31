@@ -117,6 +117,72 @@ fn lock_delay_and_shot_throttling() {
     assert!(matches!(jobs.try_recv().unwrap(), EffectJob::Npc { action: NpcAction::Shot { .. }, .. }));
     assert!(jobs.try_recv().is_err());
 }
+#[test]
+fn targeting_refresh_preserves_pending_deadline_and_rejects_out_of_range() {
+    let (mut s, _, _) = setup(Some(HOSTILE_TO_ALL));
+    s.insert(ball(1, Some(10), 50.0));
+    s.tick(0);
+    let deadline = s.brains[&1000].target.unwrap().2;
+    s.refresh_npc_targeting(1000, 100.0, Some(60.0));
+    assert_eq!(s.brains[&1000].target.unwrap().2, deadline);
+    s.refresh_npc_targeting(1000, 100.0, Some(40.0));
+    assert!(s.brains[&1000].target.is_none());
+    s.tick(1000);
+    assert!(s.brains[&1000].target.is_none());
+    s.refresh_npc_targeting(1000, 17_163.0, None);
+    s.tick(2000);
+    assert_eq!(s.brains[&1000].target.unwrap().0, 1);
+    assert_eq!(s.brains[&1000].target.unwrap().2, 2000 + lock_time_ms(17_163.0, 1.0) as i64);
+}
+
+
+#[test]
+fn projected_cycles_are_independent_and_stale_jobs_cannot_restore_effects() {
+    use crate::services::effects::{EffectKind, JammingType, projection::Projection};
+    let (mut s, mut jobs, _) = setup(Some(HOSTILE_TO_ALL));
+    let brain = s.brains.get_mut(&1000).unwrap();
+    brain.add_effect(1, 1000.0);
+    brain.add_effect(2, 2000.0);
+    s.insert(ball(1, Some(10), 50.0));
+    s.tick(0);
+    let deadline = s.brains[&1000].target.unwrap().2;
+    s.tick(deadline);
+    assert!(matches!(jobs.try_recv().unwrap(), EffectJob::Npc { action: NpcAction::Shot { .. }, .. }));
+    let EffectJob::Npc { action: NpcAction::Effect { source_module: first, generation, .. }, .. } = jobs.try_recv().unwrap() else { panic!("first projection") };
+    let EffectJob::Npc { action: NpcAction::Effect { source_module: second, .. }, .. } = jobs.try_recv().unwrap() else { panic!("second projection") };
+    assert!(first < 0 && second < 0 && first != second);
+    assert!(s.npc_projection_valid(1000, 1, generation));
+    s.upsert_projection(1, Projection { source_ship: 1000, source_module: first,
+        source_type: 1, effect_id: 1, kind: EffectKind::Projected { jamming: JammingType::Webify },
+        until_ms: i64::MAX, values: vec![], charge_values: vec![], charge_type: None });
+    s.tick(deadline + 1000);
+    assert!(matches!(jobs.try_recv().unwrap(), EffectJob::Npc { action: NpcAction::Effect { source_module, .. }, .. } if source_module == first));
+    assert!(jobs.try_recv().is_err());
+    let mut brain = s.brains.remove(&1000).unwrap();
+    s.lose_npc_target(1000, &mut brain);
+    s.brains.insert(1000, brain);
+    assert!(!s.npc_projection_valid(1000, 1, generation));
+    assert!(s.projections_on(1).is_empty());
+    s.tick(deadline + 2000);
+    assert!(!s.npc_projection_valid(1000, 1, generation));
+}
+
+#[test]
+fn departing_npc_removes_its_projections_and_invalidates_jobs() {
+    use crate::services::effects::{EffectKind, JammingType, projection::Projection};
+    let (mut s, _, _) = setup(Some(HOSTILE_TO_ALL));
+    s.insert(ball(1, Some(10), 50.0));
+    s.tick(0);
+    let deadline = s.brains[&1000].target.unwrap().2;
+    s.tick(deadline);
+    let generation = s.brains[&1000].target_generation;
+    s.upsert_projection(1, Projection { source_ship: 1000, source_module: -1,
+        source_type: 1, effect_id: 1, kind: EffectKind::Projected { jamming: JammingType::Webify },
+        until_ms: i64::MAX, values: vec![], charge_values: vec![], charge_type: None });
+    s.remove_ball(1000);
+    assert!(s.projections_on(1).is_empty());
+    assert!(!s.npc_projection_valid(1000, 1, generation));
+}
 
 #[test]
 fn stale_and_removed_targets_do_not_complete_locks() {

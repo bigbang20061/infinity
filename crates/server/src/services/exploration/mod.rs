@@ -496,7 +496,7 @@ pub async fn warp_to_scan(c: &mut Client, target: &str, min_range: f64) -> CallR
     }
     if site.wormhole.is_some() {
         ensure_wormhole_ball(&c.db, &c.world, site.id).await?;
-        return super::ship::warp_to(c, Some((site.pos, 3000.0)), site.pos, min_range, None);
+        return super::ship::warp_to(c, Some((site.pos, 3000.0)), site.pos, min_range, None).await;
     }
     let db = c.db.clone();
     let world = Arc::downgrade(&c.world);
@@ -510,7 +510,7 @@ pub async fn warp_to_scan(c: &mut Client, target: &str, min_range: f64) -> CallR
             }
         });
     });
-    super::ship::warp_to(c, None, site.pos, min_range, Some(on_exit))
+    super::ship::warp_to(c, None, site.pos, min_range, Some(on_exit)).await
 }
 
 

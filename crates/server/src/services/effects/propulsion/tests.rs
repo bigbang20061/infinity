@@ -30,4 +30,21 @@ fn propulsion_commands_wait_for_boundary_and_use_enqueue_stamp() {
     assert_eq!(events[1], event(12, "SetBallMass", vec![Value::Int(1), Value::Float(30.0)]));
     assert_eq!(events[2], event(12, "SetBallAgility", vec![Value::Int(1), Value::Float(0.25)]));
     assert_eq!(system.current_time(), 13);
+    use crate::services::effects::{projection::Projection, EffectKind, JammingType};
+    let source = Ball { id: 2, ..system.ball(1).unwrap().clone() };
+    system.insert(source);
+    let old = system.projection_revision(1);
+    system.queue_projection_kinematics(1, old, Kinematics { speed: 100.0, mass: 100.0, agility: 1.0, signature: 100.0 });
+    system.upsert_projection(1, Projection {
+        source_ship: 2, source_module: 3, source_type: 1, effect_id: 1,
+        kind: EffectKind::Projected { jamming: JammingType::Webify }, until_ms: i64::MAX,
+        values: vec![], charge_values: vec![], charge_type: None,
+    });
+    let current = system.projection_revision(1);
+    system.queue_projection_kinematics(1, current, Kinematics { speed: 10.0, mass: 30.0, agility: 0.25, signature: 40.0 });
+    system.tick(14_000);
+    assert_eq!(system.ball(1).unwrap().max_vel, 10.0);
+    system.queue_projection_kinematics(1, old, Kinematics { speed: 100.0, mass: 100.0, agility: 1.0, signature: 100.0 });
+    system.tick(15_000);
+    assert_eq!(system.ball(1).unwrap().max_vel, 10.0);
 }

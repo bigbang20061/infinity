@@ -16,7 +16,8 @@
 //! the logical counter is not reset to wall time.
 //!
 //! DB effects run on workers; timers, warp-exit callbacks and non-position
-//! dynamic state do not survive restart. Legacy sphere collisions do not emit bumps.
+//! dynamic state, including projected effects, do not survive restart. Legacy
+//! sphere collisions do not emit bumps.
 use super::*;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::future::Future;
@@ -62,6 +63,10 @@ pub struct System {
     pub(super) member_groups: HashMap<i64, std::collections::HashSet<u64>>,
     pub(super) due_brains: Vec<i64>,
     pub(super) snapshot_context: Option<snapshot::Context>,
+    pub(super) projection_sde: Option<Arc<Sde>>,
+    pub(super) projections: HashMap<i64, Vec<crate::services::effects::projection::Projection>>,
+    pub(super) projection_targets: HashMap<i64, i64>,
+    pub(super) projection_revisions: HashMap<i64, u64>,
     pub(super) snapshot_positions: HashMap<i64, (u64, V3)>,
     pub(super) snapshot_generation: u64,
     pub(super) snapshot_due: i64,
@@ -168,6 +173,8 @@ impl System {
     pub fn take(&mut self, id: i64) -> Option<Ball> {
         self.warp_exits.remove(&id);
         let ball = self.balls.remove(&id)?;
+        self.remove_projections_from(id);
+        self.remove_projections_on_departure(id);
         self.stop_all_followers(id);
         self.snapshot_positions.remove(&id);
         if let Some(char_id) = ball.char_id {
@@ -209,6 +216,7 @@ impl System {
     pub fn tick(&mut self, ms: i64) {
         self.observers.retain(|_, (_, tx)| !tx.is_closed());
         self.ms = ms;
+        self.expire_projections();
         let next_tick_ms = *self.next_tick_ms.get_or_insert(MILLISECONDS_PER_SECOND);
         let due = if ms >= next_tick_ms {
             (ms - next_tick_ms) / MILLISECONDS_PER_SECOND + 1
@@ -436,6 +444,14 @@ impl System {
         event(tick, "SetState", vec![bag])
     }
     pub fn unobserve(&mut self, client_id: i64) { self.observers.remove(&client_id); }
+    /// Enqueue fitted motion only while the projection snapshot remains current.
+    pub(crate) fn queue_projection_kinematics(&mut self, target: i64, revision: u64, values: crate::services::effects::propulsion::Kinematics) {
+        crate::services::effects::propulsion::queue_kinematics(self, target, values);
+        let (stamp, action) = self.actions.pop_back().expect("kinematics queues one action");
+        self.actions.push_back((stamp, Box::new(move |s, stamp| {
+            if s.projection_revision(target) == revision { action(s, stamp); }
+        })));
+    }
     /// Queue a command for the next destiny boundary, retaining its enqueue stamp.
     pub fn command(&mut self, ship: i64, f: impl FnOnce(&mut Ball, i64, &System) -> Vec<Value> + Send + 'static) {
         self.actions.push_back((self.current_time, Box::new(move |s, stamp| {

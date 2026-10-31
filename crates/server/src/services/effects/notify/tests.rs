@@ -1,6 +1,20 @@
 use super::*;
 
 #[test]
+fn ewar_notifications_use_client_string_slot_and_argument_order() {
+    let args = vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::str("webify")];
+    assert_eq!(ewar(1, 2, 3, "webify", true), ("OnEwarStart", args.clone()));
+    assert_eq!(ewar(1, 2, 3, "webify", false), ("OnEwarEnd", args));
+}
+
+#[test]
+fn npc_scram_slots_distinguish_mwd_blocking() {
+    assert_eq!(ewar_slot_by_id(crate::consts::EFFECT_NPC_WARP_SCRAMBLE), Some("warpScrambler"));
+    assert_eq!(ewar_slot_by_id(crate::consts::EFFECT_NPC_WARP_SCRAMBLE_MWD), Some("warpScramblerMWD"));
+    assert_eq!(ewar_slot_by_id(crate::consts::EFFECT_NPC_BEHAVIOR_WARP_SCRAMBLE), Some("warpScramblerMWD"));
+}
+
+#[test]
 fn ship_effect_start_and_stop_keep_times_and_environment() {
     let charge = Value::tuple([Value::Int(30), Value::Int(27), Value::Int(55)]);
     let env = environment::build(10, 20, 30, Some(40), Some(charge), 60);

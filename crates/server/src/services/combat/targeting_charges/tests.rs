@@ -1,4 +1,6 @@
 use super::*;
+use crate::services::effects::{projection::Projection, EffectKind, JammingType};
+use crate::space::System;
 
 #[test]
 fn bank_master_resolves_any_group_member() {
@@ -59,4 +61,36 @@ async fn member_resolution_is_separate_from_master_only_bank() {
     slave.sort_unstable();
     expected.sort_unstable();
     assert_eq!(slave, expected);
+}
+
+#[test]
+fn removed_locks_clear_only_matching_outgoing_projections() {
+    let mut s = System::new(0, Arc::default(), 1_000);
+    let ball = Ball {
+        id: 1, type_id: 1, owner_id: 1, corp_id: 1, alliance_id: -1,
+        char_id: None, signature_radius: None, mode: crate::space::MODE_STOP,
+        radius: 1.0, mass: 1.0, max_vel: 1.0, agility: 1.0, speed_fraction: 0.0,
+        pos: [0.0; 3], vel: [0.0; 3], goto: [0.0; 3], follow_id: 0,
+        old_pos: [0.0; 3], old_vel: [0.0; 3], segment_acceleration: None,
+        follow_range: 0.0, free: true, global: false, massive: false, interactive: false,
+        warp: crate::space::WarpState::default(), warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0, cloak: 0,
+        cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new(),
+    };
+    for id in 1..=4 { s.insert(Ball { id, ..ball.clone() }); }
+    let projection = |source_ship, source_module| Projection {
+        source_ship, source_module, source_type: 1, effect_id: 1,
+        kind: EffectKind::Projected { jamming: JammingType::Webify }, until_ms: i64::MAX,
+        values: vec![], charge_values: vec![], charge_type: None,
+    };
+    s.upsert_projection(2, projection(1, 10));
+    s.upsert_projection(3, projection(1, 11));
+    s.upsert_projection(2, projection(4, 12));
+    let revision = s.projection_revision(2);
+    remove_target_projections_in_system(&mut s, 1, &[2]);
+    assert!(s.projection_revision(2) > revision);
+    assert_eq!(s.projections_on(2).iter().map(|p| p.source_module).collect::<Vec<_>>(), vec![12]);
+    assert_eq!(s.projections_on(3).len(), 1);
+    remove_target_projections_in_system(&mut s, 1, &[2, 3]);
+    assert_eq!(s.projections_on(2).len(), 1);
+    assert!(s.projections_on(3).is_empty());
 }

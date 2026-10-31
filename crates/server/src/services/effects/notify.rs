@@ -1,5 +1,6 @@
 //! Effect notifications consumed by client dogma and fxSequencer.
-//! Payloads use runtime effect and item data; effect scheduling is handled elsewhere.
+//! Payloads use runtime effect and item data; EWAR slots follow client
+//! dogma/effects/GetEwarTypeByEffectID and buffBarConst. Scheduling is elsewhere.
 
 use crate::client::filetime_now;
 use crate::services::combat::Ctx;
@@ -7,6 +8,40 @@ use crate::space::event;
 use marshal::Value;
 
 use super::environment;
+
+/// Client dogma/effects/GetEwarTypeByEffectID, including chance-flag precedence.
+pub(crate) fn ewar_slot(effect: &super::registry::Effect) -> Option<&'static str> {
+    use super::registry::EffectFlag;
+    if effect.has(EffectFlag::ElectronicChance) { return Some("electronic"); }
+    if effect.has(EffectFlag::PropulsionChance) { return Some("webify"); }
+    ewar_slot_by_id(i32::try_from(effect.id).ok()?)
+}
+
+/// Client dogma/effects/BUFF_SLOTS_BY_EFFECT_ID for the supported effects.
+fn ewar_slot_by_id(id: i32) -> Option<&'static str> {
+    use crate::consts::*;
+    Some(match id {
+        EFFECT_REMOTE_ECM_FALLOFF | EFFECT_ENTITY_ECM_FALLOFF | EFFECT_NPC_BEHAVIOR_ECM => "electronic",
+        EFFECT_REMOTE_WEBIFIER_FALLOFF | EFFECT_REMOTE_WEBIFIER_ENTITY | EFFECT_NPC_BEHAVIOR_WEB => "webify",
+        EFFECT_WARP_DISRUPT | EFFECT_NPC_BEHAVIOR_WARP_DISRUPT | EFFECT_NPC_WARP_SCRAMBLE => "warpScrambler",
+        EFFECT_WARP_SCRAMBLE | EFFECT_NPC_BEHAVIOR_WARP_SCRAMBLE | EFFECT_NPC_WARP_SCRAMBLE_MWD => "warpScramblerMWD",
+        EFFECT_REMOTE_TARGET_PAINT_FALLOFF | EFFECT_REMOTE_TARGET_PAINT_ENTITY | EFFECT_NPC_BEHAVIOR_PAINTER => "ewTargetPaint",
+        EFFECT_REMOTE_SENSOR_DAMP_FALLOFF | EFFECT_REMOTE_SENSOR_DAMP_ENTITY | EFFECT_NPC_BEHAVIOR_DAMP => "ewRemoteSensorDamp",
+        EFFECT_TRACKING_DISRUPTOR | EFFECT_NPC_WEAPON_DISRUPTOR | EFFECT_NPC_ENTITY_TRACKING_DISRUPTOR | EFFECT_NPC_BEHAVIOR_TRACKING_DISRUPTOR => "ewTrackingDisrupt",
+        EFFECT_GUIDANCE_DISRUPTOR | EFFECT_NPC_BEHAVIOR_GUIDANCE_DISRUPTOR => "ewGuidanceDisrupt",
+        EFFECT_REMOTE_SENSOR_BOOST => "sensorBooster",
+        EFFECT_REMOTE_TRACKING_COMPUTER => "remoteTracking",
+        EFFECT_ENERGY_NEUTRALIZER_FALLOFF | EFFECT_ENTITY_ENERGY_NEUTRALIZER_FALLOFF | EFFECT_NPC_BEHAVIOR_NEUTRALIZER => "ewEnergyNeut",
+        EFFECT_ENERGY_NOSFERATU_FALLOFF | EFFECT_NPC_BEHAVIOR_NOSFERATU => "ewEnergyVampire",
+        _ => return None,
+    })
+}
+
+/// Tactical.OnEwarStart/End(sourceBallID, moduleID, targetBallID, jammingType).
+pub(crate) fn ewar(source: i64, module: i64, target: i64, slot: &'static str, start: bool) -> (&'static str, Vec<Value>) {
+    (if start { "OnEwarStart" } else { "OnEwarEnd" },
+        vec![Value::Int(source), Value::Int(module), Value::Int(target), Value::str(slot)])
+}
 
 /// OnGodmaShipEffect(itemID, effectID, time, start, active, environment, startTime,
 /// duration, repeat, error, actualStopTime).

@@ -18,6 +18,8 @@
 //! (hardeners through fit, propulsion speed via queued destiny commands, repairers each cycle), and a kill
 //! pays the NPC's bounty and leaves a wreck with loot.
 //! NPC effects, charge dimensions and wreck mappings come from immutable SDE datasets;
+//! NPC projected effects use SDE effect kinds and duration attributes, with
+//! actor-owned cycles and the shared projected-effect evaluator.
 //! loot prices come from `game.retail_prices` and static eligibility is applied before sampling.
 //! Target locks, reloads, module cycles, pulses and missile impacts use system
 //! actor timers. Database-backed effects run on deferred workers outside the actor.
@@ -27,6 +29,7 @@
 //! timers remain memory-only and are not resumed.
 //! Dropped cycle owners release their own in-memory activation markers without notifications.
 //! Reset clears a pilot's targets and pending locks and stops only that pilot's modules.
+//! Explicit lock removal also removes the matching outgoing projected effects.
 //! Missiles in flight use a temporary, nonpersistent ID namespace.
 //! LoadAmmo accepts an owned active or assembled docked fitting ship and owned charge
 //! stacks in its holds, the current hangar, or a directly held singleton container.
@@ -176,6 +179,9 @@ pub(super) fn attr(sde: &Sde, type_id: i32, id: i32, default: f64) -> f64 {
 pub fn reset(c: &Client) {
     let Some(char_id) = c.session.int("charid") else { return };
     state().reset_character(char_id);
+    if let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) {
+        c.world.post(system, move |s| s.remove_projections_from(ship));
+    }
 }
 
 
@@ -281,27 +287,52 @@ pub async fn spawn_npc(db: Db, world: Arc<World>, system: i64, id: i64, type_id:
         rate_of_fire_ms: stats.rate_of_fire_ms,
         repairs: stats.repairs,
     };
-    let weak_world = Arc::downgrade(&world);
-    let effects: NpcEffects = Arc::new(move |action| -> NpcFuture {
-        let db = db.clone();
-        let weak_world = weak_world.clone();
-        let stats = stats.clone();
-        Box::pin(async move {
-            let Some(world) = weak_world.upgrade() else { return };
-            match action {
-                NpcAction::Shot { me, victim } => {
-                    if let Err(e) = npc_shot(&db, &world, system, id, type_id, &stats, me, victim).await {
-                        warn!("npc {id}: {}", match e {
-                            CallError::Internal(e) => format!("{e:#}"),
-                            CallError::User { msg, .. } => msg,
-                        });
+    let mut brain = NpcBrain::new(owner, config, {
+        let weak_world = Arc::downgrade(&world);
+        let effects: NpcEffects = Arc::new(move |action| -> NpcFuture {
+            let db = db.clone();
+            let weak_world = weak_world.clone();
+            let stats = stats.clone();
+            Box::pin(async move {
+                let Some(world) = weak_world.upgrade() else { return };
+                match action {
+                    NpcAction::Shot { me, victim } => {
+                        if let Err(e) = npc_shot(&db, &world, system, id, type_id, &stats, me, victim).await {
+                            warn!("npc {id}: {}", match e {
+                                CallError::Internal(e) => format!("{e:#}"),
+                                CallError::User { msg, .. } => msg,
+                            });
+                        }
                     }
+                    NpcAction::Effect { me, victim, effect_id, source_module, duration_ms, generation } => {
+                        if let Some(effect) = super::effects::registry::resolve(world.sde(), effect_id) {
+                            if let Err(CallError::Internal(error)) = super::effects::projected::apply_npc(
+                                &db, &world, system, source_module, &me, &victim, &effect, duration_ms, generation,
+                            ).await {
+                                warn!("npc {id} projected effect {effect_id}: {error:#}");
+                            }
+                        }
+                    }
+                    NpcAction::Repair => npc_repair(&world, system, id, &stats),
                 }
-                NpcAction::Repair => npc_repair(&world, system, id, &stats),
-            }
-        })
+            })
+        });
+        effects
     });
-    let brain = NpcBrain::new(owner, config, effects);
+    brain.max_target_range = world.sde().types.attribute(type_id, ATTR_MAX_TARGET_RANGE)
+        .or_else(|| world.sde().dogma.attribute(ATTR_MAX_TARGET_RANGE).and_then(|a| a.default_value).filter(|value| *value > 0.0));
+    for entry in world.sde().types.effects(type_id) {
+        let Some(effect) = super::effects::registry::resolve(world.sde(), entry.effect_id) else { continue };
+        if !matches!(effect.kind, super::effects::EffectKind::Projected { .. }) { continue; }
+        let duration = match effect.attribute(super::effects::registry::EffectAttribute::Duration) {
+            Some(id) => match world.sde().types.attribute(type_id, id) {
+                Some(duration) => duration,
+                None => continue,
+            },
+            None => -1.0,
+        };
+        brain.add_effect(entry.effect_id, duration);
+    }
     world.post(system, move |s| {
         s.add_npc(id, brain);
     });
@@ -328,7 +359,8 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         }
         "ClearTargets" => {
             if let Some(ch) = c.session.int("charid") {
-                state().targets.remove(&ch);
+                let targets = state().targets.remove(&ch).unwrap_or_default().into_iter().collect();
+                remove_target_projections(c, targets);
             }
             c.notify("OnTarget", vec![Value::str("clear")]);
             Ok(Value::None)

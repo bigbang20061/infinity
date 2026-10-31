@@ -18,7 +18,7 @@ pub(super) async fn add_target(c: &mut Client, target: i64) -> CallResult {
     let Some((ship, t)) = cx.world.with(cx.system_id, move |s| Some((s.sampled_ball(ship_id)?, s.sampled_ball(target)?))).await.flatten() else {
         return Err(user_error(messages::MSG_TARGETING_ATTEMPT_CANCELLED, vec![]));
     };
-    let fit = Fit::load(&cx.db, cx.world.sde().clone(), cx.char_id, cx.ship_id).await?;
+    let fit = Fit::load_in_space(&cx.db, &cx.world, cx.system_id, cx.char_id, cx.ship_id).await?;
     let range = fit.value(Key::Ship, ATTR_MAX_TARGET_RANGE);
     let gap = dist(ship.pos, t.pos) - t.radius as f64;
     if gap > range {
@@ -56,17 +56,25 @@ pub(super) async fn add_target(c: &mut Client, target: i64) -> CallResult {
 
 pub(super) fn drop_targets(c: &mut Client, targets: &[i64]) {
     let Some(char_id) = c.session.int("charid") else { return };
-    {
+    let removed = {
         let mut st = state();
-        if let Some(set) = st.targets.get_mut(&char_id) {
-            for t in targets {
-                set.remove(t);
-            }
-        }
-    }
+        targets.iter().copied().filter(|t| st.targets.get_mut(&char_id).is_some_and(|set| set.remove(t))).collect()
+    };
+    remove_target_projections(c, removed);
     for t in targets {
         c.notify("OnTarget", vec![Value::str("lost"), Value::Int(*t), Value::None]);
     }
+}
+
+/// Remove outgoing effects for locks removed by an explicit targeting operation.
+pub(super) fn remove_target_projections(c: &Client, targets: Vec<i64>) {
+    let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) else { return };
+    if targets.is_empty() { return; }
+    c.world.post(system, move |s| remove_target_projections_in_system(s, ship, &targets));
+}
+
+fn remove_target_projections_in_system(s: &mut crate::space::System, ship: i64, targets: &[i64]) {
+    for &target in targets { s.remove_projections_between(ship, target); }
 }
 
 /// A destroyed ball is no longer anyone's target.
@@ -295,11 +303,11 @@ async fn load_ammo_impl(c: &mut Client, ship: i64, modules: Vec<i64>, charge_ids
     let count = loads.len();
     if loads.is_empty() { return Ok(0); }
     let notify = c.notify_tx.clone();
-    if c.session.int("solarsystemid").is_none() {
+    let Some(system) = c.session.int("solarsystemid") else {
         apply_loads(&db, &c.world, &notify, ship, loads).await?;
         return Ok(count);
-    }
-    let fit = Fit::load(&c.db, c.sde.clone(), owner, ship).await?;
+    };
+    let fit = Fit::load_in_space(&c.db, &c.world, system, owner, ship).await?;
     let groups = if generated.is_some() {
         group_loads(loads, |module| fit.value(Key::Module(module), ATTR_RELOAD_TIME))
     } else {
@@ -308,7 +316,6 @@ async fn load_ammo_impl(c: &mut Client, ship: i64, modules: Vec<i64>, charge_ids
         BTreeMap::from([((filetime_ticks_from_ms(ms), first.2), loads.into_iter().map(|load| (load, ms)).collect())])
     };
     let start = filetime_now();
-    let system = c.session.int("solarsystemid").unwrap();
     for ((ticks, type_id), loads) in groups {
         let until = start + ticks;
         let reload_ms = loads[0].1;

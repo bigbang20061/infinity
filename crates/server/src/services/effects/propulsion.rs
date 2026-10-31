@@ -28,14 +28,19 @@ pub(crate) fn queue_kinematics(system: &mut System, ship: i64, values: Kinematic
 
 /// The ship's current fitted kinematics for everyone's destiny.
 pub(super) async fn apply_propulsion(cx: &Ctx, master: i64, generation: Arc<AtomicBool>, active: bool) {
-    let Ok(fit) = Fit::load(&cx.db, cx.world.sde().clone(), cx.char_id, cx.ship_id).await else { return };
+    let Ok(fit) = Fit::load_in_space(&cx.db, &cx.world, cx.system_id, cx.char_id, cx.ship_id).await else { return };
+    let Some(revision) = fit.projection_revision() else { return };
     let values = kinematics(&fit);
     let ship = cx.ship_id;
     cx.world.post(cx.system_id, move |s| {
         let mut st = combat::state();
         if !st.activation_generation.get(&master).is_some_and(|current| Arc::ptr_eq(current, &generation))
             || st.active.contains_key(&master) != active { return; }
-        queue_kinematics(s, ship, values);
+        if s.projection_revision(ship) == revision {
+            s.queue_projection_kinematics(ship, revision, values);
+        } else {
+            s.refresh_projection_target(ship);
+        }
         if !active { st.activation_generation.remove(&master); }
     });
 }

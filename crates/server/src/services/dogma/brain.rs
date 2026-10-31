@@ -113,7 +113,11 @@ pub(crate) fn compile(fit: &Fit, char_id: i64, ship_id: i64) -> (Value, Value, V
 async fn effects(c: &Client) -> Result<(i64, Value, Value, Value), CallError> {
     let char_id = c.session.int("charid").ok_or_else(|| CallError::Internal(anyhow::anyhow!("no character selected")))?;
     let ship_id = c.session.int("shipid").unwrap_or(0);
-    let fit = Fit::load(&c.db, c.sde.clone(), char_id, ship_id).await?;
+    let fit = if let Some(system) = c.session.int("solarsystemid") {
+        Fit::load_in_space(&c.db, &c.world, system, char_id, ship_id).await?
+    } else {
+        Fit::load(&c.db, c.sde.clone(), char_id, ship_id).await?
+    };
     let (character, ship, structure) = compile(&fit, char_id, ship_id);
     Ok((char_id, character, ship, structure))
 }

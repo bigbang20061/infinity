@@ -1,7 +1,8 @@
 //! GM per-item dogma base overrides. The slash role gate is owned by the parent service.
 //! Mirrors godma item attributes and the client brain's hull preAssignment effects;
-//! overrides live in game.item_attributes and follow singleton item identity. Owned
-//! drone queries include effective fit values; no drone gameplay RPC is provided.
+//! overrides live in game.item_attributes and follow singleton item identity.
+//! Owned drone queries evaluate the owner's fit; no drone gameplay RPC is provided.
+//! ponytail: incoming drone projections require the in-space drone runtime in PR7.
 //! Charges, characters, structures, NPCs and stacked items are not supported.
 use super::{slash_error, Client, CallError};
 use crate::{dao::items::{dogma as dao, fit as fit_dao, loading::{Item, ItemQuery}}, messages};
@@ -82,6 +83,12 @@ fn drone_query_key(item: &Item, action: Action<'_>, char_id: Option<i64>) -> Opt
         && char_id == Some(item.owner_id)).then_some(Key::Drone(item.item_id))
 }
 
+fn current_projection(s: &mut crate::space::System, ship: i64, revision: u64) -> bool {
+    if s.projection_revision(ship) == revision { return true; }
+    s.refresh_projection_target(ship);
+    false
+}
+
 pub(super) async fn command(c: &mut Client, args: &[String]) -> Result<String, CallError> {
     let (target, action) = parse(args).ok_or_else(|| slash_error(messages::gm::GM_DOGMA_USAGE.into()))?;
     let ship = c.session.int("shipid");
@@ -123,9 +130,31 @@ pub(super) async fn command(c: &mut Client, args: &[String]) -> Result<String, C
         return Err(slash_error(reason.into()));
     }
     let drone_key = drone_query_key(&item, action, c.session.int("charid"));
-    let key = if matches!(action, Action::Query(_)) && item.category_id == i64::from(CATEGORY_DRONE) {
+    let mut fit_ship = ship;
+    let mut fit_pilot = c.session.int("charid").unwrap_or(0);
+    let mut fit_system = c.session.int("solarsystemid");
+    let mut key = if matches!(action, Action::Query(_)) && item.category_id == i64::from(CATEGORY_DRONE) {
         drone_key
     } else if Some(id) == ship { Some(Key::Ship) } else if modules.iter().any(|m| m.item_id == id) { Some(Key::Module(id)) } else { None };
+    if key.is_none() && matches!(action, Action::Query(_)) {
+        let candidate = if item.category_id == i64::from(crate::consts::CATEGORY_SHIP) { id }
+            else if item.category_id == i64::from(CATEGORY_MODULE) { item.location_id } else { 0 };
+        let hull = if candidate == id { Some(item.clone()) } else {
+            load_items(&c.db, &c.sde, ItemQuery::Id(candidate)).await.map_err(db_err)?.into_iter().next()
+        };
+        if let Some(hull) = hull {
+            let system = hull.location_id;
+            let fitted = candidate == id || fit_dao::modules(&c.db, candidate).await.map_err(db_err)?.iter().any(|m| m.item_id == id);
+            if fitted && c.sde.map.system(system).is_some() {
+                if let Some(pilot) = c.world.with(system, move |s| s.ball(candidate).and_then(|b| b.char_id)).await.flatten() {
+                    fit_ship = Some(candidate);
+                    fit_pilot = pilot;
+                    fit_system = Some(system);
+                    key = Some(if candidate == id { Key::Ship } else { Key::Module(id) });
+                }
+            }
+        }
+    }
     if !matches!(action, Action::Query(_)) {
         let cycle = ["duration", "speed", "capacitorNeed", "reloadTime"];
         if combat::active_modules().contains(&id)
@@ -141,7 +170,11 @@ pub(super) async fn command(c: &mut Client, args: &[String]) -> Result<String, C
     let old_fit = if drone_key.is_some() {
         Some(Fit::drone(&c.db, c.sde.clone(), char_id, id).await?)
     } else if key.is_some() {
-        Some(Fit::load(&c.db, c.sde.clone(), char_id, ship.unwrap()).await?)
+        Some(if let Some(system) = fit_system {
+            Fit::load_in_space(&c.db, &c.world, system, fit_pilot, fit_ship.unwrap()).await?
+        } else {
+            Fit::load(&c.db, c.sde.clone(), fit_pilot, fit_ship.unwrap()).await?
+        })
     } else { None };
     let old_base = old_fit.as_ref().zip(key).map(|(fit, key)| fit.base(key, attr)).unwrap_or(old_override.unwrap_or(fallback));
     let old_effective = old_fit.as_ref().zip(key).map(|(fit, key)| fit.value(key, attr));
@@ -156,7 +189,13 @@ pub(super) async fn command(c: &mut Client, args: &[String]) -> Result<String, C
         Action::List => unreachable!(),
     }
     let changed = !matches!(action, Action::Query(_));
-    let new_fit = if changed && key.is_some() { Some(Fit::load(&c.db, c.sde.clone(), char_id, ship.unwrap()).await?) } else { None };
+    let new_fit = if changed && key.is_some() {
+        Some(if let Some(system) = fit_system {
+            Fit::load_in_space(&c.db, &c.world, system, fit_pilot, fit_ship.unwrap()).await?
+        } else {
+            Fit::load(&c.db, c.sde.clone(), fit_pilot, fit_ship.unwrap()).await?
+        })
+    } else { None };
     let current_fit = new_fit.as_ref().or(old_fit.as_ref());
     let new_base = current_fit.zip(key).map(|(fit, key)| fit.base(key, attr)).unwrap_or(match action { Action::Set(_, value) => value, Action::Reset(_) => fallback, _ => old_base });
     let new_effective = current_fit.zip(key).map(|(fit, key)| fit.value(key, attr));
@@ -165,8 +204,12 @@ pub(super) async fn command(c: &mut Client, args: &[String]) -> Result<String, C
             let before = propulsion::kinematics(old);
             let after = propulsion::kinematics(new);
             if before != after && c.session.int("stationid").is_none() {
-                if let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), ship) {
-                    c.world.post(system, move |s| propulsion::queue_kinematics(s, ship, after));
+                if let (Some(system), Some(ship), Some(revision)) = (c.session.int("solarsystemid"), ship, new.projection_revision()) {
+                    c.world.post(system, move |s| {
+                        if current_projection(s, ship, revision) {
+                            s.queue_projection_kinematics(ship, revision, after);
+                        }
+                    });
                 }
             }
             let entry = notify::attribute_change(char_id, Value::Int(id), attr, Value::Float(new.value(key, attr)), Value::Float(old.value(key, attr)));

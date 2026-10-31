@@ -6,6 +6,8 @@
 //! activation are not managed here; callers provide a fit snapshot.
 //! ponytail: skill effects with fittingUsageChance require loading and filtering
 //! that attribute if such a skill appears in the SDE.
+//! ponytail: owner-fit drone queries do not include incoming drone projections;
+//! add a receiving drone fit when the in-space drone runtime arrives in PR7.
 
 use super::{db_err, CallError};
 use crate::consts::{ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_REQUIRED_SKILL_1, ATTR_SPEED_FACTOR, CATEGORY_CHARGE, CATEGORY_SHIP, CATEGORY_SKILL, EFFECT_AFTERBURNER, EFFECT_MICROWARPDRIVE, EFFECT_SKILL, TYPE_CHARACTER};
@@ -56,8 +58,6 @@ const EFFECT_CATEGORY_TARGET: i32 = 2;
 const STACKING_LIMIT: usize = 8;
 /// Dogma effect category: overload.
 const EFFECT_CATEGORY_OVERLOAD: i32 = 5;
-/// Dogma interim attribute used by the web falloff Python effect.
-const ATTR_SPEED_FACTOR_INTERIM: i32 = 2148;
 /// Dogma stacking penalty curve divisor, used by the server fitting formula.
 const STACKING_PENALTY_DIVISOR: f64 = 2.67;
 /// Server dogma stacking penalty curve squares the normalized modifier index.
@@ -97,6 +97,7 @@ struct Node {
     charge_type: Option<i32>,
     level: Option<i32>,
     overrides: Vec<(i32, f64)>,
+    charge_values: Vec<(i32, f64)>,
 }
 
 pub(crate) fn base_attribute(data: Option<&TypeData>, meta: Option<&Attribute>, attr: i32) -> f64 {
@@ -114,6 +115,11 @@ impl Node {
         }
         base_attribute(data, meta, attr)
     }
+    fn charge_base(&self, data: Option<&TypeData>, meta: Option<&Attribute>, attr: i32) -> f64 {
+        self.charge_values.binary_search_by_key(&attr, |entry| entry.0)
+            .map(|index| self.charge_values[index].1)
+            .unwrap_or_else(|_| base_attribute(data, meta, attr))
+    }
 }
 
 
@@ -126,13 +132,51 @@ pub struct Fit {
     passive_by_attribute: HashMap<i32, Vec<usize>>,
     sde: Arc<Sde>,
     memo: Mutex<HashMap<(Key, i32), f64>>,
+    projection_revision: Option<u64>,
 }
 
 impl Fit {
-    /// Load a fit that cannot carry projections. In-space callers must use
-    /// `load_projected` once their system supplies projection snapshots.
+    /// Load a fit outside space, without incoming projections.
     pub async fn load(db: &(impl crate::db::executor::Executor + ?Sized), sde: Arc<Sde>, char_id: i64, ship: i64) -> Result<Fit, CallError> {
         Self::load_projected(db, sde, char_id, ship, Vec::new()).await
+    }
+
+    /// Snapshot incoming effects from the live system before loading the fit.
+    pub(crate) async fn load_in_space(db: &(impl crate::db::executor::Executor + ?Sized), world: &crate::space::World, system: i64, char_id: i64, ship: i64) -> Result<Fit, CallError> {
+        let (projections, revision) = world.with(system, move |s| (s.projections_on(ship), s.projection_revision(ship))).await
+            .ok_or_else(|| CallError::Internal(anyhow::anyhow!("system actor stopped")))?;
+        let mut fit = Self::load_projected(db, world.sde().clone(), char_id, ship, projections).await?;
+        fit.projection_revision = Some(revision);
+        Ok(fit)
+    }
+
+    /// Revision of the actor snapshot, or None for a non-space fit.
+    pub(crate) fn projection_revision(&self) -> Option<u64> { self.projection_revision }
+
+    /// Construct an unpiloted space type using the same projection evaluator.
+    pub(crate) fn for_space_type(sde: Arc<Sde>, type_id: i32, projections: Vec<super::effects::projection::Projection>) -> Fit {
+        let mut nodes = HashMap::new();
+        nodes.insert(Key::Ship, Node {
+            type_id, data_position: sde.types.position(type_id), location: Location::Space,
+            online: true, active: false, overloaded: false, projected_effect: None,
+            charge_type: None, level: None, overrides: Vec::new(), charge_values: Vec::new(),
+        });
+        Self::insert_projections(&sde, &mut nodes, projections);
+        Fit { nodes, passive_modifiers: Vec::new(), passive_by_attribute: HashMap::new(), sde, memo: Mutex::new(HashMap::new()), projection_revision: None }
+    }
+
+    fn insert_projections(sde: &Sde, nodes: &mut HashMap<Key, Node>, projections: Vec<super::effects::projection::Projection>) {
+        for p in projections {
+            let mut values = p.values;
+            values.sort_by_key(|v| v.0);
+            let mut charge_values = p.charge_values;
+            charge_values.sort_by_key(|v| v.0);
+            nodes.insert(Key::Projected(p.source_module), Node {
+                type_id: p.source_type, data_position: sde.types.position(p.source_type),
+                location: Location::Space, online: true, active: true, overloaded: false,
+                projected_effect: Some(p.effect_id), charge_type: p.charge_type, level: None, overrides: values, charge_values,
+            });
+        }
     }
 
     /// Load the fit and explicit source-effective incoming projected effects.
@@ -159,7 +203,7 @@ impl Fit {
         let mut nodes = HashMap::new();
         let node = |type_id, location, online, active, level, overrides| Node {
             type_id, data_position: sde.types.position(type_id), location, online, active,
-            overloaded: false, projected_effect: None, charge_type: None, level, overrides,
+            overloaded: false, projected_effect: None, charge_type: None, level, overrides, charge_values: Vec::new(),
         };
         nodes.insert(Key::Char, node(TYPE_CHARACTER, Location::Char, true, false, None, character));
         nodes.insert(Key::Ship, node(ship_type, Location::Space, true, false, None, overrides.remove(&ship).unwrap_or_default()));
@@ -187,17 +231,7 @@ impl Fit {
                 nodes.insert(Key::Drone(r.item_id), node(r.type_id, Location::Space, true, false, None, overrides.remove(&r.item_id).unwrap_or_default()));
             }
         }
-        for p in projections {
-            let mut values = p.values;
-            if let Some(raw) = values.iter().find(|v| v.0 == ATTR_SPEED_FACTOR).map(|v| v.1) {
-                if !values.iter().any(|v| v.0 == ATTR_SPEED_FACTOR_INTERIM) { values.push((ATTR_SPEED_FACTOR_INTERIM, raw)); }
-            }
-            values.sort_by_key(|v| v.0);
-            let mut n = node(p.source_type, Location::Space, true, true, None, values);
-            n.projected_effect = Some(p.effect_id);
-            n.charge_type = p.charge_type;
-            nodes.insert(Key::Projected(p.source_module), n);
-        }
+        Self::insert_projections(&sde, &mut nodes, projections);
         let mut skill_effects = Vec::new();
         for r in &skills {
             if nodes.get(&Key::Skill(r.type_id)).and_then(|n| n.level).unwrap_or(0) <= 0 { continue; }
@@ -220,7 +254,7 @@ impl Fit {
                 passive_modifiers.push((Key::Skill(id), effect_id, position));
             }
         }
-        Ok(Fit { nodes, passive_modifiers, passive_by_attribute, sde, memo: Mutex::new(HashMap::new()) })
+        Ok(Fit { nodes, passive_modifiers, passive_by_attribute, sde, memo: Mutex::new(HashMap::new()), projection_revision: None })
     }
 
     /// Load the selected character ship and one owned drone, including launched drones.
@@ -238,7 +272,7 @@ impl Fit {
         fit.nodes.insert(Key::Drone(drone_item), Node {
             type_id: item.type_id, data_position: fit.sde.types.position(item.type_id),
             location: Location::Space, online: true, active: false, overloaded: false,
-            projected_effect: None, charge_type: None, level: None, overrides,
+            projected_effect: None, charge_type: None, level: None, overrides, charge_values: Vec::new(),
         });
         fit.memo.get_mut().unwrap().clear();
         Ok(fit)
@@ -299,6 +333,13 @@ impl Fit {
     /// Does modifier `m` from `source` apply to `target`?
     fn applies(&self, source: Key, m: &Modifier, target: Key) -> bool {
         let Some(t) = self.nodes.get(&target) else { return false };
+        // targetID denotes the receiving hull, including when the modified item
+        // is a module located on it.
+        if m.target_category.is_some() {
+            let category = self.nodes.get(&Key::Ship).and_then(|hull| hull.data_position)
+                .and_then(|i| self.sde.types.at_position(i).category_id);
+            if !category_matches(m.target_category, category) { return false; }
+        }
         let group = t.data_position.and_then(|i| self.sde.types.at_position(i).group_id);
         let required = |skill: Option<i32>| {
             let skill = self.required_skill(source, skill);
@@ -332,7 +373,9 @@ impl Fit {
                 mods.push((m.op, v, false));
             }
         });
-        if self.sde.types.modifies_attribute(attr) {
+        if self.sde.types.modifies_attribute(attr) || self.nodes.values().any(|node|
+            node.projected_effect.and_then(|id| self.sde.dogma.effect(id))
+                .is_some_and(|effect| effect.modifiers().iter().any(|m| m.modified == attr))) {
             let stackable = self.sde.dogma.attribute(attr).and_then(|m| m.stackable).unwrap_or(true);
             let mut sources: Vec<_> = self.nodes.keys().copied().collect();
             sources.sort_unstable();
@@ -340,19 +383,27 @@ impl Fit {
                 let node = &self.nodes[&source];
                 if matches!(source, Key::Skill(_)) { continue; }
                 let Some(data) = node.data_position.map(|i| self.sde.types.at_position(i)) else { continue };
-                for (effect, m) in data.modifiers(&self.sde.dogma, attr) {
-                    if !effect_running(source, node, effect.effect_id, effect.effect_category.unwrap_or(0), &m.domain) { continue; }
-                    if !self.applies(source, m, key) { continue; }
-                    let v = if matches!(source, Key::Projected(_)) {
-                        projected_value(node, Some(data), self.sde.dogma.attribute(m.modifying), m.modifying)
-                    } else { self.value_guarded(source, m.modifying, visiting) };
-                    let exempt = stacking_exempt(data.category_id.unwrap_or(0));
-                    mods.push((m.op, v, !stackable && !exempt));
+                if let Some(effect_id) = node.projected_effect {
+                    if let Some(effect) = self.sde.dogma.effect(effect_id) {
+                        for m in effect.modifiers().iter().filter(|m| m.modified == attr) {
+                            if !effect_running(source, node, effect_id, effect.effect_category.unwrap_or(0), &m.domain)
+                                || !self.applies(source, m, key) { continue; }
+                            let value = projected_value(node, Some(data), self.sde.dogma.attribute(m.modifying), m.modifying);
+                            mods.push((m.op, value, !stackable && !stacking_exempt(data.category_id.unwrap_or(0))));
+                        }
+                    }
+                } else {
+                    for (effect, m) in data.modifiers(&self.sde.dogma, attr) {
+                        if !effect_running(source, node, effect.effect_id, effect.effect_category.unwrap_or(0), &m.domain) { continue; }
+                        if !self.applies(source, m, key) { continue; }
+                        let value = self.value_guarded(source, m.modifying, visiting);
+                        mods.push((m.op, value, !stackable && !stacking_exempt(data.category_id.unwrap_or(0))));
+                    }
                 }
                 if let Some(charge) = node.charge_type.and_then(|t| self.sde.types.get(t)) {
                     for (_, m) in charge.modifiers(&self.sde.dogma, attr) {
                         if m.domain != "targetID" || !self.applies(source, m, key) { continue; }
-                        let value = projected_value(node, Some(charge), self.sde.dogma.attribute(m.modifying), m.modifying);
+                        let value = node.charge_base(Some(charge), self.sde.dogma.attribute(m.modifying), m.modifying);
                         mods.push((m.op, value, false));
                     }
                 }
@@ -388,6 +439,10 @@ fn effect_running(source: Key, node: &Node, effect_id: i32, category: i32, domai
         EFFECT_CATEGORY_OVERLOAD => node.online && node.overloaded,
         _ => false,
     }
+}
+
+fn category_matches(required: Option<i32>, actual: Option<i32>) -> bool {
+    required.is_none() || required == actual
 }
 
 fn modifier_applies(source: Key, m: &Modifier, target: Key, node: &Node, group: Option<i32>, required: bool) -> bool {

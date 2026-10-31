@@ -28,6 +28,97 @@ fn supplement_only_empty_lists_and_preserve_webifier_row() {
 }
 
 #[test]
+fn falloff_rows_resolve_their_raw_source_attributes() {
+    for (name, expected) in [
+        ("remoteWebifierFalloff", vec![ATTR_SPEED_FACTOR]),
+        ("remoteTargetPaintFalloff", vec![ATTR_SIGNATURE_RADIUS_BONUS]),
+        ("remoteSensorDampFalloff", vec![ATTR_SCAN_GRAVIMETRIC_STRENGTH_PERCENT, ATTR_SCAN_LADAR_STRENGTH_PERCENT, ATTR_SCAN_MAGNETOMETRIC_STRENGTH_PERCENT, ATTR_SCAN_RADAR_STRENGTH_PERCENT, ATTR_SCAN_RESOLUTION_BONUS, ATTR_MAX_TARGET_RANGE_BONUS]),
+        ("remoteSensorBoostFalloff", vec![ATTR_SCAN_GRAVIMETRIC_STRENGTH_PERCENT, ATTR_SCAN_LADAR_STRENGTH_PERCENT, ATTR_SCAN_MAGNETOMETRIC_STRENGTH_PERCENT, ATTR_SCAN_RADAR_STRENGTH_PERCENT, ATTR_SCAN_RESOLUTION_BONUS, ATTR_MAX_TARGET_RANGE_BONUS]),
+    ] {
+        let mut effect = effect(name);
+        supplement(&mut effect);
+        assert_eq!(effect.modifiers.iter().map(|row| projected_interim_source(row.modifying).unwrap()).collect::<Vec<_>>(), expected);
+    }
+    assert_eq!(projected_interim_source(ATTR_SPEED_FACTOR), None);
+}
+
+#[test]
+fn npc_projected_rows_match_client_ship_target_modifiers() {
+    for (npc, player) in [
+        ("remoteWebifierEntity", "remoteWebifierFalloff"),
+        ("npcBehaviorWebifier", "remoteWebifierFalloff"),
+        ("remoteTargetPaintEntity", "remoteTargetPaintFalloff"),
+        ("behaviorTargetPainter", "remoteTargetPaintFalloff"),
+        ("remoteSensorDampEntity", "remoteSensorDampFalloff"),
+        ("behaviorSensorDampener", "remoteSensorDampFalloff"),
+        ("npcBehaviorTrackingDisruptor", "shipModuleTrackingDisruptor"),
+        ("npcEntityTrackingDisruptor", "shipModuleTrackingDisruptor"),
+        ("npcBehaviorGuidanceDisruptor", "shipModuleGuidanceDisruptor"),
+    ] {
+        let mut npc = effect(npc);
+        let mut player = effect(player);
+        supplement(&mut npc);
+        supplement(&mut player);
+        assert_eq!(npc.modifiers.len(), player.modifiers.len());
+        for (a, b) in npc.modifiers.iter().zip(&player.modifiers) {
+            assert_eq!((&a.func, &a.domain, a.op, a.modified, a.modifying, a.skill),
+                       (&b.func, &b.domain, b.op, b.modified, b.modifying, b.skill));
+        }
+    }
+    let mut combined = effect("npcEntityWeaponDisruptor");
+    let mut tracking = effect("shipModuleTrackingDisruptor");
+    let mut guidance = effect("shipModuleGuidanceDisruptor");
+    supplement(&mut combined);
+    supplement(&mut tracking);
+    supplement(&mut guidance);
+    let expected = tracking.modifiers.iter().chain(&guidance.modifiers);
+    assert_eq!(combined.modifiers.len(), tracking.modifiers.len() + guidance.modifiers.len());
+    for (a, b) in combined.modifiers.iter().zip(expected) {
+        assert_eq!((&a.func, &a.domain, a.op, a.modified, a.modifying, a.skill),
+                   (&b.func, &b.domain, b.op, b.modified, b.modifying, b.skill));
+    }
+}
+
+#[test]
+fn disruption_categories_match_client_target_triples() {
+    let tracking = [
+        (ATTR_MAX_RANGE, ATTR_MAX_RANGE_BONUS),
+        (ATTR_FALLOFF, ATTR_FALLOFF_BONUS),
+        (ATTR_TRACKING_SPEED, ATTR_TRACKING_SPEED_BONUS),
+    ];
+    let guidance = [
+        (ATTR_MISSILE_ENTITY_VELOCITY_MULTIPLIER, ATTR_MISSILE_VELOCITY_BONUS),
+        (ATTR_MISSILE_ENTITY_FLIGHT_TIME_MULTIPLIER, ATTR_EXPLOSION_DELAY_BONUS),
+        (ATTR_MISSILE_ENTITY_AOE_VELOCITY_MULTIPLIER, ATTR_AOE_VELOCITY_BONUS),
+        (ATTR_MISSILE_ENTITY_AOE_CLOUD_SIZE_MULTIPLIER, ATTR_AOE_CLOUD_SIZE_BONUS),
+    ];
+    for (name, want_tracking, want_guidance) in [
+        ("shipModuleTrackingDisruptor", true, false),
+        ("shipModuleGuidanceDisruptor", false, true),
+        ("npcEntityWeaponDisruptor", true, true),
+    ] {
+        let mut e = effect(name);
+        supplement(&mut e);
+        for category in [CATEGORY_ENTITY, CATEGORY_DRONE] {
+            let actual: Vec<_> = e.modifiers.iter().filter(|m| m.target_category == Some(category))
+                .map(|m| {
+                    assert_eq!((m.func.as_str(), m.domain.as_str(), m.op, m.skill),
+                        ("ItemModifier", "targetID", POST_PERCENT, None));
+                    (m.modified, m.modifying)
+                }).collect();
+            let expected: Vec<_> = tracking.iter().copied().filter(|_| want_tracking)
+                .chain(guidance.iter().copied().filter(|_| want_guidance)).collect();
+            assert_eq!(actual, expected);
+        }
+        for m in e.modifiers.iter().filter(|m| m.target_category == Some(CATEGORY_SHIP)) {
+            assert_eq!((m.func.as_str(), m.domain.as_str(), m.op),
+                ("LocationRequiredSkillModifier", "targetID", POST_PERCENT));
+            assert!(matches!(m.skill, Some(TYPE_GUNNERY | TYPE_MISSILE_LAUNCHER_OPERATION)));
+        }
+    }
+}
+
+#[test]
 fn actual_bastion_name_supplements_only_empty_sde_modifiers() {
     let mut bastion = effect("moduleBonusBastionModule");
     bastion.effect_id = 6658;

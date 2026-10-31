@@ -94,7 +94,7 @@ fn skill_level_uses_shared_points_formula_before_node_override() {
     let node = super::Node {
         type_id: 1, data_position: None, location: super::Location::Char,
         online: true, active: false, overloaded: false, projected_effect: None,
-        charge_type: None, level: Some(level), overrides: vec![(super::ATTR_SKILL_LEVEL, 99.0)],
+        charge_type: None, level: Some(level), overrides: vec![(super::ATTR_SKILL_LEVEL, 99.0)], charge_values: vec![],
     };
     assert_eq!(node.base(None, None, super::ATTR_SKILL_LEVEL), 3.0);
 }
@@ -102,12 +102,23 @@ fn skill_level_uses_shared_points_formula_before_node_override() {
 fn fixture_node(location: super::Location) -> super::Node {
     super::Node { type_id: 1, data_position: None, location, online: true,
         active: false, overloaded: false, projected_effect: None,
-        charge_type: None, level: None, overrides: vec![] }
+        charge_type: None, level: None, overrides: vec![], charge_values: vec![] }
 }
 
 fn fixture_modifier(func: &str, domain: &str) -> super::Modifier {
     super::Modifier { func: func.into(), domain: domain.into(), op: 6,
-        modified: 1, modifying: 2, group: Some(10), skill: Some(20) }
+        modified: 1, modifying: 2, group: Some(10), skill: Some(20), target_category: None }
+}
+
+#[test]
+fn projected_category_gate_uses_receiving_hull() {
+    use crate::consts::{CATEGORY_DRONE, CATEGORY_ENTITY, CATEGORY_SHIP};
+    for actual in [Some(CATEGORY_SHIP), Some(CATEGORY_ENTITY), Some(CATEGORY_DRONE), None] {
+        assert!(super::category_matches(None, actual));
+        assert_eq!(super::category_matches(Some(CATEGORY_SHIP), actual), actual == Some(CATEGORY_SHIP));
+        assert_eq!(super::category_matches(Some(CATEGORY_ENTITY), actual), actual == Some(CATEGORY_ENTITY));
+        assert_eq!(super::category_matches(Some(CATEGORY_DRONE), actual), actual == Some(CATEGORY_DRONE));
+    }
 }
 
 #[test]
@@ -248,6 +259,21 @@ fn projection_script_uses_injected_value_and_target_domain() {
 }
 
 #[test]
+fn projected_module_and_charge_keep_distinct_operands() {
+    let mut source = fixture_node(super::Location::Space);
+    source.overrides = vec![(2, -60.0)];
+    source.charge_values = vec![(2, 20.0)];
+    let meta = super::Attribute { attribute_id: 2, default_value: Some(5.0), stackable: Some(true) };
+    let module_value = super::projected_value(&source, None, Some(&meta), 2);
+    let charge_value = source.charge_base(None, Some(&meta), 2);
+    assert_eq!(module_value, -60.0);
+    assert_eq!(charge_value, 20.0);
+    assert!((apply(100.0, &[(6, module_value, false), (6, charge_value, false)]) - 48.0).abs() < 1e-9);
+    source.charge_values.clear();
+    assert_eq!(source.charge_base(None, Some(&meta), 2), 5.0);
+}
+
+#[test]
 fn unknown_type_uses_attribute_default() {
     let meta = super::Attribute { attribute_id: 1, default_value: Some(7.5), stackable: None };
     assert_eq!(super::base_attribute(None, Some(&meta), 1), 7.5);
@@ -259,7 +285,7 @@ fn unknown_type_uses_attribute_default() {
 #[test]
 fn node_override_precedence_and_modifier() {
     use super::{Node, Location, ATTR_SKILL_LEVEL};
-    let mut node = Node { type_id: 1, data_position: None, location: Location::Char, online: true, active: false, overloaded: false, projected_effect: None, charge_type: None, level: None, overrides: vec![(1, 10.0), (ATTR_SKILL_LEVEL, 99.0)] };
+    let mut node = Node { type_id: 1, data_position: None, location: Location::Char, online: true, active: false, overloaded: false, projected_effect: None, charge_type: None, level: None, overrides: vec![(1, 10.0), (ATTR_SKILL_LEVEL, 99.0)], charge_values: vec![] };
     let meta = super::Attribute { attribute_id: 1, default_value: Some(7.5), stackable: None };
     assert_eq!(node.base(None, Some(&meta), 1), 10.0);
     assert_eq!(node.base(None, None, 2), 0.0);

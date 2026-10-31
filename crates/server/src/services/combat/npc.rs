@@ -2,6 +2,7 @@
 use super::*;
 use crate::services::effects::{notify::fire_fx, weapons::{hit_quality, launch_missile, report_hit, turret_roll, Missile}};
 use crate::consts::ATTR_AGILITY;
+use crate::consts::{ATTR_TRACKING_SPEED, ATTR_MISSILE_ENTITY_VELOCITY_MULTIPLIER, ATTR_MISSILE_ENTITY_FLIGHT_TIME_MULTIPLIER, ATTR_MISSILE_ENTITY_AOE_VELOCITY_MULTIPLIER, ATTR_MISSILE_ENTITY_AOE_CLOUD_SIZE_MULTIPLIER};
 use crate::sde::types::TypeData;
 use crate::space::{MODE_STOP, V3};
 
@@ -102,8 +103,35 @@ pub(super) async fn npc_stats(db: &Db, sde: &Sde, type_id: i32) -> Result<NpcSta
 /// Attach a brain to a spawned NPC; its effects run on the system's worker.
 
 
+fn npc_effective(fit: &Fit, sde: &Sde, attribute: i32, fallback: f64) -> f64 {
+    if fit.type_has_attribute(Key::Ship, attribute)
+        || sde.dogma.attribute(attribute).and_then(|a| a.default_value).is_some() {
+        fit.value(Key::Ship, attribute)
+    } else {
+        fallback
+    }
+}
+pub(super) fn npc_missile_kinematics(velocity: f64, flight_ms: f64, velocity_multiplier: f64, flight_multiplier: f64) -> (f64, f64) {
+    let velocity = (velocity * velocity_multiplier).max(1.0);
+    (velocity, velocity * ms_to_seconds(flight_ms * flight_multiplier))
+}
+
+
 /// `me` and `victim` are the actor-sampled shot snapshots captured before worker dispatch.
 pub(super) async fn npc_shot(db: &Db, world: &Arc<World>, system: i64, id: i64, type_id: i32, stats: &NpcStats, me: Ball, victim: Ball) -> Result<(), CallError> {
+    let Some(projections) = world.with(system, move |s| s.projections_on(id)).await else { return Ok(()) };
+    let sde = world.sde();
+    let fit = Fit::for_space_type(sde.clone(), type_id, projections);
+    let optimal = if fit.type_has_attribute(Key::Ship, ATTR_MAX_RANGE) { fit.value(Key::Ship, ATTR_MAX_RANGE) } else { stats.optimal };
+    let falloff = if fit.type_has_attribute(Key::Ship, ATTR_FALLOFF) { fit.value(Key::Ship, ATTR_FALLOFF) } else { stats.falloff };
+    let velocity_multiplier = npc_effective(&fit, sde, ATTR_MISSILE_ENTITY_VELOCITY_MULTIPLIER, 1.0);
+    let flight_multiplier = npc_effective(&fit, sde, ATTR_MISSILE_ENTITY_FLIGHT_TIME_MULTIPLIER, 1.0);
+    // PR11 owns application of tracking and missile explosion modifiers.
+    let _pending_application = (
+        npc_effective(&fit, sde, ATTR_TRACKING_SPEED, 0.0),
+        npc_effective(&fit, sde, ATTR_MISSILE_ENTITY_AOE_VELOCITY_MULTIPLIER, 1.0),
+        npc_effective(&fit, sde, ATTR_MISSILE_ENTITY_AOE_CLOUD_SIZE_MULTIPLIER, 1.0),
+    );
     let ship = victim.id;
     let gap = (dist(me.pos, victim.pos) - me.radius as f64 - victim.radius as f64).max(0.0);
     let owner_id = me.owner_id;
@@ -111,8 +139,10 @@ pub(super) async fn npc_shot(db: &Db, world: &Arc<World>, system: i64, id: i64, 
     let victim_char_id = victim.char_id;
     if let Some((charge, multiplier)) = &stats.missile {
         let (charge, multiplier) = (*charge, *multiplier);
-        let velocity = attr(world.sde(), charge, ATTR_MAX_VELOCITY, NPC_MISSILE_VELOCITY_MPS).max(1.0);
-        let flight = velocity * ms_to_seconds(attr(world.sde(), charge, ATTR_EXPLOSION_DELAY, NPC_MISSILE_FLIGHT_MS));
+        let (velocity, flight) = npc_missile_kinematics(
+            attr(world.sde(), charge, ATTR_MAX_VELOCITY, NPC_MISSILE_VELOCITY_MPS),
+            attr(world.sde(), charge, ATTR_EXPLOSION_DELAY, NPC_MISSILE_FLIGHT_MS),
+            velocity_multiplier, flight_multiplier);
         if gap <= flight {
             let missile = Missile {
                 charge,
@@ -126,13 +156,13 @@ pub(super) async fn npc_shot(db: &Db, world: &Arc<World>, system: i64, id: i64, 
             launch_missile(db.clone(), world.clone(), system, me, victim, owner_id, None, missile).await?;
         }
     }
-    if stats.damage.iter().any(|d| *d > 0.0) && gap <= stats.optimal + stats.falloff * NPC_TURRET_REACH_FALLOFF_MULTIPLIER {
+    if stats.damage.iter().any(|d| *d > 0.0) && gap <= optimal + falloff * NPC_TURRET_REACH_FALLOFF_MULTIPLIER {
         if let Some(guid) = stats.fx.as_deref() {
             let guid = guid.to_owned();
             let duration = stats.rate_of_fire_ms;
             world.broadcast(system, id, move |stamp| vec![fire_fx(stamp, id, None, &guid, Some(ship), None, true, true, duration, 1)]);
         }
-        let multiplier = turret_roll(gap, stats.optimal, stats.falloff);
+        let multiplier = turret_roll(gap, optimal, falloff);
         let dealt = if multiplier > 0.0 { damage(db, world, system, ship, victim_char_id, stats.damage.map(|d| d * multiplier), None).await? } else { 0.0 };
         report_hit(world, id, ship, attacker_char_id, victim_char_id, type_id, dealt, hit_quality(multiplier));
     }

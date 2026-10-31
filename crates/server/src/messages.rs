@@ -589,6 +589,8 @@ pub(crate) const MINMATAR_CATEGORY_NAME: &str = "米玛塔尔";
 pub(crate) const OTHER_FACTION_CATEGORY_NAME: &str = "其他";
 
 // Client message-catalogue names
+/// Client fittingDogmaLocation.py refusal for an activation-blocked module.
+pub(crate) const MSG_MODULE_IS_BLOCKED: &str = "ModuleIsBlocked";
 /// Client message `BkmMustBeInFlight`.
 pub(crate) const MSG_BKM_MUST_BE_IN_FLIGHT: &str = "BkmMustBeInFlight";
 /// Client message `BlueprintNotFound`.

@@ -96,8 +96,8 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             } else { None };
             // Suns, planets, moons and belts land at their warp-in point, not off the surface.
             match warp_in {
-                Some(point) => warp_to(c, None, point, min_range, on_exit),
-                None => warp_to(c, Some((pos, radius)), pos, min_range, on_exit),
+                Some(point) => warp_to(c, None, point, min_range, on_exit).await,
+                None => warp_to(c, Some((pos, radius)), pos, min_range, on_exit).await,
             }
         }
         ("beyonce", "CmdStargateJump") => {

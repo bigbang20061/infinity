@@ -80,3 +80,27 @@ fn warp_threshold_uses_unadjusted_distance_and_keeps_long_warp_events() {
         ]);
     }
 }
+
+#[test]
+fn stale_warp_snapshot_has_no_side_effects_and_can_retry() {
+    let mut s = space::System::new(0, std::sync::Arc::default(), 12_345);
+    let mut b = ship();
+    b.cloak = 1;
+    s.insert(b);
+    let old = s.projection_revision(123);
+    s.refresh_projection_target(123);
+    let point = [200_000.0, 20.0, 30.0];
+    assert!(!commit_warp(&mut s, 123, None, old, false, None, point, 0.0, None).0);
+    assert_eq!(s.ball(123).unwrap().cloak, 1);
+    s.tick(13_000);
+    assert_ne!(s.ball(123).unwrap().mode, MODE_WARP);
+    let current = s.projection_revision(123);
+    assert!(commit_warp(&mut s, 123, None, current, true, None, point, 0.0, None).0);
+    assert_eq!(s.ball(123).unwrap().cloak, 1);
+    s.refresh_projection_target(123);
+    assert!(!commit_warp(&mut s, 123, None, current, true, None, point, 0.0, None).0);
+    let current = s.projection_revision(123);
+    assert!(commit_warp(&mut s, 123, None, current, false, None, point, 0.0, None).0);
+    s.tick(14_000);
+    assert_eq!(s.ball(123).unwrap().mode, MODE_WARP);
+}
