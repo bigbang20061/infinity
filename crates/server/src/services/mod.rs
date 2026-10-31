@@ -6,6 +6,11 @@
 //! offset policy. Runtime corporation data comes from the game database. Unsupported
 //! services fall through the dispatch chain; feature limitations are documented in
 //! their modules.
+//! Scheduler registration supplies the durable periodic maintenance scans persisted in
+//! game.jobs; there are no detached maintenance sleeps. Successful periodic completion
+//! atomically reschedules the job. Boot seeds only absent or dead jobs, preserving existing
+//! deadlines and leases. Local active IDs are excluded from reclaim to prevent overlapping
+//! scans in one process; leases are not renewed.
 
 mod agency;
 mod alliances;
@@ -49,12 +54,19 @@ mod store;
 mod universe;
 mod wallets;
 
-pub use contracts::settle_auctions;
 pub use fleets::logged_off as fleet_logged_off;
-pub use market::expire_orders as expire_market_orders;
-pub use bills::run_billing;
 pub(crate) use combat::recover_pending_reloads;
 pub use exploration::unbury_sites;
+
+pub(crate) fn scheduler_registrations() -> Vec<crate::scheduler::Registration> {
+    let game = crate::config::game();
+    use crate::scheduler::{periodic, MARKET, CONTRACTS, BILLS};
+    vec![
+        periodic(MARKET, market::expire_orders, game.market.maintenance_secs as u64),
+        periodic(CONTRACTS, contracts::settle_auctions, game.contracts.maintenance_secs as u64),
+        periodic(BILLS, bills::run_billing, game.corporations.bills_maintenance_secs as u64),
+    ]
+}
 
 use crate::client::{short, Client};
 use crate::consts::GROUP_PLANET;

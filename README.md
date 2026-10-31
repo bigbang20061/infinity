@@ -48,7 +48,7 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
   - a ship's velocity, warp and cloak, so a restarted ship starts at rest.
 - A reload still running when the server stops is not resumed. At the next start its charges go back to the ship's cargo hold.
 - A ship's position in space is saved when its pilot leaves the game, and every 30 seconds while it moves. A crash therefore loses at most the last 30 seconds of movement.
-- Stopping the server with Ctrl-C or SIGTERM (`docker compose stop`) saves the position of every ship in space before it exits. The server waits at most 10 seconds for these writes.
+- Stopping the server with Ctrl-C or SIGTERM (`docker compose stop`) first stops starting scheduled jobs and gives the running ones up to `scheduler.drain_secs` to finish, then saves the position of every ship in space before it exits. The server waits at most 10 seconds for these writes.
 - Collisions use one sphere per ship or celestial, as the client does by default, not the rendered shape: a ship can bump into empty space near a station, or pass through parts of it that stick out of its sphere. Undocking uses a fixed heading and clearance rather than the station's undock points, so a very large ship can still start overlapping the station. Dynamic orientation, formations and destiny's rarer ball modes are not implemented.
 - Balances are stored with up to 36 digits (ISK: 34 integer digits and 2 decimal places; PLEX: 36 integer digits), and the server works with the full value. The client is sent at most the largest balance it displays without scientific notation: 1,000,000,000,000,000,000 ISK for a character wallet, 9,223,372,036,854,774,784 ISK for a corporation wallet, and 99,999,999,999,999 PLEX. ISK reaches the client as a double, so above about 45 trillion ISK it can no longer show every cent.
 - A `/dogma` override changes every value the server computes. The client's fitting window and HUD show it only for an attribute the ship's hull type has; for a module, or a ship attribute the hull type lacks, they keep showing the type's value, while Show Info in space shows the new one. The command's reply says so.
@@ -141,6 +141,8 @@ Start-up stops with an error that names the file and the dotted key when a key i
 | `database.connect_timeout_secs` / `.checkout_timeout_secs` | | `5` / `30` | Time limit for one connection attempt, and for waiting for a free pooled connection (`0` = wait forever) |
 | `database.startup_retry_secs` | | `[1, 16]` | First and longest wait between connection attempts at start; the wait doubles |
 | `database.schema_on_start` | | `true` | Apply `game_schema.sql` at every start. With `false` the server skips it and logs a warning; the schema must then already exist. |
+| `scheduler.poll_secs`, `.lease_secs`, `.max_concurrent` | | `5`, `60`, `8` | Scheduled jobs (market order expiry, auction settlement, bills): the longest wait before due jobs are picked up, how long a claimed job may run before another start may reclaim it (must exceed `poll_secs`), and how many run at once |
+| `scheduler.retry_base_secs`, `.dead_letter_attempts`, `.drain_secs` | | `30`, `25`, `10` | A failed job is retried after `retry_base_secs`, doubling up to 256 times that; a one-off job that fails `dead_letter_attempts` times stops and is kept for `/jobs`. The periodic jobs are never stopped. `drain_secs` bounds the wait for running jobs at shutdown. |
 | `server.public_host` | `PUBLIC_HOST` | `127.0.0.1` | Address clients use to reach this host (image server and CDN URLs). Set it when clients are not local. |
 | `server.system_capacity` | `SYSTEM_CAPACITY` | `0` | Pilots in space per solar system before stargate jumps queue (`0` = no limit) |
 | `server.bind` | `BIND` | `0.0.0.0:26000` | machoNet listener |
@@ -174,7 +176,7 @@ The database has four schemas:
 Lifecycle:
 
 - **First start.** `scripts/db-init.sh` loads `db/<schema>/<table>.sql.gz` into an empty volume. Tables whose foreign keys aren't satisfied yet are retried until everything is loaded.
-- **Every server start.** The server applies `crates/server/sql/game_schema.sql`, loads the captured retail prices, and seeds the NPC market if it is empty. It then reads the static data it uses from `sde`, `sde_native` and `sde_compat` into memory once; after startup the server never queries those schemas, so static data changes take effect at the next start.
+- **Every server start.** The server applies `crates/server/sql/game_schema.sql`, loads the captured retail prices, and seeds the NPC market if it is empty. It then reads the static data it uses from `sde`, `sde_native` and `sde_compat` into memory once; after startup the server never queries those schemas, so static data changes take effect at the next start. Scheduled jobs are kept in `game.jobs`: jobs that fell due while the server was down run right after the start, and a job left half-done by a crash runs again once its lease expires, so every job must be safe to repeat.
 - **Reset.** Remove the database volume to start over (`docker compose down`, then `docker volume rm infinity_pgdata`). The next `docker compose up` imports the dumps again.
 - **Rebuild the static data.** Put the static data JSONL bundles (`eve-online-client-static-data-<build>-jsonl` and `eve-online-static-data-<build>-jsonl`) under `./sde/`, run `docker compose run --rm sde-import`, then restart the server.
 - **Refresh the dumps.** `scripts/db-dump.ps1` replaces the folders under `db/` with dumps of the running database.
@@ -221,6 +223,9 @@ UPDATE game.accounts SET role = role | 27021597764489216 WHERE lower(user_name) 
 | `/heal` | Repair the ship in space |
 | `/dogma <ship\|itemID\|flag:N> <attribute> [value\|reset]` | Show, set or clear a per-item base value of a dogma attribute (by ID or exact name). Skills and modules still apply on top. Targets are single items only: the active ship, a module fitted at flag `N`, or any singleton item by ID. Runtime state (shield, armor and hull damage, online, charge, quantity, skills) is refused; use `/heal` or the module controls. |
 | `/dogma <target> list` | List the overrides of an item; for `ship`, of the ship and every fitted module |
+| `/jobs` | Count scheduled jobs by kind and state, and list the next ten |
+| `/jobs retry <id>` | Run a job now; a stopped job gets a fresh set of attempts |
+| `/jobs cancel <id>` | Delete a job. A job already running finishes but is not rescheduled. The periodic jobs come back at the next start. |
 | `/help` | List the commands |
 
 ## Releases

@@ -61,6 +61,8 @@ impl CorporationsConfig {
 #[derive(Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ContractsConfig {
+    /// Existing server auction maintenance cadence.
+    pub maintenance_secs: i64,
     /// Server design default minimum expiry in services/contracts/lifecycle.rs.
     pub expiry_min_minutes: i64,
     /// Server design default maximum expiry in services/contracts/lifecycle.rs.
@@ -84,6 +86,7 @@ pub struct ContractsConfig {
 impl Default for ContractsConfig {
     fn default() -> Self {
         Self {
+            maintenance_secs: 60,
             expiry_min_minutes: 60,
             expiry_max_days: 90,
             courier_min_days: 1,
@@ -99,6 +102,7 @@ impl Default for ContractsConfig {
 
 impl ContractsConfig {
     pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(self.maintenance_secs > 0, "contracts.maintenance_secs={} is outside its valid domain", self.maintenance_secs);
         anyhow::ensure!(self.expiry_min_minutes > 0, "contracts.expiry_min_minutes={} is outside its valid domain", self.expiry_min_minutes);
         anyhow::ensure!(self.expiry_max_days > 0, "contracts.expiry_max_days={} is outside its valid domain", self.expiry_max_days);
         anyhow::ensure!(self.courier_min_days > 0, "contracts.courier_min_days={} is outside its valid domain", self.courier_min_days);

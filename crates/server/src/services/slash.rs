@@ -14,6 +14,7 @@
 //! Dogma overrides require singleton items; modules and hull-foreign attributes
 //! have limited client display support. Unsupported commands return a slash error.
 //! Teleports to live balls use the system actor's sampled position; stored positions remain unchanged.
+//! Durable job inspection and control use `game.jobs`; job payloads are not displayed.
 
 use super::{db_err, Call, CallError, CallResult};
 use super::sql_pattern::matches_pattern;
@@ -23,6 +24,7 @@ use crate::messages;
 use marshal::Value;
 use tracing::info;
 mod dogma;
+mod jobs;
 
 /// Server design: clearance in metres when teleporting to an item.
 const TELEPORT_CLEARANCE: f64 = 5000.0;
@@ -47,6 +49,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("addplex", messages::gm::GM_HELP_ADD_PLEX),
     ("heal", messages::gm::GM_HELP_HEAL),
     ("dogma", messages::gm::GM_HELP_DOGMA),
+    ("jobs", messages::scheduler::HELP),
     ("help", messages::gm::GM_HELP_HELP),
 ];
 
@@ -254,6 +257,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "setisk" | "addisk" | "setplex" | "addplex" => wallet(c, &args, &command).await,
         "heal" => heal(c).await,
         "dogma" => dogma::command(c, &args).await,
+        "jobs" => jobs::command(&c.db, &args).await,
         "help" => Ok(help()),
         other => Err(slash_error(messages::gm::gm_unknown_command(other, &help()))),
     };

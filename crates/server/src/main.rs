@@ -1,8 +1,8 @@
 //! Infinity emulator server: proxy and sol node, gateway, chat, image server and CDN.
 //! The handshake mirrors the client's macho networking; state comes from the game
 //! database and SDE. Interrupted reloads return to cargo before workers or listeners
-//! start. On SIGINT or SIGTERM, listeners stop and changed pilot positions are flushed
-//! with a bounded wait; existing sessions are not drained.
+//! start. On SIGINT or SIGTERM, scheduler work drains before pilot positions are
+//! flushed with bounded waits; existing sessions are not drained.
 //! Authenticated account ownership is process-local; replacements wait for
 //! prior cleanup. Cross-process session coordination is not supported.
 
@@ -22,6 +22,7 @@ mod images;
 mod live_sessions;
 mod macho;
 mod messages;
+mod scheduler;
 mod sde;
 mod services;
 mod session;
@@ -61,9 +62,9 @@ async fn main() -> Result<()> {
     }
     let hub = chat::Hub::new(&cfg.chat.domain);
     let world = space::World::new(db.clone(), sde.clone(), cfg.server.system_capacity);
-    tokio::spawn(services::expire_market_orders(db.clone(), sde.clone(), world.clone()));
-    tokio::spawn(services::settle_auctions(db.clone(), sde.clone(), world.clone()));
-    tokio::spawn(services::run_billing(db.clone(), world.clone()));
+    let (scheduler_stop, scheduler_shutdown) = tokio::sync::watch::channel(false);
+    let mut scheduler_task = scheduler::runner::start(db.clone(), world.clone(), services::scheduler_registrations(), cfg.scheduler.clone(), scheduler_shutdown)?;
+    scheduler::seed(&db).await?;
     let gateway_task = tokio::spawn(log_exit("public gateway", gateway::serve(cfg.gateway.bind.clone(), gateway::Gateway::new(db.clone(), cfg.cdn_url()))));
     let chat_task = tokio::spawn(log_exit("chat", chat::serve(cfg.chat.bind.clone(), hub.clone())));
     let upstream = images::Upstream::new(&cfg.images.upstream, cfg.images.upstream_timeout_secs);
@@ -97,6 +98,7 @@ async fn main() -> Result<()> {
             biased;
             result = &mut shutdown => {
                 result?;
+                let _ = scheduler_stop.send(true);
                 break;
             }
             result = listener.accept() => result?,
@@ -140,6 +142,15 @@ async fn main() -> Result<()> {
     image_task.abort();
     cdn_task.abort();
     let _ = tokio::join!(gateway_task, chat_task, image_task, cdn_task);
+    match tokio::time::timeout(std::time::Duration::from_secs(cfg.scheduler.drain_secs), &mut scheduler_task).await {
+        Ok(Ok(())) => info!("scheduler drained"),
+        Ok(Err(error)) => warn!("scheduler runner failed: {error}"),
+        Err(_) => {
+            warn!("scheduler drain timed out");
+            scheduler_task.abort();
+            let _ = scheduler_task.await;
+        }
+    }
     match tokio::time::timeout(
         std::time::Duration::from_secs(cfg.server.shutdown_flush_timeout_secs),
         world.flush_positions(),
