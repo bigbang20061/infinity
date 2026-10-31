@@ -27,7 +27,7 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
 - **Agents.** Kill missions, epic arcs, NPC standings, loyalty points and LP stores.
 - **Exploration.** Anomalies and signatures, probe and directional scanning, wormholes, the data and relic hacking minigame, and belt rats.
 - **Mining.** Asteroid belts, ore, ice and gas, mining modules, and belt regrowth.
-- **Social.** Chat (local, corporation, fleet and other channels), fleets, EVE mail and notifications, the calendar, and bookmarks.
+- **Social.** Chat (local, corporation, fleet and other channels), fleets, EVE mail and notifications, the calendar, and bookmarks. Personal contacts: pilots, corporations, alliances and agents with a standing and a watchlist flag, and a separate block list; adding or editing a contact can notify the other pilot. Contacts show as online or offline, and pilots on a watchlist announce when they log on or off.
 - **Corporations and alliances.**
   - Player corporations: founding, applications and invitations, roles and titles, a bounty tax paid into the corporation wallet, and bulletins, contacts and labels.
   - Seven wallet divisions with ISK transfers between characters and corporations. Offices rented per station, with corporation hangars and rent bills that can be paid automatically.
@@ -50,6 +50,7 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
   - game events for Lua scripts other than the ballpark being bound, and vetoes from scripts
   - in direct trades: items from cargo, from inside a container or from a corporation hangar, the active ship, fitted modules and charges, and PLEX; types that cannot be traded are refused anywhere in an offered container or ship
   - the GM bounty reimbursement and bounty cache calls
+  - labels for personal contacts
 - Some runtime state lives only in memory and is lost when the server restarts:
   - fleets, combat and Crimewatch timers, ship damage, and in-progress hacking; a suspect flag from an activated kill right is the exception and is restored with its original deadline;
   - everything spawned into space (NPCs, wrecks, scheduled effects);
