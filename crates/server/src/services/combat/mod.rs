@@ -21,6 +21,8 @@
 //! loot prices come from `game.retail_prices` and static eligibility is applied before sampling.
 //! Target locks, reloads, module cycles, pulses and missile impacts use system
 //! actor timers. Database-backed effects run on deferred workers outside the actor.
+//! Targeting and weapon range decisions use positions sampled together by the system actor;
+//! wrecks and ejected pilots use the position sampled when their ball is destroyed.
 //! Reload reservations survive interruptions and return to cargo during startup; reload
 //! timers remain memory-only and are not resumed.
 //! Dropped cycle owners release their own in-memory activation markers without notifications.

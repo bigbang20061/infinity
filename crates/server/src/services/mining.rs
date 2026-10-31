@@ -13,6 +13,7 @@
 //! (miningAmount m3, with critical successes and residue waste) from the rock to the
 //! mining hold, or the cargo hold of ships without one, and tells the client
 //! (OnOreMined -> notifications.oreMinedNotificationAdapter, OnItemChange).
+//! Extraction range uses ship and rock positions sampled at the same system-actor time.
 //!
 //! Reprocessing (the station's bound reprocessingSvc) turns items into their
 //! canonical SDE type materials per portion: a station yield of 50%, raised by Reprocessing,
@@ -139,6 +140,7 @@ fn rock_ball(id: i64, type_id: i32, pos: V3, radius: f32) -> Ball {
         speed_fraction: 0.0,
         pos,
         vel: [0.0; 3],
+        old_pos: pos, old_vel: [0.0; 3], segment_target: None, segment_warp: None,
         goto: [0.0; 3],
         follow_id: 0,
         follow_range: 0.0,
@@ -148,6 +150,7 @@ fn rock_ball(id: i64, type_id: i32, pos: V3, radius: f32) -> Ball {
         warp: None,
         warp_factor: 0,
         last_ms: now_ms(),
+        interpolation_anchor_ms: 0,
         effect_stamp: 0,
         cloak: 0,
         cloak_until: 0,
@@ -342,7 +345,7 @@ pub async fn extract(db: &Db, world: &Arc<World>, notify: &NotifyTx, char_id: i6
     let Some(rock) = state().rocks.get(&target).cloned() else { return Ok(false) };
     let Some((gap, pilots)) = world.with(system, move |s| {
         let (me, it) = (s.ball(ship)?, s.ball(target)?);
-        let gap = dist(me.pos, it.pos) - me.radius as f64 - it.radius as f64;
+        let gap = dist(s.sample_position(ship)?, s.sample_position(target)?) - me.radius as f64 - it.radius as f64;
         let pilots: Vec<i64> = s.pilots().filter_map(|b| b.char_id.filter(|c| *c != char_id)).collect();
         Some((gap, pilots))
     }).await.flatten() else { return Ok(false) };

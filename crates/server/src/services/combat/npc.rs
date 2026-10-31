@@ -54,9 +54,13 @@ pub(super) async fn npc_stats(db: &Db, sde: &Sde, type_id: i32) -> Result<NpcSta
 /// Attach a brain to a spawned NPC; its effects run on the system's worker.
 
 
+/// `me` and `victim` are the actor-sampled shot snapshots captured before worker dispatch.
 pub(super) async fn npc_shot(db: &Db, world: &Arc<World>, system: i64, id: i64, type_id: i32, stats: &NpcStats, me: Ball, victim: Ball) -> Result<(), CallError> {
     let ship = victim.id;
     let gap = (dist(me.pos, victim.pos) - me.radius as f64 - victim.radius as f64).max(0.0);
+    let owner_id = me.owner_id;
+    let attacker_char_id = me.char_id;
+    let victim_char_id = victim.char_id;
     if let Some((charge, multiplier)) = &stats.missile {
         let (charge, multiplier) = (*charge, *multiplier);
         let velocity = attr(world.sde(), charge, ATTR_MAX_VELOCITY, NPC_MISSILE_VELOCITY_MPS).max(1.0);
@@ -71,7 +75,7 @@ pub(super) async fn npc_shot(db: &Db, world: &Arc<World>, system: i64, id: i64, 
                 weapon: type_id,
                 attacker: None,
             };
-            launch_missile(db.clone(), world.clone(), system, me.clone(), victim.clone(), me.owner_id, None, missile).await?;
+            launch_missile(db.clone(), world.clone(), system, me, victim, owner_id, None, missile).await?;
         }
     }
     if stats.damage.iter().any(|d| *d > 0.0) && gap <= stats.optimal + stats.falloff * NPC_TURRET_REACH_FALLOFF_MULTIPLIER {
@@ -81,8 +85,8 @@ pub(super) async fn npc_shot(db: &Db, world: &Arc<World>, system: i64, id: i64, 
             world.broadcast(system, id, move |stamp| vec![fire_fx(stamp, id, None, &guid, Some(ship), None, true, duration, 1)]);
         }
         let multiplier = turret_roll(gap, stats.optimal, stats.falloff);
-        let dealt = if multiplier > 0.0 { damage(db, world, system, ship, victim.char_id, stats.damage.map(|d| d * multiplier), None).await? } else { 0.0 };
-        report_hit(world, id, ship, me.char_id, victim.char_id, type_id, dealt, hit_quality(multiplier));
+        let dealt = if multiplier > 0.0 { damage(db, world, system, ship, victim_char_id, stats.damage.map(|d| d * multiplier), None).await? } else { 0.0 };
+        report_hit(world, id, ship, attacker_char_id, victim_char_id, type_id, dealt, hit_quality(multiplier));
     }
     Ok(())
 }

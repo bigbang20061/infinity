@@ -19,6 +19,7 @@
 //! Scan completion, probe recovery and site respawns use transient system actor timers;
 //! pending timers do not survive a restart.
 //! Probe charges are consumed atomically before transient probes are created.
+//! Probe origins, directional scans and wormhole range use actor-time sampled positions.
 //!
 //! Client scan consumers: `eve/client/script/parklife/scanSvc.py:193-198,253-260`,
 //! `eve/client/script/parklife/directionalScanSvc.py:46-49`, and
@@ -402,7 +403,7 @@ pub async fn launch_probes(c: &mut Client, call: &Call<'_>) -> CallResult {
     let base = attrs.attribute(type_id, ATTR_BASE_SENSOR_STRENGTH).unwrap_or(40.0);
     let lifetime_ms = attrs.attribute(type_id, ATTR_EXPLOSION_DELAY).unwrap_or(3_600_000.0);
     let (skill, _) = probe_skills(&c.db, char_id).await?;
-    let pos = c.world.ball(system, ship).await.map(|b| b.pos).unwrap_or([0.0; 3]);
+    let pos = c.world.with(system, move |s| s.sample_position(ship)).await.flatten().unwrap_or([0.0; 3]);
     let expiry = filetime_now() + (lifetime_ms * 10_000.0) as i64;
     enum Launch { Probes }
     let user_id = c.login.user_id;

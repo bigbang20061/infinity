@@ -7,8 +7,9 @@ fn ball(id: i64, pilot: Option<i64>, x: f64) -> Ball {
         char_id: pilot, signature_radius: pilot.map(|_| 1.0), mode: MODE_STOP, radius: 1.0, mass: 1e6,
         max_vel: 0.0, agility: 1.0, speed_fraction: 0.0,
         pos: [x, 0.0, 0.0], vel: [0.0; 3], goto: [0.0; 3],
+        old_pos: [x, 0.0, 0.0], old_vel: [0.0; 3], segment_target: None, segment_warp: None,
         follow_id: 0, follow_range: 0.0, free: true, global: false,
-        massive: true, warp: None, warp_factor: 0, last_ms: 0, effect_stamp: 0,
+        massive: true, warp: None, warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0,
         cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0,
         slim: Vec::new(),
     }
@@ -156,6 +157,50 @@ fn failed_lock_reacquires_and_ignores_stale_completion() {
     assert!(s.brains[&1000].announced);
     assert_eq!(notifications.try_recv().unwrap().1[0].as_bytes(), Some(b"otheradd".as_slice()));
     assert!(matches!(jobs.try_recv().unwrap(), EffectJob::Npc { action: NpcAction::Shot { .. }, .. }));
+}
+
+#[test]
+fn sampled_acquisition_nearest_loss_and_shot_capture() {
+    let (mut s, mut jobs, _) = setup(Some(HOSTILE_TO_ALL));
+    let mut moving = ball(1, Some(10), 50.0);
+    moving.vel = [1000.0, 0.0, 0.0];
+    s.insert(moving);
+    s.insert(ball(2, Some(11), 60.0));
+    s.tick(1000);
+    assert!(s.ball(1).unwrap().pos[0] > 200.0);
+    assert_eq!(s.sample_position(1).unwrap()[0], 50.0);
+    let (ship, pilot, deadline) = s.brains[&1000].target.unwrap();
+    assert_eq!(ship, 1);
+
+    s.complete_npc_lock(1000, ship, pilot, deadline);
+    assert!(s.brains[&1000].announced);
+    s.brains.get_mut(&1000).unwrap().next_think_ms = 1500;
+    s.tick(1500);
+    assert!(s.sample_position(1).unwrap()[0] > 200.0);
+    assert_eq!(s.brains[&1000].target.unwrap().0, 2);
+    let EffectJob::Npc { action: NpcAction::Shot { me, victim }, .. } = jobs.try_recv().unwrap() else {
+        panic!("expected captured shot");
+    };
+    assert_eq!(me.pos, [0.0, 0.0, 0.0]);
+    assert_eq!(victim.pos, [50.0, 0.0, 0.0]);
+    assert_ne!(victim.pos, s.sample_position(1).unwrap());
+}
+
+#[test]
+fn lock_rejects_sampled_out_of_range_even_when_endpoint_is_inside() {
+    let (mut s, mut jobs, _) = setup(Some(HOSTILE_TO_ALL));
+    let mut moving = ball(1, Some(10), 250.0);
+    moving.vel = [-200.0, 0.0, 0.0];
+    s.insert(moving);
+    s.brains.get_mut(&1000).unwrap().next_think_ms = 2000;
+    s.tick(1000);
+    assert!(s.ball(1).unwrap().pos[0] < 200.0);
+    assert_eq!(s.sample_position(1).unwrap()[0], 250.0);
+    s.brains.get_mut(&1000).unwrap().target = Some((1, 10, 1000));
+    s.complete_npc_lock(1000, 1, 10, 1000);
+    assert!(s.brains[&1000].target.is_none());
+    assert!(!s.brains[&1000].announced);
+    assert!(jobs.try_recv().is_err());
 }
 
 #[tokio::test]

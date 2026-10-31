@@ -209,7 +209,7 @@ pub(super) fn report_hit(world: &World, shooter: i64, target: i64, shooter_pilot
 /// One turret shot at `target`, with the fitted module's and its charge's effective attributes.
 pub(super) async fn fire_turret(cx: &Ctx, fit: &Fit, module: &Module, target: i64) -> Result<(), CallError> {
     let ship_id = cx.ship_id;
-    let Some((ship, t)) = cx.world.with(cx.system_id, move |s| Some((s.ball(ship_id)?.clone(), s.ball(target)?.clone()))).await.flatten() else { return Ok(()) };
+    let Some((ship, t)) = cx.world.with(cx.system_id, move |s| Some((s.sampled_ball(ship_id)?, s.sampled_ball(target)?))).await.flatten() else { return Ok(()) };
     let (m, ch) = (Key::Module(module.id), Key::Charge(module.id));
     let gap = (dist(ship.pos, t.pos) - t.radius as f64 - ship.radius as f64).max(0.0);
     let multiplier = turret_roll(gap, fit.value(m, ATTR_MAX_RANGE), fit.value(m, ATTR_FALLOFF));
@@ -233,8 +233,8 @@ pub(super) struct Missile {
 }
 
 
-/// Launch a missile ball from `from` at `target`: it flies client-side; on impact it
-/// explodes and deals damage scaled by explosion radius vs. the target's signature.
+/// Launch from the actor-sampled source and target captured together: it flies client-side;
+/// on impact it explodes and deals damage scaled by explosion radius vs. the target's signature.
 pub(super) async fn launch_missile(db: Db, world: Arc<World>, system: i64, from: Ball, target: Ball, owner: i64, module: Option<i64>, m: Missile) -> Result<(), CallError> {
     let size = world.sde().types.get(m.charge)
         .ok_or_else(|| CallError::Internal(anyhow::anyhow!("unknown type {}", m.charge)))?;
@@ -257,6 +257,7 @@ pub(super) async fn launch_missile(db: Db, world: Arc<World>, system: i64, from:
         speed_fraction: 0.0,
         pos: from.pos,
         vel: [0.0; 3],
+        old_pos: from.pos, old_vel: [0.0; 3], segment_target: None, segment_warp: None,
         goto: target.pos,
         follow_id: 0,
         follow_range: 0.0,
@@ -266,6 +267,7 @@ pub(super) async fn launch_missile(db: Db, world: Arc<World>, system: i64, from:
         warp: None,
         warp_factor: 0,
         last_ms: launch_ms,
+        interpolation_anchor_ms: launch_ms,
         effect_stamp: 0,
         cloak: 0,
         cloak_until: 0,
@@ -302,7 +304,7 @@ pub(super) async fn launch_missile(db: Db, world: Arc<World>, system: i64, from:
 
 pub(super) async fn fire_missile(cx: &Ctx, fit: &Fit, module: &Module, charge: i32, target: i64) -> Result<(), CallError> {
     let ship_id = cx.ship_id;
-    let Some((ship, t)) = cx.world.with(cx.system_id, move |s| Some((s.ball(ship_id)?.clone(), s.ball(target)?.clone()))).await.flatten() else { return Ok(()) };
+    let Some((ship, t)) = cx.world.with(cx.system_id, move |s| Some((s.sampled_ball(ship_id)?, s.sampled_ball(target)?))).await.flatten() else { return Ok(()) };
     let ch = Key::Charge(module.id);
     let velocity = fit.value(ch, ATTR_MAX_VELOCITY).max(1.0);
     let missile = Missile {
@@ -605,7 +607,7 @@ pub(super) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
         }
         let ship_id = cx.ship_id;
         let gap = cx.world.with(cx.system_id, move |s| {
-            s.ball(ship_id).zip(s.ball(t)).map(|(a, b)| dist(a.pos, b.pos) - a.radius as f64 - b.radius as f64)
+            s.ball(ship_id).zip(s.ball(t)).map(|(a, b)| dist(a.position_at(s.now_ms()), b.position_at(s.now_ms())) - a.radius as f64 - b.radius as f64)
         }).await.flatten();
         let fit = Fit::load(&cx.db, cx.world.sde().clone(), cx.char_id, cx.ship_id).await?;
         let range = fit.value(Key::Module(item_id), ATTR_MAX_RANGE);

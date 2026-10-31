@@ -15,7 +15,7 @@ pub(super) fn targets_of(char_id: i64) -> Vec<i64> {
 pub(super) async fn add_target(c: &mut Client, target: i64) -> CallResult {
     let Some(cx) = ctx(c) else { return Err(user_error(messages::MSG_TARGETING_ATTEMPT_CANCELLED, vec![])) };
     let ship_id = cx.ship_id;
-    let Some((ship, t)) = cx.world.with(cx.system_id, move |s| Some((s.ball(ship_id)?.clone(), s.ball(target)?.clone()))).await.flatten() else {
+    let Some((ship, t)) = cx.world.with(cx.system_id, move |s| Some((s.sampled_ball(ship_id)?, s.sampled_ball(target)?))).await.flatten() else {
         return Err(user_error(messages::MSG_TARGETING_ATTEMPT_CANCELLED, vec![]));
     };
     let fit = Fit::load(&cx.db, cx.world.sde().clone(), cx.char_id, cx.ship_id).await?;

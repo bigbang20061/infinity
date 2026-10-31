@@ -38,8 +38,9 @@ fn propulsion_and_missile_commands_wait_for_boundary_and_use_enqueue_stamp() {
         char_id: None, signature_radius: None, mode: crate::space::MODE_STOP,
         radius: 1.0, mass: 1.0, max_vel: 1.0, agility: 1.0, speed_fraction: 0.0,
         pos: [0.0; 3], vel: [0.0; 3], goto: [0.0; 3], follow_id: 0,
+        old_pos: [0.0; 3], old_vel: [0.0; 3], segment_target: None, segment_warp: None,
         follow_range: 0.0, free: true, global: false, massive: false,
-        warp: None, warp_factor: 0, last_ms: 0, effect_stamp: 0, cloak: 0,
+        warp: None, warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0, cloak: 0,
         cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new(),
     };
     system.insert(ball.clone());
@@ -74,8 +75,9 @@ fn missile_lifecycle_preserves_exploration_site() {
         char_id: None, signature_radius: None, mode: crate::space::MODE_STOP, radius: 1.0, mass: 1.0,
         max_vel: 1.0, agility: 1.0, speed_fraction: 0.0,
         pos: [1.0, 2.0, 3.0], vel: [0.0; 3], goto: [0.0; 3],
+        old_pos: [1.0, 2.0, 3.0], old_vel: [0.0; 3], segment_target: None, segment_warp: None,
         follow_id: 0, follow_range: 0.0, free: true, global: false,
-        massive: true, warp: None, warp_factor: 0, last_ms: 0, effect_stamp: 0,
+        massive: true, warp: None, warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0,
         cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new(),
     };
     let (site_id, site_type, site_pos) = (site.id, site.type_id, site.pos);
@@ -252,8 +254,9 @@ fn reload_reservation_survives_departure_and_preserves_new_marker() {
         char_id: Some(1), signature_radius: Some(1.0), mode: crate::space::MODE_STOP, radius: 1.0, mass: 1.0,
         max_vel: 1.0, agility: 1.0, speed_fraction: 0.0,
         pos: [0.0; 3], vel: [0.0; 3], goto: [0.0; 3],
+        old_pos: [0.0; 3], old_vel: [0.0; 3], segment_target: None, segment_warp: None,
         follow_id: 0, follow_range: 0.0, free: true, global: false,
-        massive: true, warp: None, warp_factor: 0, last_ms: 0, effect_stamp: 0,
+        massive: true, warp: None, warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0,
         cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new(),
     });
     let result = Arc::new(Mutex::new(None));

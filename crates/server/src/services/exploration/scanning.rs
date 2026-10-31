@@ -288,7 +288,7 @@ pub(super) async fn cone_scan(c: &mut Client, call: &Call<'_>) -> CallResult {
     let (angle, range, dir) = (n(0), n(1), [n(2), n(3), n(4)]);
     let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) else { return Ok(Value::list([])) };
     let Some(hits) = c.world.with(system, move |s| {
-        let me = s.ball(ship)?;
+        let me = s.sample_position(ship)?;
         let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt().max(CONE_DIRECTION_MIN_LENGTH);
         let half = (angle / CONE_HALF_ANGLE_DIVISOR).min(std::f64::consts::PI);
         let mut hits = vec![];
@@ -296,8 +296,9 @@ pub(super) async fn cone_scan(c: &mut Client, call: &Call<'_>) -> CallResult {
             if b.id == ship || b.cloak != 0 {
                 continue;
             }
-            let v = [b.pos[0] - me.pos[0], b.pos[1] - me.pos[1], b.pos[2] - me.pos[2]];
-            let d = dist(b.pos, me.pos);
+            let pos = b.position_at(s.now_ms());
+            let v = [pos[0] - me[0], pos[1] - me[1], pos[2] - me[2]];
+            let d = dist(pos, me);
             if d > range || d < 1.0 {
                 continue;
             }

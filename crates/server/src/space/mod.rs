@@ -10,6 +10,10 @@
 //! native constants. The server integrates movement with exponential velocity
 //! approach (tau = mass * agility / 1e6) and warp phases; this is not a claim of
 //! complete client simulation parity.
+//! Completed-segment samples reuse the movement calculation corresponding to
+//! destiny `Ball.cpp` CalculateBallPositionVelocity and retain the old/new
+//! state described by `Ballpark.cpp`'s old/new swap.
+//! Interpolation uses the wall-clock segment anchor independently of logical integration time.
 //!
 //! Celestials come from the SDE; dynamic balls stay in memory. Each system
 //! owns an actor with 100 ms timers and NPC decisions. Destiny actions retain the
@@ -175,6 +179,11 @@ pub struct Ball {
     pub speed_fraction: f32,
     pub pos: V3,
     pub vel: V3,
+    /// Start state and frozen inputs of the last completed movement segment.
+    pub old_pos: V3,
+    pub old_vel: V3,
+    pub segment_target: Option<V3>,
+    pub segment_warp: Option<Warp>,
     pub goto: V3,
     pub follow_id: i64,
     pub follow_range: f32,
@@ -185,6 +194,9 @@ pub struct Ball {
     pub warp_factor: i64,
     /// Last integration time in logical destiny milliseconds.
     pub last_ms: i64,
+    /// Wall-clock segment anchor, separate from logical `last_ms`; native Ball.h
+    /// lines 181-182 retain the old/new interpolation times.
+    pub interpolation_anchor_ms: i64,
     /// carbonengine destiny AddBall, LaunchMissile and RealWarp effect stamp, in destiny ticks;
     /// independent of integration milliseconds.
     pub effect_stamp: i64,
@@ -200,7 +212,30 @@ pub struct Ball {
     pub slim: Vec<(&'static str, Value)>,
 }
 
+fn calculate_position_velocity(pos: V3, vel: V3, target: V3, tau: f64, dt: f64) -> (V3, V3) {
+    let decay = (-dt / tau).exp();
+    let delta = sub(vel, target);
+    (add(pos, add(scale(target, dt), scale(delta, tau * -(-dt / tau).exp_m1()))),
+        add(target, scale(delta, decay)))
+}
+
 impl Ball {
+    /// Stateless view of the most recently completed logical movement segment.
+    pub fn position_at(&self, t_ms: i64) -> V3 {
+        if self.segment_target.is_none() && self.segment_warp.is_none() { return self.pos; }
+        let elapsed = t_ms.saturating_sub(self.interpolation_anchor_ms).clamp(0, MILLISECONDS_PER_SECOND);
+        if elapsed == 0 { return self.old_pos; }
+        if elapsed == MILLISECONDS_PER_SECOND { return self.pos; }
+        if let Some(w) = &self.segment_warp {
+            let sample_ms = self.last_ms.saturating_sub(MILLISECONDS_PER_SECOND).saturating_add(elapsed);
+            let fraction = (sample_ms.saturating_sub(w.start) as f64 / w.duration.max(1.0)).clamp(0.0, 1.0);
+            return add(w.from, scale(sub(w.to, w.from), fraction));
+        }
+        let tau = (self.mass * self.agility as f64 / MASS_AGILITY_SCALE).max(MIN_MOVEMENT_TAU_SECONDS);
+        calculate_position_velocity(self.old_pos, self.old_vel, self.segment_target.unwrap(), tau,
+            ms_to_seconds(elapsed as f64)).0
+    }
+
     fn flags(&self) -> u8 {
         (if self.free { FLAG_FREE } else { 0 })
             | (if self.global { FLAG_GLOBAL } else { 0 })
@@ -298,13 +333,18 @@ impl Ball {
     }
 
     /// Exact integration for a constant target velocity over elapsed milliseconds.
-    fn evolve(&mut self, ms: i64, others: &HashMap<i64, V3>) {
+    fn evolve(&mut self, ms: i64, interpolation_anchor_ms: i64, others: &HashMap<i64, V3>) {
         // Missile launch time is also the stream's effectStamp.
         if self.mode == MODE_MISSILE { return; }
         if !self.free || ms <= self.last_ms {
             self.last_ms = self.last_ms.max(ms);
             return;
         }
+        self.interpolation_anchor_ms = interpolation_anchor_ms;
+        self.old_pos = self.pos;
+        self.old_vel = self.vel;
+        self.segment_target = None;
+        self.segment_warp = self.warp.clone();
         if let Some(w) = &self.warp {
             let elapsed = (ms - w.start) as f64;
             if elapsed >= w.duration {
@@ -331,10 +371,8 @@ impl Ball {
             }).unwrap_or_default(),
             _ => V3::default(),
         };
-        let decay = (-dt / tau).exp();
-        let delta = sub(self.vel, target);
-        self.pos = add(self.pos, add(scale(target, dt), scale(delta, tau * -(-dt / tau).exp_m1())));
-        self.vel = add(target, scale(delta, decay));
+        self.segment_target = Some(target);
+        (self.pos, self.vel) = calculate_position_velocity(self.pos, self.vel, target, tau, dt);
         self.last_ms = ms;
     }
 }
@@ -539,6 +577,10 @@ impl World {
                     speed_fraction: 0.0,
                     pos,
                     vel: V3::default(),
+                    old_pos: pos,
+                    old_vel: V3::default(),
+                    segment_target: None,
+                    segment_warp: None,
                     goto: V3::default(),
                     follow_id: 0,
                     follow_range: 0.0,
@@ -548,6 +590,7 @@ impl World {
                     warp: None,
                     warp_factor: 0,
                     last_ms: tick,
+                    interpolation_anchor_ms: tick,
                     effect_stamp: 0,
                     cloak: 0,
                     cloak_until: 0,

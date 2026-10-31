@@ -1,6 +1,7 @@
 //! Undocking, flying and docking: the `ship` service (bound per location) and
 //! the `beyonce` remote ballpark (bound per solar system).
 //! Movement commands apply at destiny boundaries; jump waits and arrival cloak expiry use the actor tick.
+//! Gate range and live warp targets use positions sampled at the system actor's time.
 //! Local-chat invites use an outside-space delay for session settlement.
 //! Uses ship attributes and celestial data from the SDE and persists locations in game tables.
 //! Ship loss commits before its independently best-effort killmail and insurance operations.
@@ -92,6 +93,7 @@ pub(super) async fn ship_ball(c: &Client, ship_id: i64, pos: [f64; 3]) -> Result
         speed_fraction: 0.0,
         pos,
         vel: [0.0; 3],
+        old_pos: pos, old_vel: [0.0; 3], segment_target: None, segment_warp: None,
         goto: [0.0; 3],
         follow_id: 0,
         follow_range: 0.0,
@@ -101,6 +103,7 @@ pub(super) async fn ship_ball(c: &Client, ship_id: i64, pos: [f64; 3]) -> Result
         warp: None,
         warp_factor: ((warp_mult * base_warp * 1000.0).round() as i64).max(500),
         last_ms: now_ms(),
+        interpolation_anchor_ms: 0,
         effect_stamp: 0,
         cloak: 0,
         cloak_until: 0,
@@ -194,11 +197,12 @@ async fn stargate_jump(c: &mut Client, from_gate: i64, to_gate: i64) -> CallResu
     let dest_system: i64 = dest.dest_solar_system_id;
 
     // In range of the gate?
-    let gap = c.world.ball(system, ship).await.zip(c.world.ball(system, from_gate).await).map(|(b, gate)| {
-        ((b.pos[0] - gate.pos[0]).powi(2) + (b.pos[1] - gate.pos[1]).powi(2) + (b.pos[2] - gate.pos[2]).powi(2)).sqrt()
+    let gap = c.world.with(system, move |s| {
+        let (b, gate) = (s.ball(ship)?, s.ball(from_gate)?);
+        Some(space::dist(b.position_at(s.now_ms()), gate.position_at(s.now_ms()))
             - gate.radius as f64
-            - b.radius as f64
-    });
+            - b.radius as f64)
+    }).await.flatten();
     if gap.is_none_or(|g| g > JUMP_RANGE) {
         return Err(CallError::User { msg: messages::MSG_NOT_CLOSE_ENOUGH_TO_JUMP.into(), dict: vec![("maxdist".into(), Value::Int(JUMP_RANGE as i64))] });
     }

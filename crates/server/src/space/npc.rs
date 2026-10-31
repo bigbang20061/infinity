@@ -2,6 +2,8 @@
 //! destiny Orbit/Stop events. Combat attributes are loaded by services from SDE;
 //! Weapon and repair effects use a sequential worker; deferred jobs run concurrently.
 //! Neither runs inside the actor.
+//! Targeting uses positions sampled at the actor's clock; shot jobs capture those
+//! positions before the effects worker runs.
 //! Brains and groups are transient; persistent NPC simulation is not supported.
 use super::*;
 use std::collections::HashSet;
@@ -169,10 +171,10 @@ impl System {
     }
     fn think_npc(&mut self, id: i64, brain: &mut NpcBrain) {
         let Some(me) = self.ball(id) else { return };
-        let pos = me.pos;
+        let pos = me.position_at(self.ms);
         let current = brain.target.and_then(|(ship, _, _)| self.ball(ship))
             .filter(|b| b.cloak == 0 && b.mode != MODE_WARP && b.signature_radius.is_some()
-                && len(sub(b.pos, pos)) < brain.config.aggro_range * NPC_TARGET_LOSS_RANGE_FACTOR);
+                && len(sub(b.position_at(self.ms), pos)) < brain.config.aggro_range * NPC_TARGET_LOSS_RANGE_FACTOR);
         let victim_id = current.map(|b| b.id);
         let (shield, armor, cycle) = brain.config.repairs;
         if (shield > 0.0 || armor > 0.0) && self.ms >= brain.next_repair_ms {
@@ -183,9 +185,11 @@ impl System {
             self.lose_npc_target(id, brain);
             let nearest = self.pilots().filter(|b| b.char_id.is_some_and(|pilot|
                 brain.owner == Some(HOSTILE_TO_ALL) || brain.owner == Some(pilot) || brain.aggressors.contains(&pilot))
-                && b.signature_radius.is_some() && b.cloak == 0 && b.mode != MODE_WARP && len(sub(b.pos, pos)) <= brain.config.aggro_range)
-                .min_by(|a, b| len(sub(a.pos, pos)).total_cmp(&len(sub(b.pos, pos))))
-                .map(|b| (b.id, b.char_id.unwrap(), b.signature_radius.unwrap()));
+                && b.signature_radius.is_some() && b.cloak == 0 && b.mode != MODE_WARP)
+                .map(|b| (b, len(sub(b.position_at(self.ms), pos))))
+                .filter(|(_, distance)| *distance <= brain.config.aggro_range)
+                .min_by(|(_, a), (_, b)| a.total_cmp(b))
+                .map(|(b, _)| (b.id, b.char_id.unwrap(), b.signature_radius.unwrap()));
             if let Some((ship, pilot, signature)) = nearest {
                 let orbit = brain.config.fly_range;
                 self.command(id, move |b, stamp, _| {
@@ -206,7 +210,7 @@ impl System {
         }
         let (ship, _, _) = brain.target.unwrap();
         if brain.announced && self.ms >= brain.next_shot_ms {
-            self.npc_effect(brain, NpcAction::Shot { me: self.ball(id).unwrap().clone(), victim: self.ball(ship).unwrap().clone() });
+            self.npc_effect(brain, NpcAction::Shot { me: self.sampled_ball(id).unwrap(), victim: self.sampled_ball(ship).unwrap() });
             brain.next_shot_ms = self.ms + brain.config.rate_of_fire_ms as i64;
         }
     }
@@ -216,11 +220,11 @@ impl System {
         let valid = current && self.ball(id).zip(self.ball(ship)).is_some_and(|(me, victim)|
                 victim.char_id == Some(pilot) && victim.signature_radius.is_some()
                 && victim.cloak == 0 && victim.mode != MODE_WARP
-                && len(sub(victim.pos, me.pos)) < brain.config.aggro_range * NPC_TARGET_LOSS_RANGE_FACTOR);
+                && len(sub(victim.position_at(self.ms), me.position_at(self.ms))) < brain.config.aggro_range * NPC_TARGET_LOSS_RANGE_FACTOR);
         if valid {
             self.notify_pilot(pilot, "OnTarget", vec![Value::str("otheradd"), Value::Int(id)]);
             brain.announced = true;
-            self.npc_effect(&brain, NpcAction::Shot { me: self.ball(id).unwrap().clone(), victim: self.ball(ship).unwrap().clone() });
+            self.npc_effect(&brain, NpcAction::Shot { me: self.sampled_ball(id).unwrap(), victim: self.sampled_ball(ship).unwrap() });
             brain.next_shot_ms = self.ms + brain.config.rate_of_fire_ms as i64;
         } else if current {
             self.lose_npc_target(id, &mut brain);

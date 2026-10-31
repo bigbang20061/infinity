@@ -31,8 +31,9 @@ fn ship(velocity: V3) -> Ball {
         char_id: None, mode: MODE_STOP, radius: 10.0, signature_radius: None,
         mass: 1_000_000.0, max_vel: 200.0, agility: 1.0, speed_fraction: 1.0,
         pos: [0.0; 3], vel: velocity, goto: [0.0; 3], follow_id: 0,
+        old_pos: [0.0; 3], old_vel: velocity, segment_target: None, segment_warp: None,
         follow_range: 0.0, free: true, global: false, massive: true,
-        warp: None, warp_factor: 0, last_ms: 0, effect_stamp: 0,
+        warp: None, warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0,
         cloak: 0, cloak_until: 0, health: [1.0; DAMAGE_LAYER_COUNT],
         launcher: 0, slim: vec![],
     }
@@ -61,18 +62,20 @@ fn fixture(scenario: &Scenario) -> BTreeMap<i64, serde_json::Value> {
     rows
 }
 
+fn start_direction(system: &mut System) {
+    system.command(1, |ball, _, _| {
+        ball.mode = MODE_GOTO;
+        ball.goto = [1.0, 0.0, 0.0];
+        vec![]
+    });
+}
+
 fn replay(scenario: &Scenario, streams: bool) {
     let rows = fixture(scenario);
     let mut system = System::default();
     system.insert(ship(scenario.velocity));
     for tick in 0..=120 {
-        if tick == 1 {
-            system.command(1, |ball, _, _| {
-                ball.mode = MODE_GOTO;
-                ball.goto = [1.0, 0.0, 0.0];
-                vec![]
-            });
-        }
+        if tick == 1 { start_direction(&mut system); }
         if tick > 0 { system.tick(tick * 1000); }
         let id = 1;
         let ball = system.ball(id).expect("replay ball missing");
@@ -107,3 +110,48 @@ fn replay(scenario: &Scenario, streams: bool) {
 #[test] fn goto_stream() { replay(&GOTO, true); }
 #[test] fn align_trajectory() { replay(&ALIGN, false); }
 #[test] fn align_stream() { replay(&ALIGN, true); }
+
+fn replay_fractions(scenario: &Scenario, fixture: &str) {
+    let mut lines = fixture.lines();
+    assert_eq!(lines.next(), Some(format!("# {}-fractions: carbonengine destiny reference interpolation", scenario.name).as_str()), "{}: invalid fraction fixture header", scenario.name);
+    let mut system = System::default();
+    system.insert(ship(scenario.velocity));
+    start_direction(&mut system);
+    let fractions = [(0.0, 0), (0.1, 100), (0.5, 500), (0.9, 900), (1.0, 1000)];
+    for tick in 1..=120 {
+        let row: serde_json::Value = serde_json::from_str(lines.next().expect("missing fraction fixture row")).expect("invalid fraction fixture JSON");
+        assert_eq!(row["tick"].as_i64(), Some(tick), "{}: invalid fraction tick", scenario.name);
+        assert_eq!(row["id"].as_i64(), Some(1), "{} tick {tick}: invalid ball id", scenario.name);
+        let samples = row["samples"].as_array().expect("missing fraction samples");
+        assert_eq!(samples.len(), fractions.len(), "{} tick {tick}: invalid sample count", scenario.name);
+        let previous = system.ball(1).expect("replay ball missing").clone();
+        system.tick(tick * 1000);
+        let ball = system.ball(1).expect("replay ball missing");
+        assert_eq!(ball.old_pos, previous.pos, "{} tick {tick}: segment start position", scenario.name);
+        assert_eq!(ball.old_vel, previous.vel, "{} tick {tick}: segment start velocity", scenario.name);
+        for (sample, (fraction, offset)) in samples.iter().zip(fractions) {
+            assert_eq!(sample["fraction"].as_f64(), Some(fraction), "{} tick {tick}: invalid fraction order", scenario.name);
+            let position = sample["pos"].as_array().expect("missing fraction position");
+            let velocity = sample["vel"].as_array().expect("missing fraction velocity");
+            assert_eq!(position.len(), 3, "{} tick {tick}: invalid position length", scenario.name);
+            assert_eq!(velocity.len(), 3, "{} tick {tick}: invalid velocity length", scenario.name);
+            let expected: V3 = std::array::from_fn(|i| position[i].as_f64().filter(|v| v.is_finite()).expect("invalid position component"));
+            for component in velocity {
+                assert!(component.as_f64().is_some_and(f64::is_finite), "{} tick {tick}: invalid velocity component", scenario.name);
+            }
+            let actual = ball.position_at(tick * 1000 + offset);
+            for i in 0..3 {
+                let tolerance = 1e-3_f64.max(1e-6 * expected[i].abs());
+                assert!((actual[i] - expected[i]).abs() <= tolerance, "{} tick {tick} fraction {fraction} ball 1: position actual {:?}, expected {:?}", scenario.name, actual, expected);
+            }
+        }
+    }
+    assert!(lines.next().is_none(), "{}: unexpected fraction fixture rows", scenario.name);
+}
+
+#[test] fn goto_fractions() {
+    replay_fractions(&GOTO, include_str!("fixtures/goto-direction-rest-fractions.jsonl"));
+}
+#[test] fn align_fractions() {
+    replay_fractions(&ALIGN, include_str!("fixtures/align-direction-velocity-fractions.jsonl"));
+}

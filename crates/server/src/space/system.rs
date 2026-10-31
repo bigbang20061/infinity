@@ -81,6 +81,20 @@ impl System {
         self.balls.get(&id)
     }
 
+    /// Sample the completed segment at the actor's shared millisecond clock.
+    pub fn sample_position(&self, id: i64) -> Option<V3> {
+        self.ball(id).map(|ball| ball.position_at(self.ms))
+    }
+
+    /// Clone only the requested ball and materialize its sampled position.
+    pub fn sampled_ball(&self, id: i64) -> Option<Ball> {
+        self.ball(id).map(|ball| {
+            let mut sampled = ball.clone();
+            sampled.pos = ball.position_at(self.ms);
+            sampled
+        })
+    }
+
     pub fn balls(&self) -> impl Iterator<Item = &Ball> {
         self.balls.values()
     }
@@ -99,6 +113,11 @@ impl System {
 
     pub fn insert(&mut self, mut ball: Ball) {
         ball.last_ms = self.current_time * MILLISECONDS_PER_SECOND;
+        ball.interpolation_anchor_ms = self.ms;
+        ball.old_pos = ball.pos;
+        ball.old_vel = ball.vel;
+        ball.segment_target = None;
+        ball.segment_warp = None;
         self.take(ball.id);
         if let Some(char_id) = ball.char_id {
             self.pilots.insert(char_id, ball.id);
@@ -155,7 +174,7 @@ impl System {
             due
         };
         if !self.is_cold() { self.pending = Some(HashMap::new()); }
-        for _ in 0..steps {
+        for step in 0..steps {
             let count = self.actions.len();
             for _ in 0..count {
                 let (stamp, action) = self.actions.pop_front().unwrap();
@@ -166,7 +185,9 @@ impl System {
                 self.positions.clear();
                 self.positions.extend(self.balls.iter().map(|(&id, b)| (id, b.pos)));
                 let logical_ms = (self.current_time + 1) * MILLISECONDS_PER_SECOND;
-                for b in self.balls.values_mut() { b.evolve(logical_ms, &self.positions); }
+                let anchor_ms = if due > MAX_CATCHUP_STEPS { ms }
+                    else { next_tick_ms + step * MILLISECONDS_PER_SECOND };
+                for b in self.balls.values_mut() { b.evolve(logical_ms, anchor_ms, &self.positions); }
             }
             self.current_time += 1;
         }
@@ -227,6 +248,7 @@ impl System {
         self.actions.push_back((self.current_time, Box::new(move |s, stamp| {
             let Some(ball) = s.balls.get_mut(&id) else { return };
             ball.last_ms = s.current_time * MILLISECONDS_PER_SECOND;
+            ball.interpolation_anchor_ms = s.ms;
             ball.mode = MODE_MISSILE;
             ball.speed_fraction = 1.0;
             ball.follow_id = target;
@@ -252,7 +274,8 @@ impl System {
         Some(b)
     }
     pub fn destroy_ball(&mut self, id: i64) -> Option<Ball> {
-        let b = self.take(id)?;
+        let mut b = self.take(id)?;
+        b.pos = b.position_at(self.ms);
         let stamp = self.current_time;
         let visibility = (b.id, b.cloak);
         let events = vec![
@@ -336,6 +359,11 @@ impl System {
             let Some(mut ball) = s.balls.remove(&ship) else { return };
             ball.last_ms = s.current_time * MILLISECONDS_PER_SECOND;
             let events = f(&mut ball, stamp, s);
+            ball.interpolation_anchor_ms = s.ms;
+            ball.old_pos = ball.pos;
+            ball.old_vel = ball.vel;
+            ball.segment_target = None;
+            ball.segment_warp = None;
             let visibility = (ball.id, ball.cloak);
             s.balls.insert(ship, ball);
             if !events.is_empty() { s.deliver(Some(visibility), events); }

@@ -103,6 +103,7 @@ pub(super) async fn spawn_rats(c: &mut Client, system: i64, center: V3, faction:
         let Some(r) = pick(&candidates) else { continue };
         let d = spread.0 + rand01() * (spread.1 - spread.0);
         let v = rand_dir();
+        let pos = [center[0] + v[0] * d, center[1] + v[1] * d * 0.3, center[2] + v[2] * d];
         let ball = Ball {
             id: crate::services::missions::NEXT_NPC_ID.fetch_add(1, Ordering::Relaxed),
             type_id: r.type_id,
@@ -117,8 +118,10 @@ pub(super) async fn spawn_rats(c: &mut Client, system: i64, center: V3, faction:
             max_vel: r.attribute(ATTR_MAX_VELOCITY).unwrap_or(300.0) as f32,
             agility: r.attribute(ATTR_AGILITY).unwrap_or(3.0) as f32,
             speed_fraction: 0.0,
-            pos: [center[0] + v[0] * d, center[1] + v[1] * d * 0.3, center[2] + v[2] * d],
+            pos,
             vel: [0.0; 3],
+            old_pos: pos,
+            old_vel: [0.0; 3], segment_target: None, segment_warp: None,
             goto: [0.0; 3],
             follow_id: 0,
             follow_range: 0.0,
@@ -128,6 +131,7 @@ pub(super) async fn spawn_rats(c: &mut Client, system: i64, center: V3, faction:
             warp: None,
             warp_factor: 0,
             last_ms: ms,
+            interpolation_anchor_ms: ms,
             effect_stamp: 0,
             cloak: 0,
             cloak_until: 0,
@@ -254,6 +258,7 @@ pub(super) fn wormhole_ball(s: &Site, w: &Wormhole) -> Ball {
         speed_fraction: 0.0,
         pos: s.pos,
         vel: [0.0; 3],
+        old_pos: s.pos, old_vel: [0.0; 3], segment_target: None, segment_warp: None,
         goto: [0.0; 3],
         follow_id: 0,
         follow_range: 0.0,
@@ -263,6 +268,7 @@ pub(super) fn wormhole_ball(s: &Site, w: &Wormhole) -> Ball {
         warp: None,
         warp_factor: 0,
         last_ms: now_ms(),
+        interpolation_anchor_ms: 0,
         effect_stamp: 0,
         cloak: 0,
         cloak_until: 0,
@@ -314,7 +320,7 @@ pub(super) async fn wormhole_jump(c: &mut Client, wormhole_id: i64) -> CallResul
     };
     let Some((gap, mass)) = c.world.with(system, move |s| {
         let (me, hole) = (s.ball(ship)?, s.ball(wormhole_id)?);
-        Some((dist(me.pos, hole.pos) - hole.radius as f64 - me.radius as f64, me.mass))
+        Some((dist(me.position_at(s.now_ms()), hole.position_at(s.now_ms())) - hole.radius as f64 - me.radius as f64, me.mass))
     }).await.flatten() else { return Ok(Value::None) };
     if gap > WORMHOLE_JUMP_RANGE {
         return Err(CallError::User { msg: messages::MSG_NOT_CLOSE_ENOUGH_TO_JUMP.into(), dict: vec![("maxdist".into(), Value::Int(WORMHOLE_JUMP_RANGE as i64))] });
@@ -462,6 +468,7 @@ pub(super) fn container_ball(id: i64, type_id: i32, pos: V3, radius: f32, securi
         speed_fraction: 0.0,
         pos,
         vel: [0.0; 3],
+        old_pos: pos, old_vel: [0.0; 3], segment_target: None, segment_warp: None,
         goto: [0.0; 3],
         follow_id: 0,
         follow_range: 0.0,
@@ -471,6 +478,7 @@ pub(super) fn container_ball(id: i64, type_id: i32, pos: V3, radius: f32, securi
         warp: None,
         warp_factor: 0,
         last_ms: now_ms(),
+        interpolation_anchor_ms: 0,
         effect_stamp: 0,
         cloak: 0,
         cloak_until: 0,

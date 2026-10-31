@@ -6,11 +6,109 @@ fn ball(id: i64, pilot: Option<i64>, x: f64) -> Ball {
         char_id: pilot, signature_radius: pilot.map(|_| 1.0), mode: MODE_STOP, radius: 1.0, mass: 1e6,
         max_vel: 100.0, agility: 1.0, speed_fraction: 0.0,
         pos: [x, 0.0, 0.0], vel: [0.0; 3], goto: [0.0; 3],
+        old_pos: [x, 0.0, 0.0], old_vel: [0.0; 3], segment_target: None, segment_warp: None,
         follow_id: 0, follow_range: 0.0, free: true, global: false,
-        massive: true, warp: None, warp_factor: 0, last_ms: 0, effect_stamp: 0,
+        massive: true, warp: None, warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0,
         cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0,
         slim: Vec::new(),
     }
+}
+
+#[test]
+fn completed_segment_samples_use_shared_drag_and_clamp() {
+    let mut s = System::new(0, Arc::default(), 1_000);
+    let mut moving = ball(1, None, 5.0);
+    moving.vel = [10.0, 0.0, 0.0];
+    s.insert(moving);
+    assert_eq!(s.sample_position(1), Some([5.0, 0.0, 0.0]));
+    s.tick(1_900);
+    assert_eq!(s.sample_position(1), Some([5.0, 0.0, 0.0]));
+    s.tick(2_000);
+    let b = s.ball(1).unwrap();
+    let endpoint = b.pos;
+    let midpoint = b.position_at(2_500);
+    let mut bytes = Vec::new();
+    b.write(&mut bytes);
+    for elapsed in [0, 100, 500, 900, 1000, 900, 100, 500, 0, 1000] {
+        let actual = b.position_at(2_000 + elapsed);
+        let expected = if elapsed == 0 { b.old_pos } else if elapsed == 1000 { endpoint } else {
+            calculate_position_velocity(b.old_pos, b.old_vel, [0.0; 3], 1.0, ms_to_seconds(elapsed as f64)).0
+        };
+        assert_eq!(actual, expected);
+    }
+    assert_ne!(midpoint[0], (5.0 + endpoint[0]) / 2.0);
+    assert_eq!(b.position_at(i64::MIN), b.old_pos);
+    assert_eq!(b.position_at(i64::MAX), endpoint);
+    let mut materialized = b.clone();
+    materialized.pos = b.position_at(3_000);
+    let mut sampled_bytes = Vec::new();
+    materialized.write(&mut sampled_bytes);
+    assert_eq!(bytes, sampled_bytes);
+    s.tick(2_500);
+    assert_eq!(s.sampled_ball(1).unwrap().pos, s.sample_position(1).unwrap());
+    assert_ne!(s.sample_position(1).unwrap(), s.ball(1).unwrap().pos);
+    assert!(s.sample_position(99).is_none());
+    assert!(s.sampled_ball(99).is_none());
+    let removed = s.destroy_ball(1).unwrap();
+    assert_eq!(removed.pos, midpoint);
+    assert_ne!(removed.pos, endpoint);
+    assert!(s.ball(1).is_none());
+}
+
+#[test]
+fn warp_segment_survives_landing_and_static_modes_stay_fixed() {
+    let mut b = ball(1, None, 0.0);
+    b.mode = MODE_WARP;
+    b.warp = Some(Warp { from: [0.0; 3], to: [120.0, 0.0, 0.0], start: 0, duration: 1500.0, factor: 1 });
+    let positions = HashMap::new();
+    b.evolve(1000, 30_000, &positions);
+    assert_eq!(b.position_at(30_000), [0.0; 3]);
+    assert_eq!(b.position_at(30_500), [40.0, 0.0, 0.0]);
+    b.evolve(2000, 2000, &positions);
+    assert!(b.warp.is_none());
+    assert_eq!(b.position_at(2000), [80.0, 0.0, 0.0]);
+    assert_eq!(b.position_at(2500), [120.0, 0.0, 0.0]);
+    assert_eq!(b.position_at(3000), b.pos);
+    for mode in [MODE_RIGID, MODE_MISSILE] {
+        let mut fixed = ball(2, None, 7.0);
+        fixed.mode = mode;
+        fixed.free = mode != MODE_RIGID;
+        fixed.evolve(1000, 1000, &positions);
+        assert_eq!(fixed.position_at(1500), [7.0, 0.0, 0.0]);
+    }
+}
+
+#[test]
+fn stationary_command_replaces_previous_segment_at_application() {
+    let mut s = System::new(0, Arc::default(), 1000);
+    let mut moving = ball(1, None, 0.0);
+    moving.vel = [10.0, 0.0, 0.0];
+    s.insert(moving);
+    s.tick(2000);
+    assert_ne!(s.ball(1).unwrap().position_at(2000), s.ball(1).unwrap().pos);
+    s.command(1, |b, _, _| {
+        b.pos = [42.0, 0.0, 0.0];
+        b.vel = [0.0; 3];
+        b.mass = 2e6;
+        Vec::new()
+    });
+    s.tick(3000);
+    assert_eq!(s.sample_position(1), Some([42.0, 0.0, 0.0]));
+    assert_eq!(s.ball(1).unwrap().position_at(3500), [42.0, 0.0, 0.0]);
+}
+
+#[test]
+fn health_and_uncloak_leave_completed_segment_intact() {
+    let mut s = System::new(0, Arc::default(), 1000);
+    let mut moving = ball(1, None, 0.0);
+    moving.vel = [10.0, 0.0, 0.0];
+    moving.cloak = 1;
+    s.insert(moving);
+    s.tick(2000);
+    let before = s.ball(1).unwrap().position_at(2500);
+    s.set_health(1, [0.5; 3]);
+    s.apply_uncloak(1, 2);
+    assert_eq!(s.ball(1).unwrap().position_at(2500), before);
 }
 
 #[test]
@@ -256,8 +354,8 @@ fn constant_target_integration_is_step_size_independent() {
     one.vel = [-3.0, 4.0, 2.0];
     let mut ten = one.clone();
     let positions = HashMap::new();
-    one.evolve(1000, &positions);
-    for ms in (100..=1000).step_by(100) { ten.evolve(ms, &positions); }
+    one.evolve(1000, 1000, &positions);
+    for ms in (100..=1000).step_by(100) { ten.evolve(ms, ms, &positions); }
     for (a, b) in one.pos.into_iter().zip(ten.pos).chain(one.vel.into_iter().zip(ten.vel)) {
         assert!((a - b).abs() <= 1e-6 * a.abs().max(1.0));
     }
@@ -352,11 +450,43 @@ fn catchup_clamps_wall_delay_without_rebasing_logical_time() {
     let before = s.ball(1).unwrap().pos[0];
     s.tick(30_000);
     assert_eq!(s.current_time(), 16);
-    assert!(s.ball(1).unwrap().pos[0] > before);
-    s.tick(30_999);
-    assert_eq!(s.current_time(), 16);
+    let b = s.ball(1).unwrap();
+    assert_eq!(b.last_ms, 16_000);
+    assert_eq!(b.interpolation_anchor_ms, 30_000);
+    assert_eq!(b.old_pos[0], before);
+    assert!(b.pos[0] > before);
+    assert_eq!(b.position_at(29_999), b.old_pos);
+    assert_eq!(b.position_at(31_001), b.pos);
+    let midpoint = calculate_position_velocity(b.old_pos, b.old_vel, [0.0; 3], 1.0, 0.5).0;
+    assert_ne!(midpoint, b.pos);
+    s.tick(30_500);
+    assert_eq!(s.sample_position(1), Some(midpoint));
     s.tick(31_000);
     assert_eq!(s.current_time(), 17);
+    let b = s.ball(1).unwrap();
+    assert_eq!(b.last_ms, 17_000);
+    assert_eq!(b.interpolation_anchor_ms, 31_000);
+    let midpoint = calculate_position_velocity(b.old_pos, b.old_vel, [0.0; 3], 1.0, 0.5).0;
+    assert_ne!(midpoint, b.pos);
+    s.tick(31_500);
+    assert_eq!(s.sample_position(1), Some(midpoint));
+}
+
+#[test]
+fn ordinary_catchup_anchors_to_last_deadline() {
+    let mut s = System::new(0, Arc::default(), 0);
+    let mut b = ball(1, None, 0.0);
+    b.vel = [10.0, 0.0, 0.0];
+    s.insert(b);
+    s.tick(2_500);
+    let b = s.ball(1).unwrap();
+    assert_eq!(s.current_time(), 2);
+    assert_eq!(b.interpolation_anchor_ms, 2_000);
+    let expected = calculate_position_velocity(b.old_pos, b.old_vel, [0.0; 3], 1.0, 0.5).0;
+    assert_eq!(s.sample_position(1), Some(expected));
+    assert_ne!(expected, b.old_pos);
+    assert_eq!(b.position_at(1_999), b.old_pos);
+    assert_eq!(b.position_at(3_001), b.pos);
 }
 
 #[test]

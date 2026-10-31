@@ -71,7 +71,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             let found = if let Some(sys) = c.session.int("solarsystemid") {
                 c.world.with(sys, move |s| {
                     if by_pilot { s.pilot_ball(target) } else { s.ball(target) }
-                        .map(|b| (b.id, b.pos, b.radius as f64, s.warp_in(b.id)))
+                        .map(|b| (b.id, b.position_at(s.now_ms()), b.radius as f64, s.warp_in(b.id)))
                 }).await.flatten()
             } else {
                 None
