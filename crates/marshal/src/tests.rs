@@ -143,6 +143,17 @@ fn dbrow_layout_matches_init_from_typed_list() {
 }
 
 #[test]
+fn decoded_dbrow_column_reader() {
+    let descriptor = DbRowDescriptor::new([("itemID", DbType::I8), ("name", DbType::WStr), ("missing", DbType::I4)]);
+    let row = descriptor.row(&[Value::Int(1_000_000_000_123), Value::unicode("item"), Value::None]);
+    let decoded = loads(&dumps(&row)).unwrap();
+    assert_eq!(descriptor.get(&decoded, "itemID"), Some(Value::Int(1_000_000_000_123)));
+    assert_eq!(descriptor.get(&decoded, "name"), Some(Value::unicode("item")));
+    assert_eq!(descriptor.get(&decoded, "missing"), Some(Value::None));
+    assert_eq!(descriptor.get(&decoded, "unknown"), None);
+}
+
+#[test]
 fn dbrow_roundtrip() {
     let d = DbRowDescriptor::new([("itemID", DbType::I8), ("name", DbType::WStr), ("singleton", DbType::Bool), ("q", DbType::I4)]);
     let row = d.row(&[Value::Int(1_000_000_000_123), Value::unicode("Rifter"), Value::Bool(true), Value::None]);
