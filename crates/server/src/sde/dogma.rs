@@ -18,6 +18,9 @@ pub(crate) struct Effect {
     pub(crate) duration_attribute_id: Option<i32>,
     modifiers: Vec<Modifier>
 }
+impl Effect {
+    pub(crate) fn modifiers(&self) -> &[Modifier] { &self.modifiers }
+}
 pub(crate) struct Dogma { attributes: Vec<Attribute>, effects: Vec<Effect>, attribute_ids: HashMap<i32, usize>, effect_ids: HashMap<i32, usize>, attribute_names: HashMap<String, Vec<usize>>, effect_names: HashMap<String, Vec<usize>> }
 impl Dogma {
     pub(crate) async fn load(db: &Db) -> anyhow::Result<Self> {
