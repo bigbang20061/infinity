@@ -18,19 +18,98 @@ register.command{
     name = "hello", help = "Example", gm = true,
     fn = function(ctx, args) return "ok" end,
 }
-register.event("BallparkBound", function(ctx) end)
+register.event("CharacterSelected", function(ev)
+    log.info("Selected character " .. ev.char_id)
+end)
+register.intercept("exampleSvc", "RestrictedMethod", function(ctx, args, kwargs)
+    if not ctx:is_gm() then
+        return false, "TargetingAttemptCancelled"
+    end
+    return true
+end)
 ```
 
 RPC handlers receive the invocation context and typed tuple/dictionary wire
 values. A `"*"` method matches unclaimed methods; returning Lua `nil` from a
 wildcard falls through. Exact handlers must return an `eve` wire value. Command
 arguments are Lua strings and commands return a Lua string. `gm = true` requires
-GM privileges. `BallparkBound` is the only event currently supported. Duplicate
-claims fail startup or reload rather than replacing another script.
-Every claimed service/method is logged at load. Claims precede Rust handlers,
-except retail cache and Macho control paths. A detected `fixed::root` overlap is
-also logged as replacing a fixed answer; this does not enumerate all modeled
-service overlaps.
+GM privileges. Duplicate RPC or command claims fail startup or reload rather
+than replacing another script. Claims, events and intercepts are logged and
+listed; a detected `fixed::root` RPC overlap is also logged as replacing a fixed
+answer, but this does not enumerate all modeled service overlaps.
+
+Interceptors match an exact service/method pair, with no wildcard or argument
+rewriting. They receive the same live context and typed arguments as an RPC.
+Returning `true` permits the call; returning `false` and a client message
+catalogue key denies it with `CallError::User` and an empty dictionary. An error
+or malformed result becomes `Internal`. The example above uses an existing
+catalogue key, not inline player-visible text. Duplicate interceptor pairs are
+load errors naming both scripts, but an RPC may claim the same pair. Interceptors
+run after retail cached answers, outside Macho control paths, and before Lua RPC
+claims and Rust dispatch. Existing authorization still applies. Registration
+does not validate names against a route catalogue: unknown pairs can register
+but never fire unless a matching call is received. For market order policies,
+use actual methods such as `PlaceBuyOrder` or `PlaceMultiSellOrder`.
+
+## Events
+
+`register.event(kind, function(ev) ... end)` subscribes to a known kind;
+unknown kinds fail loading. The one argument is a plain scalar table, not a
+wire value, containing `kind` and the snake_case fields below. There is no
+invocation context: event handlers cannot use context-dependent mutators.
+Asynchronous `world` and `store` functions remain available.
+
+| Kind | Fields besides `kind` |
+|---|---|
+| `CharacterSelected` | `user_id`, `char_id` |
+| `CharacterLoggedOff` | `user_id`, `char_id` |
+| `Undocked` | `char_id`, `ship_id`, `station_id`, `system_id` |
+| `Docked` | `char_id`, `ship_id`, `station_id`, `system_id` |
+| `Jumped` | `char_id`, `ship_id`, `from_system_id`, `to_system_id` |
+| `ShipLost` | `char_id`, `ship_id`, `type_id`, `system_id` |
+| `NpcKilled` | `char_id`, `npc_id`, `type_id`, `system_id` |
+| `ItemsMoved` | `char_id`, `item_id`, `from_location_id`, `to_location_id`, `quantity` |
+| `WalletChanged` | `owner_id`, `account_key`, `balance`, `delta` |
+| `SkillTrained` | `char_id`, `type_id`, `level` |
+| `MarketOrderPlaced` | `char_id`, `order_id`, `type_id`, `quantity`, `price`, `is_buy` |
+| `MarketOrderFilled` | `order_id`, `buyer_id`, `seller_id`, `type_id`, `quantity`, `price` |
+| `MissionAccepted` | `char_id`, `agent_id`, `mission_id` |
+| `MissionCompleted` | `char_id`, `agent_id`, `mission_id` |
+| `BallparkBound` | `char_id`, `system_id` |
+
+`type_id`, `mission_id`, `quantity`, `level` and `account_key` are i32;
+other IDs are i64, money fields are f64, and `is_buy` is boolean.
+Wallet values are client-facing f64 scalars, not an exact arbitrary-decimal
+ledger. For GM `setisk` and `addisk`, balance is clamped to the client-facing
+f64 projection and delta is projected-after minus projected-before; delta can
+be zero even when the exact balance changes. The before-read can race existing
+direct writers, so it is not an exact journal. Other wallet deltas are the signed
+requested amounts. Existing direct core bypasses have event additions, but
+arbitrary DAO writes are not globally captured.
+Some autocommit shared corporation wallet writes perform an announcement or
+membership lookup after changing the balance but before queuing `WalletChanged`.
+If that lookup fails, the balance may be committed without a wallet event.
+
+`NpcKilled` confirms destruction and identifies the known killer; it is omitted
+when the killer is unknown. It is emitted before reward processing and does not
+guarantee a successful reward or wreck. NPC kill rewards are not atomic; a failed reward after a kill can leave a partial payout.
+
+`ItemsMoved` covers inventory moves, not every economic stack delta.
+`SkillTrained` is emitted lazily when completed levels are persisted, not by a
+wall-clock timer.
+
+Transaction dispatch remains synchronous: after successful COMMIT, events are
+handed off in outbox order to one ordered channel runner started by `lua::start`.
+Rolled-back or retried outboxes emit nothing. Each transaction's event order is
+preserved; cross-operation wall-time commit order is not promised. Delivery is
+asynchronous and need not finish before the caller receives its reply. The runner
+processes events and their handlers sequentially, in script load and registration
+order, with independent instruction and time budgets for each handler. Failures
+are logged and later handlers continue; a subscriber cannot change the committed
+operation's reply. When Lua is disabled, there is no runner and events are dropped.
+The event queue is best-effort and process-local, not durable across a restart.
+Each event snapshots the registry when processing starts, retaining that generation
+for all its handlers even if a reload occurs.
 
 ## Wire values and context
 
@@ -146,11 +225,12 @@ reported, and the script is not resumed after its deadline.
 Defaults are 64 MiB VM memory, 50 ms and 5,000,000 instructions per call, with
 an instruction hook every 1000 instructions. Configure these with
 `memory_limit_mb`, `call_budget_ms`, `call_budget_instructions` and
-`instruction_hook_interval` under `[lua]`. `/lua list` shows claims and limits;
-`/lua reload` builds a fresh registry and swaps it only on success. In-flight
-handlers retain their old registry; Lua globals reset, but stored values survive.
-The shipped `/motd` command is GM-only: `/motd set <text>` saves a message and
-`/motd` reads it. The message is sent on `BallparkBound`.
+`instruction_hook_interval` under `[lua]`. `/lua list` shows RPC and command
+claims, events, intercepts and limits; `/lua reload` builds a fresh registry and
+swaps it only on success. In-flight handlers retain their old registry; Lua
+globals reset, but stored values survive. The shipped `/motd` command is GM-only:
+`/motd set <text>` saves a message and `/motd` reads it. `CharacterSelected`
+sends the saved message to the registered pilot on both docked and space logins.
 
 The bundled `fixed_answers.lua` claims five reference methods. The client reads
 the information-gathering keyval when that service starts. Character rename
