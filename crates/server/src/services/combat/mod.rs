@@ -46,6 +46,7 @@ use super::fit::{Fit, Key};
 use super::{db_err, notify_error, rand01, user_error, value_id_list, Call, CallError, CallResult};
 use crate::client::{filetime_now, filetime_ticks_from_ms, Client};
 use crate::consts::{ACCOUNT_CASH, ATTR_ARMOR_DAMAGE, ATTR_CAPACITOR_CAPACITY, ATTR_CAPACITY, ATTR_CHARGE, ATTR_EXPLOSION_DELAY, ATTR_HULL_DAMAGE, ATTR_IS_ONLINE, ATTR_MASS, ATTR_MAX_RANGE, ATTR_MAX_VELOCITY, ATTR_QUANTITY, ATTR_SHIELD_CAPACITY, ATTR_SHIELD_CHARGE, ATTR_SIGNATURE_RADIUS, ATTR_STRUCTURE_HP, CATEGORY_CHARGE, DAMAGE_TYPE_COUNT, EFFECT_AFTERBURNER, EFFECT_MICROWARPDRIVE, EFFECT_ONLINE, FILETIME_SECOND, FLAG_CARGO, FLAG_HANGAR, IX_FLAG, IX_LOCATION_ID, IX_STACK_SIZE};
+use crate::consts::{ATTR_DAMAGE_MULTIPLIER, ATTR_RATE_OF_FIRE, ATTR_EM_DAMAGE, ATTR_THERMAL_DAMAGE, ATTR_KINETIC_DAMAGE, ATTR_EXPLOSIVE_DAMAGE};
 use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::{Outbox, dispatch_client, dispatch_world};
@@ -63,9 +64,8 @@ const HI_SLOTS: std::ops::RangeInclusive<i32> = 27..=34;
 const FLAG_AMMO_HOLD: i32 = 143;
 /// inventorycommon/const.py:189, flagFleetHangar.
 const FLAG_FLEET_HANGAR: i32 = 155;
-const ATTR_DAMAGE_MULTIPLIER: i32 = 64;
 const ATTR_FALLOFF: i32 = 158;
-const ATTR_DAMAGE: [i32; 4] = [114, 118, 117, 116]; // em, thermal, kinetic, explosive
+const ATTR_DAMAGE: [i32; 4] = [ATTR_EM_DAMAGE, ATTR_THERMAL_DAMAGE, ATTR_KINETIC_DAMAGE, ATTR_EXPLOSIVE_DAMAGE];
 const ATTR_HP: [i32; 3] = [ATTR_SHIELD_CAPACITY, 265, ATTR_STRUCTURE_HP]; // shield, armor, structure
 const ATTR_RESONANCE: [[i32; 4]; 3] = [[271, 274, 273, 272], [267, 270, 269, 268], [113, 110, 109, 111]];
 const ATTR_SCAN_RESOLUTION: i32 = 564;
@@ -78,7 +78,6 @@ const ATTR_SHIELD_RECHARGE_RATE: i32 = 479;
 const ATTR_RELOAD_TIME: i32 = 1795;
 const ATTR_NEXT_ACTIVATION_TIME: i32 = 2729;
 const ATTR_MISSILE_DAMAGE_MULTIPLIER: i32 = 212;
-const ATTR_RATE_OF_FIRE: i32 = 51;
 const ATTR_ENTITY_FLY_RANGE: i32 = 416;
 const ATTR_ENTITY_ATTACK_RANGE: i32 = 247;
 const ATTR_ENTITY_MISSILE_TYPE: i32 = 507;

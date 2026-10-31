@@ -73,6 +73,21 @@ pub const FACTION_GURISTAS: i64 = 500010;
 pub const FACTION_ANGEL_CARTEL: i64 = 500011;
 
 // SDE dogma attribute and effect IDs.
+/// SDE dgmEffects: skillEffect, skill-point bookkeeping rather than a modifier.
+pub const EFFECT_SKILL: i32 = 132;
+
+/// SDE dgmAttributeTypes: damageMultiplier.
+pub const ATTR_DAMAGE_MULTIPLIER: i32 = 64;
+/// SDE dgmAttributeTypes: rateOfFire.
+pub const ATTR_RATE_OF_FIRE: i32 = 51;
+/// SDE dgmAttributeTypes: emDamage.
+pub const ATTR_EM_DAMAGE: i32 = 114;
+/// SDE dgmAttributeTypes: thermalDamage.
+pub const ATTR_THERMAL_DAMAGE: i32 = 118;
+/// SDE dgmAttributeTypes: kineticDamage.
+pub const ATTR_KINETIC_DAMAGE: i32 = 117;
+/// SDE dgmAttributeTypes: explosiveDamage.
+pub const ATTR_EXPLOSIVE_DAMAGE: i32 = 116;
 /// SDE dgmAttributeTypes: mass.
 pub const ATTR_MASS: i32 = 4;
 /// SDE dgmAttributeTypes: hp (structure hitpoint capacity).
