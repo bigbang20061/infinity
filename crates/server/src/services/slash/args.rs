@@ -31,6 +31,10 @@ impl<'a> Args<'a> {
         self.values.get(index).map(String::as_str).filter(|s| !s.is_empty())
             .ok_or_else(|| slash_error(messages::gm::gm_args_missing(index + 1)))
     }
+    pub(super) fn i64(&self, index: usize) -> Result<i64, CallError> {
+        let text = self.required(index)?;
+        text.parse().map_err(|_| slash_error(messages::gm::gm_args_integer(text)))
+    }
     pub(super) async fn type_id(&self, c: &Client, index: usize) -> Result<(i32, String), CallError> {
         super::resolve_type(c, self.required(index)?).await
     }

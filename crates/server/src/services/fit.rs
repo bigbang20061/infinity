@@ -8,7 +8,7 @@
 //! that attribute if such a skill appears in the SDE.
 
 use super::{db_err, CallError};
-use crate::consts::{ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_REQUIRED_SKILL_1, ATTR_SPEED_FACTOR, CATEGORY_CHARGE, CATEGORY_SHIP, EFFECT_AFTERBURNER, EFFECT_MICROWARPDRIVE, EFFECT_SKILL, TYPE_CHARACTER};
+use crate::consts::{ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_REQUIRED_SKILL_1, ATTR_SPEED_FACTOR, CATEGORY_CHARGE, CATEGORY_SHIP, CATEGORY_SKILL, EFFECT_AFTERBURNER, EFFECT_MICROWARPDRIVE, EFFECT_SKILL, TYPE_CHARACTER};
 use crate::dao::items::fit as fit_dao;
 use crate::db::Db;
 use crate::sde::{dogma::{Attribute, Modifier}, types::TypeData, Sde};
@@ -18,8 +18,6 @@ use std::sync::{Arc, Mutex};
 use crate::consts::{ATTR_SKILL_LEVEL, ATTR_SKILL_POINTS, ATTR_SKILL_TIME_CONSTANT, CATEGORY_DRONE, FLAG_IMPLANT};
 /// SDE dgmAttributeTypes: requiredSkill1 through requiredSkill6.
 const ATTR_REQUIRED_SKILLS: [i32; 6] = [ATTR_REQUIRED_SKILL_1, 183, 184, 1285, 1289, 1290];
-/// SDE invCategories: Skill, exempt from stacking penalties.
-const CATEGORY_SKILL: i32 = 16;
 /// SDE invCategories: Implant, exempt from stacking penalties.
 const CATEGORY_IMPLANT: i32 = 20;
 /// SDE invCategories: Subsystem, exempt from stacking penalties.

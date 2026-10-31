@@ -22,6 +22,8 @@ use marshal::Value;
 use std::collections::BTreeMap;
 use tracing::warn;
 
+pub(super) mod gm;
+
 /// const.containerHangar: "my hangar in the current station".
 const CONTAINER_HANGAR: i64 = 10004;
 /// Existing server policy for the highest corporation-hangar division index.

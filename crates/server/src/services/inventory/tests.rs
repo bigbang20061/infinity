@@ -52,6 +52,22 @@ fn capacity_uses_parent_and_matching_children_from_the_same_rows() {
     assert_eq!(empty_volume.1.to_bits(), 0.0_f64.to_bits());
 }
 
+#[test]
+fn gm_fit_sources_must_belong_to_target_and_be_in_cargo_or_hangar() {
+    let mut source = item(10, 2);
+    source.owner_id = 42;
+    source.location_id = 100;
+    source.flag_id = FLAG_CARGO;
+    assert!(gm::available(&source, 42, 1, 100, Some(200)));
+    assert!(!gm::available(&source, 43, 1, 100, Some(200)));
+    source.location_id = 200;
+    source.flag_id = FLAG_HANGAR;
+    assert!(gm::available(&source, 42, 1, 100, Some(200)));
+    assert!(!gm::available(&source, 42, 1, 100, None));
+    source.flag_id = FLAG_CARGO;
+    assert!(!gm::available(&source, 42, 1, 100, Some(200)));
+}
+
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL and an existing item"]
 async fn stale_move_snapshot_is_refused_without_changing_item() {
@@ -71,6 +87,42 @@ async fn stale_move_snapshot_is_refused_without_changing_item() {
     let row = tx.query_one("SELECT owner_id FROM game.items WHERE item_id = $1", &[&snapshot.item_id]).await.expect("item remains");
     assert_eq!(row.get::<_, i64>("owner_id"), original_owner);
     tx.rollback().await.expect("rollback");
+}
+
+#[test]
+fn remote_item_notifications_route_to_target_not_gm() {
+    use crate::db::outbox::Notification;
+    let event = Notification::DirectClient { event: "OnItemChange".into(), args: vec![] };
+    assert!(matches!(gm::route_target(event, 42, Some(10)), Notification::Pilot { char_id: 42, .. }));
+    let event = Notification::DirectClient { event: "OnItemChange".into(), args: vec![] };
+    assert!(matches!(gm::route_target(event, 42, Some(42)), Notification::DirectClient { .. }));
+}
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL, loaded SDE and a fitted module with charges"]
+async fn charge_unload_and_module_move_roll_back_together() {
+    let mut config = crate::config::tests::test_database();
+    config.schema_on_start = false;
+    let db = crate::db::Db::connect(&config).await.expect("database pool");
+    let sde = Sde::load(&db).await.expect("loaded SDE");
+    let (mut client, connection) = tokio_postgres::connect(&config.url, tokio_postgres::NoTls).await.expect("connect");
+    tokio::spawn(async move { connection.await.expect("connection"); });
+    let tx = client.transaction().await.expect("transaction");
+    let row = tx.query_one("SELECT i.item_id, i.owner_id, i.location_id, i.flag_id, c.type_id, c.quantity FROM game.items i JOIN game.module_charges c ON c.ship_id = i.location_id AND c.flag_id = i.flag_id WHERE c.quantity > 0 ORDER BY i.item_id LIMIT 1 FOR UPDATE OF i", &[]).await.expect("fitted module with charge");
+    let id: i64 = row.get("item_id");
+    let owner: i64 = row.get("owner_id");
+    let ship: i64 = row.get("location_id");
+    let flag: i32 = row.get("flag_id");
+    let charge_type: i32 = row.get("type_id");
+    let charge_quantity: i32 = row.get("quantity");
+    let module = load_items(&tx, &sde, ItemQuery::Id(id)).await.expect("load module").pop().expect("module");
+    let mut outbox: Outbox = Outbox::default();
+    assert!(super::super::combat::targeting_charges::unload(&tx, &sde, &mut outbox, owner, ship, &module, ship, FLAG_CARGO).await.is_ok());
+    assert!(move_core(&tx, &sde, &mut outbox, &module, owner, ship, FLAG_CARGO, None).await.is_ok());
+    tx.rollback().await.expect("rollback");
+    let row = client.query_one("SELECT i.owner_id, i.location_id, i.flag_id, c.type_id, c.quantity FROM game.items i JOIN game.module_charges c ON c.ship_id = i.location_id AND c.flag_id = i.flag_id WHERE i.item_id = $1", &[&id]).await.expect("original module and charge");
+    assert_eq!((row.get::<_, i64>("owner_id"), row.get::<_, i64>("location_id"), row.get::<_, i32>("flag_id")), (owner, ship, flag));
+    assert_eq!((row.get::<_, i32>("type_id"), row.get::<_, i32>("quantity")), (charge_type, charge_quantity));
 }
 
 #[tokio::test]

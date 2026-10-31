@@ -1,6 +1,17 @@
 use super::*;
 
 #[test]
+fn list_limit_preserves_boundary_and_counts_omissions() {
+    let rows = vec!["row"; LIST_ROW_LIMIT].join("\n");
+    assert_eq!(limit_list(rows.clone(), false), rows);
+    assert_eq!(limit_list(format!("{rows}\nrow"), false), format!("{rows}\n{}", messages::gm::gm_rows_truncated(1)));
+    assert_eq!(limit_list(format!("{rows}\nrow\nrow\nrow"), false), format!("{rows}\n{}", messages::gm::gm_rows_truncated(3)));
+    let with_header = format!("header\n{rows}");
+    assert_eq!(limit_list(with_header.clone(), true), with_header);
+    assert_eq!(limit_list(format!("{with_header}\nrow"), true), format!("{with_header}\n{}", messages::gm::gm_rows_truncated(1)));
+}
+
+#[test]
 fn isk_grammar_and_argument_count() {
     let parse = |args: &[&str]| parse_amount(&args.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(), ISK_INTEGER_DIGITS, ISK_DECIMALS);
     for (input, expected) in [("0", "0"), ("1.2", "1.2"), (",1,,2,.3,4,", "12.34")] {

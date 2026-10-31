@@ -32,6 +32,7 @@ mod dogma;
 mod jobs;
 mod effects;
 mod skills;
+mod items;
 
 /// Server design: clearance in metres when teleporting to an item.
 const TELEPORT_CLEARANCE: f64 = 5000.0;
@@ -42,6 +43,9 @@ const ISK_INTEGER_DIGITS: usize = 34;
 const ISK_DECIMALS: usize = 2;
 /// `game_schema.sql`: account PLEX balance is numeric(36, 0).
 const PLEX_DIGITS: usize = 36;
+
+/// Server design: maximum rows returned by a GM listing.
+const LIST_ROW_LIMIT: usize = 50;
 
 const COMMANDS: &[(&str, &str)] = &[
     ("tr", messages::gm::GM_HELP_TELEPORT),
@@ -62,6 +66,14 @@ const COMMANDS: &[(&str, &str)] = &[
     ("allskills", messages::gm::GM_HELP_ALLSKILLS),
     ("removeskill", messages::gm::GM_HELP_REMOVESKILL),
     ("givestarterskills", messages::gm::GM_HELP_GIVESTARTERSKILLS),
+    ("ship", messages::gm::GM_HELP_SHIP),
+    ("spawn", messages::gm::GM_HELP_SPAWN),
+    ("fit", messages::gm::GM_HELP_FIT),
+    ("unload", messages::gm::GM_HELP_UNLOAD),
+    ("load", messages::gm::GM_HELP_LOAD),
+    ("online", messages::gm::GM_HELP_ONLINE),
+    ("iteminfo", messages::gm::GM_HELP_ITEMINFO),
+    ("typeinfo", messages::gm::GM_HELP_TYPEINFO),
     ("help", messages::gm::GM_HELP_HELP),
 ];
 
@@ -74,6 +86,20 @@ fn help() -> String {
     if crate::lua::enabled() { entries.extend(crate::lua::command_help().into_iter().map(|(_, help)| help)); }
     entries.join("\n")
 }
+
+fn limit_list(mut text: String, header: bool) -> String {
+    let Some(end) = text.match_indices('\n').nth(LIST_ROW_LIMIT - 1 + usize::from(header)).map(|(i, _)| i) else {
+        return text;
+    };
+    let omitted = text[end + 1..].lines().count();
+    if omitted > 0 {
+        text.truncate(end);
+        text.push('\n');
+        text.push_str(&messages::gm::gm_rows_truncated(omitted));
+    }
+    text
+}
+
 
 /// A type by ID or (partial) name.
 async fn resolve_type(c: &Client, arg: &str) -> Result<(i32, String), CallError> {
@@ -283,10 +309,17 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "jobs" => jobs::command(&c.db, args).await,
         "effects" => effects::command(args),
         "giveskill" | "allskills" | "removeskill" | "givestarterskills" => skills::command(c, &command, args).await,
+        // eve/devtools/script/svc_slash.py:1310-1313 passes this item ID to ship.Board.
+        "spawn" => return Some(items::spawn(c, args).await.map(Value::Int)),
+        "ship" | "fit" | "unload" | "load" | "online" | "iteminfo" | "typeinfo" => items::command(c, &command, args).await,
         "help" => Ok(help()),
         other => Err(slash_error(messages::gm::gm_unknown_command(other, &help()))),
     };
-    Some(result.map(Value::unicode))
+    let listing = matches!(command.as_str(), "sites" | "session" | "lp" | "iteminfo" | "typeinfo")
+        || (matches!(command.as_str(), "wh" | "wormhole") && args.first().is_some_and(|s| s.eq_ignore_ascii_case("status")))
+        || (command == "dogma" && args.get(1).is_some_and(|s| s == "list"));
+    let header = matches!(command.as_str(), "session" | "lp" | "typeinfo");
+    Some(result.map(|text| Value::unicode(if listing { limit_list(text, header) } else { text })))
 }
 
 #[cfg(test)]

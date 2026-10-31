@@ -7,7 +7,9 @@ pub(crate) const GM_ARGS_UNCLOSED_QUOTE: &str = "引号未闭合。";
 /// A command requires a selected character.
 pub(crate) const GM_ARGS_NO_CHARACTER: &str = "当前没有选择角色。";
 pub(crate) fn gm_args_missing(index: usize) -> String { format!("缺少第 {index} 个参数。") }
+pub(crate) fn gm_args_integer(text: &str) -> String { format!("无效的整数：{text}") }
 pub(crate) fn gm_args_unknown_target(text: &str) -> String { format!("找不到角色：{text}") }
+pub(crate) fn gm_rows_truncated(count: usize) -> String { format!("另有 {count} 行未显示。") }
 
 // GM slash commands (services/slash.rs)
 /// Teleport command help.
@@ -152,4 +154,36 @@ pub(crate) fn gm_skill_usage(command: &str) -> String {
 pub(crate) fn gm_skill_not_skill(skill: &str) -> String { format!("{skill} 不是技能。") }
 pub(crate) fn gm_skill_done(command: &str, target: i64) -> String { format!("{command} 已应用于角色 {target}。") }
 
+
+// Item administration.
+pub(crate) const GM_HELP_SHIP: &str = "/ship <类型> [角色] — 创建飞船";
+pub(crate) const GM_HELP_SPAWN: &str = "/spawn <类型> — 停靠时创建飞船并返回物品ID";
+pub(crate) const GM_HELP_FIT: &str = "/fit <角色> <类型或物品ID> [数量] — 装配模块";
+pub(crate) const GM_HELP_UNLOAD: &str = "/unload me <物品ID或类型ID> — 卸下模块";
+pub(crate) const GM_HELP_LOAD: &str = "/load me <类型ID> <数量> — 装填弹药";
+pub(crate) const GM_HELP_ONLINE: &str = "/online <飞船ID|me> — 上线模块";
+pub(crate) const GM_HELP_ITEMINFO: &str = "/iteminfo <物品ID> — 查看物品";
+pub(crate) const GM_HELP_TYPEINFO: &str = "/typeinfo <类型> — 查看类型";
+pub(crate) const GM_SHIP_TYPE_REQUIRED: &str = "指定类型不是飞船";
+pub(crate) const GM_SHIP_DOCKED_REQUIRED: &str = "目标角色必须停靠在空间站";
+pub(crate) const GM_ITEM_NOT_FOUND: &str = "找不到指定物品";
+pub(crate) const GM_ITEM_USAGE: &str = "物品命令参数无效";
+pub(crate) const GM_ITEM_TARGET_SELF: &str = "此命令仅支持当前角色";
+pub(crate) const GM_ITEM_SHIP_USAGE: &str = "用法：/ship <类型> [目标]";
+pub(crate) const GM_ITEM_SPAWN_USAGE: &str = "用法：/spawn <类型>";
+pub(crate) const GM_ITEM_FIT_USAGE: &str = "用法：/fit <目标> <类型或物品ID> [数量]";
+pub(crate) const GM_ITEM_UNLOAD_USAGE: &str = "用法：/unload me <物品ID或类型ID>";
+pub(crate) const GM_ITEM_LOAD_USAGE: &str = "用法：/load me <类型ID> <数量>";
+pub(crate) const GM_ITEM_ONLINE_USAGE: &str = "用法：/online <飞船ID|me>";
+pub(crate) const GM_ITEM_INFO_USAGE: &str = "用法：/iteminfo <物品ID>";
+pub(crate) const GM_TYPE_INFO_USAGE: &str = "用法：/typeinfo <类型>";
+pub(crate) const GM_FIT_REFUSED: &str = "无法装配：目标、物品或可用槽位无效。";
+pub(crate) fn gm_item_created(id: i64, name: &str) -> String { format!("已创建飞船 {name}（{id}）") }
+pub(crate) fn gm_item_fitted(count: usize) -> String { format!("已装配 {count} 个模块") }
+pub(crate) fn gm_item_unloaded(count: usize) -> String { format!("已卸下 {count} 个模块") }
+pub(crate) fn gm_item_loaded(count: usize) -> String { format!("已向 {count} 个兼容模块提交装填请求") }
+pub(crate) fn gm_item_online(count: usize) -> String { format!("已上线 {count} 个模块") }
+pub(crate) fn gm_item_info(item_id: i64, type_id: i32, owner: i64, location: i64, flag: i32, quantity: i32, singleton: bool) -> String { format!("物品 {item_id}：类型 {type_id}，所有者 {owner}，位置 {location}，标志 {flag}，数量 {quantity}，单例 {singleton}") }
+pub(crate) fn gm_type_info(type_id: i32, name: &str, group: i32, category: i32) -> String { format!("类型 {type_id}：{name}，组 {group}，分类 {category}") }
+pub(crate) fn gm_type_attribute(id: i32, value: f64) -> String { format!("属性 {id}：{value}") }
 
