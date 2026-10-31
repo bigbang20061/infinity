@@ -201,26 +201,24 @@ pub(crate) async fn trash_items(c: &mut Client, ids: &[i64]) -> Result<(), CallE
     ).await
 }
 
-/// The first free slot on `ship` for a module, from the module's slot effect and the
-/// ship's slot counts (lowSlots/medSlots/hiSlots/rigSlots/maxSubSystems).
-async fn free_slot(c: &Client, ship: i64, module_type: i32) -> Result<Option<i32>, CallError> {
+
+async fn free_slot_core(db: &(impl Executor + ?Sized), sde: &Sde, ship: i64, module_type: i32) -> Result<Option<i32>, CallError> {
     // (slot effect, ship slot-count attribute, first flag, max slots)
     const SLOTS: [(i32, i32, i32, i32); 5] = [(11, 12, 11, 8), (13, 13, 19, 8), (12, 14, 27, 8), (2663, 1137, 92, 8), (3772, 1367, 125, 8)];
-    let effects = c.sde.types.effects(module_type);
+    let effects = sde.types.effects(module_type);
     let Some(&(_, count_attr, first, max)) = SLOTS.iter().find(|s| effects.iter().any(|effect| effect.effect_id == s.0)) else { return Ok(None) };
-    let count = inventory_dao::type_id(&c.db, ship).await.map_err(db_err)?
-        .and_then(|type_id| c.sde.types.attribute(type_id, count_attr)).unwrap_or(0.0);
-    let used: Vec<i32> = inventory_dao::slot_flags(&c.db, ship).await.map_err(db_err)?
+    let count = inventory_dao::type_id(db, ship).await.map_err(db_err)?
+        .and_then(|type_id| sde.types.attribute(type_id, count_attr)).unwrap_or(0.0);
+    let used: Vec<i32> = inventory_dao::slot_flags(db, ship).await.map_err(db_err)?
         .into_iter().map(|r| r.flag_id).collect();
     Ok((first..first + (count as i32).min(max)).find(|f| !used.contains(f)))
 }
+
 
 /// Move `item_id` (all of it, or `qty` split off a stack) into `container` under `flag`.
 /// Returns the ID of the item now at the destination.
 pub(crate) async fn move_item(c: &mut Client, container: &Container, item_id: i64, source: Option<i64>, flag: Option<i32>, qty: Option<i64>) -> Result<Option<i64>, CallError> {
     let _lock = super::market::lock().await;
-    let mut ids = vec![item_id];
-    if let Container::Item(id) = container { ids.push(*id); }
     let char_id = c.session.int("charid").unwrap_or(0);
     let Some(item) = load_items(&c.db, &c.sde, ItemQuery::Id(item_id)).await.map_err(db_err)?.into_iter().next() else { return Ok(None) };
     if source.is_some_and(|source| source != item.location_id) || (source.is_some() && item.flag_id == FLAG_HANGAR && c.sde.map.station(item.location_id).is_some() && item.owner_id != char_id) {
@@ -237,7 +235,7 @@ pub(crate) async fn move_item(c: &mut Client, container: &Container, item_id: i6
             return Err(CallError::User { msg: messages::MSG_CUSTOM_NOTIFY.into(), dict: vec![("notify".into(), Value::unicode(messages::NO_CORPORATION_HANGAR_TAKE_ROLE))] });
         }
     }
-    let (location, owner, mut flag) = match container {
+    let (location, owner, flag) = match container {
         Container::Hangar { station_id, owner_id } => (*station_id, *owner_id, flag.filter(|f| *f != FLAG_AUTOFIT).unwrap_or(FLAG_HANGAR)),
         Container::Item(id) => match super::offices::office_owner(&c.db, *id).await? {
             // Into a corporation hangar: the corporation owns what's in it.
@@ -255,46 +253,54 @@ pub(crate) async fn move_item(c: &mut Client, container: &Container, item_id: i6
             }
         },
     };
-    if flag == FLAG_AUTOFIT {
-        flag = match free_slot(c, location, item.type_id).await? {
-            Some(slot) => slot,
-            None => FLAG_CARGO,
-        };
-    }
-    let fitting = is_fitting_flag(flag);
-    // Fitting takes one module off a stack; otherwise the requested quantity, or all of it.
-    let take = if fitting { Some(1) } else { qty }.filter(|q| *q > 0 && !item.singleton && (*q as i32) < item.quantity);
     let db = c.db.clone();
     let sde = c.sde.clone();
     db.transaction(
         move |tx, outbox: &mut Outbox| {
             let item = item.clone();
             let sde = sde.clone();
-            let ids = ids.clone();
             Box::pin(async move {
-                if !crate::dao::trades::reserved(tx, &ids).await.map_err(db_err)?.is_empty() {
-                    return Err(notify_error(messages::trade::TRADE_ITEM_RESERVED));
-                }
-                let moved_id = if let Some(q) = take {
-                    let id = split_stack(tx, &item, q as i32, owner, location, flag, fitting).await?;
-                    notify_item_change(tx, &sde, outbox, item_id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
-                    notify_item_change(tx, &sde, outbox, id, vec![(IX_LOCATION_ID, Value::Int(item.location_id)), (IX_FLAG, Value::Int(item.flag_id as i64))]).await?;
-                    id
-                } else {
-                    let singleton = item.singleton || fitting;
-                    inventory_dao::move_item(tx, item_id, location, flag, owner, singleton, fitting).await.map_err(db_err)?;
-                    let mut change = vec![(IX_LOCATION_ID, Value::Int(item.location_id)), (IX_FLAG, Value::Int(item.flag_id as i64))];
-                    if singleton != item.singleton {
-                        change.push((IX_SINGLETON, Value::Bool(item.singleton)));
+                let flag = if flag == FLAG_AUTOFIT || is_fitting_flag(flag) {
+                    if !crate::dao::items::ship::lock_reload_ship(tx, location).await.map_err(db_err)? {
+                        return Err(notify_error(messages::INSUFFICIENT_ITEM_QUANTITY));
                     }
-                    notify_item_change(tx, &sde, outbox, item_id, change).await?;
-                    item_id
-                };
-                Ok(Some(moved_id))
+                    if flag == FLAG_AUTOFIT { free_slot_core(tx, &sde, location, item.type_id).await?.unwrap_or(FLAG_CARGO) } else { flag }
+                } else { flag };
+                let take = if is_fitting_flag(flag) { Some(1) } else { qty }
+                    .filter(|q| *q > 0 && !item.singleton && (*q as i32) < item.quantity);
+                move_core(tx, &sde, outbox, &item, owner, location, flag, take).await.map(Some)
             })
         },
         |value, outbox| async move { dispatch_client(value, outbox, c) },
     ).await
+}
+
+async fn move_core<X: Send>(
+    tx: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<X>,
+    item: &Item, owner: i64, location: i64, flag: i32, take: Option<i64>,
+) -> Result<i64, CallError> {
+    if !crate::dao::trades::reserved(tx, &[item.item_id, location]).await.map_err(db_err)?.is_empty() {
+        return Err(notify_error(messages::trade::TRADE_ITEM_RESERVED));
+    }
+    let item_id = item.item_id;
+    let fitting = is_fitting_flag(flag);
+    if let Some(q) = take {
+        let id = split_stack(tx, item, q as i32, owner, location, flag, fitting).await?;
+        notify_item_change(tx, sde, outbox, item_id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
+        notify_item_change(tx, sde, outbox, id, vec![(IX_LOCATION_ID, Value::Int(item.location_id)), (IX_FLAG, Value::Int(item.flag_id as i64))]).await?;
+        Ok(id)
+    } else {
+        let singleton = item.singleton || fitting;
+        if !inventory_dao::move_item(tx, item, location, flag, owner, singleton, fitting).await.map_err(db_err)? {
+            return Err(notify_error(messages::INSUFFICIENT_ITEM_QUANTITY));
+        }
+        let mut change = vec![(IX_LOCATION_ID, Value::Int(item.location_id)), (IX_FLAG, Value::Int(item.flag_id as i64))];
+        if singleton != item.singleton {
+            change.push((IX_SINGLETON, Value::Bool(item.singleton)));
+        }
+        notify_item_change(tx, sde, outbox, item_id, change).await?;
+        Ok(item_id)
+    }
 }
 
 /// Simulate transfers in request order, retaining the original snapshots for guarded writes.
