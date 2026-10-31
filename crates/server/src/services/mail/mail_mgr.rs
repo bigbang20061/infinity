@@ -2,13 +2,14 @@
 //! Uses the mail DAO's message, status and label tables and character membership.
 //! Sending commits message, status and reply/forward writes together before notifications.
 //! Mailing lists are not supported.
-use super::super::{db_err, keyval, notify_error, value_id_list, value_text, Call, CallError, CallResult};
+use super::super::{db_err, keyval, notify_error, value_id_list, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
 use crate::consts::FILETIME_MINUTE;
 use crate::dao::mail::{self, LabelAction, Selector};
 use crate::db::Db;
 use crate::db::outbox::{dispatch_world, Outbox};
 use crate::messages;
+use crate::space::World;
 use marshal::Value;
 use std::io::Write;
 use tracing::info;
@@ -77,14 +78,30 @@ async fn corp_members(db: &Db, corp: i64) -> Result<Vec<i64>, CallError> {
 
 /// `SendMail(toCharacterIDs, toListID, toCorpOrAllianceID, title, body, isReplyTo, isForwardedFrom)` -> messageID.
 async fn send(c: &Client, call: &Call<'_>) -> CallResult {
-    let (db, world) = (&c.db, &*c.world);
     let me = c.session.int("charid").unwrap_or(0);
     let to_chars = value_id_list(call.args.first());
     let to_list = call.args.get(1).and_then(|v| v.as_int());
     let to_corp = call.args.get(2).and_then(|v| v.as_int());
-    let title = value_text(call.args.get(3), usize::try_from(crate::config::game().mail.title_max_len).unwrap_or(usize::MAX));
+    let title = call.args.get(3).and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
     let body = call.args.get(4).and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
     let (reply_to, forwarded_from) = (call.args.get(5).and_then(|v| v.as_int()).unwrap_or(0), call.args.get(6).and_then(|v| v.as_int()).unwrap_or(0));
+    let input = SendMail { to_chars, to_list, to_corp, title, body, reply_to, forwarded_from };
+    send_mail(&c.db, &c.world, me, c.session.int("corpid"), input).await.map(Value::Int)
+}
+
+pub(crate) struct SendMail {
+    pub to_chars: Vec<i64>,
+    pub to_list: Option<i64>,
+    pub to_corp: Option<i64>,
+    pub title: String,
+    pub body: String,
+    pub reply_to: i64,
+    pub forwarded_from: i64,
+}
+
+pub(crate) async fn send_mail(db: &Db, world: &World, me: i64, corpid: Option<i64>, input: SendMail) -> Result<i64, CallError> {
+    let SendMail { to_chars, to_list, to_corp, title, body, reply_to, forwarded_from } = input;
+    let title = title.chars().take(usize::try_from(crate::config::game().mail.title_max_len).unwrap_or(usize::MAX)).collect::<String>();
     if to_list.is_some() {
         return Err(notify_error(messages::MAILING_LISTS_UNSUPPORTED));
     }
@@ -95,7 +112,7 @@ async fn send(c: &Client, call: &Call<'_>) -> CallResult {
         return Err(notify_error(messages::TOO_MANY_MAIL_RECIPIENTS));
     }
     if let Some(corp) = to_corp {
-        if c.session.int("corpid") != Some(corp) {
+        if corpid != Some(corp) {
             return Err(notify_error(messages::MAIL_ONLY_TO_OWN_CORPORATION));
         }
     }
@@ -161,7 +178,7 @@ async fn send(c: &Client, call: &Call<'_>) -> CallResult {
         |id, outbox| async move { dispatch_world(id, outbox, world) },
     ).await?;
     info!("mail: {me} sent message {id} to {} recipients", inputs.3.len() - 1);
-    Ok(Value::Int(id))
+    Ok(id)
 }
 
 /// `GetBody(messageID, markRead)` -> the zlib-compressed UTF-8 body.
