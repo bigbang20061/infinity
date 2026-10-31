@@ -115,6 +115,8 @@ pub(super) struct State {
     locking: HashMap<(i64, i64), u64>,
     /// shipID -> independent jammer identities and their deadlines.
     jammed: HashMap<i64, HashMap<(i64, i64), jamming::Jam>>,
+    /// Announced locks, with source ship and target pilot for symmetric loss notices.
+    announced_locks: HashMap<(i64, i64), (i64, i64)>,
     /// moduleID -> owner and stop flag of its running cycle
     pub(super) active: HashMap<i64, ActiveModule>,
     /// Most recent activation, retained to invalidate deferred propulsion updates.
@@ -185,6 +187,7 @@ pub(super) fn attr(sde: &Sde, type_id: i32, id: i32, default: f64) -> f64 {
 /// Stop everything a character was doing in space (docking, jumping, logging off).
 pub fn reset(c: &Client) {
     let Some(char_id) = c.session.int("charid") else { return };
+    clear_character_locks(&c.world, char_id);
     state().reset_character(char_id);
     if let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) {
         c.world.post(system, move |s| { jamming::clear(s, ship); s.remove_projections_from(ship); });
@@ -379,6 +382,10 @@ pub async fn spawn_npc(db: Db, world: Arc<World>, system: i64, id: i64, type_id:
                                     super::effects::ecm::apply_npc(
                                         &db, &world, system, source_module, &me, &victim, &effect, duration_ms, generation,
                                     ).await,
+                                super::effects::EffectKind::Smartbomb =>
+                                    super::effects::aoe::apply_npc(
+                                        &db, &world, system, source_module, &me, &victim, &effect, duration_ms, generation,
+                                    ).await,
                                 _ => return,
                             };
                             match result {
@@ -399,7 +406,7 @@ pub async fn spawn_npc(db: Db, world: Arc<World>, system: i64, id: i64, type_id:
         .or_else(|| world.sde().dogma.attribute(ATTR_MAX_TARGET_RANGE).and_then(|a| a.default_value).filter(|value| *value > 0.0));
     for entry in world.sde().types.effects(type_id) {
         let Some(effect) = super::effects::registry::resolve(world.sde(), entry.effect_id) else { continue };
-        if !matches!(effect.kind, super::effects::EffectKind::Projected { .. } | super::effects::EffectKind::Neutralizer | super::effects::EffectKind::Nosferatu | super::effects::EffectKind::CapTransfer | super::effects::EffectKind::RemoteRepair { .. } | super::effects::EffectKind::Ecm) { continue; }
+        if !matches!(effect.kind, super::effects::EffectKind::Projected { .. } | super::effects::EffectKind::Neutralizer | super::effects::EffectKind::Nosferatu | super::effects::EffectKind::CapTransfer | super::effects::EffectKind::RemoteRepair { .. } | super::effects::EffectKind::Ecm | super::effects::EffectKind::Smartbomb) { continue; }
         if matches!(effect.kind, super::effects::EffectKind::RemoteRepair { .. }) && !super::effects::npc_repair::supported_for_type(world.sde(), type_id, &effect) {
             let name = world.sde().dogma.effect(entry.effect_id).and_then(|row| row.name.as_deref()).unwrap_or("unknown");
             let _ = super::effects::unsupported::refusal(Some(entry.effect_id), name, type_id);
@@ -445,7 +452,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         }
         "ClearTargets" => {
             if let Some(ch) = c.session.int("charid") {
-                let targets = state().targets.remove(&ch).unwrap_or_default().into_iter().collect();
+                let targets = clear_character_locks(&c.world, ch);
                 remove_target_projections(c, targets);
             }
             c.notify("OnTarget", vec![Value::str("clear")]);

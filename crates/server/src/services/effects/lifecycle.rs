@@ -2,22 +2,24 @@
 //! Mirrors clientDogmaLocation and godma; effect metadata comes from the SDE.
 //! Subject authorization is shared by activation, deactivation, analyzers and online changes.
 //! Projected effects and targeted ECM require a locked, present target; burst
-//! jammers do not. Runtime effects are transient; fitting limits use the shared policy.
+//! jammers do not. Runtime effects are transient; unsupported effect families are
+//! refused, and fitting limits use the shared policy.
 //! Accepted running activations cancel arrival jump cloak; online changes are not cycles.
+//! Authorized supported activations of another module break module cloak before validation.
 //! Offlining a bank member destroys the whole persisted bank; unfit removes a slave
 //! or destroys a master's bank. Committed changes stop affected cycles after the
 //! current cycle, and slave weapon activation resolves to its authorized master.
 //! Cycles are runtime-only and are not resumed after restart.
 //! A non-targeted module's first-cycle FX may be unseen by observers until the next
 //! destiny boundary applies the queued uncloak (under one second); gameplay is unaffected.
-use super::{EffectKind, registry, unsupported, repair, mining, capacitor, projected, range, ecm};
+use super::{EffectKind, registry, unsupported, repair, capacitor, ecm};
 use super::registry::{Effect, EffectAttribute, EffectFlag};
 use super::notify::{fire_fx, ship_effect};
 use super::propulsion::apply_propulsion;
-use super::weapons::{consume_charge, empty_charge, fire_missile, fire_turret};
+use super::behaviors::{Activation, on_activate, on_cycle_start, on_cycle_end, on_stop};
 use crate::services::combat::{ctx, state, ActiveModule, Ctx};
 use crate::services::combat::groups_health::{drain_capacitor, inject};
-use crate::services::combat::targeting_charges::{bank, charge_key, loaded, targets_of};
+use crate::services::combat::targeting_charges::{bank, charge_key, loaded};
 use crate::services::fit::{Fit, Key};
 use crate::services::items::load_items;
 use crate::services::{db_err, notify_error, user_error, Call, CallError, CallResult};
@@ -39,13 +41,41 @@ use super::online::OnlinePolicy;
 pub(in crate::services) fn stop_generation(stop: &AtomicBool) {
     stop.store(true, Ordering::Relaxed);
 }
+pub(crate) fn force_inactive(module: i64, generation: &Arc<AtomicBool>) -> bool {
+    let mut st = state();
+    let Some(active) = st.active.get_mut(&module).filter(|active| Arc::ptr_eq(&active.stop, generation)) else { return false };
+    active.forced_inactive = true;
+    generation.store(true, Ordering::Relaxed);
+    true
+}
+
+pub(in crate::services) async fn stop_offensive(cx: &Ctx, except_module: i64) {
+    let Ok(items) = load_items(&cx.db, cx.world.sde(), ItemQuery::Location(cx.ship_id)).await else { return };
+    let policy = OnlinePolicy { owner: cx.char_id, active_ship: Some(cx.ship_id), station: None, notify: cx.notify.clone() };
+    for item in items {
+        if item.item_id == except_module { continue; }
+        let Some(generation) = state().active.get(&item.item_id).filter(|active| active.char_id == cx.char_id).map(|active| active.stop.clone()) else { continue };
+        for row in cx.world.sde().types.effects(item.type_id) {
+            let Some(effect) = registry::resolve(cx.world.sde(), row.effect_id) else { continue };
+            if !effect.has(EffectFlag::Offensive) || effect.kind == EffectKind::Cloak || !effect.manually_activatable() { continue; }
+            if subject_core(&cx.db, cx.world.sde(), &policy, cx.ship_id, item.item_id, row.effect_id, true).await.is_err() { continue; }
+            let module = item.item_id;
+            let ship = cx.ship_id;
+            cx.world.post(cx.system_id, move |s| {
+                if force_inactive(module, &generation) { s.refresh_projection_target(ship); }
+            });
+            break;
+        }
+    }
+}
+
 
 /// Existing server module duration fallback, in milliseconds.
 const DEFAULT_MODULE_DURATION_MS: f64 = 1000.0;
 /// Existing server minimum module cycle duration.
 const MIN_MODULE_DURATION_MS: f64 = 250.0;
 /// Client UserError type-ID substitution tag.
-const UE_TYPEID: i64 = 4;
+pub(super) const UE_TYPEID: i64 = 4;
 
 
 
@@ -56,7 +86,7 @@ pub(super) struct Module {
     pub(super) flag: i32,
 }
 #[allow(clippy::too_many_arguments)]
-fn weapon_fx(cx: &Ctx, modules: &[Module], effect: &Effect, target: Option<i64>, charge: Option<i32>, start: bool, duration_ms: f64, repeat: i64) {
+pub(super) fn weapon_fx(cx: &Ctx, modules: &[Module], effect: &Effect, target: Option<i64>, charge: Option<i32>, start: bool, duration_ms: f64, repeat: i64) {
     let Some(guid) = effect.guid.as_deref().and_then(|g| g.split(',').next()).map(str::to_owned) else { return };
     let modules = modules.to_vec();
     let ship = cx.ship_id;
@@ -200,13 +230,13 @@ fn cycle_discharge(kind: EffectKind, charged: bool, need: f64) -> f64 {
     if matches!(kind, EffectKind::FueledLocalRepair { layer: 0, .. }) && charged { 0.0 } else { need }
 }
 
-fn needs_charge(kind: EffectKind) -> bool { matches!(kind, EffectKind::CapBooster) }
+fn needs_charge(kind: EffectKind) -> bool { matches!(kind, EffectKind::CapBooster | EffectKind::Bomb | EffectKind::Vorton) }
 
 fn charge_sensitive(kind: EffectKind) -> bool {
-    matches!(kind, EffectKind::CapBooster | EffectKind::FueledLocalRepair { .. })
+    matches!(kind, EffectKind::CapBooster | EffectKind::FueledLocalRepair { .. } | EffectKind::Bomb | EffectKind::Vorton)
 }
 
-fn charge_kind(id: i64, kind: EffectKind) -> EffectKind {
+pub(super) fn charge_kind(id: i64, kind: EffectKind) -> EffectKind {
     match id as i32 {
         EFFECT_ANCILLARY_REMOTE_SHIELD_BOOSTER => EffectKind::FueledLocalRepair { layer: 0, amount_attr: repair::amount_attribute(0), charge_bonus_attr: None },
         EFFECT_ANCILLARY_REMOTE_ARMOR_REPAIRER => EffectKind::FueledLocalRepair { layer: 1, amount_attr: repair::amount_attribute(1), charge_bonus_attr: Some(ATTR_CHARGED_ARMOR_DAMAGE_MULTIPLIER) },
@@ -221,174 +251,6 @@ async fn refund_refused_charge(cx: &Ctx, amount: f64) -> Result<(), CallError> {
     Ok(())
 }
 
-fn repair_ranges(fit: &Fit, cycle: &Cycle) -> (f64, f64) {
-    let module = Key::Module(cycle.modules[0].id);
-    (cycle.effect.attribute(EffectAttribute::Range).map(|a| fit.value(module, a)).unwrap_or(0.0),
-     cycle.effect.attribute(EffectAttribute::Falloff).map(|a| fit.value(module, a)).unwrap_or(0.0))
-}
-
-async fn remote_repair(cx: &Ctx, fit: &Fit, cycle: &Cycle, layer: usize) -> Result<CycleOutcome, CallError> {
-    let (optimal, falloff) = repair_ranges(fit, cycle);
-    let Ok((target, pilot, multiplier)) = repair::target(cx, cycle.target, optimal, falloff).await else {
-        return Ok(CycleOutcome::Stop("target lost"));
-    };
-    let master = cycle.modules[0].id;
-    if !state().active.get(&master).is_some_and(|active| Arc::ptr_eq(&active.stop, &cycle.stop)) {
-        return Ok(CycleOutcome::Stop("activation lost"));
-    }
-    let generation = cycle.stop.clone();
-    let source = cx.ship_id;
-    let character = cx.char_id;
-    let sde = cx.world.sde().clone();
-    let guard = move |s: &System| {
-        if !state().active.get(&master).is_some_and(|active| Arc::ptr_eq(&active.stop, &generation))
-            || !targets_of(character).contains(&target) { return false; }
-        let Some((ship, victim)) = s.sampled_ball(source).zip(s.sampled_ball(target)) else { return false; };
-        if ship.mode == MODE_WARP || victim.mode == MODE_WARP || victim.char_id != pilot { return false; }
-        let category = sde.types.get(victim.type_id).and_then(|t| t.category_id);
-        if category != Some(CATEGORY_SHIP) && !(category == Some(crate::consts::CATEGORY_ENTITY) && s.is_npc(target)) { return false; }
-        let gap = (crate::space::dist(ship.pos, victim.pos) - f64::from(ship.radius) - f64::from(victim.radius)).max(0.0);
-        range::range_multiplier(gap, optimal, falloff) > 0.0
-    };
-    let amount = cycle.repair_amount * multiplier;
-    if let Some(pilot) = pilot {
-        crate::services::combat::groups_health::repair_player(&cx.db, &cx.world, cx.system_id, target, pilot, layer, amount, guard).await?;
-    } else {
-        let sde = cx.world.sde().clone();
-        cx.world.with(cx.system_id, move |s| {
-            if guard(s) { crate::services::combat::groups_health::repair_npc_in_system(s, &sde, target, layer, amount); }
-        }).await;
-    }
-    Ok(CycleOutcome::Continue)
-}
-
-async fn on_cycle_start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle, charged: bool) -> Result<CycleOutcome, CallError> {
-    use EffectKind::*;
-    match cycle.effect.kind {
-        Turret | Missile => {
-            let target = cycle.target.unwrap_or(0);
-            if !targets_of(cx.char_id).contains(&target) { return Ok(CycleOutcome::Stop("target lost")); }
-            let mut fired = false;
-            for module in &cycle.modules {
-                let charge = match consume_charge(cx, module, None).await { Ok(Some(t)) => t, _ => continue };
-                cycle.charge_type = Some(charge);
-                fired = true;
-                let result = if cycle.effect.kind == Turret {
-                    fire_turret(cx, fit, module, target).await
-                } else {
-                    fire_missile(cx, fit, module, charge, target).await
-                };
-                if let Err(e) = result {
-                    warn!("weapon {} failed: {}", module.id, match e {
-                        CallError::Internal(e) => format!("{e:#}"), CallError::User { msg, .. } => msg,
-                    });
-                }
-            }
-            if !fired { return Ok(CycleOutcome::Stop("out of charges")); }
-            if cycle.cycles == 0 {
-                weapon_fx(cx, &cycle.modules, &cycle.effect, Some(target), cycle.charge_type, true, cycle.duration_ms, cycle.repeat);
-            }
-            Ok(CycleOutcome::Continue)
-        }
-        LocalRepair { layer, amount_attr } => {
-            cycle.repair_amount = repair::amount(fit, cycle.modules[0].id, amount_attr);
-            repair::apply(cx, layer, cycle.repair_amount, true).await;
-            Ok(CycleOutcome::Continue)
-        }
-        FueledLocalRepair { layer, amount_attr, charge_bonus_attr } => {
-            let module = &cycle.modules[0];
-            if !charged && !empty_charge(cx, module).await? { return Ok(CycleOutcome::Stop("out of charges")); }
-            cycle.repair_amount = repair::fueled(fit, module.id, amount_attr, charge_bonus_attr, charged);
-            cycle.charge_type = if charged {
-                match consume_charge(cx, module, cycle.charge_type).await? {
-                    Some(kind) => Some(kind),
-                    None => return Ok(CycleOutcome::Stop("out of charges")),
-                }
-            } else { None };
-            repair::apply(cx, layer, cycle.repair_amount, true).await;
-            Ok(CycleOutcome::Continue)
-        }
-        RemoteRepair { layer } => {
-            let (optimal, falloff) = repair_ranges(fit, cycle);
-            if repair::target(cx, cycle.target, optimal, falloff).await.is_err() {
-                return Ok(CycleOutcome::Stop("target lost"));
-            }
-            let module = &cycle.modules[0];
-            cycle.repair_amount = if let FueledLocalRepair { amount_attr, charge_bonus_attr, .. } = charge_kind(cycle.effect.id, cycle.effect.kind) {
-                if !charged && !empty_charge(cx, module).await? { return Ok(CycleOutcome::Stop("out of charges")); }
-                let amount = repair::fueled(fit, module.id, amount_attr, charge_bonus_attr, charged);
-                cycle.charge_type = if charged {
-                    match consume_charge(cx, module, cycle.charge_type).await? {
-                        Some(kind) => Some(kind),
-                        None => return Ok(CycleOutcome::Stop("out of charges")),
-                    }
-                } else { None };
-                amount
-            } else { repair::amount(fit, module.id, repair::amount_attribute(layer)) };
-            if repair::applies_at_start(layer) { remote_repair(cx, fit, cycle, layer).await } else { Ok(CycleOutcome::Continue) }
-        }
-        CapTransfer | Neutralizer | Nosferatu | CapBooster => capacitor::start(cx, fit, cycle).await,
-        Mining => Ok(mining::start(cx, cycle)),
-        Projected { .. } => {
-            let target = cycle.target.unwrap_or(0);
-            if !targets_of(cx.char_id).contains(&target) { return Ok(CycleOutcome::Stop("target lost")); }
-            for module in &cycle.modules {
-                let charge = fit.source_type(Key::Charge(module.id));
-                projected::apply(cx, fit, module.id, module.type_id, &cycle.effect, target, cycle.duration_ms, charge).await?;
-            }
-            Ok(CycleOutcome::Continue)
-        }
-        Ecm | BurstJammer => ecm::start(cx, fit, cycle).await,
-        Propulsion | Modifiers => Ok(CycleOutcome::Continue),
-        Smartbomb | Vorton |
-        Cloak | MicroJumpDrive | Salvage | Tractor | CargoScan | ShipScan | SurveyScan |
-        AutoTarget | PassiveTarget | Bomb | ProbeLaunch | Hacking | Online => unreachable!("unsupported cycle kind"),
-    }
-}
-
-async fn on_cycle_end(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<CycleOutcome, CallError> {
-    use EffectKind::*;
-    match cycle.effect.kind {
-        LocalRepair { layer, .. } | FueledLocalRepair { layer, .. } => {
-            repair::apply(cx, layer, cycle.repair_amount, false).await;
-            Ok(CycleOutcome::Continue)
-        }
-        RemoteRepair { layer } => {
-            if repair::applies_at_start(layer) { Ok(CycleOutcome::Continue) } else { remote_repair(cx, fit, cycle, layer).await }
-        }
-        Mining => Ok(mining::end(cx, fit, cycle).await),
-        Modifiers | Turret | Missile | Propulsion | Projected { .. } | CapTransfer | Neutralizer | Nosferatu | CapBooster | Ecm | BurstJammer => Ok(CycleOutcome::Continue),
-        Smartbomb | Vorton |
-        Cloak | MicroJumpDrive | Salvage | Tractor | CargoScan | ShipScan | SurveyScan |
-        AutoTarget | PassiveTarget | Bomb | ProbeLaunch | Hacking | Online => unreachable!("unsupported cycle kind"),
-    }
-}
-
-fn on_stop(s: &mut System, cx: &Ctx, cycle: &Cycle) {
-    use EffectKind::*;
-    match cycle.effect.kind {
-        Turret | Missile | FueledLocalRepair { .. } | RemoteRepair { .. } | CapTransfer | Neutralizer | Nosferatu | CapBooster | Ecm | BurstJammer => {
-            if let Some(guid) = cycle.effect.guid.as_deref().and_then(|g| g.split(',').next()) {
-                let events = cycle.modules.iter().map(|m| fire_fx(s.current_time(), cx.ship_id, Some((m.id, m.type_id)), guid, cycle.target, cycle.charge_type, cycle.effect.has(EffectFlag::Offensive), false, cycle.duration_ms, cycle.repeat)).collect();
-                s.broadcast(cx.ship_id, events);
-            }
-        }
-        Mining => mining::stop(s, cx, cycle),
-        Projected { .. } => {
-            for module in &cycle.modules { s.remove_projection(module.id); }
-        }
-        Propulsion => {
-            let cx = cx.clone();
-            let master = cycle.modules[0].id;
-            let generation = cycle.stop.clone();
-            s.defer(async move { apply_propulsion(&cx, master, generation, false).await; });
-        }
-        Modifiers | LocalRepair { .. } => {}
-        Smartbomb | Vorton |
-        Cloak | MicroJumpDrive | Salvage | Tractor | CargoScan | ShipScan | SurveyScan |
-        AutoTarget | PassiveTarget | Bomb | ProbeLaunch | Hacking | Online => unreachable!("unsupported cycle kind"),
-    }
-}
 
 pub(super) async fn cycle_begin_work(mut cycle: Cycle) {
     let cx = cycle.cx.clone();
@@ -446,7 +308,7 @@ pub(super) async fn cycle_begin_work(mut cycle: Cycle) {
             }
             Err(e) => { warn!("module {master} cycle start failed: {}", match e { CallError::Internal(e) => format!("{e:#}"), CallError::User { msg, .. } => msg }); return Err("phase failed"); }
         }
-        if cycle.cycles == 0 && matches!(cycle.effect.kind, EffectKind::FueledLocalRepair { .. } | EffectKind::RemoteRepair { .. } | EffectKind::CapTransfer | EffectKind::Neutralizer | EffectKind::Nosferatu | EffectKind::CapBooster | EffectKind::Ecm | EffectKind::BurstJammer) {
+        if cycle.effect.kind == EffectKind::Smartbomb || cycle.cycles == 0 && matches!(cycle.effect.kind, EffectKind::Bomb | EffectKind::FueledLocalRepair { .. } | EffectKind::RemoteRepair { .. } | EffectKind::CapTransfer | EffectKind::Neutralizer | EffectKind::Nosferatu | EffectKind::CapBooster | EffectKind::Ecm | EffectKind::BurstJammer) {
             weapon_fx(&cx, &cycle.modules, &cycle.effect, cycle.target, cycle.charge_type, true, cycle.duration_ms, cycle.repeat);
         }
         Ok(fit)
@@ -496,6 +358,9 @@ pub(super) fn cycle_stop(s: &mut System, mut cycle: Cycle) {
     }
     if retired { cycle.owner.armed = false; }
     drop(st);
+    if retired && matches!(cycle.effect.kind, EffectKind::Cloak | EffectKind::MicroJumpDrive) {
+        s.refresh_projection_target(cx.ship_id);
+    }
     if retired { on_stop(s, &cx, &cycle); }
     if retired && matches!(charge_kind(cycle.effect.id, cycle.effect.kind), EffectKind::FueledLocalRepair { .. }) {
         s.defer(async move {
@@ -506,70 +371,6 @@ pub(super) fn cycle_stop(s: &mut System, mut cycle: Cycle) {
     }
 }
 
-struct Activation {
-    effect: Effect,
-    module: Module,
-    target: Option<i64>,
-}
-
-async fn on_activate(cx: &Ctx, fit: &Fit, activation: &Activation) -> Result<(), CallError> {
-    use EffectKind::*;
-    match activation.effect.kind {
-        Turret | Missile => {
-            let Some(target) = activation.target.filter(|t| targets_of(cx.char_id).contains(t)) else {
-                return Err(user_error(messages::MSG_DENIED_ACTIVATE_TARGET_NOT_PRESENT, vec![]));
-            };
-            let ship = cx.ship_id;
-            let (in_warp, present) = cx.world.with(cx.system_id, move |s| {
-                (s.ball(ship).is_some_and(|b| b.mode == MODE_WARP), s.ball(target).is_some())
-            }).await.unwrap_or((false, false));
-            if in_warp { return Err(user_error(messages::MSG_DENIED_ACTIVATE_IN_WARP, vec![])); }
-            if !present { return Err(user_error(messages::MSG_DENIED_ACTIVATE_TARGET_NOT_PRESENT, vec![])); }
-            if loaded(&cx.db, cx.ship_id, activation.module.flag).await?.is_none_or(|(_, q)| q <= 0) {
-                return Err(user_error(messages::MSG_NO_CHARGES, vec![("launcher".into(), Value::tuple([Value::Int(UE_TYPEID), Value::Int(activation.module.type_id as i64)]))]));
-            }
-            Ok(())
-        }
-        Projected { .. } => {
-            let Some(target) = activation.target.filter(|t| targets_of(cx.char_id).contains(t)) else {
-                return Err(user_error(messages::MSG_DENIED_ACTIVATE_TARGET_NOT_PRESENT, vec![]));
-            };
-            let ship = cx.ship_id;
-            let sample = cx.world.with(cx.system_id, move |s| {
-                s.sampled_ball(ship).zip(s.sampled_ball(target)).map(|(a, b)| {
-                    (a.mode == MODE_WARP, crate::space::dist(a.pos, b.pos) - a.radius as f64 - b.radius as f64)
-                })
-            }).await.flatten();
-            let Some((in_warp, gap)) = sample else { return Err(user_error(messages::MSG_DENIED_ACTIVATE_TARGET_NOT_PRESENT, vec![])); };
-            if in_warp { return Err(user_error(messages::MSG_DENIED_ACTIVATE_IN_WARP, vec![])); }
-            let optimal = activation.effect.attribute(EffectAttribute::Range).map(|a| fit.value(Key::Module(activation.module.id), a)).unwrap_or(0.0);
-            let falloff = activation.effect.attribute(EffectAttribute::Falloff).map(|a| fit.value(Key::Module(activation.module.id), a)).unwrap_or(0.0);
-            if range::range_multiplier(gap.max(0.0), optimal, falloff) <= 0.0 {
-                return Err(user_error(messages::MSG_DENIED_ACTIVATE_TARGET_NOT_PRESENT, vec![]));
-            }
-            Ok(())
-        }
-        Mining => mining::validate(cx, fit, &activation.module, activation.target).await,
-        RemoteRepair { .. } => {
-            let key = Key::Module(activation.module.id);
-            let optimal = activation.effect.attribute(EffectAttribute::Range).map(|a| fit.value(key, a)).unwrap_or(0.0);
-            let falloff = activation.effect.attribute(EffectAttribute::Falloff).map(|a| fit.value(key, a)).unwrap_or(0.0);
-            repair::target(cx, activation.target, optimal, falloff).await.map(|_| ())
-        }
-        CapTransfer | Neutralizer | Nosferatu | CapBooster => capacitor::validate(cx, fit, &activation.module, &activation.effect, activation.target).await,
-        Ecm | BurstJammer => ecm::validate(cx, fit, &activation.module, &activation.effect, activation.target).await,
-        Propulsion if activation.effect.id == i64::from(EFFECT_MICROWARPDRIVE) => {
-            if fit.value(Key::Module(activation.module.id), ATTR_ACTIVATION_BLOCKED) > 0.0 {
-                return Err(user_error(messages::MSG_MODULE_IS_BLOCKED, vec![]));
-            }
-            Ok(())
-        }
-        Modifiers | LocalRepair { .. } | FueledLocalRepair { .. } | Propulsion => Ok(()),
-        Smartbomb | Vorton |
-        Cloak | MicroJumpDrive | Salvage | Tractor | CargoScan | ShipScan | SurveyScan |
-        AutoTarget | PassiveTarget | Bomb | ProbeLaunch | Hacking | Online => unreachable!("unsupported activation kind"),
-    }
-}
 
 pub(in crate::services) fn has_effect(effects: &[crate::sde::types::TypeEffect], effect: i32) -> bool {
     effects.iter().any(|entry| entry.effect_id == effect)
@@ -597,6 +398,15 @@ pub(super) async fn subject_core(ex: &(impl Executor + ?Sized), sde: &Sde, polic
         return Err(refuse());
     }
     Ok((hull, module))
+}
+
+pub(super) async fn subject_valid(cx: &Ctx, module: &Module, effect: &Effect) -> Result<bool, CallError> {
+    let policy = OnlinePolicy { owner: cx.char_id, active_ship: Some(cx.ship_id), station: None, notify: cx.notify.clone() };
+    match subject_core(&cx.db, cx.world.sde(), &policy, cx.ship_id, module.id, effect.id as i32, true).await {
+        Ok((_, item)) => Ok(item.type_id == module.type_id && item.flag_id == module.flag),
+        Err(CallError::User { .. }) => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 pub(super) async fn subject(c: &Client, ship: i64, item_id: i64, effect: i32, require_online: bool) -> Result<Item, CallError> {
@@ -642,18 +452,26 @@ pub(crate) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
         }
     }
     match kind {
-        EffectKind::Hacking => return super::super::hacking::start(c, item_id, target).await,
-        EffectKind::Online => return super::online::set_online(c, cx.ship_id, item_id, true).await,
+        EffectKind::Hacking => {
+            super::cloak::before_activate(&cx, item_id, kind).await?;
+            return super::super::hacking::start(c, item_id, target).await;
+        }
+        EffectKind::Online => {
+            super::cloak::before_activate(&cx, item_id, kind).await?;
+            return super::online::set_online(c, cx.ship_id, item_id, true).await;
+        }
         EffectKind::Modifiers | EffectKind::Turret | EffectKind::Missile |
         EffectKind::LocalRepair { .. } | EffectKind::FueledLocalRepair { .. } |
         EffectKind::Propulsion | EffectKind::Mining | EffectKind::Projected { .. } | EffectKind::CapTransfer |
-        EffectKind::Neutralizer | EffectKind::Nosferatu | EffectKind::CapBooster | EffectKind::RemoteRepair { .. } | EffectKind::Ecm | EffectKind::BurstJammer => {}
+        EffectKind::Neutralizer | EffectKind::Nosferatu | EffectKind::CapBooster | EffectKind::RemoteRepair { .. } |
+        EffectKind::Ecm | EffectKind::BurstJammer |
         EffectKind::Smartbomb | EffectKind::Vorton | EffectKind::Cloak |
         EffectKind::MicroJumpDrive | EffectKind::Salvage | EffectKind::Tractor |
         EffectKind::CargoScan | EffectKind::ShipScan | EffectKind::SurveyScan |
-        EffectKind::AutoTarget | EffectKind::PassiveTarget | EffectKind::Bomb |
+        EffectKind::AutoTarget | EffectKind::PassiveTarget | EffectKind::Bomb | EffectKind::Compression => {}
         EffectKind::ProbeLaunch => return Err(unsupported::refusal(Some(id), &effect_name, module.type_id)),
     }
+    super::cloak::before_activate(&cx, item_id, kind).await?;
     if state().reloading.get(&item_id).is_some_and(|until| *until > filetime_now()) {
         return Err(user_error(messages::MSG_CANT_ACTIVATE_RELOADING_MODULE, vec![("moduleTypeID".into(), Value::tuple([Value::Int(UE_TYPEID), Value::Int(module.type_id as i64)]))]));
     }
@@ -701,7 +519,12 @@ pub(crate) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
         st.activation_generation.insert(item_id, stop.clone());
     }
     let ship = cx.ship_id;
-    cx.world.post(cx.system_id, move |s| { s.drop_jump_cloak(ship); });
+    cx.world.post(cx.system_id, move |s| {
+        s.drop_jump_cloak(ship);
+        if matches!(kind, EffectKind::Cloak | EffectKind::MicroJumpDrive) {
+            s.refresh_projection_target(ship);
+        }
+    });
     let owner = ActivationOwner { master: item_id, generation: stop.clone(), armed: true };
     ship_effect(&cx, item_id, effect.id, target, other.clone(), true, filetime_now(), duration_ms, repeat);
     info!(user = c.login.user_id, "module {item_id} activated {effect_name} on {target:?} (x{}, {duration_ms:.0} ms, repeat {repeat})", modules.len());
@@ -735,6 +558,13 @@ pub(crate) async fn deactivate(c: &mut Client, call: &Call<'_>) -> CallResult {
     if kind == EffectKind::Online { return super::online::set_online(c, cx.ship_id, item_id, false).await; }
     if let Some(stop) = state().active.get(&item_id) {
         stop_generation(&stop.stop);
+    }
+    if kind == EffectKind::Cloak {
+        let generation = state().active.get(&item_id).map(|active| active.stop.clone());
+        let ship = cx.ship_id;
+        cx.world.post(cx.system_id, move |s| {
+            if let Some(generation) = generation { s.stop_module_cloak(ship, item_id, &generation); }
+        });
     }
     if matches!(kind, EffectKind::Projected { .. }) {
         let generation = state().active.get(&item_id).map(|active| active.stop.clone());

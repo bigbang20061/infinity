@@ -56,7 +56,10 @@ are dispatched only after commit.
 | Remote shield, armor and hull repair | Locked ships and NPCs use fitted amounts and range/falloff, rechecked at application. Server policy applies shield at cycle start and armor and hull at cycle end. Ancillary variants use the same charge, reload and capacitor rules as local ancillary repairs. Mutadaptive remote armor repair is refused. No Crimewatch assistance flags are applied. |
 | ECM and burst jammers | Targeted and area jamming use the shared lifecycle, fitted sensor strengths and actor-owned jam lifetimes. |
 | NPC remote shield, armor and hull repair | NPCs assist the most damaged eligible ally in their spawn group or ownership set, using fitted SDE repair amounts. |
-| Smartbomb, Vorton, cloak, micro jump drive, salvage, tractor, scans, target assistance and bombs | Known later families, visibly refused until implemented. |
+| Smartbombs, bombs and Vorton weapons | Area pulses, delayed bomb impacts and chained Vorton hits use the shared lifecycle and damage paths. |
+| Cloak, micro jump drive and compression | Actor-owned cloak visibility, queued micro jump movement and fitted compression availability use the shared lifecycle. Micro jump range uses fitted dogma when the module type has a range row; otherwise it uses the client 100 km distance. Invalid fitted ranges are rejected. |
+| Salvage, tractor, cargo, ship and survey scanners, automatic and passive targeting | Supported through their shared lifecycle families. Survey results come from the separately triggered modern `miningScanMgr.perform_scan` RPC, not a pushed module result. |
+| Burst jamming and probe launch | Visibly refused by this lifecycle. |
 | Explicitly excluded capital, industrial, structure and other out-of-scope groups | Refused even when an effect has modifiers. |
 
 ## Module map
@@ -65,10 +68,12 @@ All paths below are under `crates/server/src/`.
 
 - `services/effects/registry.rs`: numeric classification, scope and resolved
   effect metadata; `mod.rs` defines the kinds.
-- `services/effects/lifecycle.rs`: activation, cycles, repeat and stopping;
-  `weapons.rs`, `repair.rs`, `capacitor.rs`, `propulsion.rs`, `mining.rs`,
-  `ecm.rs` and `hacking.rs` contain the family-specific work; `projected.rs`
-  constructs projected effects.
+- `services/effects/lifecycle.rs` owns activation, cycles, repeat and stopping;
+  `behaviors.rs` dispatches family validation, cycle work and cleanup. The
+  family modules include `weapons.rs`, `repair.rs`, `capacitor.rs`,
+  `propulsion.rs`, `mining.rs`, `ecm.rs`, `projected.rs`, `aoe.rs`, `bombs.rs`,
+  `vorton.rs`, `cloak.rs`, `mjd.rs`, `compression.rs`, `tractor.rs`,
+  `scan.rs`, `targeting.rs` and `salvage.rs`; `hacking.rs` serves hacking.
 - `services/effects/environment.rs` and `notify.rs`: effect environment and
   notification payloads; `unsupported.rs` owns refusal diagnostics.
 - `services/combat/` retains targeting, ammunition, health, damage and NPC
@@ -86,6 +91,13 @@ All paths below are under `crates/server/src/`.
   change the final level before the refund; this is not an atomic reservation.
 - `sde/dogma.rs` loads dogma data; `sde/dogma/python_effects.rs` supplements
   Python-only modifiers.
+
+Salvage yield tables do not ship with the client: the server substitutes a
+configurable random selection from published Salvaged Materials types, and
+preserves loose wreck contents in a positioned cargo container. Tractor beams
+follow to surface contact and restore the target's movement properties on stop.
+Bomb and micro-jump heading follows moving velocity; when stationary it uses
+the last GOTO direction, then the existing negative Z direction.
 
 ## NPC capacitor assistance
 

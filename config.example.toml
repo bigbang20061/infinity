@@ -177,6 +177,12 @@ station_reprocessing_efficiency = 0.5 # existing NPC station reprocessing effici
 station_reprocessing_tax = 0.05     # existing NPC station reprocessing tax
 scanner_range_m = 500000            # existing survey scanner range
 
+[salvage]
+# Server substitute: one random published salvage-material stack per successful wreck salvage because no yield table ships.
+salvage_material_stacks = 1
+salvage_quantity_min = 1            # Server substitute salvage stack minimum.
+salvage_quantity_max = 3            # Server substitute salvage stack maximum.
+
 [exploration]
 ice_site_chance = 0.3               # existing ice-field chance in k-space systems
 gas_site_chance = 0.5               # existing high-sec gas signature chance; low/null/j-space always

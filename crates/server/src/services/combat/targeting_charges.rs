@@ -8,6 +8,12 @@
 //! A jam clears completed and pending locks and refuses new lock transitions;
 //! acquisition is possible again when the jam expires. Locks are not resumed
 //! after restart.
+//! Lock range and capacity are evaluated at acquisition; completion rechecks the
+//! sampled positions and current lock count against that same fitted snapshot.
+//! Announced player locks remember their recipient until removal; passive locks
+//! send no target-side acquisition or loss notification.
+//! Cycle-owned attempts require an active, unstopped generation at acquisition;
+//! completion only requires that generation not to have been stopped.
 use super::*;
 
 // ---------------------------------------------------------------- targeting
@@ -32,15 +38,39 @@ impl State {
 }
 
 
+pub(in crate::services) fn targeters_of(ship: i64) -> Vec<i64> {
+    targeters_in(&state(), ship)
+}
+
+fn targeters_in(st: &State, ship: i64) -> Vec<i64> {
+    st.targets.iter().filter_map(|(&pilot, targets)| targets.contains(&ship).then_some(pilot)).collect()
+}
+
 /// AddTarget(targetID) -> (lockPending, targets). The lock completes after the lock
 /// time from the ship's scan resolution and the target's signature radius, with
 /// `OnTarget('add', targetID)`.
 pub(super) async fn add_target(c: &mut Client, target: i64) -> CallResult {
     let Some(cx) = ctx(c) else { return Err(user_error(messages::MSG_TARGETING_ATTEMPT_CANCELLED, vec![])) };
+    add_target_ctx(&cx, target, false).await
+}
+
+pub(in crate::services) async fn add_target_ctx(cx: &Ctx, target: i64, silent: bool) -> CallResult {
+    add_target_impl(cx, target, silent, None).await
+}
+
+pub(in crate::services) async fn add_target_for_cycle(cx: &Ctx, target: i64, silent: bool, module: i64, generation: Arc<AtomicBool>) -> CallResult {
+    add_target_impl(cx, target, silent, Some((module, generation))).await
+}
+
+async fn add_target_impl(cx: &Ctx, target: i64, silent: bool, owner: Option<(i64, Arc<AtomicBool>)>) -> CallResult {
+    crate::services::effects::cloak::before_lock(cx).await?;
     let ship_id = cx.ship_id;
     let Some((ship, t)) = cx.world.with(cx.system_id, move |s| Some((s.sampled_ball(ship_id)?, s.sampled_ball(target)?))).await.flatten() else {
         return Err(user_error(messages::MSG_TARGETING_ATTEMPT_CANCELLED, vec![]));
     };
+    if ship.char_id != Some(cx.char_id) || (ship.cloak != 0 && ship.cloak != crate::space::CLOAK_RESTORE) || t.cloak != 0 || target == ship_id {
+        return Err(user_error(messages::MSG_TARGETING_ATTEMPT_CANCELLED, vec![]));
+    }
     let fit = Fit::load_in_space(&cx.db, &cx.world, cx.system_id, cx.char_id, cx.ship_id).await?;
     let range = fit.value(Key::Ship, ATTR_MAX_TARGET_RANGE);
     let gap = dist(ship.pos, t.pos) - t.radius as f64;
@@ -52,30 +82,58 @@ pub(super) async fn add_target(c: &mut Client, target: i64) -> CallResult {
     let pilot_limit = fit.value(Key::Char, ATTR_MAX_LOCKED_TARGETS);
     let ship_limit = fit.value(Key::Ship, ATTR_MAX_LOCKED_TARGETS);
     let max_targets = if pilot_limit > 0.0 { ship_limit.min(pilot_limit) } else { ship_limit } as usize;
-    if targets_of(cx.char_id).len() >= max_targets.max(1) {
-        return Err(user_error(messages::MSG_CUSTOM_NOTIFY, vec![("notify".into(), Value::unicode(messages::target_limit(max_targets.max(1))))]));
-    }
     let delay = lock_time_ms(fit.value(Key::Ship, ATTR_SCAN_RESOLUTION), attr(cx.world.sde(), t.type_id, ATTR_SIGNATURE_RADIUS, t.radius as f64));
     let attempt = NEXT_LOCK.fetch_add(1, Ordering::Relaxed);
     let char_id = cx.char_id;
-    let inserted = cx.world.with(cx.system_id, move |s| {
+    let acquisition_owner = owner.clone();
+    let current = cx.world.with(cx.system_id, move |s| {
+        if !s.contains(ship_id) || !s.contains(target) || jamming::is_jammed(ship_id, s.now_ms()) {
+            return Err(user_error(messages::MSG_TARGETING_ATTEMPT_CANCELLED, vec![]));
+        }
         let mut st = state();
-        if !s.contains(ship_id) || !s.contains(target) || !st.begin_lock(ship_id, char_id, target, attempt, s.now_ms()) { return false; }
+        if !lock_owner_valid(&st, acquisition_owner.as_ref()) {
+            return Err(user_error(messages::MSG_TARGETING_ATTEMPT_CANCELLED, vec![]));
+        }
+        let current: Vec<_> = st.targets.get(&char_id).map(|targets| targets.iter().copied().collect()).unwrap_or_default();
+        if current.contains(&target) || st.locking.contains_key(&(char_id, target)) {
+            return Ok((false, st.locking.contains_key(&(char_id, target)), current));
+        }
+        if current.len() >= max_targets.max(1) {
+            return Err(user_error(messages::MSG_CUSTOM_NOTIFY, vec![("notify".into(), Value::unicode(messages::target_limit(max_targets.max(1))))]));
+        }
+        if !st.begin_lock(ship_id, char_id, target, attempt, s.now_ms()) {
+            return Err(user_error(messages::MSG_TARGETING_ATTEMPT_CANCELLED, vec![]));
+        }
         drop(st);
         s.drop_jump_cloak(ship_id);
-        true
-    }).await.unwrap_or(false);
-    if !inserted { return Err(user_error(messages::MSG_TARGETING_ATTEMPT_CANCELLED, vec![])); }
-    debug!(user = c.login.user_id, "locking {target} in {delay}ms");
-    let current = targets_of(cx.char_id);
+        Ok((true, true, current))
+    }).await.ok_or_else(|| user_error(messages::MSG_TARGETING_ATTEMPT_CANCELLED, vec![]))??;
+    if !current.0 {
+        return Ok(Value::tuple([Value::Bool(current.1), Value::list(current.2.into_iter().map(Value::Int))]));
+    }
+    debug!("locking {target} in {delay}ms");
+    let current = current.2;
     let world = cx.world.clone();
+    let cx = cx.clone();
     world.schedule(cx.system_id, delay, move |s| {
-        let (still_wanted, completed) = {
+        let valid = !jamming::is_jammed(ship_id, s.now_ms()) && s.sampled_ball(ship_id).zip(s.sampled_ball(target)).is_some_and(|(ship, t)|
+            ship.char_id == Some(cx.char_id) && ship.cloak == 0 && t.cloak == 0
+                && dist(ship.pos, t.pos) - t.radius as f64 <= range);
+        let pilot = s.ball(target).and_then(|ball| ball.char_id);
+        let (still_wanted, added) = {
             let mut st = state();
-            st.complete_lock(ship_id, cx.char_id, target, attempt, s.now_ms(), s.contains(ship_id) && s.contains(target))
+            let result = finish_lock(&mut st, ship_id, cx.char_id, target, attempt, s.now_ms(), valid, max_targets, owner.as_ref());
+            if result.1 && !silent {
+                if let Some(pilot) = pilot { st.announced_locks.insert((cx.char_id, target), (ship_id, pilot)); }
+            }
+            result
         };
-        if completed {
-            cx.notify("OnTarget", vec![Value::str("add"), Value::Int(target)]);
+        if added {
+            notify_lock(target, ship_id, silent, |args| cx.notify("OnTarget", args), |args| {
+                if let Some(pilot) = pilot {
+                    s.notify_pilot(pilot, "OnTarget", args);
+                }
+            });
         } else if still_wanted {
             cx.notify("OnTarget", vec![Value::str("lost"), Value::Int(target), Value::None]);
         }
@@ -83,12 +141,32 @@ pub(super) async fn add_target(c: &mut Client, target: i64) -> CallResult {
     Ok(Value::tuple([Value::Bool(true), Value::list(current.into_iter().map(Value::Int))]))
 }
 
+fn lock_owner_valid(st: &State, owner: Option<&(i64, Arc<AtomicBool>)>) -> bool {
+    owner.is_none_or(|(module, generation)| !generation.load(Ordering::Relaxed)
+        && st.active.get(module).is_some_and(|active| !active.forced_inactive && Arc::ptr_eq(&active.stop, generation)))
+}
+
+fn finish_lock(st: &mut State, ship: i64, character: i64, target: i64, attempt: u64, now: i64, valid: bool, limit: usize, owner: Option<&(i64, Arc<AtomicBool>)>) -> (bool, bool) {
+    let valid = valid && !owner.is_some_and(|(_, generation)| generation.load(Ordering::Relaxed))
+        && st.targets.get(&character).is_none_or(|targets| targets.len() < limit.max(1) && !targets.contains(&target));
+    st.complete_lock(ship, character, target, attempt, now, valid)
+}
+
+fn notify_lock(target: i64, ship: i64, silent: bool, owner: impl FnOnce(Vec<Value>), other: impl FnOnce(Vec<Value>)) {
+    owner(vec![Value::str("add"), Value::Int(target)]);
+    if !silent { other(vec![Value::str("otheradd"), Value::Int(ship)]); }
+}
+
 pub(super) fn drop_targets(c: &mut Client, targets: &[i64]) {
     let Some(char_id) = c.session.int("charid") else { return };
-    let removed = {
+    let (removed, notices) = {
         let mut st = state();
-        targets.iter().copied().filter(|t| st.targets.get_mut(&char_id).is_some_and(|set| set.remove(t))).collect()
+        for target in targets { st.locking.remove(&(char_id, *target)); }
+        let removed: Vec<_> = targets.iter().copied().filter(|t| st.targets.get_mut(&char_id).is_some_and(|set| set.remove(t))).collect();
+        let notices = take_announced(&mut st, |ch, target| ch == char_id && targets.contains(&target));
+        (removed, notices)
     };
+    notify_lost(&c.world, notices);
     remove_target_projections(c, removed);
     for t in targets {
         c.notify("OnTarget", vec![Value::str("lost"), Value::Int(*t), Value::None]);
@@ -106,14 +184,78 @@ fn remove_target_projections_in_system(s: &mut crate::space::System, ship: i64, 
     for &target in targets { s.remove_projections_between(ship, target); }
 }
 
+fn take_announced(st: &mut State, mut matches: impl FnMut(i64, i64) -> bool) -> Vec<(i64, i64)> {
+    let mut notices = Vec::new();
+    st.announced_locks.retain(|&(character, target), entry| {
+        if matches(character, target) { notices.push(*entry); false } else { true }
+    });
+    notices
+}
+
+fn notify_lost(world: &World, notices: Vec<(i64, i64)>) {
+    for (ship, pilot) in notices {
+        world.notify_pilot(pilot, "OnTarget", vec![Value::str("otherlost"), Value::Int(ship), Value::None]);
+    }
+}
+
+pub(super) fn clear_character_lock_state(st: &mut State, character: i64) -> (HashSet<i64>, HashSet<i64>, Vec<(i64, i64)>) {
+    let mut pending = HashSet::new();
+    st.locking.retain(|&(ch, target), _| {
+        if ch == character { pending.insert(target); false } else { true }
+    });
+    let targets = st.targets.remove(&character).unwrap_or_default();
+    let notices = take_announced(st, |ch, _| ch == character);
+    (targets, pending, notices)
+}
+
+pub(super) fn clear_character_locks(world: &World, character: i64) -> Vec<i64> {
+    let (targets, _, notices) = clear_character_lock_state(&mut state(), character);
+    notify_lost(world, notices);
+    targets.into_iter().collect()
+}
+
+/// Clear incoming and outgoing locks without discarding ship condition or capacitor.
+pub(in crate::services) fn clear_locks_on(world: &World, system: i64, ship: i64, owner: i64) {
+    let (incoming, outgoing, notices) = {
+        let mut st = state();
+        let (incoming, outgoing) = clear_lock_state(&mut st, ship, owner);
+        let notices = take_announced(&mut st, |ch, target| ch == owner || target == ship);
+        (incoming, outgoing, notices)
+    };
+    notify_lost(world, notices);
+    world.post(system, move |s| {
+        for target in outgoing {
+            s.remove_projections_between(ship, target);
+            s.notify_pilot(owner, "OnTarget", vec![Value::str("lost"), Value::Int(target), Value::None]);
+        }
+        for character in incoming {
+            if let Some(source) = s.pilot_ball(character).map(|ball| ball.id) {
+                s.remove_projections_between(source, ship);
+            }
+            s.notify_pilot(character, "OnTarget", vec![Value::str("lost"), Value::Int(ship), Value::None]);
+        }
+    });
+}
+
+fn clear_lock_state(st: &mut State, ship: i64, owner: i64) -> (Vec<i64>, HashSet<i64>) {
+    st.locking.retain(|(character, target), _| *character != owner && *target != ship);
+    let outgoing = st.targets.remove(&owner).unwrap_or_default();
+    let incoming = st.targets.iter_mut()
+        .filter_map(|(&character, targets)| targets.remove(&ship).then_some(character)).collect();
+    (incoming, outgoing)
+}
+
 /// A destroyed ball is no longer anyone's target.
 pub(super) fn forget_target(world: &World, target: i64) {
-    let holders: Vec<i64> = {
+    let (holders, notices) = {
         let mut st = state();
         st.hp.remove(&target);
         st.locking.retain(|(_, t), _| *t != target);
-        st.targets.iter_mut().filter_map(|(ch, set)| set.remove(&target).then_some(*ch)).collect()
+        let holders: Vec<i64> = st.targets.iter_mut().filter_map(|(ch, set)| set.remove(&target).then_some(*ch)).collect();
+        let notices = take_announced(&mut st, |_, t| t == target);
+        (holders, notices)
     };
+    notify_lost(world, notices);
     for ch in holders {
         world.notify_pilot(ch, "OnTarget", vec![Value::str("lost"), Value::Int(target), Value::str("Exploding")]);
     }

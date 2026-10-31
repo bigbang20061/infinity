@@ -98,6 +98,8 @@ pub const FACTION_GURISTAS: i64 = 500010;
 pub const FACTION_ANGEL_CARTEL: i64 = 500011;
 
 // SDE dogma attribute and effect IDs.
+/// Client dogma/const.py: attributeEmpFieldRange.
+pub const ATTR_EMP_FIELD_RANGE: i32 = 99;
 /// SDE dgmEffects: skillEffect, skill-point bookkeeping rather than a modifier.
 pub const EFFECT_SKILL: i32 = 132;
 /// SDE dgmAttributeTypes: skillTimeConstant.
@@ -183,6 +185,8 @@ pub const ATTR_AGILITY: i32 = 70;
 pub const ATTR_SIGNATURE_RADIUS: i32 = 552;
 /// SDE dgmAttributeTypes: maxRange.
 pub const ATTR_MAX_RANGE: i32 = 54;
+/// SDE dgmAttributeTypes: maxTractorVelocity.
+pub const ATTR_MAX_TRACTOR_VELOCITY: i32 = 1045;
 /// SDE dgmAttributeTypes: quantity.
 pub const ATTR_QUANTITY: i32 = 805;
 /// SDE dgmAttributeTypes: isOnline.

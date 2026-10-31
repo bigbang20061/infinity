@@ -50,19 +50,19 @@ pub(crate) fn apply(s: &mut System, source: i64, module: i64, target: i64, durat
     let now = s.now_ms();
     let started = crate::client::filetime_from_unix_ms(now);
     let generation = NEXT_LOCK.fetch_add(1, Ordering::Relaxed);
-    let (lost, until) = {
+    let (lost, notices, until) = {
         let mut st = state();
         let records = st.jammed.entry(target).or_default();
         let until = now.saturating_add(duration_ms.ceil() as i64)
             .max(records.get(&(source, module)).map_or(now, |record| record.until));
         records.insert((source, module), Jam { until, generation, recipients, started });
-        let mut lost = victim_pilot.and_then(|pilot| st.targets.remove(&pilot)).unwrap_or_default();
-        if let Some(pilot) = victim_pilot {
-            st.locking.retain(|&(character, locked), _| {
-                if character == pilot { lost.insert(locked); false } else { true }
-            });
-        }
-        (lost, until)
+        let (lost, notices) = if let Some(pilot) = victim_pilot {
+            let (targets, pending, notices) = super::targeting_charges::clear_character_lock_state(&mut st, pilot);
+            let mut lost = targets;
+            lost.extend(pending);
+            (lost, notices)
+        } else { (Default::default(), Vec::new()) };
+        (lost, notices, until)
     };
     s.drop_npc_targets(target);
     if let Some(pilot) = victim_pilot {
@@ -70,6 +70,9 @@ pub(crate) fn apply(s: &mut System, source: i64, module: i64, target: i64, durat
             s.remove_projections_between(target, locked);
             s.notify_pilot(pilot, "OnTarget", vec![Value::str("lost"), Value::Int(locked), Value::None]);
         }
+    }
+    for (ship, pilot) in notices {
+        s.notify_pilot(pilot, "OnTarget", vec![Value::str("otherlost"), Value::Int(ship), Value::None]);
     }
     for pilot in recipients.into_iter().flatten() {
         let (event, args) = notify::jam(source, module, target, true, started, (until - now) as f64);

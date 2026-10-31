@@ -1,9 +1,10 @@
 //! Numeric classification of dogma effects for the shared effects lifecycle.
 //!
 //! IDs and modifier rows come from the SDE; client dogma effect constants and
-//! `eve/client/script/dogma/clientDogmaLocation.py` supply behavior references.
-//! Projected effects and ECM use the shared lifecycle, with transient
-//! system-owned state. Remaining unsupported effect families are refused.
+//! `eve/client/script/dogma/clientDogmaLocation.py` supply behavior references;
+//! pythonEffects supply corresponding behavior names. Supported families,
+//! including projected effects and ECM, use the shared lifecycle and actor state;
+//! unsupported families remain visibly refused.
 pub(crate) mod registry;
 pub(crate) mod projection;
 pub(crate) mod projected;
@@ -15,8 +16,19 @@ pub(crate) mod propulsion;
 pub(crate) mod weapons;
 pub(crate) mod hacking;
 pub(crate) mod lifecycle;
+mod behaviors;
 pub(crate) mod online;
 pub(crate) mod fitting;
+pub(crate) mod aoe;
+mod bombs;
+mod vorton;
+pub(crate) mod cloak;
+mod mjd;
+mod compression;
+mod tractor;
+mod scan;
+mod salvage;
+mod targeting;
 mod repair;
 mod mining;
 mod capacitor;
@@ -38,5 +50,7 @@ pub(crate) enum EffectKind {
     CapTransfer, Neutralizer, Nosferatu, CapBooster, Propulsion, Mining,
     Projected { jamming: JammingType }, Ecm, BurstJammer, Cloak,
     MicroJumpDrive, Salvage, Tractor, CargoScan, ShipScan, SurveyScan,
-    AutoTarget, PassiveTarget, Bomb, ProbeLaunch, Hacking, Online,
+    AutoTarget, PassiveTarget, Bomb, Compression, ProbeLaunch, Hacking, Online,
 }
+
+#[cfg(test)] mod tests;

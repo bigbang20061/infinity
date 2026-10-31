@@ -209,7 +209,7 @@ fn classify(effect_id: i32, has_modifiers: bool) -> Option<EffectKind> {
         EFFECT_WARP_DISRUPT_SPHERE => return None,
         EFFECT_ENTOSIS_LINK => return None,
         EFFECT_SNOWBALL_LAUNCHING => return None,
-        EFFECT_INDUSTRIAL_ITEM_COMPRESSION => return None,
+        EFFECT_INDUSTRIAL_ITEM_COMPRESSION => Compression,
         EFFECT_CLONE_RESPAWN_BAY => return None,
         EFFECT_MICRO_JUMP_PORTAL => return None,
         EFFECT_MICRO_JUMP_PORTAL_CAPITAL => return None,

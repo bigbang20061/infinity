@@ -42,6 +42,7 @@ pub struct Config {
     pub npc: game::world::NpcConfig,
     pub crimewatch: game::world::CrimewatchConfig,
     pub mining: game::world::MiningConfig,
+    pub salvage: game::SalvageConfig,
     pub exploration: game::world::ExplorationConfig,
     pub industry: game::economy::IndustryConfig,
     pub corporations: game::social::CorporationsConfig,
@@ -81,6 +82,7 @@ impl PartialEq for Config {
             && self.npc == other.npc
             && self.crimewatch == other.crimewatch
             && self.mining == other.mining
+            && self.salvage == other.salvage
             && self.exploration == other.exploration
             && self.industry == other.industry
             && self.corporations == other.corporations
@@ -221,6 +223,7 @@ impl Config {
             npc: self.npc.clone(),
             crimewatch: self.crimewatch.clone(),
             mining: self.mining.clone(),
+            salvage: self.salvage.clone(),
             exploration: self.exploration.clone(),
             industry: self.industry.clone(),
             corporations: self.corporations.clone(),

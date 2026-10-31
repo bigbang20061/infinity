@@ -61,6 +61,31 @@ fn special_fx_has_all_client_arguments() {
 }
 
 #[test]
+fn scans_encode_client_rows_and_argument_order() {
+    let rows = vec![(34, 7), (35, 12345678901)];
+    let encoded = Value::list([
+        Value::tuple([Value::Int(34), Value::Int(7)]),
+        Value::tuple([Value::Int(35), Value::Int(12345678901)]),
+    ]);
+    assert_eq!(cargo_scan_args(42, rows.clone()), vec![Value::Int(42), encoded.clone()]);
+    assert_eq!(ship_scan_args(42, 1.5, 3.0, rows), vec![Value::Int(42), Value::Float(1.5), Value::Float(3.0), encoded]);
+    assert_eq!(cargo_scan_args(42, vec![]), vec![Value::Int(42), Value::list([])]);
+}
+
+#[test]
+fn special_fx_graphic_info_preserves_other_arguments() {
+    let info = Value::dict([("targets", Value::list([Value::Int(40), Value::Int(41)]))]);
+    assert_eq!(fire_fx_with_info(100, 30, Some((10, 11)), "effects.Laser", Some(40), Some(55), true, true, 250.0, 3, info.clone()),
+        event(100, "OnSpecialFX", vec![
+            Value::Int(30), Value::Int(10), Value::Int(11), Value::Int(40), Value::Int(55),
+            Value::str("effects.Laser"), Value::Bool(true), Value::Int(1), Value::Int(1),
+            Value::Float(250.0), Value::Int(3), Value::None, Value::Int(0), info,
+        ]));
+    assert_eq!(fire_fx(100, 30, None, "effects.Laser", None, None, false, false, 250.0, 0),
+        fire_fx_with_info(100, 30, None, "effects.Laser", None, None, false, false, 250.0, 0, Value::None));
+}
+
+#[test]
 fn attribute_change_preserves_sublocation_and_values() {
     let item = Value::tuple([Value::Int(30), Value::Int(27), Value::Int(55)]);
     let Value::Tuple(args) = attribute_change(20, item.clone(), 99, Value::Int(3), Value::Int(4)) else { panic!("expected attribute change tuple") };

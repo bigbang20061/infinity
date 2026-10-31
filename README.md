@@ -20,6 +20,9 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
   - Electronic warfare from ships and NPCs: stasis webifiers, warp scramblers and disruptors, target painters, sensor dampeners, tracking and guidance disruptors, remote sensor boosters and remote tracking computers, including their scripts. A scrambled ship cannot warp, and scrambling shuts off microwarpdrives. Tracking and guidance disruption shorten an NPC's range and lower its hit chance and missile damage. Targeted ECM and burst jammers work against the target's strongest sensor type: the chance is the jammer's strength for that type against the sensor's strength, with optimal range and falloff. A jammed ship or NPC loses its locks and cannot lock again until the jam ends, after the module's jam duration or its cycle time.
   - Capacitor warfare from ships and NPCs: neutralizers, nosferatu and capacitor transfer, with optimal range and falloff. Capacitor boosters use their charges, and ancillary shield boosters and armor repairers use their charges and reload from cargo automatically when they run dry. An NPC transfers capacitor only to another NPC of its own spawn group, or with the same owner, never to its player target.
   - Remote shield, armor and hull repair from ships and NPCs, with optimal range and falloff: shield lands at the start of a cycle, armor and hull at the end, as for local repair. Ancillary remote repairers use their charges and reload from cargo. An NPC repairs the most damaged ally of its own spawn group or owner, never its target. Remote assistance, capacitor transfer included, does not give Crimewatch flags yet.
+  - Smartbombs, bombs and Vorton projectors. A smartbomb, fitted to a ship or an NPC, damages the ships, drones and NPCs in range around it. A bomb flies ahead of the launching ship and detonates after its flight time. A Vorton projector hits a locked target and chains to further targets in range of it, up to the fitted target count.
+  - Cloaking devices with the client's activation rules and targeting delay, micro jump drives, tractor beams, cargo and ship scanners, survey scanner cycles, and automatic and passive targeting. A tractor beam pulls a wreck or container to the ship's surface. Compression modules advertise their fitted types and range.
+  - Salvagers: the chance is the wreck's access difficulty against the salvager's bonus. A successful salvage claims the wreck once and leaves its loot in it. Wreck yield tables do not ship with the client, so it gives `salvage.salvage_material_stacks` stacks of a random published salvaged material instead (see Configuration).
   - NPC AI, bounties, wrecks and loot.
   - Crimewatch: timers, criminal flags, security status, CONCORD and killmails.
   - Player bounties on characters, corporations and alliances, with contributions, leaderboards and search. A pilot who destroys a target's ship is paid from the matching bounty pools, at most 20% of the destroyed value, once per killmail.
@@ -51,15 +54,16 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
   - fleet warps, boosts and the fleet finder
   - shared bookmark folders
   - plugging in implants and consuming boosters; implants and boosters already in a character's slots do apply
-  - modules whose effect is not implemented yet, among them mutadaptive remote armor repairers, smartbombs, micro jump drives, salvagers, tractor beams and bombs. Activating one is refused with a message, and `/effects unsupported` lists the effects tried since the server started.
+  - modules whose effect is not implemented yet, among them mutadaptive remote armor repairers. Activating one is refused with a message, and `/effects unsupported` lists the effects tried since the server started.
   - in direct trades: items from cargo, from inside a container or from a corporation hangar, the active ship, fitted modules and charges, and PLEX; types that cannot be traded are refused anywhere in an offered container or ship
   - the GM bounty reimbursement and bounty cache calls
   - labels for personal contacts
   - LP store offers that cost Analysis Kredits: they are listed, but buying one is refused
   - module heat damage from overheating, and repairs at structures
+  - compressing items, although compression modules activate; and survey scan results pushed by the scanner: the mining overlay gets them through its own scan call
   - loot rights: any pilot whose ship is within 2,500 m of a wreck or cargo container in space can take from it, and taking from someone else's does not make the pilot a suspect
 - Some runtime state lives only in memory and is lost when the server restarts:
-  - fleets, combat and Crimewatch timers, ECM jams, and in-progress hacking; a suspect flag from an activated kill right is the exception and is restored with its original deadline;
+  - fleets, combat and Crimewatch timers, ECM jams, tractor pulls, and in-progress hacking; a suspect flag from an activated kill right is the exception and is restored with its original deadline;
   - everything spawned into space (NPCs, wrecks, scheduled effects);
   - a ship's velocity, warp and cloak, so a restarted ship starts at rest.
 - A reload still running when the server stops is not resumed. At the next start its charges go back to the ship's cargo hold.
@@ -67,6 +71,7 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
 - A ship's shield charge and its armor and hull damage are saved when it docks, jumps through a gate or wormhole, or is swapped, when its pilot logs off, and with the periodic and shutdown position saves, including ships that are not moving. Armor and hull damage survive a restart, and shields recharge from the time they were saved. A crash can lose condition changes made since the last periodic save.
 - Stopping the server with Ctrl-C or SIGTERM (`docker compose stop`) first stops starting scheduled jobs and gives the running ones up to `scheduler.drain_secs` to finish, then saves the position and condition of every ship in space before it exits. The server waits at most 10 seconds for these writes.
 - Collisions use one sphere per ship or celestial, as the client does by default, not the rendered shape: a ship can bump into empty space near a station, or pass through parts of it that stick out of its sphere. Undocking uses a fixed heading and clearance rather than the station's undock points, so a very large ship can still start overlapping the station. Dynamic orientation, formations and destiny's rarer ball modes are not implemented.
+- Ships have no orientation of their own. A micro jump or a bomb goes along the ship's velocity, or along its last commanded heading when it is stopped, or along a fixed default direction when it has neither.
 - Balances are stored with up to 36 digits (ISK: 34 integer digits and 2 decimal places; PLEX: 36 integer digits), and the server works with the full value. The client is sent at most the largest balance it displays without scientific notation: 1,000,000,000,000,000,000 ISK for a character wallet, 9,223,372,036,854,774,784 ISK for a corporation wallet, and 99,999,999,999,999 PLEX. ISK reaches the client as a double, so above about 45 trillion ISK it can no longer show every cent.
 - A `/dogma` override changes every value the server computes. The client's fitting window and HUD show it only for an attribute the ship's hull type has; for a module, or a ship attribute the hull type lacks, they keep showing the type's value, while Show Info in space shows the new one. The command's reply says so.
 
@@ -191,6 +196,7 @@ Some keys switch behaviour on or off rather than set a number:
 | `crimewatch.concord_enabled` | `true` | With `false`, CONCORD does not respond. Criminal flags, timers and security status penalties still apply. |
 | `bounty.kill_right_lifetime_days` / `.kill_right_suspect_secs` | `30` / `900` | How long an earned kill right lasts, and how long activating one makes the aggressor a suspect. Both must be positive. |
 | `gm.spawn_distance_m` / `.clear_radius_m` / `.max_spawn_count` | `5000` / `100000` / `100` | Default distance of GM-spawned NPCs and debris, default radius of `/npcclear`, and the most NPCs one GM command may spawn |
+| `salvage.salvage_material_stacks` / `.salvage_quantity_min` / `.salvage_quantity_max` | `1` / `1` / `3` | What a successful salvage gives, since wreck yield tables do not ship with the client: this many stacks of a random published salvaged material, each of between the minimum and maximum units. All must be positive, and the maximum at least the minimum. |
 
 ## Database
 

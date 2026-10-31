@@ -168,3 +168,98 @@ async fn ancillary_auto_reload_db_smoke() {
     assert_eq!(final_other, INCOMPATIBLE_QUANTITY);
     assert!(final_pending.unwrap().is_empty());
 }
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
+async fn actor_completes_passive_and_normal_locks_with_symmetric_notifications() {
+    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = Arc::new(Sde::load(&db).await.unwrap());
+    let ship_type = sde.types.iter().filter(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_SHIP)
+        && t.attribute(ATTR_MAX_TARGET_RANGE).unwrap_or(0.0) > 0.0
+        && t.attribute(ATTR_SIGNATURE_RADIUS).unwrap_or(0.0) > 0.0)
+        .max_by(|a, b| a.attribute(ATTR_SCAN_RESOLUTION).unwrap_or(0.0).total_cmp(&b.attribute(ATTR_SCAN_RESOLUTION).unwrap_or(0.0)))
+        .expect("ship type").type_id;
+    let module_type = sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_MODULE)).expect("module type").type_id;
+    let charge_type = sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_CHARGE)).expect("charge type").type_id;
+    let system = 1;
+    let fixture = create(&db, ship_type, module_type, charge_type, charge_type, system).await.unwrap();
+    let world = World::new(db.clone(), sde, 1);
+    let (owner_tx, mut owner_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (target_tx, mut target_rx) = tokio::sync::mpsc::unbounded_channel();
+    let target = -fixture.ship;
+    let target_pilot = -fixture.character;
+    world.register_pilot(fixture.character, owner_tx.clone());
+    world.register_pilot(target_pilot, target_tx);
+    world.add_ship(system, ball(fixture.ship, ship_type, fixture.character)).await.unwrap();
+    world.add_ship(system, ball(target, ship_type, target_pilot)).await.unwrap();
+    let cx = Ctx { db: db.clone(), world: world.clone(), notify: owner_tx, char_id: fixture.character, ship_id: fixture.ship, system_id: system };
+    let test_cx = cx.clone();
+    let test_world = world.clone();
+    let result = tokio::spawn(async move {
+        let cx = test_cx;
+        let world = test_world;
+        for case in 0..5 {
+            let generation = Arc::new(AtomicBool::new(false));
+            state().active.insert(fixture.module, ActiveModule {
+                char_id: fixture.character, stop: generation.clone(), forced_inactive: false,
+            });
+            add_target_for_cycle(&cx, target, false, fixture.module, generation.clone()).await.ok().expect("cycle lock starts");
+            {
+                let mut st = state();
+                match case {
+                    0 => generation.store(true, Ordering::Relaxed),
+                    1 => st.active.get_mut(&fixture.module).unwrap().stop = Arc::new(AtomicBool::new(false)),
+                    2 => {
+                        st.active.get_mut(&fixture.module).unwrap().forced_inactive = true;
+                        generation.store(true, Ordering::Relaxed);
+                    }
+                    3 => { st.active.remove(&fixture.module); }
+                    _ => {}
+                }
+            }
+            let (_, args) = tokio::time::timeout(Duration::from_secs(120), owner_rx.recv()).await.unwrap().unwrap();
+            if case == 0 || case == 2 {
+                assert_eq!(args[0].as_bytes(), Some(b"lost".as_slice()));
+                assert!(!state().locking.contains_key(&(fixture.character, target)));
+                assert!(!targets_of(fixture.character).contains(&target));
+                assert!(target_rx.try_recv().is_err());
+            } else {
+                assert_eq!(args[0].as_bytes(), Some(b"add".as_slice()));
+                let (_, args) = tokio::time::timeout(Duration::from_secs(2), target_rx.recv()).await.unwrap().unwrap();
+                assert_eq!(args[0].as_bytes(), Some(b"otheradd".as_slice()));
+                clear_character_locks(&world, fixture.character);
+                let (_, args) = tokio::time::timeout(Duration::from_secs(2), target_rx.recv()).await.unwrap().unwrap();
+                assert_eq!(args[0].as_bytes(), Some(b"otherlost".as_slice()));
+            }
+            state().active.remove(&fixture.module);
+        }
+        add_target_ctx(&cx, target, true).await.ok().expect("passive lock starts");
+        let (_, args) = tokio::time::timeout(Duration::from_secs(120), owner_rx.recv()).await.unwrap().unwrap();
+        assert_eq!(args[0].as_bytes(), Some(b"add".as_slice()));
+        assert_eq!(args[1].as_int(), Some(target));
+        assert!(targets_of(fixture.character).contains(&target));
+        assert!(target_rx.try_recv().is_err());
+        clear_character_locks(&world, fixture.character);
+        assert!(target_rx.try_recv().is_err());
+        add_target_ctx(&cx, target, false).await.ok().expect("normal lock starts");
+        let (_, args) = tokio::time::timeout(Duration::from_secs(120), owner_rx.recv()).await.unwrap().unwrap();
+        assert_eq!(args[0].as_bytes(), Some(b"add".as_slice()));
+        let (_, args) = tokio::time::timeout(Duration::from_secs(2), target_rx.recv()).await.unwrap().unwrap();
+        assert_eq!(args[0].as_bytes(), Some(b"otheradd".as_slice()));
+        assert_eq!(args[1].as_int(), Some(fixture.ship));
+        clear_character_locks(&world, fixture.character);
+        let (_, args) = tokio::time::timeout(Duration::from_secs(2), target_rx.recv()).await.unwrap().unwrap();
+        assert_eq!(args[0].as_bytes(), Some(b"otherlost".as_slice()));
+        assert_eq!(args[1].as_int(), Some(fixture.ship));
+    }).await;
+    clear_character_locks(&world, fixture.character);
+    state().active.remove(&fixture.module);
+    world.remove_ball(system, fixture.ship).await;
+    world.remove_ball(system, target).await;
+    world.unregister_pilot(fixture.character);
+    world.unregister_pilot(target_pilot);
+    drop(cx);
+    drop(world);
+    cleanup(&db, fixture).await.unwrap();
+    result.unwrap();
+}

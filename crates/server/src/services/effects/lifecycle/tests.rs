@@ -31,6 +31,36 @@ fn fuel_discharge_and_empty_booster_policy() {
     assert!(!needs_charge(shield));
     assert!(charge_sensitive(armor));
     assert!(!charge_sensitive(EffectKind::Neutralizer));
+    for kind in [EffectKind::Bomb, EffectKind::Vorton] {
+        assert!(needs_charge(kind));
+        assert!(charge_sensitive(kind));
+        assert_eq!(cycle_discharge(kind, true, 20.0), 20.0);
+    }
+}
+
+#[test]
+fn completed_cycle_retirement_preserves_committed_action_generation() {
+    use crate::space::{Ball, WarpState, MODE_STOP};
+    crate::tests::init_config();
+    let mut system = System::new(1, Arc::default(), 1000);
+    system.insert(Ball {
+        id: 1, type_id: 1, owner_id: 1, corp_id: 1, alliance_id: -1,
+        char_id: None, signature_radius: None, mode: MODE_STOP, radius: 1.0, mass: 1e6,
+        max_vel: 100.0, agility: 1.0, speed_fraction: 0.0,
+        pos: [0.0; 3], vel: [0.0; 3], goto: [0.0; 3], old_pos: [0.0; 3],
+        old_vel: [0.0; 3], segment_acceleration: None, follow_id: 0, follow_range: 0.0,
+        free: true, global: false, interactive: false, massive: true,
+        warp: WarpState::default(), warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0,
+        effect_stamp: 0, cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new(),
+    });
+    let generation = Arc::new(AtomicBool::new(false));
+    let guard = generation.clone();
+    system.set_ball_position(1, [10.0, 20.0, 30.0], move |_, _| !guard.load(Ordering::Relaxed));
+    let mut active = HashMap::new();
+    active.insert(1, ActiveModule { char_id: 1, stop: generation.clone(), forced_inactive: false });
+    assert!(retire_activation(&mut active, 1, &generation, || {}));
+    system.tick(2000);
+    assert_eq!(system.ball(1).unwrap().pos, [10.0, 20.0, 30.0]);
 }
 
 #[test]
