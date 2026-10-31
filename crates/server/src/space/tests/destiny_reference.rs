@@ -81,7 +81,7 @@ fn start_direction(system: &mut System) {
 fn compare_position(actual: V3, expected: V3, context: &str) {
     for i in 0..3 {
         let tolerance = 1e-3_f64.max(1e-6 * expected[i].abs());
-        assert!((actual[i] - expected[i]).abs() <= tolerance, "{context}: position actual {actual:?}, expected {expected:?}");
+        assert!((actual[i] - expected[i]).abs() <= tolerance, "{context}: actual {actual:?}, expected {expected:?}");
     }
 }
 
@@ -114,6 +114,9 @@ pub(super) fn replay(name: &str, fixture_data: &str, balls: Vec<Ball>, stream_ti
                 let pos = row["pos"].as_array().unwrap();
                 let expected = std::array::from_fn(|i| pos[i].as_f64().unwrap());
                 compare_position(ball.pos, expected, &format!("{name} tick {tick} ball {id}"));
+                let vel = row["vel"].as_array().unwrap();
+                let expected = std::array::from_fn(|i| vel[i].as_f64().unwrap());
+                compare_position(ball.vel, expected, &format!("{name} tick {tick} ball {id} velocity"));
                 assert_eq!(i64::from(ball.mode), row["mode"].as_i64().unwrap(), "{name} tick {tick} ball {id}: mode");
                 assert_eq!(ball.effect_stamp, row["effectStamp"].as_i64().unwrap(), "{name} tick {tick} ball {id}: effect stamp");
             }
@@ -142,10 +145,16 @@ pub(super) fn replay_fractions(name: &str, fixture: &str, balls: Vec<Ball>, setu
     for tick in 1..=120 {
         let previous: BTreeMap<_, _> = ids.iter().map(|id| (*id, system.ball(*id).expect("replay ball missing").clone())).collect();
         system.tick(tick * 1000);
-        for id in &ids {
+        let mut rows = BTreeMap::new();
+        for _ in &ids {
             let row: serde_json::Value = serde_json::from_str(lines.next().expect("missing fraction fixture row")).expect("invalid fraction fixture JSON");
             assert_eq!(row["tick"].as_i64(), Some(tick), "{name}: invalid fraction tick");
-            assert_eq!(row["id"].as_i64(), Some(*id), "{name} tick {tick}: invalid ball id");
+            let id = row["id"].as_i64().expect("missing fraction ball id");
+            assert!(ids.contains(&id), "{name} tick {tick}: invalid ball id {id}");
+            assert!(rows.insert(id, row).is_none(), "{name} tick {tick}: duplicate ball id {id}");
+        }
+        for id in &ids {
+            let row = rows.get(id).expect("missing fraction fixture ball row");
             let samples = row["samples"].as_array().expect("missing fraction samples");
             assert_eq!(samples.len(), fractions.len(), "{name} tick {tick} ball {id}: invalid sample count");
             let ball = system.ball(*id).expect("replay ball missing");
