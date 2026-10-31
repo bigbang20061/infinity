@@ -251,6 +251,7 @@ fn cycle_deadlines_and_deactivation() {
 
 #[test]
 fn reload_reservation_survives_departure_and_preserves_new_marker() {
+    crate::tests::init_config();
     let mut s = System::default();
     s.insert(Ball {
         id: 42, type_id: 1, owner_id: 1, corp_id: 1, alliance_id: -1,
