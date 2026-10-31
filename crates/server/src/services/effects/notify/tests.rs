@@ -8,6 +8,22 @@ fn ewar_notifications_use_client_string_slot_and_argument_order() {
 }
 
 #[test]
+fn jam_notifications_preserve_identity_filetime_and_milliseconds() {
+    let identity = vec![Value::Int(11), Value::Int(22), Value::Int(33), Value::str("electronic")];
+    let started = 133_000_000_000_000_000;
+    let (name, args) = jam(11, 22, 33, true, started, 20_000.5);
+    assert_eq!(name, "OnJamStart");
+    assert_eq!(args.len(), 6);
+    assert_eq!(&args[..4], identity.as_slice());
+    assert_eq!(args[4], Value::Int(started));
+    assert_eq!(args[5], Value::Float(20_000.5));
+    let (name, args) = jam(11, 22, 33, false, started, 20_000.5);
+    assert_eq!(name, "OnJamEnd");
+    assert_eq!(args.len(), 4);
+    assert_eq!(args, identity);
+}
+
+#[test]
 fn npc_scram_slots_distinguish_mwd_blocking() {
     assert_eq!(ewar_slot_by_id(crate::consts::EFFECT_NPC_WARP_SCRAMBLE), Some("warpScrambler"));
     assert_eq!(ewar_slot_by_id(crate::consts::EFFECT_NPC_WARP_SCRAMBLE_MWD), Some("warpScramblerMWD"));

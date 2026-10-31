@@ -17,7 +17,7 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
   - Targeting, ammunition, weapon groups, turrets and missiles, and capacitor.
   - Weapon groups: online guns of the same type and ammunition can be linked into a bank in slot order, and banks can be merged, peeled, unlinked and destroyed. A bank fires and reloads as one, and activating a slave fires its master's bank. Taking any member offline destroys its bank; dragging a fitted gun out of its slot removes it from its bank, or destroys the bank if it is the master. Bank membership is saved; a firing cycle is not.
   - Turret hit chance follows carbonengine destiny's accuracy formula, for ships and NPCs: angular velocity against tracking and signature, and surface distance against optimal range and falloff. Missile damage is scaled by the target's signature radius and speed, at the moment the missile hits, against the missile's explosion radius and velocity. NPCs with no falloff hit only inside optimal range, and NPCs with no tracking ignore angular velocity.
-  - Electronic warfare from ships and NPCs: stasis webifiers, warp scramblers and disruptors, target painters, sensor dampeners, tracking and guidance disruptors, remote sensor boosters and remote tracking computers, including their scripts. A scrambled ship cannot warp, and scrambling shuts off microwarpdrives. Tracking and guidance disruption shorten an NPC's range and lower its hit chance and missile damage.
+  - Electronic warfare from ships and NPCs: stasis webifiers, warp scramblers and disruptors, target painters, sensor dampeners, tracking and guidance disruptors, remote sensor boosters and remote tracking computers, including their scripts. A scrambled ship cannot warp, and scrambling shuts off microwarpdrives. Tracking and guidance disruption shorten an NPC's range and lower its hit chance and missile damage. Targeted ECM and burst jammers work against the target's strongest sensor type: the chance is the jammer's strength for that type against the sensor's strength, with optimal range and falloff. A jammed ship or NPC loses its locks and cannot lock again until the jam ends, after the module's jam duration or its cycle time.
   - Capacitor warfare from ships and NPCs: neutralizers, nosferatu and capacitor transfer, with optimal range and falloff. Capacitor boosters use their charges, and ancillary shield boosters and armor repairers use their charges and reload from cargo automatically when they run dry. An NPC transfers capacitor only to another NPC of its own spawn group, or with the same owner, never to its player target.
   - Remote shield, armor and hull repair from ships and NPCs, with optimal range and falloff: shield lands at the start of a cycle, armor and hull at the end, as for local repair. Ancillary remote repairers use their charges and reload from cargo. An NPC repairs the most damaged ally of its own spawn group or owner, never its target. Remote assistance, capacitor transfer included, does not give Crimewatch flags yet.
   - NPC AI, bounties, wrecks and loot.
@@ -51,7 +51,7 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
   - fleet warps, boosts and the fleet finder
   - shared bookmark folders
   - plugging in implants and consuming boosters; implants and boosters already in a character's slots do apply
-  - modules whose effect is not implemented yet, among them mutadaptive remote armor repairers, ECM, smartbombs, micro jump drives, salvagers, tractor beams and bombs. Activating one is refused with a message, and `/effects unsupported` lists the effects tried since the server started.
+  - modules whose effect is not implemented yet, among them mutadaptive remote armor repairers, smartbombs, micro jump drives, salvagers, tractor beams and bombs. Activating one is refused with a message, and `/effects unsupported` lists the effects tried since the server started.
   - in direct trades: items from cargo, from inside a container or from a corporation hangar, the active ship, fitted modules and charges, and PLEX; types that cannot be traded are refused anywhere in an offered container or ship
   - the GM bounty reimbursement and bounty cache calls
   - labels for personal contacts
@@ -59,7 +59,7 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
   - module heat damage from overheating, and repairs at structures
   - loot rights: any pilot whose ship is within 2,500 m of a wreck or cargo container in space can take from it, and taking from someone else's does not make the pilot a suspect
 - Some runtime state lives only in memory and is lost when the server restarts:
-  - fleets, combat and Crimewatch timers, and in-progress hacking; a suspect flag from an activated kill right is the exception and is restored with its original deadline;
+  - fleets, combat and Crimewatch timers, ECM jams, and in-progress hacking; a suspect flag from an activated kill right is the exception and is restored with its original deadline;
   - everything spawned into space (NPCs, wrecks, scheduled effects);
   - a ship's velocity, warp and cloak, so a restarted ship starts at rest.
 - A reload still running when the server stops is not resumed. At the next start its charges go back to the ship's cargo hold.

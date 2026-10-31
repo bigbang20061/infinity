@@ -5,6 +5,9 @@
 //! Automatic reload searches only ship cargo.
 //! Reload timer markers are memory-only; newer starts return older reservations, and startup recovery returns pending charges rather than resuming timers.
 //! Accepted targeting attempts cancel arrival jump cloak before the lock timer.
+//! A jam clears completed and pending locks and refuses new lock transitions;
+//! acquisition is possible again when the jam expires. Locks are not resumed
+//! after restart.
 use super::*;
 
 // ---------------------------------------------------------------- targeting
@@ -12,6 +15,22 @@ use super::*;
 pub(crate) fn targets_of(char_id: i64) -> Vec<i64> {
     state().targets.get(&char_id).map(|t| t.iter().copied().collect()).unwrap_or_default()
 }
+impl State {
+    pub(super) fn begin_lock(&mut self, ship: i64, pilot: i64, target: i64, attempt: u64, now: i64) -> bool {
+        if jamming::jammed_in(self, ship, now) { return false; }
+        self.locking.insert((pilot, target), attempt);
+        true
+    }
+
+    pub(super) fn complete_lock(&mut self, ship: i64, pilot: i64, target: i64, attempt: u64, now: i64, present: bool) -> (bool, bool) {
+        let wanted = self.locking.get(&(pilot, target)) == Some(&attempt);
+        if wanted { self.locking.remove(&(pilot, target)); }
+        let completed = wanted && present && !jamming::jammed_in(self, ship, now);
+        if completed { self.targets.entry(pilot).or_default().insert(target); }
+        (wanted, completed)
+    }
+}
+
 
 /// AddTarget(targetID) -> (lockPending, targets). The lock completes after the lock
 /// time from the ship's scan resolution and the target's signature radius, with
@@ -38,19 +57,24 @@ pub(super) async fn add_target(c: &mut Client, target: i64) -> CallResult {
     }
     let delay = lock_time_ms(fit.value(Key::Ship, ATTR_SCAN_RESOLUTION), attr(cx.world.sde(), t.type_id, ATTR_SIGNATURE_RADIUS, t.radius as f64));
     let attempt = NEXT_LOCK.fetch_add(1, Ordering::Relaxed);
-    state().locking.insert((cx.char_id, target), attempt);
-    cx.world.post(cx.system_id, move |s| { s.drop_jump_cloak(ship_id); });
+    let char_id = cx.char_id;
+    let inserted = cx.world.with(cx.system_id, move |s| {
+        let mut st = state();
+        if !s.contains(ship_id) || !s.contains(target) || !st.begin_lock(ship_id, char_id, target, attempt, s.now_ms()) { return false; }
+        drop(st);
+        s.drop_jump_cloak(ship_id);
+        true
+    }).await.unwrap_or(false);
+    if !inserted { return Err(user_error(messages::MSG_TARGETING_ATTEMPT_CANCELLED, vec![])); }
     debug!(user = c.login.user_id, "locking {target} in {delay}ms");
     let current = targets_of(cx.char_id);
     let world = cx.world.clone();
     world.schedule(cx.system_id, delay, move |s| {
-        let still_wanted = {
+        let (still_wanted, completed) = {
             let mut st = state();
-            st.locking.get(&(cx.char_id, target)) == Some(&attempt) && st.locking.remove(&(cx.char_id, target)).is_some()
+            st.complete_lock(ship_id, cx.char_id, target, attempt, s.now_ms(), s.contains(ship_id) && s.contains(target))
         };
-        let present = s.contains(ship_id) && s.contains(target);
-        if still_wanted && present {
-            state().targets.entry(cx.char_id).or_default().insert(target);
+        if completed {
             cx.notify("OnTarget", vec![Value::str("add"), Value::Int(target)]);
         } else if still_wanted {
             cx.notify("OnTarget", vec![Value::str("lost"), Value::Int(target), Value::None]);

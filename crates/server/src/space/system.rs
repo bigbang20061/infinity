@@ -22,6 +22,7 @@
 //! sphere collisions do not emit bumps. Taking, replacing or destroying an NPC
 //! releases its in-memory combat health and capacitor state; temporary player
 //! removal preserves that state.
+//! Taking a ball also ends its in-memory ECM lockout before its pilot leaves.
 use super::*;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::future::Future;
@@ -178,6 +179,9 @@ impl System {
 
     pub fn take(&mut self, id: i64) -> Option<Ball> {
         self.warp_exits.remove(&id);
+        if self.balls.contains_key(&id) {
+            crate::services::combat::jamming::clear(self, id);
+        }
         let ball = self.balls.remove(&id)?;
         self.remove_projections_from(id);
         self.remove_projections_on_departure(id);

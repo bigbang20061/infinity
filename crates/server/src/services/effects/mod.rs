@@ -1,8 +1,9 @@
 //! Numeric classification of dogma effects for the shared effects lifecycle.
 //!
 //! IDs and modifier rows come from the SDE; client dogma effect constants and
-//! pythonEffects supply corresponding behavior names. Projected effects use the
-//! shared lifecycle and transient system-owned projections; later families are refused.
+//! `eve/client/script/dogma/clientDogmaLocation.py` supply behavior references.
+//! Projected effects and ECM use the shared lifecycle, with transient
+//! system-owned state. Remaining unsupported effect families are refused.
 pub(crate) mod registry;
 pub(crate) mod projection;
 pub(crate) mod projected;
@@ -20,6 +21,7 @@ mod mining;
 mod capacitor;
 pub(crate) mod npc_capacitor;
 pub(crate) mod npc_repair;
+pub(crate) mod ecm;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum JammingType {
     Webify, Scramble, Disrupt, Paint, Damp, TrackingDisrupt, GuidanceDisrupt,
