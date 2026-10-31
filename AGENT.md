@@ -97,6 +97,7 @@ Any other tag starts nothing.
 
   Update this block whenever behaviour changes.
 - Comments state facts and reasons the code can't show: protocol details, client file and function references, formulas and their sources. Don't narrate what the code obviously does.
+- Comments, test names and file names stand on their own. Never cite internal planning labels (decision, work-item or pull request numbers such as `D3`, `W13`, `PR7`) or tool jargon; state the fact or reason the label stood for.
 - Code, comments, log messages and docs are written in English.
 
 ### File layout

@@ -4,10 +4,10 @@
 //! game database. Mirrors `dogma/effects/modifiers.py`, `dogma/const.py`, and
 //! `dogma/attributes/skillLevelAttribute.py`. Projection lifetime and overload
 //! activation are not managed here; callers provide a fit snapshot.
-//! ponytail: skill effects with fittingUsageChance require loading and filtering
+//! Skill effects with fittingUsageChance require loading and filtering
 //! that attribute if such a skill appears in the SDE.
-//! ponytail: owner-fit drone queries do not include incoming drone projections;
-//! add a receiving drone fit when the in-space drone runtime arrives in PR7.
+//! Owner-fit drone queries do not include incoming drone projections;
+//! add a receiving drone fit when the in-space drone runtime exists.
 
 use super::{db_err, CallError};
 use crate::consts::{ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_REQUIRED_SKILL_1, ATTR_SPEED_FACTOR, CATEGORY_CHARGE, CATEGORY_SHIP, CATEGORY_SKILL, EFFECT_AFTERBURNER, EFFECT_MICROWARPDRIVE, EFFECT_SKILL, TYPE_CHARACTER};

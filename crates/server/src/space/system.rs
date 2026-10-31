@@ -86,7 +86,7 @@ impl System {
     pub fn current_time(&self) -> i64 { self.current_time }
     /// Schedule relative to this actor's current millisecond clock. Due timers
     /// run only on ticks, ordered by deadline and then insertion order (also for
-    /// zero delays). D3 applies: no await, DB access or calls back into World.
+    /// zero delays). Closures run inside the actor: no await, DB access or calls back into World.
     pub fn schedule(&mut self, delay_ms: u64, f: impl FnOnce(&mut System) + Send + 'static) {
         self.schedule_at(self.ms.saturating_add(i64::try_from(delay_ms).unwrap_or(i64::MAX)), f);
     }

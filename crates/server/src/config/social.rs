@@ -211,7 +211,7 @@ impl CalendarConfig {
 pub struct SpaceConfig {
     /// Issue 4: persist changed positions every 30 seconds, bounding default crash loss.
     pub position_snapshot_secs: i64,
-    /// D6 server space actor mailbox budget.
+    /// Server policy: mailbox depth above which a space actor logs a warning.
     pub mailbox_budget: i64,
 }
 

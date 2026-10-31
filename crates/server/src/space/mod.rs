@@ -685,7 +685,7 @@ impl World {
         if let Some(handle) = self.running(id) { let _ = handle.send(Box::new(f)); }
     }
     /// No implicit loading; no-op if the system is not running. The delay starts
-    /// when the actor processes this message; the closure runs on a due tick (D3).
+    /// when the actor processes this message; the closure runs on a due tick.
     pub fn schedule(&self, system: i64, delay_ms: u64, f: impl FnOnce(&mut System) + Send + 'static) {
         self.post(system, move |s| s.schedule(delay_ms, f));
     }

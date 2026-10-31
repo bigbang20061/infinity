@@ -214,6 +214,6 @@ fn missing_follow_target_stops_and_clears_follow_state() {
 }
 
 pub(super) mod destiny_reference;
-mod pr2_reference;
+mod kinematics_reference;
 mod collision_reference;
 
