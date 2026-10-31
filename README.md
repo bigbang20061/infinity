@@ -25,7 +25,7 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
   - Regional market: seeded NPC orders, escrow, taxes and fees, history.
   - Contracts: item exchange, auction and courier.
   - Industry: manufacturing, research, copying and invention.
-- **Agents.** Kill missions, epic arcs, NPC standings, loyalty points and LP stores.
+- **Agents.** Kill missions, epic arcs, NPC standings, loyalty points and LP stores. LP store offers come from a catalogue the operator imports from ESI with `lp-import` (see [LP offer import](docs/lp-import.md)); the server itself never contacts ESI. While the catalogue is empty, every NPC corporation offers its race's faction items, priced from retail values, and the server logs a warning at start. You can buy an offer for yourself or, with withdrawal access to the chosen wallet division, for your corporation, which then pays the LP and ISK; the required items always come from your hangar in the station.
 - **Exploration.** Anomalies and signatures, probe and directional scanning, wormholes, the data and relic hacking minigame, and belt rats.
 - **Mining.** Asteroid belts, ore, ice and gas, mining modules, and belt regrowth.
 - **Social.** Chat (local, corporation, fleet and other channels), fleets, EVE mail and notifications, the calendar, and bookmarks. Personal contacts: pilots, corporations, alliances and agents with a standing and a watchlist flag, and a separate block list; adding or editing a contact can notify the other pilot. Contacts show as online or offline, and pilots on a watchlist announce when they log on or off.
@@ -52,6 +52,7 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
   - in direct trades: items from cargo, from inside a container or from a corporation hangar, the active ship, fitted modules and charges, and PLEX; types that cannot be traded are refused anywhere in an offered container or ship
   - the GM bounty reimbursement and bounty cache calls
   - labels for personal contacts
+  - LP store offers that cost Analysis Kredits: they are listed, but buying one is refused
 - Some runtime state lives only in memory and is lost when the server restarts:
   - fleets, combat and Crimewatch timers, ship damage, and in-progress hacking; a suspect flag from an activated kill right is the exception and is restored with its original deadline;
   - everything spawned into space (NPCs, wrecks, scheduled effects);
@@ -74,6 +75,7 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
 | `crates/server/retail` | Data captured from the retail server for this build (CDN content, cached machoNet calls) |
 | `crates/marshal` | `blue.marshal` codec, plus the `marshal-dump` tool |
 | `crates/sde-import` | Loads static data bundles (JSONL) into PostgreSQL |
+| `crates/lp-import` | Operator tool that imports NPC corporations' LP store offers from ESI (see [docs/lp-import.md](docs/lp-import.md)) |
 | `crates/blue-patch` | Patches the client's `blue.dll` so an edited `start.ini` still loads |
 | `db/` | Per-table database dumps that are loaded into a fresh database |
 | `scripts/` | Database init and dump, client patching and launching, and the dev loop |

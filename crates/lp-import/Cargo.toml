@@ -1,0 +1,13 @@
+[package]
+name = "lp-import"
+description = "Import operator-fetched ESI loyalty store offers"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serde_json.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true

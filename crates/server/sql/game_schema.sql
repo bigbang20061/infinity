@@ -639,12 +639,25 @@ CREATE TABLE IF NOT EXISTS game.calendar_responses (
 );
 CREATE INDEX IF NOT EXISTS calendar_responses_char_idx ON game.calendar_responses (char_id);
 
--- Loyalty points per issuing NPC corporation.
+-- Loyalty points per owner (character or corporation) and issuing NPC corporation.
 CREATE TABLE IF NOT EXISTS game.lp_balances (
     char_id bigint NOT NULL,
     corp_id bigint NOT NULL,
     amount  bigint NOT NULL,
     PRIMARY KEY (char_id, corp_id)
+);
+
+-- LP store catalogue (dao::lp_offers); requirements retain their JSON array order.
+CREATE TABLE IF NOT EXISTS game.lp_offers (
+    corporation_id bigint NOT NULL,
+    offer_id bigint NOT NULL,
+    type_id integer NOT NULL CHECK (type_id > 0),
+    quantity integer NOT NULL CHECK (quantity > 0),
+    lp_cost bigint NOT NULL CHECK (lp_cost >= 0),
+    isk_cost bigint NOT NULL CHECK (isk_cost >= 0),
+    ak_cost bigint NOT NULL CHECK (ak_cost >= 0),
+    required_items jsonb NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(required_items) = 'array'),
+    PRIMARY KEY (corporation_id, offer_id)
 );
 
 -- Personal skill plans (public gateway eve_public.character.skill.plan).

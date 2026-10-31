@@ -26,13 +26,14 @@ const ROLE_JUNIOR_ACCOUNTANT: i64 = 4_503_599_627_370_496;
 /// Client appConst.corpRoleAccountCanTake1; other divisions' roles are the next bits.
 const ROLE_CAN_TAKE_1: i64 = 134_217_728;
 
-fn valid_key(key: i32) -> bool {
+pub(super) fn valid_key(key: i32) -> bool {
     (ACCOUNT_CASH..ACCOUNT_CASH + DIVISIONS).contains(&key)
 }
 
 
 /// Whether `char_id` may pay out of `corp`'s division `key`.
 pub(super) async fn may_take(db: &Db, char_id: i64, corp: i64, key: i32) -> Result<bool, CallError> {
+    if !valid_key(key) { return Ok(false); }
     let can_take = ROLE_CAN_TAKE_1 << (key - ACCOUNT_CASH);
     has_role_or_is_ceo(db, char_id, corp, ROLE_DIRECTOR | ROLE_ACCOUNTANT | can_take).await
 }

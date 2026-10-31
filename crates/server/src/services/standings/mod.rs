@@ -10,11 +10,9 @@
 //! changes use the caller's executor and outbox so completion dispatches after commit.
 //! Mission gain and decline rates are operator-configured.
 //!
-//! Loyalty points (game.lp_balances) are paid per corporation by missions and spent in that
-//! corporation's LP store. The live stores' offer tables never shipped with the client or
-//! the SDE, so a store here sells the faction items (meta group 4) of the corporation's race
-//! that traded on the retail market, at one LP per 2,000 ISK of retail value plus 1,000 ISK
-//! per LP.
+//! Loyalty balances use game.lp_balances for both characters and corporations. Imported
+//! game.lp_offers are authoritative; only a globally empty catalogue uses synthesized
+//! faction offers derived from retail prices. Analysis Kredits cannot be spent.
 
 use super::{db_err, notify_error, Call, CallError, CallResult};
 use crate::client::Client;
@@ -130,17 +128,32 @@ pub(crate) async fn lp_balances(db: &Db, char_id: i64) -> Result<Vec<(i64, i64)>
         .into_iter().map(|row| (row.corp_id, row.amount)).collect())
 }
 
-/// Add (or, negative, take) loyalty points with `corp`; taking more than there is fails.
-pub async fn add_lp<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, char_id: i64, corp: i64, amount: i64) -> Result<(), CallError> {
-    if amount == 0 || corp == 0 {
-        return Ok(());
-    }
-    let Some(after) = crate::dao::wallets::loyalty::add(db, char_id, corp, amount).await.map_err(db_err)? else {
-        let before = lp_balance(db, char_id, corp).await?;
+/// Change an owner's LP and queue the appropriate post-commit notification.
+pub(super) async fn change_lp<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, owner: i64, issuer: i64, amount: i64, corporation: bool) -> Result<(), CallError> {
+    if amount == 0 || issuer == 0 { return Ok(()); }
+    let Some(after) = crate::dao::wallets::loyalty::add(db, owner, issuer, amount).await.map_err(db_err)? else {
+        let before = lp_balance(db, owner, issuer).await?;
         return Err(notify_error(&messages::loyalty_balance_message(before)));
     };
-    let before = after - amount;
-    outbox.notify_pilot(char_id, "OnLPChange", vec![Value::str("lp"), Value::Int(corp), Value::Int(before), Value::Int(after)]);
+    if corporation {
+        for member in crate::dao::characters::members::active_ids(db, owner).await.map_err(db_err)? {
+            outbox.notify_pilot(member, "OnCorpLPChange", vec![Value::str("lp"), Value::Int(issuer)]);
+        }
+    } else {
+        outbox.notify_pilot(owner, "OnLPChange", vec![Value::str("lp"), Value::Int(issuer), Value::Int(after - amount), Value::Int(after)]);
+    }
+    Ok(())
+}
+
+/// Add or take character loyalty points.
+pub async fn add_lp<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, char_id: i64, corp: i64, amount: i64) -> Result<(), CallError> {
+    change_lp(db, outbox, char_id, corp, amount, false).await
+}
+
+pub(crate) async fn initialize(db: &crate::db::Db) -> Result<(), crate::db::Error> {
+    if crate::dao::lp_offers::is_empty(db).await? {
+        tracing::warn!("LP offer catalogue is empty; using synthetic retail-derived offers");
+    }
     Ok(())
 }
 
