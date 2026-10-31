@@ -10,7 +10,7 @@ use crate::handshake::Login;
 use crate::macho::{cmd, Address, Packet, ERR_WRAPPEDEXCEPTION};
 use crate::services::{self, Call, CallError};
 use crate::session::Session;
-use crate::Config;
+use crate::config::Config;
 use anyhow::{anyhow, Result};
 use marshal::Value;
 use std::sync::Arc;
@@ -83,7 +83,7 @@ impl Client {
 
     /// Register a bound object and return its wire form: `TY_CALLBACK(marshal((oid, refID)))`.
     pub fn bind(&mut self, service: &str, bind_params: Value) -> Value {
-        let oid = format!("N={}:{}", self.cfg.node_id, self.next_oid);
+        let oid = format!("N={}:{}", self.cfg.server.node_id, self.next_oid);
         self.next_oid += 1;
         self.bound.insert(oid.clone(), (service.to_string(), bind_params));
         let reference = Value::tuple([Value::str(oid), Value::Int(filetime_now())]);
@@ -91,7 +91,7 @@ impl Client {
     }
 
     fn proxy_address(&self) -> Address {
-        Address::Node { node_id: self.cfg.node_id, service: None, call_id: Value::None }
+        Address::Node { node_id: self.cfg.server.node_id, service: None, call_id: Value::None }
     }
 
     /// Change session attributes and queue a SessionChangeNotification for the client.

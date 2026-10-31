@@ -1,0 +1,206 @@
+# Infinity server. Every key is optional; shown values are the defaults.
+# Precedence: environment variable (deployment keys only) > this file > default.
+
+[server]
+bind = "0.0.0.0:26000"              # env: BIND; existing server listener
+public_host = "127.0.0.1"           # env: PUBLIC_HOST; address clients use for chat/images/CDN
+node_id = 888444                    # env: NODE_ID; node ID the client sees
+system_capacity = 0                 # env: SYSTEM_CAPACITY; pilots per system before gate jumps queue, 0 = unlimited
+login_takeover = true               # existing behavior: replace the live session; false refuses the new login
+shutdown_flush_timeout_secs = 10    # server policy: bound on the position flush at shutdown
+# Values checked by the client handshake; change only for another client build.
+macho_version = 496                 # env: MACHO_VERSION
+boot_version = 24.01                # env: BOOT_VERSION
+boot_build = 3653293                # env: BOOT_BUILD
+boot_codename = "EVE-RELEASE"       # env: BOOT_CODENAME
+boot_region = "optic"               # env: BOOT_REGION
+
+[development]
+auto_register_accounts = true       # existing behavior: register unknown names on first login; false refuses them
+auto_register_role = "player"       # default role for auto-registration: "player" or "gm"
+
+[logging]
+filter = "info,infinity_server=debug"   # env: RUST_LOG; existing tracing EnvFilter fallback
+
+[database]
+# A nonempty libpq connection string or URL wins over the individual fields.
+url = ""                            # env: DATABASE_URL; keep secrets in the environment, not here
+host = "127.0.0.1"                  # env: DATABASE_HOST; local PostgreSQL default
+port = 5432                         # env: DATABASE_PORT; PostgreSQL default port
+user = "infinity"                   # env: DATABASE_USER; default database user
+password = ""                       # env: DATABASE_PASSWORD; keep secrets in the environment
+name = "infinity"                   # env: DATABASE_NAME; default database name
+application_name = "infinity-server" # server connection name shown in pg_stat_activity
+pool_size = 16                      # env: DATABASE_POOL_SIZE; leave capacity for administrators
+connect_timeout_secs = 5            # server policy: timeout per connection attempt
+checkout_timeout_secs = 30          # server policy: pooled connection wait timeout; 0 = wait forever
+startup_retry_secs = [1, 16]        # existing startup reconnect backoff: first and maximum delays, doubling
+schema_on_start = true              # existing behavior: apply the idempotent game schema on every start
+
+[chat]
+bind = "0.0.0.0:5222"               # env: CHAT_BIND; existing XMPP listener
+domain = "infinity"                 # env: CHAT_DOMAIN; existing XMPP domain
+banned_words = true                 # existing policy: off makes the client drop every chat line
+
+[images]
+bind = "0.0.0.0:26001"              # env: IMAGE_BIND; existing image listener
+port = 26001                        # env: IMAGE_PORT; public image port
+dir = "/data/images"                # env: IMAGE_DIR; image storage directory
+upstream = "https://images.evetech.net" # env: IMAGE_UPSTREAM; empty means never fetch
+upload_limit_mib = 8                # server image-upload size limit
+upstream_timeout_secs = 10          # server upstream image request timeout
+
+[gateway]
+bind = "0.0.0.0:26002"              # env: GATEWAY_BIND; existing public gateway listener
+
+[cdn]
+bind = "0.0.0.0:80"                 # env: CDN_BIND; existing plain HTTP content listener
+
+# Game parameters have no environment overrides.
+
+[accounts]
+starting_plex = 1000                # existing SQL default for an account's PLEX vault; old-row default remains; input ceiling 0..=9223372036854775807
+character_slots = 3                 # server character-selection policy
+
+[characters]
+starting_isk = 5000000.00           # finite, >= 0 and <= 9999999999999.99; 15 significant digits (f64 DBL_DIG): the largest two-decimal amount that survives decimal → f64 → PostgreSQL float8::numeric unchanged
+name_min_len = 3                    # server character-name validation policy
+name_max_len = 37                   # server character-name validation policy
+name_max_spaces = 2                 # server character-name validation policy
+delete_delay_secs = 30              # server deletion policy: biomass guard
+free_respecs = 1                    # existing character free-respec allowance
+
+[market]
+broker_fee = 0.03                   # existing market default broker fee
+broker_fee_min_isk = 100            # market minimum broker fee
+sales_tax = 0.08                    # existing market default transaction tax
+max_order_days = 90                 # longest order duration offered by the market windows
+npc_buy_ratio = 0.8                 # server market policy: fraction of the NPC sell price
+maintenance_secs = 60               # server market order maintenance cadence
+order_history_days = 90             # server closed-order history retention
+transaction_history_days = 30       # server default transaction-history period
+price_history_days = 365            # server market price-history retention
+
+[store]
+plex_price_isk_fallback = 23500000  # server fallback ISK per PLEX when no retail price is known
+daily_gift = { type_id = 52520, quantity = 10000 } # existing free daily offer: skill points
+daily_turnover_utc = "03:00:00"      # existing daily turnover in UTC
+fast_checkout = false               # existing policy: real-money purchase flow is off
+
+[missions]
+site_distance_m = 15000000          # existing mission site distance from its planet
+spawn_range_m = [15000, 40000]     # existing mission NPC spawn distance range
+# Existing ISK and LP rewards by agent level 1..5; level 5 also covers higher levels.
+rewards = [
+  { isk = 90000,   lp = 150  },
+  { isk = 350000,  lp = 450  },
+  { isk = 1000000, lp = 1300 },
+  { isk = 2800000, lp = 3500 },
+  { isk = 7000000, lp = 8000 },
+]
+
+[standings]
+mission_corp_gain = 0.01            # existing corporation gain per agent level
+mission_agent_gain_multiplier = 2.0 # existing agent gain multiplier relative to corporation gain
+mission_faction_gain_divisor = 5.0  # existing faction gain divisor relative to corporation gain
+decline_loss = -0.01                # existing decline or quit penalty; 0 disables it
+
+[combat]
+bounty_multiplier = 1.0             # existing behavior: NPC bounty payout unchanged
+lock_time_factor = 40000            # existing player targeting formula factor
+lock_time_min_secs = 0.5            # existing player targeting minimum
+lock_time_max_secs = 60             # existing player targeting maximum
+npc_think_ms = 1000                 # existing once-per-second NPC thinking cadence
+npc_target_loss_range_factor = 2.0  # existing server target-loss policy
+
+[npc]
+belt_rats = true                    # existing behavior: region pirates spawn when a pilot warps to a belt
+belt_rat_respawn_secs = 900         # existing cleared-belt respawn delay
+belt_spawn_range_m = [5000, 20000]  # existing belt NPC spawn distance range
+site_spawn_range_m = [15000, 40000] # existing site NPC spawn distance range
+cleared_site_linger_secs = 30       # existing cleared-site linger before removal
+hacked_site_linger_secs = 600       # existing hacked-site linger before removal
+
+[crimewatch]
+concord_enabled = true              # existing behavior: CONCORD responds to criminals in high-sec
+weapons_timer_secs = 60             # existing weapons timer duration
+pvp_timer_secs = 900                # existing PvP timer duration
+criminal_timer_secs = 900           # existing criminal timer duration
+engagement_secs = 300               # existing engagement duration
+outlaw_threshold = -5.0             # existing security status threshold for outlaws
+highsec_threshold = 0.45            # existing high-sec threshold for CONCORD response
+concord_base_delay_secs = 6         # existing CONCORD base response delay
+concord_delay_per_security_secs = 28 # existing CONCORD response delay slope per security point
+security_gain_npc_kill = 0.0005     # existing NPC kill gain: fraction of distance to +10
+security_loss_aggression = 0.025    # existing illegal aggression loss: fraction of distance to -10
+security_loss_kill = 0.05           # existing illegal kill loss: fraction of distance to -10
+killmail_attacker_window_secs = 300 # existing window before older damage stops counting an attacker
+
+[mining]
+belt_regrowth_secs = 7200           # existing delay before an emptied belt grows back
+ore_rocks = [15, 25]                # existing ore rocks per belt field range
+ore_rock_m3 = [4000, 25000]         # existing ore rock volume range
+ice_rocks = [6, 11]                 # existing ice rocks per field range
+ice_rock_units = [300, 1500]        # existing ice quantity range in units of the ice type's volume
+gas_clouds = [5, 9]                 # existing gas clouds per field range
+gas_cloud_m3 = [3000, 15000]        # existing gas cloud volume range
+station_reprocessing_efficiency = 0.5 # existing NPC station reprocessing efficiency
+station_reprocessing_tax = 0.05     # existing NPC station reprocessing tax
+scanner_range_m = 500000            # existing survey scanner range
+
+[exploration]
+ice_site_chance = 0.3               # existing ice-field chance in k-space systems
+gas_site_chance = 0.5               # existing high-sec gas signature chance; low/null/j-space always
+scan_uncertainty_floor_m = 10000000 # existing minimum scan sphere of uncertainty
+wormhole_lifetime_min = 960         # existing fallback wormhole lifetime in minutes
+wormhole_total_mass_kg = 1000000000 # existing fallback total wormhole mass
+wormhole_jump_mass_kg = 300000000   # existing fallback per-jump wormhole mass
+
+[industry]
+job_cost_rate = 0.02                # existing industry job cost rate
+scc_surcharge_rate = 0.04           # existing SCC surcharge rate
+highsec_security_tax = 0.05         # existing high-sec industry security tax
+npc_facility_tax = 0.0025           # existing NPC station industry service tax
+system_cost_index = 0.02            # existing fixed index: no activity tracking
+invention_skill_probability = 0.0333333 # existing approximate invention skill probability per level
+job_time_multiplier = 1.0           # existing behavior: job duration unchanged; below 1 is faster
+max_run_secs = 2592000              # existing maximum industry run duration
+max_runs = 1000000                  # existing hard maximum industry runs
+history_days = 90                   # server completed-job history retention
+
+[corporations]
+min_management_skill_level = 1      # existing minimum Corporation Management skill level
+initial_shares = 1000               # existing initial corporation shares
+max_bulletins = 10                  # existing corporation/alliance bulletin limit
+office_slots_per_station = 24       # server office capacity policy; capacity was not shipped
+office_rent_base_isk = 100000       # server minimum office rent
+office_rent_per_security_isk = 900000 # server additional rent at security 1
+bills_maintenance_secs = 600        # server billing maintenance cadence
+advance_billing_days = 7            # server advance-billing policy
+
+[contracts]
+expiry_min_minutes = 60             # existing contract expiry lower bound
+expiry_max_days = 90                # existing contract expiry upper bound
+courier_min_days = 1                # existing courier duration lower bound
+courier_max_days = 365              # existing courier duration upper bound
+max_items = 500                     # existing contract item limit
+title_max_len = 100                 # existing contract title limit
+description_max_len = 4000          # existing contract description limit
+page_size = 100                     # existing contract search default page size
+page_size_max = 1000                # existing contract search maximum page size
+
+[clones]
+jump_cooldown_hours = 24            # existing base jump-clone cooldown
+synchronizing_hours_per_level = 1   # existing Infomorph Synchronizing cooldown reduction per level
+
+[mail]
+title_max_len = 150                 # server mail title policy
+
+[calendar]
+max_invitees = 50                   # existing calendar invitee limit
+title_max_len = 100                 # existing calendar title limit
+description_max_len = 10000         # existing calendar description limit
+
+[space]
+position_snapshot_secs = 30         # server position persistence interval; bounds crash loss
+mailbox_budget = 10000              # server space actor mailbox depth budget

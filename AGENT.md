@@ -23,7 +23,7 @@ These rules apply to anyone changing this repository, coding agents and humans a
 - **No hardcoding.** Logic contains no magic numbers and no literal type, group, attribute or item IDs.
   - Name every value as a `const`. Its doc comment states the source: a client constant (file and name), an SDE ID, a carbonengine value, or a design decision of this server. A constant only one module uses sits at the top of that module. A game-data constant used by more than one module is defined once in `consts.rs` and imported (see Shared helpers); never redefine it locally, and never give two different meanings the same name (an effect ID and an effect category, seconds and FILETIME units).
   - Values the SDE or dogma data provides are read from that data, not copied. For example, lock time comes from the ship's scan resolution and the target's signature radius, for players and NPCs alike.
-  - Deployment settings (addresses, ports, capacities) come from `Config` environment variables.
+  - Deployment settings (addresses, ports, capacities, the database connection) come from `Config` (`crates/server/src/config/`): the `config.toml` file, overridden by the environment variable named in `config.example.toml`. The server reads environment variables nowhere else.
   - Player-visible text and client message names are never written inline; they are defined in `messages.rs` (see Player-visible text).
   - Unit conversions go through the shared helpers, never inline factors such as `* 10_000` or `/ 1000`.
   - Exempt: `0` and `1` as identities, array indices, and test fixtures.

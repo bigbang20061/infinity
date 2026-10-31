@@ -9,7 +9,7 @@
 
 use crate::conn::Conn;
 use crate::db::Db;
-use crate::Config;
+use crate::config::Config;
 use anyhow::{anyhow, bail, Context, Result};
 use marshal::Value;
 use tracing::{info, warn};
@@ -64,11 +64,11 @@ fn crc_hqx(data: &[u8], mut crc: u16) -> u16 {
 fn handshake_tuple(cfg: &Config, user_count: i64) -> Value {
     Value::tuple([
         Value::Int(HANDSHAKE_SECRET_KEY),
-        Value::Int(cfg.macho_version),
+        Value::Int(cfg.server.macho_version),
         Value::Int(user_count),
-        Value::Float(cfg.boot_version),
-        Value::Int(cfg.boot_build),
-        Value::str(format!("{}@{}", cfg.boot_codename, cfg.boot_region)),
+        Value::Float(cfg.server.boot_version),
+        Value::Int(cfg.server.boot_build),
+        Value::str(format!("{}@{}", cfg.server.boot_codename, cfg.server.boot_region)),
         Value::None, // update info (const.responseUnknown on a real proxy)
     ])
 }
@@ -92,8 +92,8 @@ pub async fn run(mut conn: Conn, cfg: &Config, db: &Db, client_id: i64) -> Resul
         if s1.len() != COMPATIBILITY_FIELDS || s1[0].as_int() != Some(HANDSHAKE_SECRET_KEY) {
             bail!("bad compatibility handshake: {step1:?}");
         }
-        if s1[1].as_int() != Some(cfg.macho_version) || s1[4].as_int() != Some(cfg.boot_build) {
-            warn!("client reports macho {:?} build {:?}; server is {} / {}", s1[1], s1[4], cfg.macho_version, cfg.boot_build);
+        if s1[1].as_int() != Some(cfg.server.macho_version) || s1[4].as_int() != Some(cfg.server.boot_build) {
+            warn!("client reports macho {:?} build {:?}; server is {} / {}", s1[1], s1[4], cfg.server.macho_version, cfg.server.boot_build);
         }
 
         // Step 2: optional VIP key, then queue check or crypto context.
@@ -125,13 +125,13 @@ pub async fn run(mut conn: Conn, cfg: &Config, db: &Db, client_id: i64) -> Resul
 
         let response = Value::dict([
             ("challenge_responsehash", placebo_hash(vec![client_challenge])),
-            ("macho_version", Value::Int(cfg.macho_version)),
-            ("boot_version", Value::Float(cfg.boot_version)),
-            ("boot_build", Value::Int(cfg.boot_build)),
-            ("boot_codename", Value::str(&cfg.boot_codename)),
-            ("boot_region", Value::str(&cfg.boot_region)),
+            ("macho_version", Value::Int(cfg.server.macho_version)),
+            ("boot_version", Value::Float(cfg.server.boot_version)),
+            ("boot_build", Value::Int(cfg.server.boot_build)),
+            ("boot_codename", Value::str(&cfg.server.boot_codename)),
+            ("boot_region", Value::str(&cfg.server.boot_region)),
             ("cluster_usercount", Value::Int(db.online_count())),
-            ("proxy_nodeid", Value::Int(cfg.node_id)),
+            ("proxy_nodeid", Value::Int(cfg.server.node_id)),
             ("user_logonqueueposition", Value::Int(LOGON_QUEUE_POSITION)),
             ("config_vals", cfg.global_config()),
         ]);
