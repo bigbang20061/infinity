@@ -16,6 +16,7 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
 - **Combat.**
   - Targeting, ammunition, weapon groups, turrets and missiles, and capacitor.
   - Electronic warfare from ships and NPCs: stasis webifiers, warp scramblers and disruptors, target painters, sensor dampeners, tracking and guidance disruptors, remote sensor boosters and remote tracking computers, including their scripts. A scrambled ship cannot warp, and scrambling shuts off microwarpdrives. Tracking and guidance disruption already shorten an NPC's range, but do not yet change its hit chance or missile damage.
+  - Capacitor warfare from ships and NPCs: neutralizers, nosferatu and capacitor transfer, with optimal range and falloff. Capacitor boosters use their charges, and ancillary shield boosters and armor repairers use their charges and reload from cargo automatically when they run dry. An NPC transfers capacitor only to another NPC of its own spawn group, or with the same owner, never to its player target. Capacitor transfer does not give Crimewatch assistance flags yet.
   - NPC AI, bounties, wrecks and loot.
   - Crimewatch: timers, criminal flags, security status, CONCORD and killmails.
   - Player bounties on characters, corporations and alliances, with contributions, leaderboards and search. A pilot who destroys a target's ship is paid from the matching bounty pools, at most 20% of the destroyed value, once per killmail.
@@ -47,7 +48,7 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
   - fleet warps, boosts and the fleet finder
   - shared bookmark folders
   - plugging in implants and consuming boosters; implants and boosters already in a character's slots do apply
-  - modules whose effect is not implemented yet, among them capacitor warfare and transfer, remote repair, ECM, smartbombs, micro jump drives, salvagers, tractor beams and bombs. Activating one is refused with a message, and `/effects unsupported` lists the effects tried since the server started.
+  - modules whose effect is not implemented yet, among them remote repair, ECM, smartbombs, micro jump drives, salvagers, tractor beams and bombs. Activating one is refused with a message, and `/effects unsupported` lists the effects tried since the server started.
   - in direct trades: items from cargo, from inside a container or from a corporation hangar, the active ship, fitted modules and charges, and PLEX; types that cannot be traded are refused anywhere in an offered container or ship
   - the GM bounty reimbursement and bounty cache calls
   - labels for personal contacts
