@@ -26,6 +26,15 @@ pub(super) async fn client(db: crate::db::Db, character: i64) -> (Client, tokio:
 }
 
 #[test]
+fn unit_from_bits_covers_unit_interval() {
+    assert_eq!(unit_from_bits(0), 0.0);
+    let max = unit_from_bits(u64::MAX);
+    assert!(max < 1.0 && max > 0.999);
+    assert_eq!(unit_from_bits(1u64 << 63), 0.5);
+    assert_eq!(unit_from_bits(0x4000_0000_0000_0000), 0.25);
+}
+
+#[test]
 fn surface_offset_includes_radius() {
     let center = [1.0e9, -2.0e9, 3.0e9];
     for radius in [0.0, 6_000_000.0, 1.0e12] {

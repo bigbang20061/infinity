@@ -184,9 +184,13 @@ pub(super) fn value_id_list(v: Option<&Value>) -> Vec<i64> {
     v.and_then(|v| v.items()).unwrap_or(&[]).iter().filter_map(|v| v.as_int()).collect()
 }
 
+fn unit_from_bits(bits: u64) -> f64 {
+    (bits >> (u64::BITS - RANDOM_SIGNIFICANT_BITS)) as f64 / (1u64 << RANDOM_SIGNIFICANT_BITS) as f64
+}
+
 /// A uniformly distributed binary64 value in [0, 1).
 pub fn rand01() -> f64 {
-    (crate::handshake::rand_i64() as u64 >> (u64::BITS - RANDOM_SIGNIFICANT_BITS)) as f64 / (1u64 << RANDOM_SIGNIFICANT_BITS) as f64
+    unit_from_bits(crate::handshake::random_u64())
 }
 
 /// A random unit vector, uniform on the sphere.
