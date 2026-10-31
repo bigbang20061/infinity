@@ -2,6 +2,9 @@
 //! The client slash service consumes these strings; they read no database and
 //! implement neither gameplay behavior nor localisation.
 
+/// An argument quote was not closed.
+pub(crate) const GM_ARGS_UNCLOSED_QUOTE: &str = "引号未闭合。";
+
 // GM slash commands (services/slash.rs)
 /// Teleport command help.
 pub(crate) const GM_HELP_TELEPORT: &str = "/tr me <itemID|characterID|solarSystemID|stationID|celestialID> — teleport";

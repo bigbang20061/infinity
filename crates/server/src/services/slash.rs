@@ -14,7 +14,11 @@
 //! Dogma overrides require singleton items; modules and hull-foreign attributes
 //! have limited client display support. Unsupported commands return a slash error.
 //! Teleports to live balls use the system actor's sampled position; stored positions remain unchanged.
+//! Quoted arguments are grouped by the shared parser. Skill, item, NPC, social
+//! and exploration commands delegate to their owning services and game data.
 //! Durable job inspection and control use `game.jobs`; job payloads are not displayed.
+//! Listings are limited to 50 rows; full help remains available. Teleport
+//! extensions and hit-chance administration are not supported here.
 
 use super::{db_err, Call, CallError, CallResult};
 use super::sql_pattern::matches_pattern;
@@ -23,6 +27,7 @@ use crate::consts::{CLIENT_MAX_ISK, CLIENT_MAX_PLEX, FLAG_CARGO, FLAG_HANGAR, GM
 use crate::messages;
 use marshal::Value;
 use tracing::info;
+mod args;
 mod dogma;
 mod jobs;
 mod effects;
@@ -65,7 +70,6 @@ fn help() -> String {
     entries.join("\n")
 }
 
-
 /// A type by ID or (partial) name.
 async fn resolve_type(c: &Client, arg: &str) -> Result<(i32, String), CallError> {
     let row = match arg.parse::<i32>() {
@@ -85,10 +89,10 @@ async fn resolve_type(c: &Client, arg: &str) -> Result<(i32, String), CallError>
 }
 
 /// /tr me <destination>
-async fn tr(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
+async fn tr(c: &mut Client, args: &[String]) -> Result<String, CallError> {
     let dest = match args {
-        ["me", dest, ..] => *dest,
-        [dest] if *dest != "me" => *dest,
+        [me, dest, ..] if me == "me" => dest.as_str(),
+        [dest] if dest != "me" => dest.as_str(),
         _ => return Err(slash_error(messages::gm::GM_TELEPORT_USAGE.into())),
     };
     let Ok(id) = dest.parse::<i64>() else { return Err(slash_error(messages::gm::gm_invalid_id(dest))) };
@@ -137,7 +141,7 @@ async fn tr(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
     Err(slash_error(messages::gm::gm_target_not_found(id)))
 }
 
-async fn create(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
+async fn create(c: &mut Client, args: &[String]) -> Result<String, CallError> {
     let Some(what) = args.first() else { return Err(slash_error(messages::gm::GM_CREATE_USAGE.into())) };
     let qty: i32 = args.get(1).and_then(|q| q.parse().ok()).unwrap_or(1).clamp(1, 1_000_000_000);
     let (type_id, name) = resolve_type(c, what).await?;
@@ -153,7 +157,7 @@ async fn create(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
     Ok(messages::gm::gm_created_item(qty, &name, type_id))
 }
 
-fn parse_amount(args: &[&str], integer_digits: usize, decimals: usize) -> Option<String> {
+fn parse_amount(args: &[String], integer_digits: usize, decimals: usize) -> Option<String> {
     let [arg] = args else { return None };
     let amount = arg.replace(',', "");
     let (integer, fraction) = match amount.split_once('.') {
@@ -191,7 +195,7 @@ fn wallet_error(error: crate::db::Error) -> CallError {
     }
 }
 
-async fn wallet(c: &mut Client, args: &[&str], command: &str) -> Result<String, CallError> {
+async fn wallet(c: &mut Client, args: &[String], command: &str) -> Result<String, CallError> {
     let (usage, digits, decimals) = match command {
         "setisk" => (messages::gm::GM_SET_ISK_USAGE, ISK_INTEGER_DIGITS, ISK_DECIMALS),
         "addisk" => (messages::gm::GM_ADD_ISK_USAGE, ISK_INTEGER_DIGITS, ISK_DECIMALS),
@@ -242,11 +246,14 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
 
     let line = call.args.first().and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
     let line = line.trim().trim_start_matches('/');
-    let mut words = line.split_whitespace();
-    let command = words.next().unwrap_or("").to_lowercase();
-    let args: Vec<&str> = words.collect();
+    let words = match args::tokenize(line) {
+        Ok(words) => words,
+        Err(error) => return Some(Err(error)),
+    };
+    let command = words.first().map(|s| s.to_lowercase()).unwrap_or_default();
+    let args = words.get(1..).unwrap_or_default();
     if crate::lua::enabled() {
-        if let Some(result) = crate::lua::command(c, &command, &args).await {
+        if let Some(result) = crate::lua::command(c, &command, args).await {
             return Some(result.map(Value::unicode));
         }
     }
@@ -260,16 +267,16 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     }
     info!(user = c.login.user_id, "slash: /{line}");
     let result = match command.as_str() {
-        "tr" => tr(c, &args).await,
+        "tr" => tr(c, args).await,
         "wh" | "wormhole" => super::exploration::gm_wormhole(c).await,
         "scanall" => super::exploration::gm_scan_all(c).await,
         "sites" => super::exploration::gm_sites(c).await,
-        "create" | "createitem" => create(c, &args).await,
-        "setisk" | "addisk" | "setplex" | "addplex" => wallet(c, &args, &command).await,
+        "create" | "createitem" => create(c, args).await,
+        "setisk" | "addisk" | "setplex" | "addplex" => wallet(c, args, &command).await,
         "heal" => heal(c).await,
-        "dogma" => dogma::command(c, &args).await,
-        "jobs" => jobs::command(&c.db, &args).await,
-        "effects" => effects::command(&args),
+        "dogma" => dogma::command(c, args).await,
+        "jobs" => jobs::command(&c.db, args).await,
+        "effects" => effects::command(args),
         "help" => Ok(help()),
         other => Err(slash_error(messages::gm::gm_unknown_command(other, &help()))),
     };

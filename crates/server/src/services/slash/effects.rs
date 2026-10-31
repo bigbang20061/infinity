@@ -4,11 +4,11 @@
 use super::{slash_error, CallError};
 use crate::{messages, services::effects::unsupported};
 
-fn valid_args(args: &[&str]) -> bool {
-    matches!(args, ["unsupported"])
+fn valid_args(args: &[String]) -> bool {
+    matches!(args, [action] if action.as_str() == "unsupported")
 }
 
-pub(super) fn command(args: &[&str]) -> Result<String, CallError> {
+pub(super) fn command(args: &[String]) -> Result<String, CallError> {
     if !valid_args(args) {
         return Err(slash_error(messages::gm::GM_EFFECTS_USAGE.into()));
     }
