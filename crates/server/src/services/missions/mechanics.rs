@@ -325,11 +325,6 @@ pub(super) async fn options(c: &Client, mission_id: i32) -> Result<Vec<i64>, Cal
     Ok(out)
 }
 
-pub(super) async fn set_state(c: &Client, agent_id: i64, state: i32) -> Result<(), CallError> {
-    let me = c.session.int("charid").unwrap_or(0);
-    crate::dao::missions::set_state(&c.db, me, agent_id, state, filetime_now()).await.map_err(db_err)?;
-    Ok(())
-}
 
 pub(super) async fn remove(c: &Client, agent_id: i64) -> Result<(), CallError> {
     let me = c.session.int("charid").unwrap_or(0);

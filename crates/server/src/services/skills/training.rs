@@ -65,8 +65,6 @@ pub(super) fn plan_skills(done: &[(i32, i32, i64)], training: Option<(i32, i64)>
     }
     plan
 }
-
-/// Apply training progress up to now: finished entries become trained levels.
 pub(super) async fn advance_training(db: &(impl Executor + ?Sized), char_id: i64, now: i64) -> Result<Vec<(i32, i32)>, CallError> {
     let done = collect_finished(db, char_id, now).await?;
     training_dao::write_skills(db, char_id, &plan_skills(&done, None)).await.map_err(db_err)?;
@@ -85,7 +83,17 @@ async fn in_training_sp(db: &(impl Executor + ?Sized), char_id: i64, now: i64) -
 
 pub(super) async fn skills_dict(c: &mut Client, char_id: i64) -> Result<Value, CallError> {
     let now = filetime_now();
-    let finished = advance_training(&c.db, char_id, now).await?;
+    let db = c.db.clone();
+    let finished = db.transaction(
+        move |tx, _outbox: &mut Outbox| Box::pin(async move {
+            let finished = advance_training(tx, char_id, now).await?;
+            Ok(finished)
+        }),
+        |finished, outbox| {
+            let client = &mut *c;
+            async move { dispatch_client(finished, outbox, client) }
+        },
+    ).await?;
     for &(type_id, level) in &finished {
         info!("character {char_id} finished training skill {type_id} to level {level}");
     }
@@ -124,7 +132,18 @@ pub(super) async fn skills_dict(c: &mut Client, char_id: i64) -> Result<Value, C
 }
 
 pub(super) async fn queue_list(c: &mut Client, char_id: i64) -> Result<Value, CallError> {
-    let finished = advance_training(&c.db, char_id, filetime_now()).await?;
+    let now = filetime_now();
+    let db = c.db.clone();
+    let finished = db.transaction(
+        move |tx, _outbox: &mut Outbox| Box::pin(async move {
+            let finished = advance_training(tx, char_id, now).await?;
+            Ok(finished)
+        }),
+        |finished, outbox| {
+            let client = &mut *c;
+            async move { dispatch_client(finished, outbox, client) }
+        },
+    ).await?;
     for &(type_id, level) in &finished {
         info!("character {char_id} finished training skill {type_id} to level {level}");
     }
@@ -227,3 +246,5 @@ pub(super) async fn save_queue(c: &mut Client, char_id: i64, queue: &Value, acti
         },
     ).await
 }
+
+#[cfg(test)] mod tests;
