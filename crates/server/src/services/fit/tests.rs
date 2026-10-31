@@ -18,3 +18,4 @@ fn unknown_type_uses_attribute_default() {
     let null_default = super::Attribute { default_value: None, ..meta };
     assert_eq!(super::base_attribute(None, Some(&null_default), 1), 0.0);
 }
+

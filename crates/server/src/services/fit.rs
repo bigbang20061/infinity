@@ -11,18 +11,22 @@
 //! penalties. Other modifier functions and operations, including PostPercentUnNerfed
 //! and the special skill relationship, are not evaluated; this is not full client
 //! dogma parity. Passive, online and running activation effects are considered;
-//! propulsion uses a server formula instead of modifier data.
+//! audited migrated Python skill effects without SDE modifier rows are included.
+//! Skill traversal excludes implants and boosters; propulsion uses a server formula.
+//! ponytail: the audited SDE has no skill effect whose fittingUsageChance attribute
+//! exists on its skill type; if that changes, load that field and filter such effects.
 
 use super::{db_err, CallError};
-use crate::consts::{ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_REQUIRED_SKILL_1, ATTR_SIGNATURE_RADIUS, CATEGORY_CHARGE, CATEGORY_SHIP, EFFECT_AFTERBURNER, EFFECT_MICROWARPDRIVE, TYPE_CHARACTER};
+use crate::consts::{ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_REQUIRED_SKILL_1, ATTR_SIGNATURE_RADIUS, CATEGORY_CHARGE, CATEGORY_SHIP, EFFECT_AFTERBURNER, EFFECT_MICROWARPDRIVE, EFFECT_SKILL, TYPE_CHARACTER};
+use crate::consts::{ATTR_DAMAGE_MULTIPLIER, ATTR_RATE_OF_FIRE, ATTR_EM_DAMAGE, ATTR_THERMAL_DAMAGE, ATTR_KINETIC_DAMAGE, ATTR_EXPLOSIVE_DAMAGE};
 use crate::dao::items::fit as fit_dao;
 use crate::db::Db;
 use crate::sde::{dogma::{Attribute, Modifier}, types::TypeData, Sde};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// SDE dgmAttributeTypes: skillLevel.
-const ATTR_SKILL_LEVEL: i32 = 280;
+pub(super) const ATTR_SKILL_LEVEL: i32 = 280;
 /// SDE dgmAttributeTypes: requiredSkill1 through requiredSkill6.
 const ATTR_REQUIRED_SKILLS: [i32; 6] = [ATTR_REQUIRED_SKILL_1, 183, 184, 1285, 1289, 1290];
 /// SDE invCategories: Skill, exempt from stacking penalties.
@@ -46,31 +50,56 @@ const ATTR_MASS_ADDITION: i32 = 796;
 /// SDE dgmAttributeTypes: signatureRadiusBonus.
 const ATTR_SIGNATURE_RADIUS_BONUS: i32 = 554;
 /// SDE dogma modifier operation: PreAssign.
-const OP_PRE_ASSIGN: i32 = -1;
+pub(crate) const OP_PRE_ASSIGN: i32 = -1;
 /// SDE dogma modifier operation: PreMul.
-const OP_PRE_MUL: i32 = 0;
+pub(crate) const OP_PRE_MUL: i32 = 0;
 /// SDE dogma modifier operation: PreDiv.
-const OP_PRE_DIV: i32 = 1;
+pub(crate) const OP_PRE_DIV: i32 = 1;
 /// SDE dogma modifier operation: ModAdd.
-const OP_MOD_ADD: i32 = 2;
+pub(crate) const OP_MOD_ADD: i32 = 2;
 /// SDE dogma modifier operation: ModSub.
-const OP_MOD_SUB: i32 = 3;
+pub(crate) const OP_MOD_SUB: i32 = 3;
 /// SDE dogma modifier operation: PostMul.
-const OP_POST_MUL: i32 = 4;
+pub(crate) const OP_POST_MUL: i32 = 4;
 /// SDE dogma modifier operation: PostDiv.
-const OP_POST_DIV: i32 = 5;
+pub(crate) const OP_POST_DIV: i32 = 5;
 /// SDE dogma modifier operation: PostPercent.
-const OP_POST_PERCENT: i32 = 6;
+pub(crate) const OP_POST_PERCENT: i32 = 6;
 /// SDE dogma modifier operation: PostAssign.
-const OP_POST_ASSIGN: i32 = 7;
+pub(crate) const OP_POST_ASSIGN: i32 = 7;
 /// Dogma stacking penalty curve divisor, used by the server fitting formula.
 const STACKING_PENALTY_DIVISOR: f64 = 2.67;
 /// Server dogma stacking penalty curve squares the normalized modifier index.
 const STACKING_PENALTY_EXPONENT: i32 = 2;
 /// Percentage points per whole multiplier.
-const PERCENT_SCALE: f64 = 100.0;
+pub(crate) const PERCENT_SCALE: f64 = 100.0;
 /// SDE modifier skillTypeID sentinel selecting the source item's type.
 const MODIFIER_SOURCE_ITEM_TYPE: i32 = -1;
+/// Client dogma/const.py attribute damageMultiplierBonus.
+const ATTR_DAMAGE_MULTIPLIER_BONUS: i32 = 292;
+/// Client dogma/const.py attribute cloakingTargetingDelay.
+const ATTR_CLOAKING_TARGETING_DELAY: i32 = 560;
+/// Client dogma/const.py attribute cloakingTargetingDelayBonus.
+const ATTR_CLOAKING_TARGETING_DELAY_BONUS: i32 = 619;
+/// Client dogma/const.py attribute rofBonus.
+const ATTR_ROF_BONUS: i32 = 293;
+
+/// Python effects without SDE modifier rows, from dogma/pythonEffects/migratedeffects.py.
+fn migrated_skill_modifiers() -> &'static HashMap<&'static str, Modifier> {
+    static MODIFIERS: OnceLock<HashMap<&'static str, Modifier>> = OnceLock::new();
+    MODIFIERS.get_or_init(|| [
+        ("missileEMDmgBonus", "OwnerRequiredSkillModifier", "charID", ATTR_EM_DAMAGE, ATTR_DAMAGE_MULTIPLIER_BONUS),
+        ("missileExplosiveDmgBonus", "OwnerRequiredSkillModifier", "charID", ATTR_EXPLOSIVE_DAMAGE, ATTR_DAMAGE_MULTIPLIER_BONUS),
+        ("missileKineticDmgBonus2", "OwnerRequiredSkillModifier", "charID", ATTR_KINETIC_DAMAGE, ATTR_DAMAGE_MULTIPLIER_BONUS),
+        ("missileThermalDmgBonus", "OwnerRequiredSkillModifier", "charID", ATTR_THERMAL_DAMAGE, ATTR_DAMAGE_MULTIPLIER_BONUS),
+        ("droneDmgBonus", "OwnerRequiredSkillModifier", "charID", ATTR_DAMAGE_MULTIPLIER, ATTR_DAMAGE_MULTIPLIER_BONUS),
+        ("cloakingTargetingDelayBonusPostPercentCloakingTargetingDelayBonusForShipModulesRequiringCloaking", "LocationRequiredSkillModifier", "shipID", ATTR_CLOAKING_TARGETING_DELAY, ATTR_CLOAKING_TARGETING_DELAY_BONUS),
+        ("selfRof", "LocationRequiredSkillModifier", "shipID", ATTR_RATE_OF_FIRE, ATTR_ROF_BONUS),
+    ].into_iter().map(|(name, func, domain, modified, modifying)| {
+        (name, Modifier { func: func.into(), domain: domain.into(), op: OP_POST_PERCENT, modified, modifying, group: None, skill: Some(MODIFIER_SOURCE_ITEM_TYPE) })
+    }).collect())
+}
+
 
 /// An item in the fit.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -101,9 +130,17 @@ fn base_attribute(data: Option<&TypeData>, meta: Option<&Attribute>, attr: i32) 
 }
 
 
+// SDE positions remain stable in the immutable Arc<Sde>; fallbacks are static.
+enum PassiveModifier {
+    Sde { effect_id: i32, position: usize },
+    Fallback(&'static Modifier),
+}
+
 /// A character's active ship with everything that modifies it.
 pub struct Fit {
     nodes: HashMap<Key, Node>,
+    passive_modifiers: Vec<(Key, PassiveModifier)>,
+    passive_by_attribute: HashMap<i32, Vec<usize>>,
     sde: Arc<Sde>,
     memo: Mutex<HashMap<(Key, i32), f64>>,
 }
@@ -136,7 +173,59 @@ impl Fit {
                 nodes.insert(Key::Charge(*m), Node { type_id: t, data_position: sde.types.position(t), in_ship: true, online: true, active: false, level: None });
             }
         }
-        Ok(Fit { nodes, sde, memo: Mutex::new(HashMap::new()) })
+        let mut skill_effects = Vec::new();
+        for r in &skills {
+            if r.level <= 0 { continue; }
+            if let Some(data) = sde.types.get(r.type_id) {
+                for entry in data.effects() {
+                    if entry.effect_id == EFFECT_SKILL { continue; }
+                    if sde.dogma.effect(entry.effect_id).is_some_and(|effect| effect.effect_category.unwrap_or(0) == EFFECT_CATEGORY_PASSIVE) {
+                        skill_effects.push((r.type_id, entry.effect_id));
+                    }
+                }
+            }
+        }
+        skill_effects.sort_unstable();
+        let mut passive_modifiers = Vec::new();
+        let mut passive_by_attribute: HashMap<i32, Vec<usize>> = HashMap::new();
+        for (id, effect_id) in skill_effects {
+            let Some(effect) = sde.dogma.effect(effect_id) else { continue };
+            for (position, modifier) in effect.modifiers().iter().enumerate() {
+                passive_by_attribute.entry(modifier.modified).or_default().push(passive_modifiers.len());
+                passive_modifiers.push((Key::Skill(id), PassiveModifier::Sde { effect_id, position }));
+            }
+            if effect.modifiers().is_empty() {
+                if let Some(modifier) = effect.name.as_deref().and_then(|name| migrated_skill_modifiers().get(name)) {
+                    passive_by_attribute.entry(modifier.modified).or_default().push(passive_modifiers.len());
+                    passive_modifiers.push((Key::Skill(id), PassiveModifier::Fallback(modifier)));
+                }
+            }
+        }
+        Ok(Fit { nodes, passive_modifiers, passive_by_attribute, sde, memo: Mutex::new(HashMap::new()) })
+    }
+
+    /// Visit passive skill modifiers in stable skill and effect order, including
+    /// Python effects absent from the SDE modifier table.
+    pub(crate) fn passive_skill_modifiers(&self, visit: impl FnMut(Key, &Modifier)) {
+        self.visit_passive_modifiers(0..self.passive_modifiers.len(), visit);
+    }
+
+    fn visit_passive_modifiers(&self, indices: impl IntoIterator<Item = usize>, mut visit: impl FnMut(Key, &Modifier)) {
+        for index in indices {
+            let (source, handle) = &self.passive_modifiers[index];
+            let modifier = match handle {
+                PassiveModifier::Sde { effect_id, position } => &self.sde.dogma.effect(*effect_id).expect("indexed skill effect").modifiers()[*position],
+                PassiveModifier::Fallback(modifier) => modifier,
+            };
+            visit(*source, modifier);
+        }
+    }
+
+    pub(crate) fn required_skill(&self, source: Key, skill: Option<i32>) -> Option<i32> {
+        match skill {
+            Some(MODIFIER_SOURCE_ITEM_TYPE) | None => self.nodes.get(&source).map(|n| n.type_id),
+            value => value,
+        }
     }
 
     fn base(&self, key: Key, attr: i32) -> f64 {
@@ -164,10 +253,7 @@ impl Fit {
             _ => None,
         };
         let required = |skill: Option<i32>| {
-            let skill = match skill {
-                Some(MODIFIER_SOURCE_ITEM_TYPE) | None => self.nodes.get(&source).map(|n| n.type_id),
-                s => s,
-            };
+            let skill = self.required_skill(source, skill);
             skill.is_some_and(|s| t.data_position.is_some_and(|i| {
                 let data = self.sde.types.at_position(i);
                 ATTR_REQUIRED_SKILLS.iter().filter_map(|a| data.fit_attribute(*a)).any(|v| v as i32 == s && s > 0) }))
@@ -199,9 +285,16 @@ impl Fit {
         }
         // (operation, value, penalized)
         let mut mods: Vec<(i32, f64, bool)> = Vec::new();
+        self.visit_passive_modifiers(self.passive_by_attribute.get(&attr).into_iter().flatten().copied(), |source, m| {
+            if self.applies(source, m, key) {
+                let v = self.value_guarded(source, m.modifying, visiting);
+                mods.push((m.op, v, false));
+            }
+        });
         if self.sde.types.modifies_attribute(attr) {
             let stackable = self.sde.dogma.attribute(attr).and_then(|m| m.stackable).unwrap_or(true);
             for (&source, node) in &self.nodes {
+                if matches!(source, Key::Skill(_)) { continue; }
                 let Some(data) = node.data_position.map(|i| self.sde.types.at_position(i)) else { continue };
                 for (effect, m) in data.modifiers(&self.sde.dogma, attr) {
                     let running = match effect.effect_category.unwrap_or(0) {

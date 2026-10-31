@@ -3,10 +3,7 @@
 //! `eve/common/script/dogma/baseDogmaLocation.py:1960-1967`.
 //! Presentation fields and other inventory tables are outside this dataset.
 use std::collections::{HashMap, HashSet};
-use crate::{consts::{ATTR_CAPACITY, ATTR_MASS, ATTR_RADIUS, ATTR_VOLUME}, dao::sde::types as dao, db::Db};
-
-/// skillEffect: skill point bookkeeping (operation 9), not a modifier we evaluate.
-const EFFECT_SKILL: i32 = 132;
+use crate::{consts::{ATTR_CAPACITY, ATTR_MASS, ATTR_RADIUS, ATTR_VOLUME, EFFECT_SKILL}, dao::sde::types as dao, db::Db};
 
 pub(crate) struct TypeData {
     pub(crate) type_id: i32,

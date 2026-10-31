@@ -7,8 +7,13 @@
 //! volume and radius fall back to typed SDE type columns: this is server schema
 //! behavior, not a validated client fallback. Effective fitting is the subset in
 //! `services/fit.rs`, not a complete implementation of client dogma.
+//! Character brains compile passive skills; implants, boosters and structures are unsupported.
+//! Brain versions are in-memory and reset when the server restarts.
+pub(crate) mod brain;
+
 
 use super::{db_err, item_descriptor, keyval, Call, CallError, CallResult};
+use super::{combat, exploration, fit, skills};
 use crate::client::{filetime_now, short, Client};
 use crate::dao::items::loading::{Item, ItemQuery};
 use super::items::load_items;
@@ -33,8 +38,6 @@ const HUD_ATTRIBUTE_1177: i64 = 1177;
 const ONLINE_EFFECT_DURATION: i64 = -1;
 /// Server online-effect repeat wire choice for godma.py RefreshItemEffects' tuple.
 const ONLINE_EFFECT_REPEAT: i64 = -1;
-/// Server brain version wire choice for godma.py ProcessAllInfo's character brain tuple.
-const BRAIN_VERSION: i64 = -1;
 
 /// Inventory wire quantity: singleton originals are -1 and blueprint copies are -2.
 pub(super) fn wire_quantity(singleton: bool, quantity: i64) -> i64 {
@@ -114,7 +117,7 @@ fn info_keyed(item_row: Value, key: Value, attributes: BTreeMap<i64, f64>, activ
 async fn character_info(c: &Client) -> Result<Value, CallError> {
     let char_id = c.session.int("charid").ok_or_else(|| CallError::Internal(anyhow::anyhow!("no character selected")))?;
     let ship_id = c.session.int("shipid").unwrap_or(0);
-    let character_attrs = super::skills::attributes::character_attributes(c, char_id).await?;
+    let character_attrs = skills::attributes::character_attributes(c, char_id).await?;
     let mut attrs = type_attributes(c, TYPE_CHARACTER);
     attrs.extend(character_attrs);
     let item = Item {
@@ -159,9 +162,9 @@ pub async fn ship_state(c: &Client, ship_id: i64) -> Result<Value, CallError> {
     };
     let mut instances: Vec<(Value, Value)> = items.iter().map(|i| instance(Value::Int(i.item_id), online.contains(&i.item_id))).collect();
     // Loaded charges: sublocations (shipID, flagID, typeID) with their quantities.
-    let (quantities, charges) = super::combat::flag_quantities(c, ship_id).await?;
+    let (quantities, charges) = combat::flag_quantities(c, ship_id).await?;
     instances.extend(charges.into_iter().map(|k| instance(k, false)));
-    let banks = super::combat::banks(&c.db, ship_id).await?;
+    let banks = combat::banks(&c.db, ship_id).await?;
     Ok(Value::tuple([Value::Dict(instances), quantities, banks, Value::Dict(vec![])]))
 }
 
@@ -173,18 +176,18 @@ async fn ship_info(c: &Client) -> Result<Vec<(Value, Value)>, CallError> {
     let mut out = Vec::new();
     // Runtime state the HUD reads: a full capacitor (with skills), and the ship's shield,
     // armor and structure as combat left them.
-    super::combat::refill_capacitor(ship_id);
+    combat::refill_capacitor(ship_id);
     let char_id = c.session.int("charid").unwrap_or(0);
-    let fit = super::fit::Fit::load(&c.db, c.sde.clone(), char_id, ship_id).await?;
-    let (cap, shield_max) = (fit.value(super::fit::Key::Ship, ATTR_CAPACITOR_CAPACITY), fit.value(super::fit::Key::Ship, ATTR_SHIELD_CAPACITY));
-    let (shield, armor_damage, hull_damage) = super::combat::ship_condition(ship_id).unwrap_or((shield_max, 0.0, 0.0));
+    let fit = fit::Fit::load(&c.db, c.sde.clone(), char_id, ship_id).await?;
+    let (cap, shield_max) = (fit.value(fit::Key::Ship, ATTR_CAPACITOR_CAPACITY), fit.value(fit::Key::Ship, ATTR_SHIELD_CAPACITY));
+    let (shield, armor_damage, hull_damage) = combat::ship_condition(ship_id).unwrap_or((shield_max, 0.0, 0.0));
     for item in items {
         let mut attrs = type_attributes(c, item.type_id);
         // Supply fitted values for ship and module attributes, including HUD maxima.
         let key = if item.item_id == ship_id {
-            Some(super::fit::Key::Ship)
+            Some(fit::Key::Ship)
         } else if item.location_id == ship_id {
-            Some(super::fit::Key::Module(item.item_id))
+            Some(fit::Key::Module(item.item_id))
         } else {
             None
         };
@@ -227,7 +230,7 @@ async fn ship_info(c: &Client) -> Result<Vec<(Value, Value)>, CallError> {
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
     // Targeting, ammo, weapon groups and module activation.
-    if let Some(r) = super::combat::dispatch(c, call).await {
+    if let Some(r) = combat::dispatch(c, call).await {
         return r;
     }
     let flag = |i: usize| call.args.get(i).map(|v| !v.is_none() && v.as_int() != Some(0)).unwrap_or(false);
@@ -239,7 +242,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
                 let char_id = c.session.int("charid").unwrap_or(0);
                 // (charItems, brain); brain = (version, charEffects, shipEffects, structureEffects)
                 // -- godma.Prime unpacks "_, charBrain = allInfo.charInfo".
-                let brain = Value::tuple([Value::Int(BRAIN_VERSION), Value::list([]), Value::list([]), Value::list([])]);
+                let brain = brain::bootstrap(c).await?;
                 Value::tuple([Value::Dict(vec![(Value::Int(char_id), ch)]), brain])
             } else {
                 Value::None
@@ -280,7 +283,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
             Ok(ch)
         }
         "CheckSendLocationInfo" | "LogAttribute" => Ok(Value::None),
-        "LaunchProbes" => super::exploration::launch_probes(c, call).await,
+        "LaunchProbes" => exploration::launch_probes(c, call).await,
         // SetModuleOnline(shipID, moduleID) / TakeModuleOffline(shipID, moduleID): the client
         // runs the online effect itself (fitting checks included); we remember the state.
         "SetModuleOnline" | "TakeModuleOffline" => {

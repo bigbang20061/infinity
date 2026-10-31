@@ -1,7 +1,9 @@
 //! Skill training calculations and queue policy for characterskills/util.py.
 //! Uses game.skills, game.skill_queue, game.characters and startup SDE data;
 //! missing ranks and attributes use server fallbacks.
-//! This module does not model attribute modifiers.
+//! Finished levels update the live dogma brain after writes; attribute modifiers
+//! are not used to calculate training rates here.
+//! Finished levels are materialized on skill-handler calls, and no server completion timer exists.
 use super::*;
 use super::attributes::{character_attributes_db, CHAR_ATTRIBUTES};
 use super::formulas::sp_for_level;
@@ -81,11 +83,13 @@ async fn in_training_sp(db: &(impl Executor + ?Sized), char_id: i64, now: i64) -
     }))
 }
 
-pub(super) async fn skills_dict(c: &Client, char_id: i64) -> Result<Value, CallError> {
+pub(super) async fn skills_dict(c: &mut Client, char_id: i64) -> Result<Value, CallError> {
     let now = filetime_now();
-    for (type_id, level) in advance_training(&c.db, char_id, now).await? {
+    let finished = advance_training(&c.db, char_id, now).await?;
+    for &(type_id, level) in &finished {
         info!("character {char_id} finished training skill {type_id} to level {level}");
     }
+    if !finished.is_empty() { crate::services::dogma::brain::update(c).await?; }
     let training = in_training_sp(&c.db, char_id, now).await?;
     let rows = training_dao::current(&c.db, char_id).await.map_err(db_err)?;
     let now = filetime_now();
@@ -119,10 +123,12 @@ pub(super) async fn skills_dict(c: &Client, char_id: i64) -> Result<Value, CallE
     ))
 }
 
-pub(super) async fn queue_list(c: &Client, char_id: i64) -> Result<Value, CallError> {
-    for (type_id, level) in advance_training(&c.db, char_id, filetime_now()).await? {
+pub(super) async fn queue_list(c: &mut Client, char_id: i64) -> Result<Value, CallError> {
+    let finished = advance_training(&c.db, char_id, filetime_now()).await?;
+    for &(type_id, level) in &finished {
         info!("character {char_id} finished training skill {type_id} to level {level}");
     }
+    if !finished.is_empty() { crate::services::dogma::brain::update(c).await?; }
     queue_list_db(&c.db, char_id).await
 }
 
@@ -212,10 +218,12 @@ pub(super) async fn save_queue(c: &mut Client, char_id: i64, queue: &Value, acti
             })
         },
         |finished, outbox| async move {
-            for (type_id, level) in finished {
+            for &(type_id, level) in &finished {
                 info!("character {char_id} finished training skill {type_id} to level {level}");
             }
-            dispatch_client((), outbox, c)
+            dispatch_client((), outbox, c)?;
+            if !finished.is_empty() { crate::services::dogma::brain::update(c).await?; }
+            Ok(())
         },
     ).await
 }
