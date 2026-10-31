@@ -10,6 +10,7 @@ pub(crate) mod starting;
 mod skill_mgr2;
 mod skill_handler;
 mod training;
+pub(crate) mod completion;
 pub(crate) mod gm;
 #[cfg(test)]
 mod tests;

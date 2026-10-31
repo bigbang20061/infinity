@@ -4,7 +4,7 @@
 //! Arithmetic operations through PostAssign and PostPercentUnNerfed are compiled;
 //! the special skill relationship is derived by Fit, not emitted. Structure effects
 //! and implant/booster injection or expiry are not supported. Versions are in-memory;
-//! training-completion updates occur when skill handlers collect completed training.
+//! training-completion updates follow scheduled and mutation-time completions.
 
 use super::super::{fit::{Fit, Key, OP_PRE_ASSIGN, OP_PRE_MUL, OP_PRE_DIV, OP_MOD_ADD, OP_MOD_SUB, OP_POST_MUL, OP_POST_DIV, OP_POST_PERCENT, OP_POST_PERCENT_UNNERFED, OP_POST_ASSIGN, PERCENT_SCALE}, keyval, CallError};
 use crate::{client::Client, consts::ATTR_SKILL_LEVEL};

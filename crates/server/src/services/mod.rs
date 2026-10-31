@@ -48,7 +48,7 @@ mod orgs;
 mod mining;
 mod missions;
 mod ship;
-mod skills;
+pub(crate) mod skills;
 pub(crate) mod standings;
 mod slash;
 mod sql_pattern;
@@ -72,6 +72,7 @@ pub(crate) fn scheduler_registrations() -> Vec<crate::scheduler::Registration> {
         trade::timeout_registration(),
         crate::scheduler::register(bounty::kill_rights::EXPIRY_KIND, bounty::kill_rights::expire),
         crate::scheduler::register(bounty::payout::KIND, bounty::payout::handle),
+        crate::scheduler::register(skills::completion::KIND, skills::completion::handle),
     ]
 }
 

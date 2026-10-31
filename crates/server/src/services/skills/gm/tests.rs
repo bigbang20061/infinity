@@ -110,7 +110,7 @@ async fn database_gm_mutations_materialize_overdue_training_before_queue_changes
     queue::insert(&tx, character, &active).await.expect("insert future target");
     assert!(remove(&tx, &mut outbox, &sde, character, &[target]).await.is_ok());
     assert!(queue::list(&tx, character).await.expect("read queue").is_empty());
-    assert!(super::super::training::advance_training(&tx, character, filetime_now()).await.is_ok());
+    assert!(super::super::training::complete_tx(&tx, &mut outbox, character, filetime_now()).await.is_ok());
     assert!(training::current(&tx, character).await.expect("read skills").iter().all(|s| s.type_id != target));
     training::set_level(&tx, character, other, 0, 0).await.expect("reset skill");
     done.type_id = other;

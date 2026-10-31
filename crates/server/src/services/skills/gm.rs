@@ -3,8 +3,8 @@
 //! Skill queues for changed skills are removed; unrelated entries retain their order.
 //! Completed training and GM grants share one skills-changed notification per batch.
 //! Skill reductions reconcile the owner's online fitted ships after the batch.
-use super::{db_err, keyval, CallError};
-use super::{formulas::sp_for_level, starting::starting_levels, training::{advance_training, queue_list_db, queue_training_events, skill_type}};
+use super::{db_err, CallError};
+use super::{formulas::sp_for_level, starting::starting_levels, training::{complete_tx, queue_list_db, skill_info, skill_type}};
 use crate::{client::{Client, filetime_now, BRAIN_REFRESH}, consts::CATEGORY_SKILL, dao::{items::{fit, ship}, skills::{queue, training}}, db::{executor::Executor, outbox::Outbox}, sde::Sde};
 use crate::services::effects::online::{self, OnlineChanged};
 use marshal::Value;
@@ -19,19 +19,6 @@ pub(crate) fn all_levels(sde: &Sde, published: bool, level: i32) -> Vec<(i32, i3
     sde.types.iter().filter(|t| t.category_id == Some(CATEGORY_SKILL) && (!published || t.published == Some(true))).map(|t| (t.type_id, level)).collect()
 }
 
-fn skill_info(sde: &Sde, type_id: i32, level: i32, points: i64, now: i64) -> Value {
-    keyval([
-        ("typeID", Value::Int(type_id as i64)),
-        ("trainedSkillLevel", Value::Int(level as i64)),
-        ("effectiveSkillLevel", Value::Int(level as i64)),
-        ("virtualSkillLevel", Value::None),
-        ("trainedSkillPoints", Value::Int(points)),
-        ("skillPoints", Value::Int(points)),
-        ("skillLevel", Value::Int(level as i64)),
-        ("skillRank", Value::Float(skill_type(sde, type_id).rank)),
-        ("timeStamp", Value::Int(now)),
-    ])
-}
 
 async fn clean_queue<E>(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<E>, sde: &Sde, char_id: i64, types: &BTreeSet<i32>, now: i64, finished: &[(i32, i32)]) -> Result<Vec<(Value, Value)>, CallError> {
     let changed: BTreeSet<_> = finished.iter().map(|(type_id, _)| *type_id).filter(|id| !types.contains(id)).collect();
@@ -44,6 +31,7 @@ async fn clean_queue<E>(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<E>, s
     };
     let rows = queue::list(tx, char_id).await.map_err(db_err)?;
     if !rows.iter().any(|r| types.contains(&r.type_id)) {
+        super::completion::reschedule(tx, char_id).await?;
         if !finished.is_empty() {
             outbox.notify_pilot(char_id, "OnNewSkillQueueSaved", vec![queue_list_db(tx, char_id).await?]);
         }
@@ -54,6 +42,7 @@ async fn clean_queue<E>(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<E>, s
     for row in rows {
         queue::insert(tx, char_id, &row).await.map_err(db_err)?;
     }
+    super::completion::reschedule(tx, char_id).await?;
     outbox.notify_pilot(char_id, "OnNewSkillQueueSaved", vec![queue_list_db(tx, char_id).await?]);
     Ok(infos)
 }
@@ -77,9 +66,9 @@ fn retain_queue(rows: Vec<queue::QueueEntry>, types: &BTreeSet<i32>, now: i64) -
 }
 
 pub(crate) async fn set_levels<E>(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<E>, sde: &Sde, char_id: i64, levels: &[(i32, i32)]) -> Result<(), CallError> {
+    crate::dao::characters::selection::lock_character(tx, char_id).await.map_err(db_err)?;
     let now = filetime_now();
-    let finished = advance_training(tx, char_id, now).await?;
-    queue_training_events(outbox, char_id, &finished);
+    let finished = complete_tx(tx, outbox, char_id, now).await?;
     write_levels(tx, outbox, sde, char_id, levels, now, &finished).await
 }
 
@@ -100,10 +89,10 @@ async fn write_levels<E>(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<E>, 
 }
 
 pub(crate) async fn remove<E>(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<E>, sde: &Sde, char_id: i64, type_ids: &[i32]) -> Result<(), CallError> {
+    crate::dao::characters::selection::lock_character(tx, char_id).await.map_err(db_err)?;
     let now = filetime_now();
     let types: BTreeSet<_> = type_ids.iter().copied().collect();
-    let finished = advance_training(tx, char_id, now).await?;
-    queue_training_events(outbox, char_id, &finished);
+    let finished = complete_tx(tx, outbox, char_id, now).await?;
     let changed = clean_queue(tx, outbox, sde, char_id, &types, now, &finished).await?;
     if !changed.is_empty() {
         outbox.notify_pilot(char_id, "OnServerSkillsChanged", vec![Value::Dict(changed), Value::None, Value::Int(now)]);
@@ -119,9 +108,9 @@ pub(crate) async fn remove<E>(tx: &(impl Executor + ?Sized), outbox: &mut Outbox
 }
 
 async fn grant_starters<E>(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<E>, sde: &Sde, char_id: i64) -> Result<(), CallError> {
+    crate::dao::characters::selection::lock_character(tx, char_id).await.map_err(db_err)?;
     let now = filetime_now();
-    let finished = advance_training(tx, char_id, now).await?;
-    queue_training_events(outbox, char_id, &finished);
+    let finished = complete_tx(tx, outbox, char_id, now).await?;
     let race = training::race(tx, char_id).await.map_err(db_err)?.ok_or_else(|| CallError::Internal(anyhow::anyhow!("character disappeared")))?;
     let existing: BTreeSet<_> = training::current(tx, char_id).await.map_err(db_err)?.into_iter().map(|s| s.type_id).collect();
     let seed: Vec<_> = starting_levels(sde, race).filter(|(type_id, _)| !existing.contains(type_id)).collect();
@@ -153,6 +142,7 @@ pub(crate) async fn apply(c: &mut Client, char_id: i64, change: Change) -> Resul
                 Change::Set(levels) => set_levels(tx, outbox, &sde, char_id, &levels).await,
                 Change::Remove(types) => remove(tx, outbox, &sde, char_id, &types).await,
                 Change::RemoveAll => {
+                    crate::dao::characters::selection::lock_character(tx, char_id).await.map_err(db_err)?;
                     let mut types: BTreeSet<_> = training::current(tx, char_id).await.map_err(db_err)?.into_iter().map(|s| s.type_id).collect();
                     types.extend(queue::list(tx, char_id).await.map_err(db_err)?.into_iter().map(|s| s.type_id));
                     let types: Vec<_> = types.into_iter().collect();
@@ -165,7 +155,7 @@ pub(crate) async fn apply(c: &mut Client, char_id: i64, change: Change) -> Resul
             }
             Ok(())
         })
-    }, |(), outbox| async move { online::dispatch_changed((), outbox, c) }).await
+    }, |(), outbox| async move { let result = online::dispatch_changed((), outbox, c); crate::scheduler::wake(); result }).await
 }
 
 #[cfg(test)] mod tests;

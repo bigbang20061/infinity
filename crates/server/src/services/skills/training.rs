@@ -1,10 +1,8 @@
 //! Skill training calculations and queue policy for characterskills/util.py.
 //! Uses game.skills, game.skill_queue, game.characters and startup SDE data;
 //! missing ranks and attributes use server fallbacks.
-//! Finished levels update the live dogma brain after writes; attribute modifiers
-//! are not used to calculate training rates here.
-//! Finished levels are materialized on skill-handler calls, and no server completion timer exists.
-//! Materialized finished queue entries emit skill events; reads do not start a timer.
+//! Finished levels are committed by the durable completion scheduler or mutations;
+//! training rates use effective character attributes computed by Fit.
 use super::*;
 use super::attributes::{character_attributes_db, CHAR_ATTRIBUTES};
 use super::formulas::sp_for_level;
@@ -44,9 +42,22 @@ pub(super) fn skill_type(sde: &crate::sde::Sde, type_id: i32) -> SkillType {
         secondary: attribute(ATTR_SECONDARY).map(|v| v as i64).unwrap_or(CHAR_ATTRIBUTES[2]),
     }
 }
+pub(super) fn skill_info(sde: &crate::sde::Sde, type_id: i32, level: i32, points: i64, now: i64) -> Value {
+    keyval([
+        ("typeID", Value::Int(type_id as i64)),
+        ("trainedSkillLevel", Value::Int(level as i64)),
+        ("effectiveSkillLevel", Value::Int(level as i64)),
+        ("virtualSkillLevel", Value::None),
+        ("trainedSkillPoints", Value::Int(points)),
+        ("skillPoints", Value::Int(points)),
+        ("skillLevel", Value::Int(level as i64)),
+        ("skillRank", Value::Float(skill_type(sde, type_id).rank)),
+        ("timeStamp", Value::Int(now)),
+    ])
+}
 
 /// Collect finished entries and restore the remaining queue positions.
-pub(super) async fn collect_finished(db: &(impl Executor + ?Sized), char_id: i64, now: i64) -> Result<Vec<(i32, i32, i64)>, CallError> {
+async fn collect_finished(db: &(impl Executor + ?Sized), char_id: i64, now: i64) -> Result<Vec<(i32, i32, i64)>, CallError> {
     Ok(queue_dao::collect_finished(db, char_id, now).await.map_err(db_err)?.into_iter().map(|r| (r.type_id, r.to_level, r.dest_sp)).collect())
 }
 
@@ -84,12 +95,14 @@ pub(super) fn queue_training_events<X>(outbox: &mut Outbox<X>, char_id: i64, fin
     }
 }
 
-/// Apply training progress up to now: finished entries become trained levels.
-pub(super) async fn advance_training(db: &(impl Executor + ?Sized), char_id: i64, now: i64) -> Result<Vec<(i32, i32)>, CallError> {
+/// Complete due rows in the caller's serialized mutation transaction.
+pub(super) async fn complete_tx<E>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<E>, char_id: i64, now: i64) -> Result<Vec<(i32, i32)>, CallError> {
     let levels = training_dao::current(db, char_id).await.map_err(db_err)?.into_iter().map(|r| (r.type_id, r.level)).collect();
     let done = collect_finished(db, char_id, now).await?;
     training_dao::write_skills(db, char_id, &plan_skills(&done, None)).await.map_err(db_err)?;
-    Ok(completed_levels(&done, levels))
+    let finished = completed_levels(&done, levels);
+    queue_training_events(outbox, char_id, &finished);
+    Ok(finished)
 }
 
 /// SP accrued so far by the entry currently in training, if any.
@@ -104,22 +117,6 @@ async fn in_training_sp(db: &(impl Executor + ?Sized), char_id: i64, now: i64) -
 
 pub(super) async fn skills_dict(c: &mut Client, char_id: i64) -> Result<Value, CallError> {
     let now = filetime_now();
-    let db = c.db.clone();
-    let finished = db.transaction(
-        move |tx, outbox: &mut Outbox| Box::pin(async move {
-            let finished = advance_training(tx, char_id, now).await?;
-            queue_training_events(outbox, char_id, &finished);
-            Ok(finished)
-        }),
-        |finished, outbox| {
-            let client = &mut *c;
-            async move { dispatch_client(finished, outbox, client) }
-        },
-    ).await?;
-    for &(type_id, level) in &finished {
-        info!("character {char_id} finished training skill {type_id} to level {level}");
-    }
-    if !finished.is_empty() { crate::services::dogma::brain::update(c).await?; }
     let training = in_training_sp(&c.db, char_id, now).await?;
     let rows = training_dao::current(&c.db, char_id).await.map_err(db_err)?;
     let now = filetime_now();
@@ -127,50 +124,16 @@ pub(super) async fn skills_dict(c: &mut Client, char_id: i64) -> Result<Value, C
         rows.iter()
             .map(|r| {
                 let (type_id, level, mut sp) = (r.type_id, r.level, r.skill_points);
-                let rank = skill_type(&c.sde, type_id).rank;
                 if let Some((t, trained)) = training {
-                    if t == type_id {
-                        sp = sp.max(trained);
-                    }
+                    if t == type_id { sp = sp.max(trained); }
                 }
-                let lvl = Value::Int(level as i64);
-                (
-                    Value::Int(type_id as i64),
-                    keyval([
-                        ("typeID", Value::Int(type_id as i64)),
-                        ("trainedSkillLevel", lvl.clone()),
-                        ("effectiveSkillLevel", lvl.clone()),
-                        ("virtualSkillLevel", Value::None),
-                        ("trainedSkillPoints", Value::Int(sp)),
-                        ("skillPoints", Value::Int(sp)),
-                        ("skillLevel", lvl),
-                        ("skillRank", Value::Float(rank)),
-                        ("timeStamp", Value::Int(now)),
-                    ]),
-                )
+                (Value::Int(type_id as i64), skill_info(&c.sde, type_id, level, sp, now))
             })
             .collect(),
     ))
 }
 
 pub(super) async fn queue_list(c: &mut Client, char_id: i64) -> Result<Value, CallError> {
-    let now = filetime_now();
-    let db = c.db.clone();
-    let finished = db.transaction(
-        move |tx, outbox: &mut Outbox| Box::pin(async move {
-            let finished = advance_training(tx, char_id, now).await?;
-            queue_training_events(outbox, char_id, &finished);
-            Ok(finished)
-        }),
-        |finished, outbox| {
-            let client = &mut *c;
-            async move { dispatch_client(finished, outbox, client) }
-        },
-    ).await?;
-    for &(type_id, level) in &finished {
-        info!("character {char_id} finished training skill {type_id} to level {level}");
-    }
-    if !finished.is_empty() { crate::services::dogma::brain::update(c).await?; }
     queue_list_db(&c.db, char_id).await
 }
 
@@ -194,6 +157,41 @@ pub(super) async fn queue_list_db(db: &(impl Executor + ?Sized), char_id: i64) -
     ))
 }
 
+async fn save_queue_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox, sde: &std::sync::Arc<crate::sde::Sde>, char_id: i64, entries: Vec<(i64, i64, i64)>, activate: bool, notify: bool, now: i64) -> Result<Vec<(i32, i32)>, CallError> {
+    crate::dao::characters::selection::lock_character(tx, char_id).await.map_err(db_err)?;
+    let mut finished = complete_tx(tx, outbox, char_id, now).await?;
+    let training = in_training_sp(tx, char_id, now).await?;
+    training_dao::write_skills(tx, char_id, &plan_skills(&[], training)).await.map_err(db_err)?;
+    let attrs = character_attributes_db(tx, sde, char_id).await?;
+    let current: HashMap<i32, (i32, i64)> = training_dao::current(tx, char_id).await.map_err(db_err)?.into_iter().map(|r| (r.type_id, (r.level, r.skill_points))).collect();
+    queue_dao::clear(tx, char_id).await.map_err(db_err)?;
+    let mut t = now;
+    for (pos, (_, type_id, to_level)) in entries.into_iter().enumerate() {
+        let st = skill_type(&sde, type_id as i32);
+        let (cur_level, cur_sp) = current.get(&(type_id as i32)).copied().unwrap_or((0, 0));
+        let start_sp = if cur_level as i64 == to_level - 1 { cur_sp.max(sp_for_level(st.rank, to_level - 1)) } else { sp_for_level(st.rank, to_level - 1) };
+        let dest_sp = sp_for_level(st.rank, to_level);
+        let rate = attrs.get(&st.primary).copied().unwrap_or(FALLBACK_TRAINING_ATTRIBUTE) + attrs.get(&st.secondary).copied().unwrap_or(FALLBACK_TRAINING_ATTRIBUTE) / SECONDARY_ATTRIBUTE_DIVISOR;
+        let (start, end) = if activate {
+            let end = t + (((dest_sp - start_sp).max(0) as f64 / rate) * FILETIME_MINUTE as f64) as i64;
+            let s = t;
+            t = end;
+            (Some(s), Some(end))
+        } else {
+            (None, None)
+        };
+        queue_dao::insert(tx, char_id, &queue_dao::QueueEntry { position: pos as i32, type_id: type_id as i32, to_level: to_level as i32, start_sp, dest_sp, start_time: start, end_time: end }).await.map_err(db_err)?;
+    }
+    if notify {
+        finished.extend(complete_tx(tx, outbox, char_id, now).await?);
+    }
+    super::completion::reschedule(tx, char_id).await?;
+    super::completion::notify_completed(tx, outbox, sde, char_id, now, &finished).await?;
+    if notify {
+        outbox.notify_client("OnNewSkillQueueSaved", vec![queue_list_db(tx, char_id).await?]);
+    }
+    Ok(finished)
+}
 /// `SaveNewQueue({idx: (typeID, toLevel)}, activate=bool)`: rebuild the queue with timings.
 pub(super) async fn save_queue(c: &mut Client, char_id: i64, queue: &Value, activate: bool, notify: bool) -> Result<(), CallError> {
     let now = filetime_now();
@@ -215,58 +213,15 @@ pub(super) async fn save_queue(c: &mut Client, char_id: i64, queue: &Value, acti
             let entries = entries.clone();
             let sde = sde.clone();
             Box::pin(async move {
-    let mut done = collect_finished(tx, char_id, now).await?;
-    let training = in_training_sp(tx, char_id, now).await?;
-    let plan = plan_skills(&done, training);
-    let attrs = character_attributes_db(tx, &sde, char_id).await?;
-    let mut current: HashMap<i32, (i32, i64)> = training_dao::current(tx, char_id).await.map_err(db_err)?.into_iter().map(|r| (r.type_id, (r.level, r.skill_points))).collect();
-    let levels = current.iter().map(|(&type_id, &(level, _))| (type_id, level)).collect();
-    let training = training.filter(|(type_id, _)| current.contains_key(type_id) || plan.get(type_id).is_some_and(|(level, _)| level.is_some()));
-    for (&type_id, &(level, sp)) in &plan {
-        if let Some(level) = level {
-            current.entry(type_id).and_modify(|skill| {
-                skill.0 = skill.0.max(level);
-                skill.1 = skill.1.max(sp);
-            }).or_insert((level, sp));
-        } else if let Some(skill) = current.get_mut(&type_id) {
-            skill.1 = skill.1.max(sp);
-        }
-    }
-    queue_dao::clear(tx, char_id).await.map_err(db_err)?;
-    let mut t = now;
-    for (pos, (_, type_id, to_level)) in entries.into_iter().enumerate() {
-        let st = skill_type(&sde, type_id as i32);
-        let (cur_level, cur_sp) = current.get(&(type_id as i32)).copied().unwrap_or((0, 0));
-        let start_sp = if cur_level as i64 == to_level - 1 { cur_sp.max(sp_for_level(st.rank, to_level - 1)) } else { sp_for_level(st.rank, to_level - 1) };
-        let dest_sp = sp_for_level(st.rank, to_level);
-        let rate = attrs.get(&st.primary).copied().unwrap_or(FALLBACK_TRAINING_ATTRIBUTE) + attrs.get(&st.secondary).copied().unwrap_or(FALLBACK_TRAINING_ATTRIBUTE) / SECONDARY_ATTRIBUTE_DIVISOR;
-        let (start, end) = if activate {
-            let end = t + (((dest_sp - start_sp).max(0) as f64 / rate) * FILETIME_MINUTE as f64) as i64;
-            let s = t;
-            t = end;
-            (Some(s), Some(end))
-        } else {
-            (None, None)
-        };
-        queue_dao::insert(tx, char_id, &queue_dao::QueueEntry { position: pos as i32, type_id: type_id as i32, to_level: to_level as i32, start_sp, dest_sp, start_time: start, end_time: end }).await.map_err(db_err)?;
-    }
-    if notify {
-        done.extend(collect_finished(tx, char_id, now).await?);
-    }
-    training_dao::write_skills(tx, char_id, &plan_skills(&done, training)).await.map_err(db_err)?;
-    queue_training_events(outbox, char_id, &completed_levels(&done, levels));
-    if notify {
-        outbox.notify_client("OnNewSkillQueueSaved", vec![queue_list_db(tx, char_id).await?]);
-    }
-    Ok(done.into_iter().map(|(type_id, level, _)| (type_id, level)).collect::<Vec<_>>())
+                save_queue_tx(tx, outbox, &sde, char_id, entries, activate, notify, now).await
             })
         },
         |finished, outbox| async move {
             for &(type_id, level) in &finished {
                 info!("character {char_id} finished training skill {type_id} to level {level}");
             }
+            crate::scheduler::wake();
             dispatch_client((), outbox, c)?;
-            if !finished.is_empty() { crate::services::dogma::brain::update(c).await?; }
             Ok(())
         },
     ).await
