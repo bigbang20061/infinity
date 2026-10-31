@@ -1,6 +1,7 @@
 //! Effect notifications consumed by client dogma and fxSequencer.
 //! Payloads use runtime effect and item data; EWAR slots follow client
-//! dogma/effects/GetEwarTypeByEffectID and buffBarConst. Scheduling is elsewhere.
+//! dogma/effects/GetEwarTypeByEffectID and buffBarConst. Jam start times are
+//! FILETIME and durations are milliseconds. Scheduling and delivery are elsewhere.
 
 use crate::client::filetime_now;
 use crate::services::combat::Ctx;
@@ -41,6 +42,13 @@ fn ewar_slot_by_id(id: i32) -> Option<&'static str> {
 pub(crate) fn ewar(source: i64, module: i64, target: i64, slot: &'static str, start: bool) -> (&'static str, Vec<Value>) {
     (if start { "OnEwarStart" } else { "OnEwarEnd" },
         vec![Value::Int(source), Value::Int(module), Value::Int(target), Value::str(slot)])
+}
+
+/// godma.OnJamStart/End identifies each jam by source, module, target and type.
+pub(crate) fn jam(source: i64, module: i64, target: i64, start: bool, started: i64, duration_ms: f64) -> (&'static str, Vec<Value>) {
+    let mut args = vec![Value::Int(source), Value::Int(module), Value::Int(target), Value::str("electronic")];
+    if start { args.extend([Value::Int(started), Value::Float(duration_ms)]); }
+    (if start { "OnJamStart" } else { "OnJamEnd" }, args)
 }
 
 /// OnGodmaShipEffect(itemID, effectID, time, start, active, environment, startTime,

@@ -1,5 +1,6 @@
 //! NPC combat uses SDE entity and charge attributes, projected Fit values and
 //! shared weapon application; routing and state live in the parent module.
+//! Queued shots revalidate the actor's current target and ECM lockout.
 //! The client has no NPC server combat implementation to mirror.
 use super::*;
 use crate::services::effects::{notify::fire_fx, weapons::{hit_quality, launch_missile, report_hit, target_signature, turret_chance, turret_roll, Missile}};
@@ -130,8 +131,10 @@ pub(super) fn npc_missile_kinematics(velocity: f64, flight_ms: f64, velocity_mul
 
 
 /// `me` and `victim` are the actor-sampled shot snapshots captured before worker dispatch.
-pub(super) async fn npc_shot(db: &Db, world: &Arc<World>, system: i64, id: i64, type_id: i32, stats: &NpcStats, me: Ball, victim: Ball) -> Result<(), CallError> {
-    let Some(projections) = world.with(system, move |s| s.projections_on(id)).await else { return Ok(()) };
+pub(super) async fn npc_shot(db: &Db, world: &Arc<World>, system: i64, id: i64, type_id: i32, stats: &NpcStats, me: Ball, victim: Ball, generation: u64) -> Result<(), CallError> {
+    let target = victim.id;
+    let Some(Some(projections)) = world.with(system, move |s|
+        s.npc_projection_valid(id, target, generation).then(|| s.projections_on(id))).await else { return Ok(()) };
     let sde = world.sde();
     let fit = Fit::for_space_type(sde.clone(), type_id, projections);
     let optimal = if fit.type_has_attribute(Key::Ship, ATTR_MAX_RANGE) { fit.value(Key::Ship, ATTR_MAX_RANGE) } else { stats.optimal };
@@ -158,6 +161,7 @@ pub(super) async fn npc_shot(db: &Db, world: &Arc<World>, system: i64, id: i64, 
             attr(world.sde(), charge, ATTR_EXPLOSION_DELAY, NPC_MISSILE_FLIGHT_MS),
             velocity_multiplier, flight_multiplier);
         if gap <= flight {
+            if world.with(system, move |s| s.npc_projection_valid(id, target, generation)).await != Some(true) { return Ok(()); }
             let missile = Missile {
                 charge,
                 raw: ATTR_DAMAGE.map(|a| attr(world.sde(), charge, a, 0.0) * multiplier),
@@ -175,6 +179,7 @@ pub(super) async fn npc_shot(db: &Db, world: &Arc<World>, system: i64, id: i64, 
         }
     }
     if let Some(chance) = chance {
+        if world.with(system, move |s| s.npc_projection_valid(id, target, generation)).await != Some(true) { return Ok(()); }
         if let Some(guid) = stats.fx.as_deref() {
             let guid = guid.to_owned();
             let duration = stats.rate_of_fire_ms;

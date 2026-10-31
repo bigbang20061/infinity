@@ -242,6 +242,14 @@ pub const EFFECT_ANCILLARY_REMOTE_ARMOR_REPAIRER: i32 = 6651;
 pub const EFFECT_ANCILLARY_REMOTE_SHIELD_BOOSTER: i32 = 6652;
 /// SDE dgmEffects: ShipModuleRemoteArmorMutadaptiveRepairer.
 pub const EFFECT_MUTADAPTIVE_REMOTE_ARMOR_REPAIRER: i32 = 7166;
+/// Client dogma/const.py: attributeScanGravimetricStrength.
+pub const ATTR_SCAN_GRAVIMETRIC_STRENGTH: i32 = 211;
+/// Client dogma/const.py: attributeScanLadarStrength.
+pub const ATTR_SCAN_LADAR_STRENGTH: i32 = 209;
+/// Client dogma/const.py: attributeScanMagnetometricStrength.
+pub const ATTR_SCAN_MAGNETOMETRIC_STRENGTH: i32 = 210;
+/// Client dogma/const.py: attributeScanRadarStrength.
+pub const ATTR_SCAN_RADAR_STRENGTH: i32 = 208;
 /// SDE dgmEffects: remoteECMFalloff.
 pub const EFFECT_REMOTE_ECM_FALLOFF: i32 = 6470;
 /// SDE dgmEffects: entityECMFalloff.

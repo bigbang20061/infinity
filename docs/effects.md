@@ -33,7 +33,7 @@ inventory of every unsupported SDE effect.
 | Hacking and probe launch | Classified for existing exploration paths; classification alone does not guarantee every item or call path. |
 | Projected web, warp disruption and scrambling, target painting, sensor damping, tracking and guidance disruption, remote sensor and tracking enhancement | Runtime projections use the shared Fit evaluator and actor-owned lifetimes. Warp scramble status refuses warp entry; a scram that blocks propulsion stops a running microwarpdrive and refuses a new activation, without stopping afterburners. |
 | Remote shield, armor and hull repair | Locked ships and NPCs use fitted amounts and range/falloff, rechecked at application. Server policy applies shield at cycle start and armor and hull at cycle end. Ancillary variants use the same charge, reload and capacitor rules as local ancillary repairs. Mutadaptive remote armor repair is refused. No Crimewatch assistance flags are applied. |
-| ECM | A known later family, visibly refused until implemented. |
+| ECM and burst jammers | Targeted and area jamming use the shared lifecycle, fitted sensor strengths and actor-owned jam lifetimes. |
 | NPC remote shield, armor and hull repair | NPCs assist the most damaged eligible ally in their spawn group or ownership set, using fitted SDE repair amounts. |
 | Smartbomb, Vorton, cloak, micro jump drive, salvage, tractor, scans, target assistance and bombs | Known later families, visibly refused until implemented. |
 | Explicitly excluded capital, industrial, structure and other out-of-scope groups | Refused even when an effect has modifiers. |
@@ -45,9 +45,9 @@ All paths below are under `crates/server/src/`.
 - `services/effects/registry.rs`: numeric classification, scope and resolved
   effect metadata; `mod.rs` defines the kinds.
 - `services/effects/lifecycle.rs`: activation, cycles, repeat and stopping;
-  `weapons.rs`, `repair.rs`, `capacitor.rs`, `propulsion.rs`, `mining.rs` and
-  `hacking.rs` contain the family-specific work; `projected.rs` constructs
-  projected effects.
+  `weapons.rs`, `repair.rs`, `capacitor.rs`, `propulsion.rs`, `mining.rs`,
+  `ecm.rs` and `hacking.rs` contain the family-specific work; `projected.rs`
+  constructs projected effects.
 - `services/effects/environment.rs` and `notify.rs`: effect environment and
   notification payloads; `unsupported.rs` owns refusal diagnostics.
 - `services/combat/` retains targeting, ammunition, health, damage and NPC
@@ -78,6 +78,24 @@ eligible recipient means no transfer. The existing NPC effect timer drives the
 attempt; the commit rechecks the hostile target generation, recipient
 eligibility and range. NPC assistance does not generate Crimewatch flags.
 
+## Electronic jamming
+
+Targeted ECM requires a live locked target, neither ship in warp, and positive
+range strength. The victim's strongest positive effective racial sensor selects
+the matching racial jammer strength. Jam probability is that strength times the
+shared range multiplier divided by the effective sensor strength, capped at one;
+invalid or non-positive strengths cannot jam. ECCM and other fitted sensor
+modifiers increase the effective defense through Fit.
+
+Burst jammers require no lock and ignore any supplied target. They attempt each
+eligible ship in the burst radius except the source, recording aggression for
+each player victim regardless of the roll. Successful jams clear existing and
+pending locks and prevent new locks until expiry. Jam state is transient: each
+source/module has its own expiry and refresh generation, and overlapping jams
+keep the target jammed until the last live record expires. Stopping a module
+does not cancel a successful jam's chosen duration. Runtime state is lost on
+restart.
+
 ## Wire contract
 
 `OnGodmaShipEffect` carries eleven arguments: `(itemID, effectID, time, start,
@@ -97,6 +115,12 @@ start, active, duration, repeat, startTime, graphicInfo, area)`.
 `(sourceBallID, moduleID, targetBallID, jammingType)`. The last argument is a
 client string slot, selected from effect chance flags and the effect-ID slot
 table, not a numeric effect kind. A blocked warp returns `CustomNotify`.
+
+`OnJamStart` carries `(sourceBallID, moduleID, targetBallID, "electronic",
+startTime, duration)`; `startTime` is FILETIME and `duration` is milliseconds.
+`OnJamEnd` carries only the first four fields. Both identify an individual
+source/module jam. The corresponding electronic `OnEwarStart` and `OnEwarEnd`
+use the four-field EWAR contract above.
 
 ## Fit evaluator data and scope
 

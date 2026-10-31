@@ -1,8 +1,8 @@
 //! Actor-owned activation cycles for supported dogma effects.
 //! Mirrors clientDogmaLocation and godma; effect metadata comes from the SDE.
 //! Subject authorization is shared by activation, deactivation, analyzers and online changes.
-//! Projected effects require a locked, present target and use transient system state;
-//! later-wave behavior families are refused and resource fitting policy is not implemented.
+//! Projected effects and targeted ECM require a locked, present target; burst
+//! jammers do not. Runtime effects are transient and fitting policy is not implemented.
 //! Accepted running activations cancel arrival jump cloak; online changes are not cycles.
 //! Offlining a bank member destroys the whole persisted bank; unfit removes a slave
 //! or destroys a master's bank. Committed changes stop affected cycles after the
@@ -10,7 +10,7 @@
 //! Cycles are runtime-only and are not resumed after restart.
 //! A non-targeted module's first-cycle FX may be unseen by observers until the next
 //! destiny boundary applies the queued uncloak (under one second); gameplay is unaffected.
-use super::{EffectKind, registry, unsupported, repair, mining, capacitor, projected, range};
+use super::{EffectKind, registry, unsupported, repair, mining, capacitor, projected, range, ecm};
 use super::registry::{Effect, EffectAttribute, EffectFlag};
 use super::notify::{fire_fx, ship_effect};
 use super::propulsion::apply_propulsion;
@@ -338,8 +338,9 @@ async fn on_cycle_start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle, charged: bool) -
             }
             Ok(CycleOutcome::Continue)
         }
+        Ecm | BurstJammer => ecm::start(cx, fit, cycle).await,
         Propulsion | Modifiers => Ok(CycleOutcome::Continue),
-        Smartbomb | Vorton | Ecm | BurstJammer |
+        Smartbomb | Vorton |
         Cloak | MicroJumpDrive | Salvage | Tractor | CargoScan | ShipScan | SurveyScan |
         AutoTarget | PassiveTarget | Bomb | ProbeLaunch | Hacking | Online => unreachable!("unsupported cycle kind"),
     }
@@ -356,8 +357,8 @@ async fn on_cycle_end(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<CycleOut
             if repair::applies_at_start(layer) { Ok(CycleOutcome::Continue) } else { remote_repair(cx, fit, cycle, layer).await }
         }
         Mining => Ok(mining::end(cx, fit, cycle).await),
-        Modifiers | Turret | Missile | Propulsion | Projected { .. } | CapTransfer | Neutralizer | Nosferatu | CapBooster => Ok(CycleOutcome::Continue),
-        Smartbomb | Vorton | Ecm | BurstJammer |
+        Modifiers | Turret | Missile | Propulsion | Projected { .. } | CapTransfer | Neutralizer | Nosferatu | CapBooster | Ecm | BurstJammer => Ok(CycleOutcome::Continue),
+        Smartbomb | Vorton |
         Cloak | MicroJumpDrive | Salvage | Tractor | CargoScan | ShipScan | SurveyScan |
         AutoTarget | PassiveTarget | Bomb | ProbeLaunch | Hacking | Online => unreachable!("unsupported cycle kind"),
     }
@@ -366,7 +367,7 @@ async fn on_cycle_end(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<CycleOut
 fn on_stop(s: &mut System, cx: &Ctx, cycle: &Cycle) {
     use EffectKind::*;
     match cycle.effect.kind {
-        Turret | Missile | FueledLocalRepair { .. } | RemoteRepair { .. } | CapTransfer | Neutralizer | Nosferatu | CapBooster => {
+        Turret | Missile | FueledLocalRepair { .. } | RemoteRepair { .. } | CapTransfer | Neutralizer | Nosferatu | CapBooster | Ecm | BurstJammer => {
             if let Some(guid) = cycle.effect.guid.as_deref().and_then(|g| g.split(',').next()) {
                 let events = cycle.modules.iter().map(|m| fire_fx(s.current_time(), cx.ship_id, Some((m.id, m.type_id)), guid, cycle.target, cycle.charge_type, cycle.effect.has(EffectFlag::Offensive), false, cycle.duration_ms, cycle.repeat)).collect();
                 s.broadcast(cx.ship_id, events);
@@ -383,7 +384,7 @@ fn on_stop(s: &mut System, cx: &Ctx, cycle: &Cycle) {
             s.defer(async move { apply_propulsion(&cx, master, generation, false).await; });
         }
         Modifiers | LocalRepair { .. } => {}
-        Smartbomb | Vorton | Ecm | BurstJammer |
+        Smartbomb | Vorton |
         Cloak | MicroJumpDrive | Salvage | Tractor | CargoScan | ShipScan | SurveyScan |
         AutoTarget | PassiveTarget | Bomb | ProbeLaunch | Hacking | Online => unreachable!("unsupported cycle kind"),
     }
@@ -425,6 +426,7 @@ pub(super) async fn cycle_begin_work(mut cycle: Cycle) {
             && capacitor::validate(&cx, &fit, &cycle.modules[0], &cycle.effect, cycle.target).await.is_err() {
             return Err("target lost");
         }
+        if matches!(cycle.effect.kind, EffectKind::Ecm | EffectKind::BurstJammer) && ecm::validate(&cx, &fit, &cycle.modules[0], &cycle.effect, cycle.target).await.is_err() { return Err("target lost"); }
         let discharge = cycle.effect.attribute(EffectAttribute::Discharge).unwrap_or(ATTR_CAPACITOR_NEED);
         let need = cycle_discharge(resource_kind, charged, cycle.modules.iter().map(|m| fit.value(Key::Module(m.id), discharge)).sum());
         if !drain_capacitor(&cx, &fit, need) {
@@ -444,7 +446,7 @@ pub(super) async fn cycle_begin_work(mut cycle: Cycle) {
             }
             Err(e) => { warn!("module {master} cycle start failed: {}", match e { CallError::Internal(e) => format!("{e:#}"), CallError::User { msg, .. } => msg }); return Err("phase failed"); }
         }
-        if cycle.cycles == 0 && matches!(cycle.effect.kind, EffectKind::FueledLocalRepair { .. } | EffectKind::RemoteRepair { .. } | EffectKind::CapTransfer | EffectKind::Neutralizer | EffectKind::Nosferatu | EffectKind::CapBooster) {
+        if cycle.cycles == 0 && matches!(cycle.effect.kind, EffectKind::FueledLocalRepair { .. } | EffectKind::RemoteRepair { .. } | EffectKind::CapTransfer | EffectKind::Neutralizer | EffectKind::Nosferatu | EffectKind::CapBooster | EffectKind::Ecm | EffectKind::BurstJammer) {
             weapon_fx(&cx, &cycle.modules, &cycle.effect, cycle.target, cycle.charge_type, true, cycle.duration_ms, cycle.repeat);
         }
         Ok(fit)
@@ -555,6 +557,7 @@ async fn on_activate(cx: &Ctx, fit: &Fit, activation: &Activation) -> Result<(),
             repair::target(cx, activation.target, optimal, falloff).await.map(|_| ())
         }
         CapTransfer | Neutralizer | Nosferatu | CapBooster => capacitor::validate(cx, fit, &activation.module, &activation.effect, activation.target).await,
+        Ecm | BurstJammer => ecm::validate(cx, fit, &activation.module, &activation.effect, activation.target).await,
         Propulsion if activation.effect.id == i64::from(EFFECT_MICROWARPDRIVE) => {
             if fit.value(Key::Module(activation.module.id), ATTR_ACTIVATION_BLOCKED) > 0.0 {
                 return Err(user_error(messages::MSG_MODULE_IS_BLOCKED, vec![]));
@@ -562,7 +565,7 @@ async fn on_activate(cx: &Ctx, fit: &Fit, activation: &Activation) -> Result<(),
             Ok(())
         }
         Modifiers | LocalRepair { .. } | FueledLocalRepair { .. } | Propulsion => Ok(()),
-        Smartbomb | Vorton | Ecm | BurstJammer |
+        Smartbomb | Vorton |
         Cloak | MicroJumpDrive | Salvage | Tractor | CargoScan | ShipScan | SurveyScan |
         AutoTarget | PassiveTarget | Bomb | ProbeLaunch | Hacking | Online => unreachable!("unsupported activation kind"),
     }
@@ -620,6 +623,7 @@ pub(crate) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
         return Err(unsupported::refusal(Some(id), &effect_name, module.type_id));
     };
     let kind = effect.kind;
+    let target = if kind == EffectKind::BurstJammer { None } else { target };
     if id == EFFECT_MUTADAPTIVE_REMOTE_ARMOR_REPAIRER || !registry::activation_in_scope(module.category_id, module.group_id, kind) || !effect.manually_activatable() {
         return Err(unsupported::refusal(Some(id), &effect_name, module.type_id));
     }
@@ -641,9 +645,8 @@ pub(crate) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
         EffectKind::Modifiers | EffectKind::Turret | EffectKind::Missile |
         EffectKind::LocalRepair { .. } | EffectKind::FueledLocalRepair { .. } |
         EffectKind::Propulsion | EffectKind::Mining | EffectKind::Projected { .. } | EffectKind::CapTransfer |
-        EffectKind::Neutralizer | EffectKind::Nosferatu | EffectKind::CapBooster | EffectKind::RemoteRepair { .. } => {}
-        EffectKind::Smartbomb | EffectKind::Vorton |
-        EffectKind::Ecm | EffectKind::BurstJammer | EffectKind::Cloak |
+        EffectKind::Neutralizer | EffectKind::Nosferatu | EffectKind::CapBooster | EffectKind::RemoteRepair { .. } | EffectKind::Ecm | EffectKind::BurstJammer => {}
+        EffectKind::Smartbomb | EffectKind::Vorton | EffectKind::Cloak |
         EffectKind::MicroJumpDrive | EffectKind::Salvage | EffectKind::Tractor |
         EffectKind::CargoScan | EffectKind::ShipScan | EffectKind::SurveyScan |
         EffectKind::AutoTarget | EffectKind::PassiveTarget | EffectKind::Bomb |

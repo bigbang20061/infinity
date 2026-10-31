@@ -2,10 +2,11 @@
 //! destiny Orbit/Stop events. Combat attributes are loaded by services from SDE;
 //! Weapon, repair and projected effects use a sequential worker outside the actor.
 //! Projected cycles have independent actor timers and capture sampled positions;
-//! target generations prevent queued jobs from restoring an obsolete projection
-//! or applying to an obsolete target. Think intervals and AI target-loss range use
+//! process-unique target generations prevent queued jobs from applying to an
+//! obsolete target or NPC incarnation. Think intervals and AI target-loss range use
 //! combat configuration; projected scan resolution and dogma target range refresh
-//! separately under actor revisions.
+//! separately under actor revisions. ECM immediately removes locks and prevents
+//! targeting and offensive actions until the jam expires.
 //! Brains and groups are transient; persistent NPC simulation is not supported.
 use super::*;
 use std::collections::HashSet;
@@ -18,6 +19,13 @@ static NEXT_GROUP: AtomicU64 = AtomicU64::new(1);
 /// Process-local NPC effect identities occupy the negative, non-item ID namespace.
 static NEXT_NPC_MODULE: AtomicI64 = AtomicI64::new(-1);
 
+static NEXT_NPC_TARGET_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_npc_target_generation() -> u64 {
+    NEXT_NPC_TARGET_GENERATION.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .expect("NPC target generation exhausted")
+}
+
 /// Server NPC targeting policy: sentinel owner permitting targets among all pilots.
 pub const HOSTILE_TO_ALL: i64 = -1;
 pub type NpcFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -26,7 +34,7 @@ pub type NpcFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 pub type NpcEffects = Arc<dyn Fn(NpcAction) -> NpcFuture + Send + Sync>;
 
 pub enum NpcAction {
-    Shot { me: Ball, victim: Ball },
+    Shot { me: Ball, victim: Ball, generation: u64 },
     Effect { me: Ball, victim: Ball, effect_id: i32, source_module: i64, duration_ms: f64, generation: u64 },
     Repair,
 }
@@ -66,7 +74,7 @@ impl NpcBrain {
     pub fn new(owner: Option<i64>, config: NpcConfig, effects: NpcEffects) -> Self {
         Self { owner, config, effects, target: None, announced: false,
             next_shot_ms: 0, next_repair_ms: 0, next_think_ms: 0,
-            max_target_range: None, aggressors: HashSet::new(), modules: Vec::new(), target_generation: 0 }
+            max_target_range: None, aggressors: HashSet::new(), modules: Vec::new(), target_generation: next_npc_target_generation() }
     }
     /// Register an SDE effect instance with a process-unique negative module ID.
     pub(crate) fn add_effect(&mut self, effect_id: i32, duration_ms: f64) {
@@ -207,8 +215,8 @@ impl System {
     }
     fn lose_npc_target(&mut self, id: i64, brain: &mut NpcBrain) {
         self.remove_projections_from(id);
-        brain.target_generation = brain.target_generation.checked_add(1).expect("NPC target generation exhausted");
         if let Some((_, pilot, _)) = brain.target.take() {
+            brain.target_generation = next_npc_target_generation();
             self.notify_pilot(pilot, "OnTarget", vec![Value::str("otherlost"), Value::Int(id), Value::None]);
             self.command(id, |b, stamp, _| {
                 b.stop();
@@ -216,6 +224,11 @@ impl System {
             });
         }
         brain.announced = false;
+    }
+    pub(crate) fn drop_npc_targets(&mut self, id: i64) {
+        let Some(mut brain) = self.brains.remove(&id) else { return };
+        self.lose_npc_target(id, &mut brain);
+        self.brains.insert(id, brain);
     }
     pub(super) fn refresh_npc_targeting(&mut self, id: i64, scan_resolution: f64, max_target_range: Option<f64>) {
         let Some(mut brain) = self.brains.remove(&id) else { return };
@@ -241,6 +254,10 @@ impl System {
             brain.next_repair_ms = self.ms + cycle as i64;
             self.npc_effect(brain, NpcAction::Repair);
         }
+        if crate::services::combat::jamming::is_jammed(id, self.now_ms()) {
+            if brain.target.is_some() { self.lose_npc_target(id, brain); }
+            return;
+        }
         if victim_id.is_none() {
             self.lose_npc_target(id, brain);
             let nearest = self.pilots().filter(|b| b.char_id.is_some_and(|pilot|
@@ -260,23 +277,26 @@ impl System {
                         event(stamp, "SetSpeedFraction", vec![Value::Int(id), Value::Float(1.0)])]
                 });
                 let locked = self.ms.saturating_add(lock_time_ms(brain.config.scan_resolution, signature) as i64);
+                brain.target_generation = next_npc_target_generation();
                 brain.target = Some((ship, pilot, locked));
                 brain.announced = false;
                 brain.next_shot_ms = locked;
-                self.schedule_at(locked, move |s| s.complete_npc_lock(id, ship, pilot, locked));
+                let generation = brain.target_generation;
+                self.schedule_at(locked, move |s| s.complete_npc_lock(id, ship, pilot, locked, generation));
             }
             return;
         }
         let (ship, _, _) = brain.target.unwrap();
         if brain.announced && self.ms >= brain.next_shot_ms {
-            self.npc_effect(brain, NpcAction::Shot { me: self.sampled_ball(id).unwrap(), victim: self.sampled_ball(ship).unwrap() });
+            self.npc_effect(brain, NpcAction::Shot { me: self.sampled_ball(id).unwrap(), victim: self.sampled_ball(ship).unwrap(), generation: brain.target_generation });
             brain.next_shot_ms = self.ms + brain.config.rate_of_fire_ms as i64;
         }
     }
     /// Validate a queued NPC projection or effect in the actor immediately before it applies.
     pub(crate) fn npc_projection_valid(&self, id: i64, target: i64, generation: u64) -> bool {
         let Some(brain) = self.brains.get(&id) else { return false };
-        brain.target_generation == generation && brain.announced
+        !crate::services::combat::jamming::is_jammed(id, self.now_ms())
+            && brain.target_generation == generation && brain.announced
             && brain.target.is_some_and(|(ship, _, _)| ship == target)
             && self.ball(id).zip(self.ball(target)).is_some_and(|(me, victim)|
                 victim.cloak == 0 && victim.mode != MODE_WARP && victim.signature_radius.is_some()
@@ -299,10 +319,12 @@ impl System {
                 s.npc_effect_cycle(id, target, generation, index));
         }
     }
-    fn complete_npc_lock(&mut self, id: i64, ship: i64, pilot: i64, deadline: i64) {
+    fn complete_npc_lock(&mut self, id: i64, ship: i64, pilot: i64, deadline: i64, generation: u64) {
         let Some(mut brain) = self.brains.remove(&id) else { return };
-        let current = brain.target == Some((ship, pilot, deadline)) && !brain.announced;
-        let valid = current && self.ball(id).zip(self.ball(ship)).is_some_and(|(me, victim)|
+        let current = brain.target_generation == generation
+            && brain.target == Some((ship, pilot, deadline)) && !brain.announced;
+        let valid = current && !crate::services::combat::jamming::is_jammed(id, self.now_ms())
+            && self.ball(id).zip(self.ball(ship)).is_some_and(|(me, victim)|
                 victim.char_id == Some(pilot) && victim.signature_radius.is_some()
                 && victim.cloak == 0 && victim.mode != MODE_WARP
                 && len(sub(victim.position_at(self.ms), me.position_at(self.ms))) < brain.config.aggro_range * crate::config::game().combat.npc_target_loss_range_factor
@@ -310,7 +332,7 @@ impl System {
         if valid {
             self.notify_pilot(pilot, "OnTarget", vec![Value::str("otheradd"), Value::Int(id)]);
             brain.announced = true;
-            self.npc_effect(&brain, NpcAction::Shot { me: self.sampled_ball(id).unwrap(), victim: self.sampled_ball(ship).unwrap() });
+            self.npc_effect(&brain, NpcAction::Shot { me: self.sampled_ball(id).unwrap(), victim: self.sampled_ball(ship).unwrap(), generation: brain.target_generation });
             brain.next_shot_ms = self.ms + brain.config.rate_of_fire_ms as i64;
         } else if current {
             self.lose_npc_target(id, &mut brain);

@@ -113,6 +113,8 @@ pub(super) struct State {
     targets: HashMap<i64, HashSet<i64>>,
     /// (charID, targetID) -> lock attempt in progress
     locking: HashMap<(i64, i64), u64>,
+    /// shipID -> independent jammer identities and their deadlines.
+    jammed: HashMap<i64, HashMap<(i64, i64), jamming::Jam>>,
     /// moduleID -> owner and stop flag of its running cycle
     pub(super) active: HashMap<i64, ActiveModule>,
     /// Most recent activation, retained to invalidate deferred propulsion updates.
@@ -185,7 +187,7 @@ pub fn reset(c: &Client) {
     let Some(char_id) = c.session.int("charid") else { return };
     state().reset_character(char_id);
     if let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) {
-        c.world.post(system, move |s| s.remove_projections_from(ship));
+        c.world.post(system, move |s| { jamming::clear(s, ship); s.remove_projections_from(ship); });
     }
 }
 
@@ -193,6 +195,7 @@ pub fn reset(c: &Client) {
 mod reload_recovery;
 pub(crate) use reload_recovery::recover_pending_reloads;
 pub(crate) mod targeting_charges;
+pub(crate) mod jamming;
 use targeting_charges::*;
 pub(in crate::services) mod banks;
 use banks::weapon_groups;
@@ -349,8 +352,8 @@ pub async fn spawn_npc(db: Db, world: Arc<World>, system: i64, id: i64, type_id:
             Box::pin(async move {
                 let Some(world) = weak_world.upgrade() else { return };
                 match action {
-                    NpcAction::Shot { me, victim } => {
-                        if let Err(e) = npc_shot(&db, &world, system, id, type_id, &stats, me, victim).await {
+                    NpcAction::Shot { me, victim, generation } => {
+                        if let Err(e) = npc_shot(&db, &world, system, id, type_id, &stats, me, victim, generation).await {
                             warn!("npc {id}: {}", match e {
                                 CallError::Internal(e) => format!("{e:#}"),
                                 CallError::User { msg, .. } => msg,
@@ -370,6 +373,10 @@ pub async fn spawn_npc(db: Db, world: Arc<World>, system: i64, id: i64, type_id:
                                     ).await,
                                 super::effects::EffectKind::RemoteRepair { .. } =>
                                     super::effects::npc_repair::apply_npc(
+                                        &db, &world, system, source_module, &me, &victim, &effect, duration_ms, generation,
+                                    ).await,
+                                super::effects::EffectKind::Ecm =>
+                                    super::effects::ecm::apply_npc(
                                         &db, &world, system, source_module, &me, &victim, &effect, duration_ms, generation,
                                     ).await,
                                 _ => return,
@@ -392,18 +399,23 @@ pub async fn spawn_npc(db: Db, world: Arc<World>, system: i64, id: i64, type_id:
         .or_else(|| world.sde().dogma.attribute(ATTR_MAX_TARGET_RANGE).and_then(|a| a.default_value).filter(|value| *value > 0.0));
     for entry in world.sde().types.effects(type_id) {
         let Some(effect) = super::effects::registry::resolve(world.sde(), entry.effect_id) else { continue };
-        if !matches!(effect.kind, super::effects::EffectKind::Projected { .. } | super::effects::EffectKind::Neutralizer | super::effects::EffectKind::Nosferatu | super::effects::EffectKind::CapTransfer | super::effects::EffectKind::RemoteRepair { .. }) { continue; }
+        if !matches!(effect.kind, super::effects::EffectKind::Projected { .. } | super::effects::EffectKind::Neutralizer | super::effects::EffectKind::Nosferatu | super::effects::EffectKind::CapTransfer | super::effects::EffectKind::RemoteRepair { .. } | super::effects::EffectKind::Ecm) { continue; }
         if matches!(effect.kind, super::effects::EffectKind::RemoteRepair { .. }) && !super::effects::npc_repair::supported_for_type(world.sde(), type_id, &effect) {
             let name = world.sde().dogma.effect(entry.effect_id).and_then(|row| row.name.as_deref()).unwrap_or("unknown");
             let _ = super::effects::unsupported::refusal(Some(entry.effect_id), name, type_id);
             continue;
         }
-        let duration = match effect.attribute(super::effects::registry::EffectAttribute::Duration) {
-            Some(id) => match world.sde().types.attribute(type_id, id) {
-                Some(duration) => duration,
-                None => continue,
-            },
-            None => -1.0,
+        let duration = if matches!(effect.kind, super::effects::EffectKind::Ecm) {
+            let Some(duration) = super::effects::ecm::npc_cycle_duration(world.sde(), type_id, &effect) else { continue };
+            duration
+        } else {
+            match effect.attribute(super::effects::registry::EffectAttribute::Duration) {
+                Some(id) => match world.sde().types.attribute(type_id, id) {
+                    Some(duration) => duration,
+                    None => continue,
+                },
+                None => -1.0,
+            }
         };
         brain.add_effect(entry.effect_id, duration);
     }

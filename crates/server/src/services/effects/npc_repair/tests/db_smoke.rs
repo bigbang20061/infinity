@@ -24,15 +24,19 @@ fn ball(id: i64, type_id: i32, owner: i64, pilot: Option<i64>) -> Ball {
     }
 }
 
-fn brain(hostile: Option<i64>) -> NpcBrain {
+fn brain(hostile: Option<i64>, shots: Option<tokio::sync::mpsc::UnboundedSender<u64>>) -> NpcBrain {
     let mut brain = NpcBrain::new(hostile.map(|_| crate::space::HOSTILE_TO_ALL), NpcConfig {
         fly_range: 1.0, aggro_range: 1000.0, rate_of_fire_ms: 1e9,
         scan_resolution: 17_163.0, repairs: (0.0, 0.0, 1000.0),
-    }, Arc::new(|_| Box::pin(async {})));
+    }, Arc::new(move |action| {
+        if let crate::space::NpcAction::Shot { generation, .. } = action {
+            if let Some(tx) = &shots { let _ = tx.send(generation); }
+        }
+        Box::pin(async {})
+    }));
     if let Some(id) = hostile {
         brain.target = Some((id, 1, 0));
         brain.announced = true;
-        brain.next_shot_ms = i64::MAX;
     }
     brain
 }
@@ -66,20 +70,23 @@ async fn npc_repair_real_sde_phase_selection_and_guards() {
         let rival = source + 3;
         let outsider = source + 4;
         world.system(system).await.unwrap();
+        let (shot_tx, mut shot_rx) = tokio::sync::mpsc::unbounded_channel();
         world.with(system, move |s| {
             s.insert(ball(source, source_type, 1, None));
             s.insert(ball(hostile, target_type, 2, Some(1)));
             s.insert(ball(ally, target_type, 1, None));
             s.insert(ball(rival, target_type, 1, None));
             s.insert(ball(outsider, target_type, 2, None));
-            s.add_npc(source, brain(Some(hostile)));
-            s.add_npc(ally, brain(None));
-            s.add_npc(rival, brain(None));
-            s.add_npc(outsider, brain(None));
+            s.add_npc(source, brain(Some(hostile), Some(shot_tx)));
+            s.add_npc(ally, brain(None, None));
+            s.add_npc(rival, brain(None, None));
+            s.add_npc(outsider, brain(None, None));
         }).await.unwrap();
+        let generation = tokio::time::timeout(std::time::Duration::from_secs(10), shot_rx.recv())
+            .await.expect("NPC shot timed out").expect("NPC callback closed");
         let full_source = world.ball(system, source).await.unwrap();
         let full_victim = world.ball(system, hostile).await.unwrap();
-        apply_npc(&db, &world, system, 0, &full_source, &full_victim, &effect, CYCLE_MS, 0).await.ok().unwrap();
+        apply_npc(&db, &world, system, 0, &full_source, &full_victim, &effect, CYCLE_MS, generation).await.ok().unwrap();
         let full = world.with(system, move |s| npc_health_fraction(s.ball(ally).unwrap(), layer).unwrap()).await.unwrap();
         assert_eq!(full, 1.0);
         let raw = (0..layer).map(|i| hp[i] / resonance[i]).sum::<f64>() + hp[layer] * 0.5 / resonance[layer];
@@ -96,11 +103,11 @@ async fn npc_repair_real_sde_phase_selection_and_guards() {
         let mut missing = me.clone();
         missing.type_id = missing_type;
         assert!(!supported_for_type(&sde, missing_type, &effect));
-        apply_npc(&db, &world, system, 0, &missing, &victim, &effect, CYCLE_MS, 0).await.ok().unwrap();
+        apply_npc(&db, &world, system, 0, &missing, &victim, &effect, CYCLE_MS, generation).await.ok().unwrap();
         assert!(world.after(system, CYCLE_WAIT_MS).await);
         let unchanged = world.with(system, move |s| npc_health_fraction(s.ball(ally).unwrap(), layer).unwrap()).await.unwrap();
         assert_eq!(unchanged, before);
-        apply_npc(&db, &world, system, 0, &me, &victim, &effect, CYCLE_MS, 0).await.ok().unwrap();
+        apply_npc(&db, &world, system, 0, &me, &victim, &effect, CYCLE_MS, generation).await.ok().unwrap();
         let (first, second) = world.with(system, move |s| (npc_health_fraction(s.ball(ally).unwrap(), layer).unwrap(), npc_health_fraction(s.ball(rival).unwrap(), layer).unwrap())).await.unwrap();
         if layer == 0 { assert!(first > before); } else { assert_eq!(first, before); }
         assert_eq!(second, before, "equal health ties choose the lower ID");
@@ -111,18 +118,18 @@ async fn npc_repair_real_sde_phase_selection_and_guards() {
             let after = world.with(system, move |s| npc_health_fraction(s.ball(ally).unwrap(), layer).unwrap()).await.unwrap();
             assert!(after > before, "armor and hull repair at cycle end");
             // The remaining damaged ally is selected, then made ineligible before the timer.
-            apply_npc(&db, &world, system, 0, &me, &victim, &effect, CYCLE_MS, 0).await.ok().unwrap();
+            apply_npc(&db, &world, system, 0, &me, &victim, &effect, CYCLE_MS, generation).await.ok().unwrap();
             world.with(system, move |s| { s.spawn_group([source], |_| {}); }).await.unwrap();
             assert!(world.after(system, CYCLE_WAIT_MS).await);
             let unchanged = world.with(system, move |s| npc_health_fraction(s.ball(rival).unwrap(), layer).unwrap()).await.unwrap();
             assert_eq!(unchanged, before, "an ally leaving the support group cancels the repair");
-            apply_npc(&db, &world, system, 0, &me, &victim, &effect, CYCLE_MS, 0).await.ok().unwrap();
+            apply_npc(&db, &world, system, 0, &me, &victim, &effect, CYCLE_MS, generation).await.ok().unwrap();
             assert!(world.after(system, CYCLE_WAIT_MS).await);
             let no_ally = world.with(system, move |s| npc_health_fraction(s.ball(rival).unwrap(), layer).unwrap()).await.unwrap();
             assert_eq!(no_ally, before, "no eligible ally starts no repair");
 
             world.with(system, move |s| { s.spawn_group([source, rival], |_| {}); }).await.unwrap();
-            apply_npc(&db, &world, system, 0, &me, &victim, &effect, MOVE_CYCLE_MS, 0).await.ok().unwrap();
+            apply_npc(&db, &world, system, 0, &me, &victim, &effect, MOVE_CYCLE_MS, generation).await.ok().unwrap();
             world.with(system, move |s| {
                 s.command(rival, |ball, _, _| {
                     ball.pos = [1.0e12, 0.0, 0.0];
@@ -142,14 +149,15 @@ async fn npc_repair_real_sde_phase_selection_and_guards() {
                 });
             }).await.unwrap();
             assert!(world.after(system, 1_200).await);
-            apply_npc(&db, &world, system, 0, &me, &victim, &effect, 10_000.0, 0).await.ok().unwrap();
+            apply_npc(&db, &world, system, 0, &me, &victim, &effect, 10_000.0, generation).await.ok().unwrap();
             world.with(system, move |s| { s.remove_ball(hostile); }).await.unwrap();
             assert!(world.after(system, 1_500).await);
             world.with(system, move |s| { s.insert(ball(hostile, target_type, 2, Some(1))); }).await.unwrap();
             assert!(world.after(system, 5_000).await);
-            let new_generation = world.with(system, move |s| (1..32).find(|generation|
-                s.npc_projection_valid(source, hostile, *generation))).await.unwrap();
-            assert!(new_generation.is_some(), "the same hostile must be locked under a new generation");
+            let new_generation = tokio::time::timeout(std::time::Duration::from_secs(10), shot_rx.recv())
+                .await.expect("relocked NPC shot timed out").expect("NPC callback closed");
+            assert_ne!(new_generation, generation, "the same hostile must be locked under a new generation");
+            assert!(world.with(system, move |s| s.npc_projection_valid(source, hostile, new_generation)).await.unwrap());
             assert!(world.after(system, 4_000).await);
             let stale = world.with(system, move |s| npc_health_fraction(s.ball(rival).unwrap(), layer).unwrap()).await.unwrap();
             assert_eq!(stale, before, "a stale generation cannot repair even after relocking");

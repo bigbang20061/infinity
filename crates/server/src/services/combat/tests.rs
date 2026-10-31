@@ -94,6 +94,23 @@ async fn npc_projected_weapon_attributes_change_application() {
     stats.opt_sig = 1000.0;
     stats.missile = None;
     stats.fx = None;
+    let (shot_tx, mut shot_rx) = tokio::sync::mpsc::unbounded_channel();
+    world.with(system, move |s| {
+        let mut brain = crate::space::NpcBrain::new(None, crate::space::NpcConfig {
+            fly_range: 1.0, aggro_range: 1e9, rate_of_fire_ms: 1e9,
+            scan_resolution: 1.0, repairs: (0.0, 0.0, 1000.0),
+        }, Arc::new(move |action| {
+            if let crate::space::NpcAction::Shot { generation, .. } = action {
+                let _ = shot_tx.send(generation);
+            }
+            Box::pin(async {})
+        }));
+        brain.target = Some((target_id, 1, 0));
+        brain.announced = true;
+        assert!(s.add_npc(shooter_id, brain));
+    }).await.unwrap();
+    let generation = tokio::time::timeout(std::time::Duration::from_secs(10), shot_rx.recv())
+        .await.expect("NPC shot timed out").expect("NPC callback closed");
     let reset_hp = || {
         state().hp.insert(target_id, Hp { now: [1e6; 3], max: [1e6; 3], resonance: [[1.0; 4]; 3] });
     };
@@ -115,10 +132,10 @@ async fn npc_projected_weapon_attributes_change_application() {
     };
     reset_hp();
     set_projection(0.0, 0.0, 0.0).await;
-    npc_shot(&db, &world, system, shooter_id, npc, &stats, shooter.clone(), victim.clone()).await.ok().unwrap();
+    npc_shot(&db, &world, system, shooter_id, npc, &stats, shooter.clone(), victim.clone(), generation).await.ok().unwrap();
     assert_eq!(remaining(), 1e6, "unprojected tracking must miss the fast transverse target");
     set_projection(-100.0, 0.0, 0.0).await;
-    npc_shot(&db, &world, system, shooter_id, npc, &stats, shooter.clone(), victim.clone()).await.ok().unwrap();
+    npc_shot(&db, &world, system, shooter_id, npc, &stats, shooter.clone(), victim.clone(), generation).await.ok().unwrap();
     assert!(remaining() < 1e6, "zero projected tracking uses the NPC angular-term deviation");
 
     stats.damage = [0.0; 4];
@@ -127,7 +144,7 @@ async fn npc_projected_weapon_attributes_change_application() {
     for (velocity_bonus, radius_bonus) in [(0.0, 0.0), (-50.0, 0.0), (0.0, 100.0)] {
         reset_hp();
         set_projection(0.0, velocity_bonus, radius_bonus).await;
-        npc_shot(&db, &world, system, shooter_id, npc, &stats, shooter.clone(), victim.clone()).await.ok().unwrap();
+        npc_shot(&db, &world, system, shooter_id, npc, &stats, shooter.clone(), victim.clone(), generation).await.ok().unwrap();
         assert!(world.after(system, 2000).await);
         dealt.push(1e6 - remaining());
     }
