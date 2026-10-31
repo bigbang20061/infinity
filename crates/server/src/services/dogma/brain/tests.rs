@@ -75,3 +75,38 @@ fn hull_override_filter_reset_and_skill_preassignment() {
     assert!(effects.is_empty());
 }
 
+
+#[test]
+fn booster_bonus_and_penalty_combine_as_unnerfed_percent_on_wire() {
+    let mut effects = BTreeMap::new();
+    let t = target("LRS", OP_POST_PERCENT_UNNERFED, Some(6));
+    combine(&mut effects, t.clone(), 20.0, 101);
+    combine(&mut effects, t.clone(), -10.0, 102);
+    let effect = effects.remove(&t).unwrap();
+    assert!((effect.value - 8.0).abs() < 1e-9);
+    let Value::Reduce { data, .. } = wire(&t, effect, 42) else { panic!("expected reduce") };
+    let Value::Tuple(parts) = *data else { panic!("expected tuple") };
+    assert!(parts[2].get("operation") == Some(&Value::Int(OP_POST_PERCENT_UNNERFED as i64)));
+    assert!(parts[2].get("extras") == Some(&Value::tuple([Value::Int(6)])));
+    assert!(parts[2].get("skills") == Some(&Value::list([Value::Int(101), Value::Int(102)])));
+    assert!((parts[2].get("value").unwrap().as_float().unwrap() - 8.0).abs() < 1e-9);
+}
+
+#[test]
+fn zero_assignment_and_multiplication_are_emitted_but_zero_division_is_ignored() {
+    for op in [OP_PRE_ASSIGN, OP_POST_ASSIGN, OP_PRE_MUL, OP_POST_MUL] {
+        let mut effects = BTreeMap::new();
+        let t = target("M", op, None);
+        combine(&mut effects, t.clone(), 0.0, 101);
+        let Value::Reduce { data, .. } = wire(&t, effects.remove(&t).unwrap(), 42) else { panic!("expected reduce") };
+        let Value::Tuple(parts) = *data else { panic!("expected tuple") };
+        assert_eq!(parts[2].get("value").unwrap().as_float(), Some(0.0));
+        assert!(parts[2].get("operation") == Some(&Value::Int(op as i64)));
+    }
+    for op in [OP_PRE_DIV, OP_POST_DIV, OP_MOD_ADD, OP_MOD_SUB, OP_POST_PERCENT, OP_POST_PERCENT_UNNERFED] {
+        let mut effects = BTreeMap::new();
+        combine(&mut effects, target("M", op, None), 0.0, 101);
+        assert!(effects.is_empty());
+    }
+}
+

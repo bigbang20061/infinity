@@ -1,12 +1,13 @@
-//! Passive skill and active-hull base override brain compilation for dogmaIM and OnServerBrainUpdated.
+//! Active skill, implant and booster modifiers and hull overrides for dogmaIM and OnServerBrainUpdated.
 //! Mirrors eve/client/script/dogma/allSkillsCharBrain.py and
-//! eve/common/script/dogma/effect.py, using Fit's SDE and learned skill nodes.
-//! Versions are in-memory; implants, boosters, structure effects and unsupported
-//! operations such as PostPercentUnNerfed are not compiled.
-//! Training-completion updates occur when skill-handler calls collect completed training, not independently at wall-clock completion.
+//! eve/common/script/dogma/effect.py, using Fit's SDE and active character material.
+//! Arithmetic operations through PostAssign and PostPercentUnNerfed are compiled;
+//! the special skill relationship is derived by Fit, not emitted. Structure effects
+//! and implant/booster injection or expiry are not supported. Versions are in-memory;
+//! training-completion updates occur when skill handlers collect completed training.
 
-use super::super::{fit::{Fit, Key, ATTR_SKILL_LEVEL, OP_PRE_ASSIGN, OP_PRE_MUL, OP_PRE_DIV, OP_MOD_ADD, OP_MOD_SUB, OP_POST_MUL, OP_POST_DIV, OP_POST_PERCENT, OP_POST_ASSIGN, PERCENT_SCALE}, keyval, CallError};
-use crate::client::Client;
+use super::super::{fit::{Fit, Key, OP_PRE_ASSIGN, OP_PRE_MUL, OP_PRE_DIV, OP_MOD_ADD, OP_MOD_SUB, OP_POST_MUL, OP_POST_DIV, OP_POST_PERCENT, OP_POST_PERCENT_UNNERFED, OP_POST_ASSIGN, PERCENT_SCALE}, keyval, CallError};
+use crate::{client::Client, consts::ATTR_SKILL_LEVEL};
 use marshal::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock};
@@ -31,12 +32,14 @@ struct Effect {
     skills: Vec<i32>,
 }
 fn combine(effects: &mut BTreeMap<Target, Effect>, target: Target, value: f64, skill: i32) {
+    // Division by zero is ignored by Fit; zero additions and percentages are neutral.
+    if value == 0.0 && matches!(target.operation, OP_PRE_DIV | OP_POST_DIV | OP_MOD_ADD | OP_MOD_SUB | OP_POST_PERCENT | OP_POST_PERCENT_UNNERFED) { return; }
     if let Some(effect) = effects.get_mut(&target) {
         effect.value = match target.operation {
             OP_PRE_ASSIGN | OP_POST_ASSIGN => value,
             OP_PRE_MUL | OP_PRE_DIV | OP_POST_MUL | OP_POST_DIV => effect.value * value,
             OP_MOD_ADD | OP_MOD_SUB => effect.value + value,
-            OP_POST_PERCENT => (PERCENT_SCALE + effect.value) * (PERCENT_SCALE + value) / PERCENT_SCALE - PERCENT_SCALE,
+            OP_POST_PERCENT | OP_POST_PERCENT_UNNERFED => (PERCENT_SCALE + effect.value) / PERCENT_SCALE * ((PERCENT_SCALE + value) / PERCENT_SCALE) * PERCENT_SCALE - PERCENT_SCALE,
             _ => unreachable!(),
         };
         effect.skills.push(skill);
@@ -75,8 +78,8 @@ fn wire(target: &Target, effect: Effect, to_item: i64) -> Value {
 pub(crate) fn compile(fit: &Fit, char_id: i64, ship_id: i64) -> (Value, Value, Value) {
     let mut effects: BTreeMap<Target, Effect> = BTreeMap::new();
     insert_hull_overrides(&mut effects, fit.overrides(Key::Ship), |attribute| fit.type_has_attribute(Key::Ship, attribute));
-    fit.passive_skill_modifiers(|source, modifier| {
-        let Key::Skill(skill) = source else { return };
+    fit.brain_modifiers(|source, modifier| {
+        let Some(source_type) = fit.source_type(source) else { return };
         let ship = match modifier.domain.as_str() {
             "shipID" => true,
             "charID" => false,
@@ -91,12 +94,11 @@ pub(crate) fn compile(fit: &Fit, char_id: i64, ship_id: i64) -> (Value, Value, V
             _ => return,
         };
         if matches!(kind, "LG" | "LRS" | "ORS") && extra.is_none() { return; }
-        if !(OP_PRE_ASSIGN..=OP_POST_ASSIGN).contains(&modifier.op) { return; }
+        if !(OP_PRE_ASSIGN..=OP_POST_ASSIGN).contains(&modifier.op) && modifier.op != OP_POST_PERCENT_UNNERFED { return; }
         let value = fit.value(source, modifier.modifying);
         if kind == "M" && modifier.modified == ATTR_SKILL_LEVEL { return; }
-        if value == 0.0 { return; }
         let target = Target { ship, attribute: modifier.modified, kind, operation: modifier.op, extra };
-        combine(&mut effects, target, value, skill);
+        combine(&mut effects, target, value, source_type);
     });
     let mut char_effects = Vec::new();
     let mut ship_effects = Vec::new();

@@ -120,7 +120,8 @@ fn info_keyed(item_row: Value, key: Value, attributes: BTreeMap<i64, f64>, activ
 async fn character_info(c: &Client) -> Result<Value, CallError> {
     let char_id = c.session.int("charid").ok_or_else(|| CallError::Internal(anyhow::anyhow!("no character selected")))?;
     let ship_id = c.session.int("shipid").unwrap_or(0);
-    let character_attrs = skills::attributes::character_attributes(c, char_id).await?;
+    // The client sets these base values before applying the character brain's modifiers.
+    let character_attrs = skills::attributes::base_character_attributes(&c.db, &c.sde, char_id).await?;
     let mut attrs = type_attributes(c, TYPE_CHARACTER);
     attrs.extend(character_attrs);
     let item = Item {

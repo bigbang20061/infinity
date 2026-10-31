@@ -4,6 +4,7 @@
 //! pythonEffects supply corresponding behavior names. Later-wave kinds are
 //! classified here but are not implemented by this registry.
 pub(crate) mod registry;
+pub(crate) mod projection;
 pub(crate) mod environment;
 pub(crate) mod notify;
 pub(crate) mod unsupported;

@@ -66,6 +66,37 @@ same sublocation tuple as its item. `OnSpecialFX` carries fourteen arguments:
 `(shipID, moduleID, moduleTypeID, targetID, chargeTypeID, guid, isOffensive,
 start, active, duration, repeat, startTime, graphicInfo, area)`.
 
+## Fit evaluator data and scope
+
+Fit evaluates character, ship, module, charge and skill nodes alongside active
+brain items, drones and explicitly supplied incoming projections. Brain items
+are limited to character-owned implants in flag 89 and boosters in flag 88;
+hangar and cargo items do not apply. Player implant plugging and booster use
+RPCs, including booster lifecycle, remain with skills-complete and are not
+implemented here.
+Character item info transmits base character attributes because the client
+applies the compiled brain afterward. Effective character and training
+attributes come from the same Fit evaluator, so implant bonuses are applied
+once rather than doubled.
+
+Modifier evaluation covers item, location, group and required-skill domains,
+including character-location brain items and drones. Operation 8 applies
+unpenalized percent modifiers; special operation 9 derives skill level from
+skill points and rank. Overload modifier data is evaluated only when the
+snapshot marks a node overloaded; this does not add an overload RPC.
+Ordinary numeric evaluation retains per-fit memoization, not a persistent
+keyed cache with invalidation. Client stacking penalties independently truncate
+the strongest upward and downward modifiers to eight each.
+
+`Fit::load_projected` is the single loading implementation and accepts
+source-effective values for a specific incoming effect, its source module and
+type, and optional charge or script type. Only that effect's target modifiers
+reach the victim; the evaluator does not load the source ship. `Fit::load` is
+an unprojected convenience. PR3 owns runtime projection storage and expiry and
+must migrate all in-space callers to provide system projections. This evaluator
+support does not implement runtime electronic warfare, drone gameplay or new
+RPCs.
+
 ## SDE and Python modifiers
 
 At startup, dogma loads SDE effects and modifier rows. The Python modifier
