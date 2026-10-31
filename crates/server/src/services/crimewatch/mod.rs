@@ -1,8 +1,8 @@
 //! Crimewatch: combat timers, criminal flags, engagements, security status, CONCORD and
 //! killmails (eve/client/script/ui/services/crimewatchSvc.py, crimewatch.const).
 //!
-//! Activating a weapon on another pilot's ship is legal against criminals, configured outlaws,
-//! pilots you are engaged with, and anywhere outside empire space. Otherwise it is a criminal
+//! Activating a weapon on another pilot's ship is legal against criminals or suspects, configured
+//! outlaws, pilots you are engaged with, and anywhere outside empire space. Otherwise it is a criminal
 //! act: the aggressor loses security status and is flagged criminal; in configured high-sec
 //! CONCORD destroys their ship after a response time that grows as security falls, unless
 //! CONCORD responses are disabled. Aggression starts weapons and PvP timers and a mutual
@@ -12,8 +12,9 @@
 //! window; an illegal kill costs those aggressors more security status. Killing NPCs that carry
 //! a bounty slowly raises it. Security adjustments and CONCORD response delays are configurable.
 //! CONCORD responses use the crime system's actor timer; character expiry timers
-//! follow pilots across systems and stations on Tokio tasks. These timers and
-//! criminal flags are in memory and do not survive a server restart.
+//! follow pilots across systems and stations on Tokio tasks. These timers and flags
+//! are in memory; at startup active persisted kill rights restore their suspect flags
+//! without extending their deadlines. Other timers and flags are lost on restart.
 //! Killmail records, kill-report notifications and security penalties commit together;
 //! damage contributions remain in memory until that transaction commits.
 //! System security comes from the startup SDE map; character security is persisted in game data.
@@ -41,6 +42,7 @@ const PVP_IDLE: i64 = 200;
 const PVP_TIMER: i64 = 202;
 const CRIMINAL_IDLE: i64 = 300;
 const CRIMINAL_TIMER: i64 = 303;
+const SUSPECT_TIMER: i64 = 304;
 const NPC_IDLE: i64 = 400;
 const DISAPPROVAL_IDLE: i64 = 500;
 const SAFETY_LEVEL_FULL: i64 = 2;
@@ -59,6 +61,7 @@ struct Pilot {
     weapons_until: i64,
     pvp_until: i64,
     criminal_until: i64,
+    suspect_until: i64,
 }
 
 /// An attacker's share of the damage to a ship.
@@ -103,7 +106,7 @@ pub fn weapons_timer(char_id: i64) -> Option<i64> {
 }
 
 fn is_criminal(char_id: i64, now: i64) -> bool {
-    state().pilots.get(&char_id).is_some_and(|p| p.criminal_until > now)
+    state().pilots.get(&char_id).is_some_and(|p| p.criminal_until > now || p.suspect_until > now)
 }
 
 pub async fn security_status(db: &(impl Executor + ?Sized), char_id: i64) -> Result<f64, CallError> {
@@ -197,7 +200,13 @@ pub async fn aggress(db: &Db, world: &Arc<World>, system: i64, attacker: i64, at
     if legal {
         return Ok(());
     }
-    announce(world, attacker, "OnCriminalTimerUpdate", CRIMINAL_TIMER, CRIMINAL_IDLE, until);
+    if let Err(error) = super::bounty::kill_rights::earn(db, world, victim, attacker).await {
+        match error {
+            CallError::Internal(error) => warn!("crimewatch: earning kill right failed: {error:#}"),
+            CallError::User { msg, .. } => warn!("crimewatch: earning kill right refused: {msg}"),
+        }
+    }
+    world.notify_pilot(attacker, "OnCriminalTimerUpdate", vec![Value::Int(CRIMINAL_TIMER), Value::Int(until)]);
     let mut outbox = Outbox::default();
     shift_security(db, &mut outbox, attacker, policy.security_loss_aggression, -10.0).await?;
     dispatch_world((), outbox, world)?;
@@ -206,7 +215,7 @@ pub async fn aggress(db: &Db, world: &Arc<World>, system: i64, attacker: i64, at
         for pilot in pilots_in(world, system).await {
             world.notify_pilot(pilot, "OnSystemCriminalFlagUpdates", vec![Value::list([]), Value::list([]), Value::list([Value::Int(attacker)])]);
         }
-        clear_flag_later(db.clone(), world.clone(), attacker, until);
+        clear_flag_later(db.clone(), world.clone(), attacker, until, Flag::Criminal);
     }
     if reserve_concord(policy.concord_enabled, system_sec, policy.highsec_threshold, attacker) {
         dispatch_concord(world.clone(), system, attacker, system_sec);
@@ -218,31 +227,71 @@ fn reserve_concord(enabled: bool, security: f64, highsec_threshold: f64, attacke
     enabled && security >= highsec_threshold && state().concord.insert(attacker)
 }
 
-/// Lift a criminal flag once it runs out, telling the system the pilot is in by then.
-fn clear_flag_later(db: Db, world: Arc<World>, char_id: i64, until: i64) {
+#[derive(Clone, Copy)]
+enum Flag { Criminal, Suspect }
+
+impl Flag {
+    fn until(self, pilot: &Pilot) -> i64 {
+        match self { Self::Criminal => pilot.criminal_until, Self::Suspect => pilot.suspect_until }
+    }
+}
+
+/// Resolve the effective flag without hiding a still-active criminal or suspect.
+fn effective_flag(pilot: &Pilot, now: i64) -> (usize, i64, Option<i64>) {
+    if pilot.criminal_until > now {
+        (2, CRIMINAL_TIMER, Some(pilot.criminal_until))
+    } else if pilot.suspect_until > now {
+        (1, SUSPECT_TIMER, Some(pilot.suspect_until))
+    } else {
+        (0, CRIMINAL_IDLE, None)
+    }
+}
+
+async fn announce_flag(db: &Db, world: &World, char_id: i64) {
+    let (slot, timer_state, until) = {
+        let st = state();
+        st.pilots.get(&char_id).map(|p| effective_flag(p, filetime_now()))
+            .unwrap_or((0, CRIMINAL_IDLE, None))
+    };
+    world.notify_pilot(char_id, "OnCriminalTimerUpdate", vec![Value::Int(timer_state), until.map(Value::Int).unwrap_or(Value::None)]);
+    let system = match crate::dao::characters::crimewatch::solar_system(db, char_id).await {
+        Ok(system) => system,
+        Err(e) => { warn!("crimewatch: locating {char_id}: {e}"); None }
+    };
+    if let Some(system) = system {
+        for pilot in pilots_in(world, system).await {
+            let mut flags = vec![Value::list([]), Value::list([]), Value::list([])];
+            flags[slot] = Value::list([Value::Int(char_id)]);
+            world.notify_pilot(pilot, "OnSystemCriminalFlagUpdates", flags);
+        }
+    }
+}
+
+/// Apply a suspect flag for a paid or owner-activated kill right.
+pub async fn flag_suspect(db: &Db, world: &Arc<World>, char_id: i64, until: i64) {
+    {
+        let mut st = state();
+        let pilot = st.pilots.entry(char_id).or_default();
+        pilot.suspect_until = pilot.suspect_until.max(until);
+    }
+    announce_flag(db, world, char_id).await;
+    clear_flag_later(db.clone(), world.clone(), char_id, until, Flag::Suspect);
+}
+
+/// Lift an expired flag while preserving any other active flag.
+fn clear_flag_later(db: Db, world: Arc<World>, char_id: i64, until: i64, flag: Flag) {
     tokio::spawn(async move {
         let mut until = until;
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(ms_from_filetime_ticks((until - filetime_now()).max(0)) as u64 + CHARACTER_TIMER_GRACE_MS)).await;
-            let current = state().pilots.get(&char_id).map(|p| p.criminal_until).unwrap_or(0);
+            let current = state().pilots.get(&char_id).map(|p| flag.until(p)).unwrap_or(0);
             if current > filetime_now() {
                 until = current;
                 continue;
             }
             break;
         }
-        let system: Option<i64> = match crate::dao::characters::crimewatch::solar_system(&db, char_id).await {
-            Ok(system) => system,
-            Err(e) => {
-                warn!("crimewatch: locating {char_id}: {e}");
-                None
-            }
-        };
-        if let Some(system) = system {
-            for pilot in pilots_in(&world, system).await {
-                world.notify_pilot(pilot, "OnSystemCriminalFlagUpdates", vec![Value::list([Value::Int(char_id)]), Value::list([]), Value::list([])]);
-            }
-        }
+        announce_flag(&db, &world, char_id).await;
     });
 }
 
@@ -320,6 +369,7 @@ pub async fn ship_lost(db: &Db, world: &World, system: i64, victim: i64, victim_
                 }
             }
             info!("crimewatch: killmail {kill_id} for {victim}'s ship type {ship_type} in {system} ({attacker_count} attackers, {isk_lost:.0} ISK)");
+            crate::scheduler::wake();
             dispatch_world((), outbox, world)
         },
     ).await
@@ -366,6 +416,12 @@ async fn write_killmail<X: Send>(
         final_ship_type: final_c.ship_type, final_weapon_type: final_c.weapon_type, final_damage: final_c.damage,
         final_sec, isk_lost, involved: &involved, blob: &blob,
     }).await.map_err(db_err)?;
+    super::bounty::kill_rights::consume(db, outbox, victim, now).await?;
+    if let Some(final_char) = final_char {
+        super::bounty::payout::schedule(db, super::bounty::payout::Payload {
+            killmail_id: kill_id, victim, victim_corp, ship_type, final_char, isk_lost,
+        }, now).await?;
+    }
 
     // Kill reports (notificationconst groupWar): the victim's, and the final blow's.
     super::mail::notify(db, outbox, victim, NOTIFICATION_KILL_REPORT_VICTIM, NOTIFICATION_GROUP_WAR, victim, &format!("{{killMailHash: '', killMailID: {kill_id}}}"))

@@ -82,6 +82,8 @@ fn invalid_numeric_values_report_field_and_value() {
         ("[crimewatch]\nconcord_delay_per_security_secs = 0", "crimewatch.concord_delay_per_security_secs", "0"),
         ("[crimewatch]\nconcord_base_delay_secs = 6.5", "crimewatch.concord_base_delay_secs", "6.5"),
         ("[crimewatch]\nconcord_delay_per_security_secs = 28.5", "crimewatch.concord_delay_per_security_secs", "28.5"),
+        ("[bounty]\nkill_right_lifetime_days = 0", "bounty.kill_right_lifetime_days", "0"),
+        ("[bounty]\nkill_right_suspect_secs = 0", "bounty.kill_right_suspect_secs", "0"),
     ] {
         let error = load_error(contents);
         assert!(error.contains(field) && error.contains(value), "expected {field} and {value} in {error}");
@@ -110,6 +112,8 @@ fn representation_overflows_are_rejected_with_the_key_and_value() {
         ("[crimewatch]\nconcord_base_delay_secs = 9223372036854775807", "crimewatch.concord_base_delay_secs", "9223372036854775807"),
         ("[crimewatch]\nconcord_delay_per_security_secs = 9223372036854775807", "crimewatch.concord_delay_per_security_secs", "9223372036854775807"),
         ("[space]\nposition_snapshot_secs = 9223372036854775807", "space.position_snapshot_secs", "9223372036854775807"),
+        ("[bounty]\nkill_right_lifetime_days = 9223372036854775807", "bounty.kill_right_lifetime_days", "9223372036854775807"),
+        ("[bounty]\nkill_right_suspect_secs = 9223372036854775807", "bounty.kill_right_suspect_secs", "9223372036854775807"),
     ] {
         let error = load_error(contents);
         assert!(error.contains(key) && error.contains(value), "{error}");

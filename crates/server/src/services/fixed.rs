@@ -169,9 +169,6 @@ pub(super) fn station(call: &Call<'_>) -> Option<CallResult> {
         ("scanMgr", "SignalTrackerRegister") => Value::None,
         ("monolithTaskTrackerMgr", "HasEverWarped") => Value::Bool(true),
         ("essMgr", "GetDataForClientSolarSystem") => Value::None,
-        ("bountyProxy", "GetMyKillRights") => Value::list([]),
-        // (bounties [(targetID, bounty)], killRights)
-        ("bountyProxy", "GetBountiesAndKillRights") => Value::tuple([Value::list([]), Value::list([])]),
         // (solarSystemID, campaignSnapshot): no insurgency here. The system must match the
         // session's or the client asks again.
         ("userSvc", "GetMultiCharactersTrainingSlots") => empty_dict(),

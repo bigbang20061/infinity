@@ -1,7 +1,7 @@
 //! Client timer and security state methods for `crimewatch`.
 //! Mirrors `eve/client/script/ui/services/crimewatchSvc.py`.
 //! Security uses `game.characters`; timers and engagements are in memory.
-//! Security transaction history and suspect flags are not modelled.
+//! Security transaction history is not modelled; flags are memory-only.
 
 use super::*;
 
@@ -23,12 +23,16 @@ async fn client_states(c: &Client) -> Value {
         running(pilot.map(|p| p.weapons_until), WEAPONS_TIMER, WEAPONS_IDLE),
         running(pilot.map(|p| p.pvp_until), PVP_TIMER, PVP_IDLE),
         timer(NPC_IDLE, None),
-        running(pilot.map(|p| p.criminal_until), CRIMINAL_TIMER, CRIMINAL_IDLE),
+        match pilot {
+            Some(p) => { let (_, state, until) = effective_flag(p, now); timer(state, until) },
+            None => timer(CRIMINAL_IDLE, None),
+        },
         timer(DISAPPROVAL_IDLE, None),
     ]);
     let engagements = Value::Dict(st.engagements.iter().filter(|((a, _), until)| *a == me && **until > now).map(|((_, b), until)| (Value::Int(*b), Value::Int(*until))).collect());
     let criminals: Vec<Value> = st.pilots.iter().filter(|(ch, p)| p.criminal_until > now && here.contains(ch)).map(|(ch, _)| Value::Int(*ch)).collect();
-    Value::tuple([timers, engagements, Value::tuple([Value::List(criminals), Value::list([])]), Value::Int(SAFETY_LEVEL_FULL)])
+    let suspects: Vec<Value> = st.pilots.iter().filter(|(ch, p)| p.suspect_until > now && p.criminal_until <= now && here.contains(ch)).map(|(ch, _)| Value::Int(*ch)).collect();
+    Value::tuple([timers, engagements, Value::tuple([Value::List(criminals), Value::List(suspects)]), Value::Int(SAFETY_LEVEL_FULL)])
 }
 
 pub(super) async fn dispatch(c: &Client, call: &Call<'_>) -> Option<CallResult> {

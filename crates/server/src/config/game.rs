@@ -11,7 +11,7 @@ pub mod world;
 #[path = "social.rs"]
 pub mod social;
 
-fn duration(key: &str, value: i64, unit: i64, future: bool) -> Result<()> {
+pub(super) fn duration(key: &str, value: i64, unit: i64, future: bool) -> Result<()> {
     let ticks = value.checked_mul(unit);
     anyhow::ensure!(ticks.is_some_and(|ticks| !future || crate::client::filetime_now().checked_add(ticks).is_some()),
         "{key}={value} exceeds the representable duration or deadline");
@@ -29,6 +29,8 @@ fn milliseconds(key: &str, seconds: i64) -> Result<()> {
 #[derive(Default, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GameConfig {
+    /// Bounty and kill-right policy.
+    pub bounty: super::bounty::BountyConfig,
     /// Accounts policy.
     pub accounts: economy::AccountsConfig,
     /// Characters policy.
@@ -71,6 +73,7 @@ pub struct GameConfig {
 
 impl GameConfig {
     pub fn validate(&self) -> Result<()> {
+        self.bounty.validate()?;
         self.accounts.validate()?;
         self.characters.validate()?;
         self.market.validate()?;

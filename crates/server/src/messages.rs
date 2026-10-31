@@ -4,6 +4,7 @@
 //! the client's slash service. This module reads no database and does not
 //! implement localisation, data-derived names, or protocol identifiers.
 
+pub(crate) mod bounty;
 pub(crate) mod effects;
 pub(crate) mod gm;
 pub(crate) mod scheduler;
@@ -633,6 +634,10 @@ pub(crate) const MSG_CORP_BULLETIN_NOT_FOUND: &str = "CorpBulletinNotFound";
 pub(crate) const MSG_CORP_TOO_MANY_BULLETINS: &str = "CorpTooManyBulletins";
 /// Client message `CustomNotify`.
 pub(crate) const MSG_CUSTOM_NOTIFY: &str = "CustomNotify";
+/// Client kill-right refusal keys.
+pub(crate) const MSG_NO_VALID_KILL_RIGHT: &str = "NoValidKillRight";
+pub(crate) const MSG_KILL_RIGHT_EXPIRED: &str = "KillRightExpired";
+pub(crate) const MSG_KILL_RIGHT_NOT_FOR_SALE: &str = "KillRightNotForSale";
 /// Client message `CustomQuestion`.
 pub(crate) const MSG_CUSTOM_QUESTION: &str = "CustomQuestion";
 /// Client message `DeniedActivateInWarp`.
