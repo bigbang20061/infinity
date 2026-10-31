@@ -39,7 +39,7 @@ fn missile_lifecycle_preserves_exploration_site() {
         max_vel: 1.0, agility: 1.0, speed_fraction: 0.0,
         pos: [1.0, 2.0, 3.0], vel: [0.0; 3], goto: [0.0; 3],
         follow_id: 0, follow_range: 0.0, free: true, global: false,
-        massive: true, warp: None, warp_factor: 0, last_ms: 0,
+        massive: true, warp: None, warp_factor: 0, last_ms: 0, effect_stamp: 0,
         cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new(),
     };
     let (site_id, site_type, site_pos) = (site.id, site.type_id, site.pos);
@@ -216,7 +216,7 @@ fn reload_reservation_survives_departure_and_preserves_new_marker() {
         max_vel: 1.0, agility: 1.0, speed_fraction: 0.0,
         pos: [0.0; 3], vel: [0.0; 3], goto: [0.0; 3],
         follow_id: 0, follow_range: 0.0, free: true, global: false,
-        massive: true, warp: None, warp_factor: 0, last_ms: 0,
+        massive: true, warp: None, warp_factor: 0, last_ms: 0, effect_stamp: 0,
         cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new(),
     });
     let result = Arc::new(Mutex::new(None));

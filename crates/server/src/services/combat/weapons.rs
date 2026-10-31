@@ -236,6 +236,7 @@ pub(super) async fn launch_missile(db: Db, world: Arc<World>, system: i64, from:
         .ok_or_else(|| CallError::Internal(anyhow::anyhow!("unknown type {}", m.charge)))?;
     let mut slim = vec![("sourceShipID", Value::Int(from.id))];
     slim.push(("launchModules", Value::list(module.map(Value::Int))));
+    let launch_ms = now_ms();
     let missile = Ball {
         id: NEXT_MISSILE_ID.fetch_add(1, Ordering::Relaxed),
         type_id: m.charge,
@@ -260,7 +261,8 @@ pub(super) async fn launch_missile(db: Db, world: Arc<World>, system: i64, from:
         massive: false,
         warp: None,
         warp_factor: 0,
-        last_ms: now_ms(),
+        last_ms: launch_ms,
+        effect_stamp: crate::space::destiny_stamp(launch_ms),
         cloak: 0,
         cloak_until: 0,
         health: [1.0; 3],

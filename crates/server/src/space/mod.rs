@@ -190,6 +190,9 @@ pub struct Ball {
     pub warp_factor: i64,
     /// Last integration time in Unix milliseconds; missiles retain their launch time.
     pub last_ms: i64,
+    /// carbonengine destiny AddBall, LaunchMissile and RealWarp effect stamp, in destiny ticks;
+    /// independent of integration milliseconds.
+    pub effect_stamp: i64,
     /// Cloak mode (0 = visible). Cloaked balls exist only for their owner.
     pub cloak: u8,
     /// When an arrival cloak lapses (FILETIME), to tell a lapse from a later cloak.
@@ -249,7 +252,7 @@ impl Ball {
                 o.extend_from_slice(&self.follow_id.to_le_bytes());
                 o.extend_from_slice(&self.follow_range.to_le_bytes());
                 o.extend_from_slice(&self.launcher.to_le_bytes());
-                o.extend_from_slice(&(destiny_stamp(self.last_ms) as i32).to_le_bytes()); // effectStamp: launch tick
+                o.extend_from_slice(&(self.effect_stamp as i32).to_le_bytes()); // effectStamp: launch tick
                 for c in self.goto {
                     o.extend_from_slice(&c.to_le_bytes());
                 }
@@ -259,7 +262,7 @@ impl Ball {
                 for c in w.to {
                     o.extend_from_slice(&c.to_le_bytes());
                 }
-                o.extend_from_slice(&(destiny_stamp(w.start) as i32).to_le_bytes()); // effectStamp
+                o.extend_from_slice(&(self.effect_stamp as i32).to_le_bytes()); // effectStamp
                 o.extend_from_slice(&dist(w.to, w.from).to_le_bytes()); // total warp length
                 // minRange (a double in mFollowId's slot); 0 because `to` already includes it.
                 o.extend_from_slice(&0.0f64.to_le_bytes());
@@ -550,6 +553,7 @@ impl World {
                     warp: None,
                     warp_factor: 0,
                     last_ms: tick,
+                    effect_stamp: 0,
                     cloak: 0,
                     cloak_until: 0,
                     health: [1.0; 3],

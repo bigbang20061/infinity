@@ -148,6 +148,7 @@ fn rock_ball(id: i64, type_id: i32, pos: V3, radius: f32) -> Ball {
         warp: None,
         warp_factor: 0,
         last_ms: now_ms(),
+        effect_stamp: 0,
         cloak: 0,
         cloak_until: 0,
         health: [1.0; 3],

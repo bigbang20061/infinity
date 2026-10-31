@@ -101,6 +101,7 @@ pub(super) async fn ship_ball(c: &Client, ship_id: i64, pos: [f64; 3]) -> Result
         warp: None,
         warp_factor: ((warp_mult * base_warp * 1000.0).round() as i64).max(500),
         last_ms: now_ms(),
+        effect_stamp: 0,
         cloak: 0,
         cloak_until: 0,
         health: [1.0; 3],
@@ -479,6 +480,7 @@ pub(super) fn warp_to(c: &mut Client, object: Option<(V3, f64)>, point: V3, min_
         b.goto = to;
         b.speed_fraction = 1.0;
         b.warp = Some(Warp { from: b.pos, to, start: b.last_ms, duration: seconds_to_ms_f64(align + warp_duration(b.warp_factor as f64, distance)), factor: b.warp_factor });
+        b.effect_stamp = space::destiny_stamp(b.last_ms);
         // Destiny only enters warp once aligned at 75% of max velocity, and thrust scales
         // with the speed fraction (Ball::IsAlignedForWarp, GotoThrust): warp at full throttle,
         // or a stopped ship sits aligning until the 180 s MAX_ALIGN_TICKS fallback.

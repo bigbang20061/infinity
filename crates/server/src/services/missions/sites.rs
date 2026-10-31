@@ -130,6 +130,7 @@ pub(super) async fn ensure_site(c: &mut Client, m: &Mission) -> Result<(), CallE
             warp: None,
             warp_factor: 0,
             last_ms: tick,
+            effect_stamp: 0,
             cloak: 0,
             cloak_until: 0,
             health: [1.0; 3],
