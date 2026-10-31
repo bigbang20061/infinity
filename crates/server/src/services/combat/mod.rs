@@ -252,7 +252,7 @@ pub(crate) mod groups_health;
 use groups_health::*;
 pub(crate) mod weapons;
 use weapons::*;
-mod npc;
+pub(super) mod npc;
 use npc::*;
 
 pub(super) fn quantity_change(owner: i64, ship: i64, flag: i32, type_id: i32, new: i64, old: i64) -> Value {
