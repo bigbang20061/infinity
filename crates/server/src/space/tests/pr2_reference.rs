@@ -54,7 +54,7 @@ fn direction(system: &mut System, id: i64, v: V3) {
 fn commands(system: &mut System, name: &str) {
     match name {
         "follow-rigid-station" => follow(system, 1, 2, 1500.0, MODE_FOLLOW),
-        "stop-full-speed" => system.command(1, |b, _, _| { b.mode = MODE_STOP; b.speed_fraction = 0.0; vec![] }),
+        "stop-full-speed" => system.command(1, |b, _, _| { b.stop(); vec![] }),
         "orbit-static-and-moving" => {
             follow(system, 202, 201, 500.0, MODE_ORBIT);
             follow(system, 203, 201, 20000.0, MODE_ORBIT);

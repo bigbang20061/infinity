@@ -28,18 +28,18 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         ("beyonce", "CmdStop") => {
             if let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) {
                 c.world.command(system, ship, |b, t, _| {
-                    b.mode = MODE_STOP;
-                    b.speed_fraction = 0.0;
+                    b.stop();
                     vec![event(t, "Stop", vec![Value::Int(b.id)])]
                 });
             }
             Ok(Value::None)
         }
         ("beyonce", "CmdSetSpeedFraction") => {
-            let frac = f(a.first()).clamp(0.0, 1.0) as f32;
+            let frac = f(a.first()) as f32;
+            if !frac.is_finite() { return Some(Ok(Value::None)); }
             movement(c, move |b, t, _| {
-                b.speed_fraction = frac;
-                vec![event(t, "SetSpeedFraction", vec![Value::Int(b.id), Value::Float(frac as f64)])]
+                b.set_speed_fraction(frac);
+                vec![event(t, "SetSpeedFraction", vec![Value::Int(b.id), Value::Float(b.speed_fraction as f64)])]
             })
         }
         ("beyonce", "CmdFollowBall") | ("beyonce", "CmdOrbit") => {

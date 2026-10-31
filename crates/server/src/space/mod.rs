@@ -23,9 +23,8 @@
 //! (`Ballpark.cpp:4102-4113`) falls back to GotoPoint for a raw destination
 //! strictly below 100 km, without WarpFX.
 //!
-//! The 0.1-second tau floor limits low-effective-mass fidelity. Finite GOTO
-//! arrival scaling, follow, orbit, full warp and missile flight remain approximate;
-//! collisions and bumps are not modelled. Orientations, formations, miniballs,
+//! Finite GOTO arrival scaling, follow, orbit, full warp and missile flight
+//! remain approximate; collisions and bumps are not modelled. Orientations, formations, miniballs,
 //! AddBalls2 and unsupported ball modes are not implemented.
 //! Shared vector distances are defined here for simulation and service callers.
 
@@ -44,6 +43,7 @@ mod system;
 mod npc;
 mod warpin;
 mod snapshot;
+mod stop;
 pub use npc::{HOSTILE_TO_ALL, NpcAction, NpcBrain, NpcConfig, NpcEffects, NpcFuture};
 pub use system::System;
 use actor::SystemHandle;
@@ -82,9 +82,6 @@ const DEFAULT_WARP_FACTOR: i64 = 3000;
 const DAMAGE_STATE_SHIELD_RECHARGE_TAU: f64 = 100_000.0;
 /// Carbonengine Ballpark constructor friction.
 const DESTINY_FRICTION: f64 = 1e6;
-/// ponytail: The 0.1-second floor limits low-effective-mass fidelity; replace it
-/// when native effective-mass semantics are implemented.
-const MIN_MOVEMENT_TAU_SECONDS: f64 = 0.1;
 /// Carbonengine Ballpark::Integrate Taylor-series threshold.
 const INTEGRATE_TAYLOR_THRESHOLD: f64 = 1e-10;
 /// Carbonengine Ballpark::SetupWarpConstants.
@@ -231,7 +228,7 @@ pub struct Ball {
 /// Carbonengine Ballpark::Integrate and Vector3d reciprocal-division ordering.
 fn integrate(position: V3, velocity: V3, acceleration: V3, mass: f64, friction: f64, time: f64) -> (V3, V3) {
     if time == 0.0 { return (position, velocity); }
-    let time_factor = (-friction / mass * time).exp();
+    let time_factor = if mass <= 0.0 { 0.0 } else { (-friction / mass * time).exp() };
     let friction2 = friction * friction;
     let ook2 = 1.0 / friction2;
     let ook = 1.0 / friction;
@@ -268,8 +265,8 @@ impl Ball {
             let fraction = (sample_ms.saturating_sub(w.start) as f64 / w.duration.max(1.0)).clamp(0.0, 1.0);
             return add(w.from, scale(sub(w.to, w.from), fraction));
         }
-        let mass = (self.mass * self.agility as f64).max(DESTINY_FRICTION * MIN_MOVEMENT_TAU_SECONDS);
-        let acceleration = scale(self.segment_target.unwrap(), DESTINY_FRICTION / mass);
+        let mass = self.mass * self.agility as f64;
+        let acceleration = if mass > 0.0 { scale(self.segment_target.unwrap(), DESTINY_FRICTION / mass) } else { V3::default() };
         integrate(self.old_pos, self.old_vel, acceleration, mass, DESTINY_FRICTION,
             ms_to_seconds(elapsed as f64)).0
     }
@@ -379,6 +376,7 @@ impl Ball {
             return;
         }
         self.interpolation_anchor_ms = interpolation_anchor_ms;
+        if self.mode == MODE_STOP { self.evolve_stop(); }
         self.old_pos = self.pos;
         self.old_vel = self.vel;
         self.segment_target = None;
@@ -398,7 +396,7 @@ impl Ball {
             return;
         }
         let dt = ms_to_seconds((ms - self.last_ms) as f64);
-        let mass = (self.mass * self.agility as f64).max(DESTINY_FRICTION * MIN_MOVEMENT_TAU_SECONDS);
+        let mass = self.mass * self.agility as f64;
         let speed = (self.max_vel * self.speed_fraction) as f64;
         let target = match self.mode {
             MODE_GOTO => scale(goto_norm(sub(self.goto, self.pos)), speed),
@@ -410,7 +408,7 @@ impl Ball {
             _ => V3::default(),
         };
         self.segment_target = Some(target);
-        let acceleration = scale(target, DESTINY_FRICTION / mass);
+        let acceleration = if mass > 0.0 { scale(target, DESTINY_FRICTION / mass) } else { V3::default() };
         (self.pos, self.vel) = integrate(self.pos, self.vel, acceleration, mass, DESTINY_FRICTION, dt);
         self.last_ms = ms;
     }

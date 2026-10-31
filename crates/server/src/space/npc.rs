@@ -158,8 +158,7 @@ impl System {
         if let Some((_, pilot, _)) = brain.target.take() {
             self.notify_pilot(pilot, "OnTarget", vec![Value::str("otherlost"), Value::Int(id), Value::None]);
             self.command(id, |b, stamp, _| {
-                b.mode = MODE_STOP;
-                b.speed_fraction = 0.0;
+                b.stop();
                 vec![event(stamp, "Stop", vec![Value::Int(b.id)])]
             });
         }
@@ -192,7 +191,7 @@ impl System {
                     b.mode = MODE_ORBIT;
                     b.follow_id = ship;
                     b.follow_range = orbit as f32;
-                    b.speed_fraction = 1.0;
+                    b.set_speed_fraction(1.0);
                     vec![event(stamp, "Orbit", vec![Value::Int(id), Value::Int(ship), Value::Float(orbit)]),
                         event(stamp, "SetSpeedFraction", vec![Value::Int(id), Value::Float(1.0)])]
                 });

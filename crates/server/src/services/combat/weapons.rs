@@ -84,13 +84,17 @@ pub(super) async fn apply_propulsion(cx: &Ctx, master: i64, generation: Arc<Atom
 }
 
 pub(super) fn propulsion_transition(b: &mut Ball, stamp: i64, speed: f64, mass: f64, signature: f64) -> Vec<Value> {
-    b.max_vel = speed as f32;
-    b.mass = mass;
+    b.set_max_speed(speed as f32);
+    b.set_ball_mass(mass);
     b.signature_radius = Some(signature);
-    vec![
-        event(stamp, "SetMaxSpeed", vec![Value::Int(b.id), Value::Float(speed)]),
-        event(stamp, "SetBallMass", vec![Value::Int(b.id), Value::Float(mass)]),
-    ]
+    let mut events = Vec::new();
+    if (speed as f32).is_finite() && speed >= 0.0 {
+        events.push(event(stamp, "SetMaxSpeed", vec![Value::Int(b.id), Value::Float(speed)]));
+    }
+    if mass.is_finite() && mass > 0.0 {
+        events.push(event(stamp, "SetBallMass", vec![Value::Int(b.id), Value::Float(mass)]));
+    }
+    events
 }
 
 #[derive(Clone)]

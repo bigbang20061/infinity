@@ -89,7 +89,7 @@ fn target_loss_stops_and_notifies_beyond_double_aggro() {
     assert!(s.brains[&1000].target.is_none());
     s.tick(2000);
     assert_eq!(s.ball(1000).unwrap().mode, MODE_STOP);
-    assert_eq!(s.ball(1000).unwrap().speed_fraction, 0.0);
+    assert_eq!(s.ball(1000).unwrap().speed_fraction, 1.0);
     let batch = events.try_recv().unwrap();
     assert!(batch.iter().any(|v| {
         let Value::Tuple(parts) = v else { return false };

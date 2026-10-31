@@ -258,9 +258,7 @@ pub(super) async fn jump_out_and_arrive(c: &mut Client, system: i64, ship: i64, 
     // Jump out where everyone can see it, and let the gate animation run.
     c.world.uncloak(system, ship).await;
     c.world.command(system, ship, move |b, t, _| {
-        b.mode = MODE_STOP;
-        b.speed_fraction = 0.0;
-        b.vel = [0.0; 3];
+        b.stop();
         vec![
             event(t, "Stop", vec![Value::Int(b.id)]),
             special_fx(t, b.id, Some(through), other_type, guid, Some(Value::tuple([Value::Int(dest_system)]))),
@@ -491,7 +489,7 @@ fn warp_command(b: &mut Ball, t: i64, object: Option<(V3, f64)>, point: V3, min_
         b.mode = MODE_GOTO;
         b.goto = point;
         b.warp = None;
-        if b.speed_fraction == 0.0 { b.speed_fraction = 1.0; }
+        if b.speed_fraction == 0.0 { b.set_speed_fraction(1.0); }
         return vec![event(t, "GotoPoint", vec![Value::Int(b.id), Value::Float(point[0]), Value::Float(point[1]), Value::Float(point[2])])];
     }
     let (center, stand_off) = match object {
@@ -506,7 +504,7 @@ fn warp_command(b: &mut Ball, t: i64, object: Option<(V3, f64)>, point: V3, min_
     let align = -tau * 0.25f64.ln();
     b.mode = MODE_WARP;
     b.goto = to;
-    b.speed_fraction = 1.0;
+    b.set_speed_fraction(1.0);
     b.warp = Some(Warp { from: b.pos, to, start: b.last_ms, duration: seconds_to_ms_f64(align + warp_duration(b.warp_factor as f64, distance)), factor: b.warp_factor });
     b.effect_stamp = t;
     // Destiny only enters warp once aligned at 75% of max velocity, and thrust scales
@@ -526,7 +524,7 @@ fn warp_command(b: &mut Ball, t: i64, object: Option<(V3, f64)>, point: V3, min_
 /// Ensure a stationary ship starts moving when given a heading (client sends 1.0 separately too).
 fn ensure_moving(b: &mut Ball, tick: i64, ev: &mut Vec<Value>) {
     if b.speed_fraction <= 0.0 {
-        b.speed_fraction = 1.0;
+        b.set_speed_fraction(1.0);
         ev.push(event(tick, "SetSpeedFraction", vec![Value::Int(b.id), Value::Float(1.0)]));
     }
 }
