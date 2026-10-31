@@ -1,6 +1,6 @@
 //! Server-side effective attributes for the active character, ship, fitted modules
 //! and charges. Static attributes, effects and modifiers come from the shared SDE;
-//! fitted items, charges and skill levels come from the runtime game database.
+//! fitted items, per-item base overrides, charges and skill levels come from the runtime game database.
 //! Client modifier classes and domains: `dogma/effects/modifiers.py:8-25,48-140`;
 //! operation precedence and stacking categories:
 //! `dogma/const.py:7-51`.
@@ -122,11 +122,24 @@ struct Node {
     /// A module running its activation effect.
     active: bool,
     level: Option<i32>,
+    overrides: Vec<(i32, f64)>,
 }
 
 fn base_attribute(data: Option<&TypeData>, meta: Option<&Attribute>, attr: i32) -> f64 {
     data.and_then(|t| t.fit_attribute(attr))
         .unwrap_or_else(|| meta.and_then(|m| m.default_value).unwrap_or(0.0))
+}
+
+impl Node {
+    fn base(&self, data: Option<&TypeData>, meta: Option<&Attribute>, attr: i32) -> f64 {
+        if attr == ATTR_SKILL_LEVEL {
+            if let Some(level) = self.level { return level as f64; }
+        }
+        if let Ok(index) = self.overrides.binary_search_by_key(&attr, |entry| entry.0) {
+            return self.overrides[index].1;
+        }
+        base_attribute(data, meta, attr)
+    }
 }
 
 
@@ -153,24 +166,29 @@ impl Fit {
         let skills = crate::dao::skills::levels::levels(db, char_id).await.map_err(db_err)?;
         let modules = fit_dao::modules(db, ship).await.map_err(db_err)?;
         let charges = fit_dao::charges(db, ship).await.map_err(db_err)?;
+        let ids: Vec<i64> = std::iter::once(ship).chain(modules.iter().map(|m| m.item_id)).collect();
+        let mut overrides: HashMap<i64, Vec<(i32, f64)>> = HashMap::new();
+        for row in crate::dao::items::dogma::overrides_for(db, &ids).await.map_err(db_err)? {
+            overrides.entry(row.item_id).or_default().push((row.attribute_id, row.value));
+        }
         let active = super::combat::active_modules();
         let mut nodes = HashMap::new();
-        nodes.insert(Key::Char, Node { type_id: char_type, data_position: sde.types.position(char_type), in_ship: false, online: true, active: false, level: None });
-        nodes.insert(Key::Ship, Node { type_id: ship_type, data_position: sde.types.position(ship_type), in_ship: false, online: true, active: false, level: None });
+        nodes.insert(Key::Char, Node { type_id: char_type, data_position: sde.types.position(char_type), in_ship: false, online: true, active: false, level: None, overrides: Vec::new() });
+        nodes.insert(Key::Ship, Node { type_id: ship_type, data_position: sde.types.position(ship_type), in_ship: false, online: true, active: false, level: None, overrides: overrides.remove(&ship).unwrap_or_default() });
         for r in &skills {
             let t = r.type_id;
-            nodes.insert(Key::Skill(t), Node { type_id: t, data_position: sde.types.position(t), in_ship: false, online: true, active: false, level: Some(r.level) });
+            nodes.insert(Key::Skill(t), Node { type_id: t, data_position: sde.types.position(t), in_ship: false, online: true, active: false, level: Some(r.level), overrides: Vec::new() });
         }
         let mut module_by_flag = HashMap::new();
         for r in &modules {
             let (id, t, online, flag) = (r.item_id, r.type_id, r.online, r.flag_id);
             module_by_flag.insert(flag, id);
-            nodes.insert(Key::Module(id), Node { type_id: t, data_position: sde.types.position(t), in_ship: true, online, active: online && active.contains(&id), level: None });
+            nodes.insert(Key::Module(id), Node { type_id: t, data_position: sde.types.position(t), in_ship: true, online, active: online && active.contains(&id), level: None, overrides: overrides.remove(&id).unwrap_or_default() });
         }
         for r in &charges {
             let (flag, t) = (r.flag_id, r.type_id);
             if let Some(m) = module_by_flag.get(&flag) {
-                nodes.insert(Key::Charge(*m), Node { type_id: t, data_position: sde.types.position(t), in_ship: true, online: true, active: false, level: None });
+                nodes.insert(Key::Charge(*m), Node { type_id: t, data_position: sde.types.position(t), in_ship: true, online: true, active: false, level: None, overrides: Vec::new() });
             }
         }
         let mut skill_effects = Vec::new();
@@ -230,12 +248,7 @@ impl Fit {
 
     fn base(&self, key: Key, attr: i32) -> f64 {
         let Some(node) = self.nodes.get(&key) else { return 0.0 };
-        if attr == ATTR_SKILL_LEVEL {
-            if let Some(level) = node.level {
-                return level as f64;
-            }
-        }
-        base_attribute(node.data_position.map(|i| self.sde.types.at_position(i)), self.sde.dogma.attribute(attr), attr)
+        node.base(node.data_position.map(|i| self.sde.types.at_position(i)), self.sde.dogma.attribute(attr), attr)
     }
 
     /// Does modifier `m` from `source` apply to `target`?
