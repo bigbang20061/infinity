@@ -27,26 +27,22 @@ pub(crate) async fn insert_loot(ex: &(impl Executor + ?Sized), kind: i32, owner:
     ex.execute("INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity) VALUES ($1, $2, $3, 0, $4)", &[&kind, &owner, &wreck, &quantity]).await
 }
 
-pub(crate) struct FittedWeapon { pub item_id: i64, pub type_id: i32 }
-impl FittedWeapon { fn from_row(row: &Row) -> Self { Self { item_id: row.get("item_id"), type_id: row.get("type_id") } } }
-pub(crate) async fn link(ex: &(impl Executor + ?Sized), ship: i64, master: i64, slave: i64) -> Result<(), Error> {
-    ex.execute("UPDATE game.weapon_banks SET master_id = $2 WHERE ship_id = $1 AND master_id = $3", &[&ship, &master, &slave]).await?;
-    ex.execute("INSERT INTO game.weapon_banks (ship_id, master_id, slave_id) VALUES ($1, $2, $3) ON CONFLICT (slave_id) DO UPDATE SET master_id = EXCLUDED.master_id", &[&ship, &master, &slave]).await?;
-    Ok(())
-}
-pub(crate) async fn peel_and_link(ex: &(impl Executor + ?Sized), ship: i64, master: i64, slave: i64) -> Result<(), Error> {
-    ex.execute("DELETE FROM game.weapon_banks WHERE ship_id = $1 AND slave_id = $2", &[&ship, &slave]).await?;
-    ex.execute("INSERT INTO game.weapon_banks (ship_id, master_id, slave_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING", &[&ship, &master, &slave]).await?;
-    Ok(())
-}
 pub(crate) async fn clear_banks(ex: &(impl Executor + ?Sized), ship: i64) -> Result<u64, Error> {
     ex.execute("DELETE FROM game.weapon_banks WHERE ship_id = $1", &[&ship]).await
 }
-pub(crate) async fn fitted_weapons(ex: &(impl Executor + ?Sized), ship: i64, first: i32, last: i32) -> Result<Vec<FittedWeapon>, Error> {
-    Ok(ex.query("SELECT item_id, type_id FROM game.items WHERE location_id = $1 AND flag_id BETWEEN $2 AND $3 AND online ORDER BY flag_id", &[&ship, &first, &last]).await?.iter().map(FittedWeapon::from_row).collect())
+pub(crate) async fn move_bank(ex: &(impl Executor + ?Sized), ship: i64, target: i64, source: i64) -> Result<(), Error> {
+    ex.execute("UPDATE game.weapon_banks SET master_id = $2 WHERE ship_id = $1 AND master_id = $3", &[&ship, &target, &source]).await?;
+    ex.execute("INSERT INTO game.weapon_banks (ship_id, master_id, slave_id) VALUES ($1, $2, $3)", &[&ship, &target, &source]).await?;
+    Ok(())
 }
-pub(crate) async fn unlink_last(ex: &(impl Executor + ?Sized), ship: i64, master: i64) -> Result<Option<i64>, Error> {
-    Ok(ex.query_opt("DELETE FROM game.weapon_banks WHERE slave_id = (SELECT max(slave_id) FROM game.weapon_banks WHERE ship_id = $1 AND master_id = $2) RETURNING slave_id", &[&ship, &master]).await?.as_ref().map(Slave::from_row).map(|r| r.slave_id))
+pub(crate) async fn peel_first(ex: &(impl Executor + ?Sized), ship: i64, master: i64) -> Result<Option<i64>, Error> {
+    Ok(ex.query_opt("DELETE FROM game.weapon_banks WHERE ship_id = $1 AND slave_id = (SELECT b.slave_id FROM game.weapon_banks b JOIN game.items i ON i.item_id = b.slave_id WHERE b.ship_id = $1 AND b.master_id = $2 ORDER BY i.flag_id, i.item_id LIMIT 1) RETURNING slave_id", &[&ship, &master]).await?.as_ref().map(Slave::from_row).map(|r| r.slave_id))
+}
+pub(crate) async fn destroy(ex: &(impl Executor + ?Sized), ship: i64, master: i64) -> Result<u64, Error> {
+    ex.execute("DELETE FROM game.weapon_banks WHERE ship_id = $1 AND master_id = $2", &[&ship, &master]).await
+}
+pub(crate) async fn remove_slave(ex: &(impl Executor + ?Sized), ship: i64, slave: i64) -> Result<u64, Error> {
+    ex.execute("DELETE FROM game.weapon_banks WHERE ship_id = $1 AND slave_id = $2", &[&ship, &slave]).await
 }
 pub(crate) async fn delete_reserved(ex: &(impl Executor + ?Sized), ship: i64, rows: &std::collections::BTreeMap<i32, (i32, i32, i64)>) -> Result<bool, Error> {
     for (&flag, &(kind, quantity, _)) in rows {

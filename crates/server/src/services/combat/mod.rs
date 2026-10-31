@@ -194,6 +194,8 @@ mod reload_recovery;
 pub(crate) use reload_recovery::recover_pending_reloads;
 pub(crate) mod targeting_charges;
 use targeting_charges::*;
+pub(in crate::services) mod banks;
+use banks::weapon_groups;
 pub(crate) mod groups_health;
 use groups_health::*;
 use super::effects::notify::attribute_change;
@@ -441,7 +443,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "GetTargeters" => Ok(Value::list([])),
         "LoadAmmo" => load_ammo(c, call).await,
         "UnloadAmmo" => unload_ammo(c, call).await,
-        "LinkWeapons" | "LinkAllWeapons" | "UnlinkModule" | "UnlinkAllModules" | "MergeModuleGroups" | "PeelAndLink" | "GetWeaponBankInfoForShip" => {
+        "LinkWeapons" | "LinkAllWeapons" | "UnlinkModule" | "UnlinkAllModules" | "MergeModuleGroups" | "PeelAndLink" | "DestroyWeaponBank" | "GetWeaponBankInfoForShip" => {
             weapon_groups(c, call).await
         }
         "Activate" => lifecycle::activate(c, call).await,

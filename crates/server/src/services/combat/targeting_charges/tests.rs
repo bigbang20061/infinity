@@ -4,14 +4,6 @@ use crate::space::System;
 
 mod auto_reload_db;
 
-#[test]
-fn bank_master_resolves_any_group_member() {
-    use crate::dao::items::charges::Bank;
-    let rows = vec![Bank { master_id: 10, slave_id: 11 }, Bank { master_id: 10, slave_id: 12 }, Bank { master_id: 20, slave_id: 21 }];
-    for member in [10, 11, 12] { assert_eq!(bank_master(&rows, member), 10); }
-    assert_eq!(bank_master(&rows, 21), 20);
-    assert_eq!(bank_master(&rows, 30), 30);
-}
 
 #[test]
 fn reload_groups_use_each_modules_deadline_and_charge_type() {

@@ -2,6 +2,7 @@ use super::*;
 use std::sync::Mutex;
 mod refund_db;
 mod forced_retire;
+mod banks_db;
 
 #[test]
 fn blocker_uses_target_modifier_source_not_scramble_identity() {
@@ -187,7 +188,7 @@ fn online_dispatch_stops_current_cycle_and_notifies_actual_ship() {
     }
     let (notify, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut outbox = Outbox::default();
-    outbox.operation(OnlineChanged { module, online: false, char_id: 2, ship_id: 3, notify });
+    outbox.operation(OnlineChanged { module, online: false, char_id: 2, ship_id: 3, notify, bank_stops: crate::services::combat::banks::capture_stop(module).into_iter().collect(), notify_online: true });
     assert!(!stop.load(Ordering::Relaxed));
     assert!(rx.try_recv().is_err());
     for entry in outbox.into_entries() {

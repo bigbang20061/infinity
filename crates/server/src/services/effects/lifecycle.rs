@@ -4,6 +4,10 @@
 //! Projected effects require a locked, present target and use transient system state;
 //! later-wave behavior families are refused and resource fitting policy is not implemented.
 //! Accepted running activations cancel arrival jump cloak; online changes are not cycles.
+//! Offlining a bank member destroys the whole persisted bank; unfit removes a slave
+//! or destroys a master's bank. Committed changes stop affected cycles after the
+//! current cycle, and slave weapon activation resolves to its authorized master.
+//! Cycles are runtime-only and are not resumed after restart.
 //! A non-targeted module's first-cycle FX may be unseen by observers until the next
 //! destiny boundary applies the queued uncloak (under one second); gameplay is unaffected.
 use super::{EffectKind, registry, unsupported, repair, mining, capacitor, projected, range};
@@ -45,6 +49,8 @@ pub(in crate::services) struct OnlineChanged {
     pub char_id: i64,
     pub ship_id: i64,
     pub notify: NotifyTx,
+    pub bank_stops: Vec<crate::services::combat::banks::BankStop>,
+    pub notify_online: bool,
 }
 
 impl OnlinePolicy {
@@ -63,27 +69,44 @@ pub(in crate::services) async fn set_online_core<E: From<OnlineChanged> + Send>(
     ship: i64, item: i64, online: bool,
 ) -> Result<bool, CallError> {
     let refuse = || notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION);
+    if !crate::dao::items::ship::lock_reload_ship(ex, ship).await.map_err(db_err)? { return Err(refuse()); }
     let (hull, module) = subject_core(ex, sde, policy, ship, item, EFFECT_ONLINE as i32, false).await?;
     let was_online = crate::dao::items::dogma::online(ex, ship).await.map_err(db_err)?.iter().any(|entry| entry.item_id == item);
-    if was_online == online { return Ok(false); }
-    let changed = crate::dao::items::combat::set_online(ex, item, ship, policy.owner, module.flag_id, module.type_id, hull.type_id, hull.location_id, hull.flag_id, hull.singleton, online).await.map_err(db_err)?;
-    if changed == 0 { return Err(refuse()); }
-    outbox.operation(OnlineChanged { module: item, online, char_id: policy.owner, ship_id: ship, notify: policy.notify.clone() }.into());
-    Ok(true)
+    if was_online == online && online { return Ok(false); }
+    let before = if online { None } else { Some(crate::services::combat::banks::snapshot(ex, ship, &[item]).await?) };
+    let master = if online { item } else { crate::services::combat::targeting_charges::master_for_member(ex, ship, item).await? };
+    let item_stop = if online { None } else { crate::services::combat::banks::capture_stop(item) };
+    let changed = was_online != online;
+    if changed && crate::dao::items::combat::set_online(ex, item, ship, policy.owner, module.flag_id, module.type_id, hull.type_id, hull.location_id, hull.flag_id, hull.singleton, online).await.map_err(db_err)? == 0 { return Err(refuse()); }
+    let mut bank_stops = Vec::new();
+    let mut bank_changed = false;
+    if let Some(before) = before {
+        if crate::services::combat::banks::remove_member(ex, ship, item, master, true).await? {
+            bank_changed = true;
+            bank_stops = crate::services::combat::banks::changes(ex, ship, before).await?;
+            outbox.notify_sender(policy.notify.clone(), "OnWeaponBanksChanged", vec![Value::Int(ship), crate::services::combat::banks(ex, ship).await?]);
+        }
+    }
+    if changed || bank_changed {
+        bank_stops.extend(item_stop);
+        outbox.operation(OnlineChanged { module: item, online, char_id: policy.owner, ship_id: ship, notify: policy.notify.clone(), bank_stops, notify_online: changed }.into());
+    }
+    Ok(changed)
 }
 
 pub(in crate::services) fn apply_online_changed(change: OnlineChanged) {
-    if !change.online {
-        if let Some(active) = state().active.get(&change.module) {
-            active.stop.store(true, Ordering::Relaxed);
-        }
-    }
+    for stop in change.bank_stops { crate::services::combat::banks::apply_stop(stop); }
+    if !change.notify_online { return; }
     let now = filetime_now();
     let environment = super::environment::build(change.module, change.char_id, change.ship_id, None, None, EFFECT_ONLINE);
     let effect = super::notify::ship_effect_args(change.module, EFFECT_ONLINE, environment, change.online, now, -1.0, -1, now);
     let attr = attribute_change(change.char_id, Value::Int(change.module), ATTR_IS_ONLINE, Value::Int(change.online as i64), Value::Int(!change.online as i64));
     let _ = change.notify.send(("OnGodmaShipEffect".into(), effect));
     let _ = change.notify.send(("OnModuleAttributeChanges".into(), vec![Value::list([attr])]));
+}
+
+pub(in crate::services) fn stop_generation(stop: &AtomicBool) {
+    stop.store(true, Ordering::Relaxed);
 }
 
 /// Existing server module duration fallback, in milliseconds.
@@ -649,7 +672,7 @@ pub(super) async fn subject(c: &Client, ship: i64, item_id: i64, effect: i32, re
 
 /// Activate(itemID, effectName, targetID, repeat)
 pub(crate) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
-    let item_id = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
+    let mut item_id = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
     let effect_name = call.args.get(1).and_then(|v| v.as_text()).map(|s| s.into_owned()).unwrap_or_default();
     let target = call.args.get(2).and_then(|v| v.as_int());
     let repeat = call.args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
@@ -661,13 +684,25 @@ pub(crate) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
     if matches.next().is_some() { return Err(CallError::Internal(anyhow::anyhow!("multiple effects named {effect_name}"))); }
     drop(matches);
     let id = row.effect_id;
-    let module = subject(c, cx.ship_id, item_id, id, id != EFFECT_ONLINE as i32).await?;
+    let mut module = subject(c, cx.ship_id, item_id, id, id != EFFECT_ONLINE as i32).await?;
     let Some(effect) = registry::resolve(cx.world.sde(), id) else {
         return Err(unsupported::refusal(Some(id), &effect_name, module.type_id));
     };
     let kind = effect.kind;
     if id == EFFECT_MUTADAPTIVE_REMOTE_ARMOR_REPAIRER || !registry::activation_in_scope(module.category_id, module.group_id, kind) || !effect.manually_activatable() {
         return Err(unsupported::refusal(Some(id), &effect_name, module.type_id));
+    }
+    // Bank reads and activation are serialized by the single live session; concurrent
+    // entry points would need to serialize the final bank read and registration with mutations.
+    if matches!(kind, EffectKind::Turret | EffectKind::Missile) {
+        let master = crate::services::combat::targeting_charges::master_for_member(&c.db, cx.ship_id, item_id).await?;
+        if master != item_id {
+            module = subject(c, cx.ship_id, master, id, true).await?;
+            if !registry::activation_in_scope(module.category_id, module.group_id, kind) {
+                return Err(unsupported::refusal(Some(id), &effect_name, module.type_id));
+            }
+            item_id = master;
+        }
     }
     match kind {
         EffectKind::Hacking => return super::super::hacking::start(c, item_id, target).await,
@@ -780,7 +815,7 @@ pub(crate) async fn deactivate(c: &mut Client, call: &Call<'_>) -> CallResult {
     }
     if kind == EffectKind::Online { return set_online(c, cx.ship_id, item_id, false).await; }
     if let Some(stop) = state().active.get(&item_id) {
-        stop.stop.store(true, Ordering::Relaxed);
+        stop_generation(&stop.stop);
     }
     if matches!(kind, EffectKind::Projected { .. }) {
         let generation = state().active.get(&item_id).map(|active| active.stop.clone());
