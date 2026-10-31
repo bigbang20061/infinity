@@ -75,6 +75,11 @@ store_value_limit_bytes = 65536     # Maximum encoded value size in the script s
 # [lua.scripts.motd]                # Arbitrary per-script TOML settings.
 
 # Game parameters have no environment overrides.
+[gm]
+spawn_distance_m = 5000.0          # GM NPC and debris default distance, server policy
+clear_radius_m = 100000.0          # default GM NPC clear radius, server policy
+max_spawn_count = 100              # per-command NPC spawn limit, server policy
+
 
 [accounts]
 starting_plex = 1000                # existing SQL default for an account's PLEX vault; old-row default remains; input ceiling 0..=9223372036854775807

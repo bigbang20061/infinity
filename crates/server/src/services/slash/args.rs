@@ -35,6 +35,11 @@ impl<'a> Args<'a> {
         let text = self.required(index)?;
         text.parse().map_err(|_| slash_error(messages::gm::gm_args_integer(text)))
     }
+    pub(super) fn f64(&self, index: usize) -> Result<f64, CallError> {
+        let text = self.required(index)?;
+        text.parse::<f64>().ok().filter(|n| n.is_finite())
+            .ok_or_else(|| slash_error(messages::gm::gm_args_number(text)))
+    }
     pub(super) async fn type_id(&self, c: &Client, index: usize) -> Result<(i32, String), CallError> {
         super::resolve_type(c, self.required(index)?).await
     }

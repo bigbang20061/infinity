@@ -8,6 +8,7 @@ pub(crate) const GM_ARGS_UNCLOSED_QUOTE: &str = "引号未闭合。";
 pub(crate) const GM_ARGS_NO_CHARACTER: &str = "当前没有选择角色。";
 pub(crate) fn gm_args_missing(index: usize) -> String { format!("缺少第 {index} 个参数。") }
 pub(crate) fn gm_args_integer(text: &str) -> String { format!("无效的整数：{text}") }
+pub(crate) fn gm_args_number(text: &str) -> String { format!("无效的数值：{text}") }
 pub(crate) fn gm_args_unknown_target(text: &str) -> String { format!("找不到角色：{text}") }
 pub(crate) fn gm_rows_truncated(count: usize) -> String { format!("另有 {count} 行未显示。") }
 
@@ -187,3 +188,18 @@ pub(crate) fn gm_item_info(item_id: i64, type_id: i32, owner: i64, location: i64
 pub(crate) fn gm_type_info(type_id: i32, name: &str, group: i32, category: i32) -> String { format!("类型 {type_id}：{name}，组 {group}，分类 {category}") }
 pub(crate) fn gm_type_attribute(id: i32, value: f64) -> String { format!("属性 {id}：{value}") }
 
+// NPC, debris and damage administration.
+pub(crate) const GM_HELP_ENTITY: &str = "/entity deploy <数量> <typeID> — 生成 NPC";
+pub(crate) const GM_HELP_NPC: &str = "/npc <类型或组> [数量] [距离] — 生成 NPC";
+pub(crate) const GM_HELP_NPCCLEAR: &str = "/npcclear [半径|system] — 清除 GM 生成的 NPC";
+pub(crate) const GM_HELP_WRECK: &str = "/wreck [类型] [距离] — 生成残骸";
+pub(crate) const GM_HELP_CONTAINER: &str = "/container [类型] [距离] — 生成货柜";
+pub(crate) const GM_HELP_DMG: &str = "/dmg <shield|armor|hull|all> <百分比> — 设置舰船损伤";
+pub(crate) const GM_NPC_USAGE: &str = "用法：/npc <类型或组> [数量] [距离]；/entity deploy <数量> <typeID>";
+pub(crate) const GM_NPC_CLEAR_USAGE: &str = "用法：/npcclear [半径|system]";
+pub(crate) const GM_DEBRIS_USAGE: &str = "用法：/wreck 或 /container [类型] [距离]";
+pub(crate) const GM_DAMAGE_USAGE: &str = "用法：/dmg <shield|armor|hull|all> <0至100的百分比>";
+pub(crate) const GM_DAMAGE_SET: &str = "舰船损伤已设置。";
+pub(crate) fn gm_npc_spawned(count: usize) -> String { format!("已生成 {count} 个NPC。") }
+pub(crate) fn gm_npc_cleared(count: usize) -> String { format!("已移除 {count} 个GM生成的NPC。") }
+pub(crate) fn gm_debris_spawned(id: i64) -> String { format!("已生成太空物体 {id}。") }

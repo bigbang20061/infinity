@@ -10,6 +10,8 @@ pub mod economy;
 pub mod world;
 #[path = "social.rs"]
 pub mod social;
+#[path = "gm.rs"]
+pub mod gm;
 
 pub(super) fn duration(key: &str, value: i64, unit: i64, future: bool) -> Result<()> {
     let ticks = value.checked_mul(unit);
@@ -69,6 +71,8 @@ pub struct GameConfig {
     pub calendar: social::CalendarConfig,
     /// Space policy.
     pub space: social::SpaceConfig,
+    /// GM spawn policy.
+    pub gm: gm::GmConfig,
 }
 
 impl GameConfig {
@@ -93,6 +97,7 @@ impl GameConfig {
         self.mail.validate()?;
         self.calendar.validate()?;
         self.space.validate()?;
+        self.gm.validate()?;
         Ok(())
     }
 }

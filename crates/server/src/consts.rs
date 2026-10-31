@@ -47,6 +47,8 @@ pub const TYPE_CAPSULE: i32 = 670;
 pub const GROUP_PLANET: i32 = 7;
 /// SDE invGroups: Asteroid Belt.
 pub const GROUP_ASTEROID_BELT: i32 = 9;
+/// SDE invGroups: Wreck.
+pub const GROUP_WRECK: i32 = 186;
 /// SDE invCategories: Owner.
 pub const CATEGORY_OWNER: i32 = 1;
 /// SDE invCategories: Ship.

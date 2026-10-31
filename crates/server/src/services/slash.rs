@@ -33,6 +33,8 @@ mod jobs;
 mod effects;
 mod skills;
 mod items;
+mod npc;
+mod combat;
 
 /// Server design: clearance in metres when teleporting to an item.
 const TELEPORT_CLEARANCE: f64 = 5000.0;
@@ -74,6 +76,12 @@ const COMMANDS: &[(&str, &str)] = &[
     ("online", messages::gm::GM_HELP_ONLINE),
     ("iteminfo", messages::gm::GM_HELP_ITEMINFO),
     ("typeinfo", messages::gm::GM_HELP_TYPEINFO),
+    ("entity", messages::gm::GM_HELP_ENTITY),
+    ("npc", messages::gm::GM_HELP_NPC),
+    ("npcclear", messages::gm::GM_HELP_NPCCLEAR),
+    ("wreck", messages::gm::GM_HELP_WRECK),
+    ("container", messages::gm::GM_HELP_CONTAINER),
+    ("dmg", messages::gm::GM_HELP_DMG),
     ("help", messages::gm::GM_HELP_HELP),
 ];
 
@@ -312,6 +320,8 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         // eve/devtools/script/svc_slash.py:1310-1313 passes this item ID to ship.Board.
         "spawn" => return Some(items::spawn(c, args).await.map(Value::Int)),
         "ship" | "fit" | "unload" | "load" | "online" | "iteminfo" | "typeinfo" => items::command(c, &command, args).await,
+        "entity" | "npc" | "npcclear" | "wreck" | "container" => npc::command(c, &command, args).await,
+        "dmg" => combat::command(c, &command, args).await,
         "help" => Ok(help()),
         other => Err(slash_error(messages::gm::gm_unknown_command(other, &help()))),
     };

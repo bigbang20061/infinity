@@ -41,6 +41,20 @@ fn load_error(contents: &str) -> String {
         Err(error) => format!("{error:#}"),
     }
 }
+#[test]
+fn gm_spawn_policy_rejects_invalid_limits() {
+    let mut config = Config::default();
+    assert!(config.validate().is_ok());
+    config.gm.spawn_distance_m = f64::NAN;
+    assert!(config.validate().is_err());
+    config.gm.spawn_distance_m = 0.0;
+    config.gm.clear_radius_m = -1.0;
+    assert!(config.validate().is_err());
+    config.gm.clear_radius_m = 0.0;
+    config.gm.max_spawn_count = 0;
+    assert!(config.validate().is_err());
+}
+
 
 #[test]
 fn trade_timeout_is_parsed_and_must_be_positive() {

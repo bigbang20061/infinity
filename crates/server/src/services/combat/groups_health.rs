@@ -285,6 +285,37 @@ pub(crate) async fn repair_player(db: &Db, world: &World, system: i64, ship: i64
     let _ = db;
     Ok(())
 }
+/// Set the damage fraction of selected layers of the active player ship.
+pub(crate) async fn set_damage(c: &Client, system: i64, ship: i64, char_id: i64, layers: [bool; 3], fraction: f64) -> Result<(), CallError> {
+    let stats = ship_stats(&c.db, &c.world, char_id, ship).await?;
+    let now = filetime_now();
+    let mut st = state();
+    let mut cond = st.condition.get(&ship).cloned().unwrap_or_else(|| Condition {
+        now: stats.max, stats: stats.clone(), shield_at: now,
+    });
+    cond.now[0] = recharge(cond.now[0], cond.stats.max[0], cond.stats.shield_tau_ms, (now - cond.shield_at) as f64 / FILETIME_SECOND as f64);
+    let old = cond.now;
+    cond.now = set_damage_layers(cond.now, stats.max, layers, fraction);
+    let max = stats.max;
+    cond.stats = stats;
+    cond.shield_at = now;
+    let changes = vec![
+        attribute_change(char_id, Value::Int(ship), ATTR_SHIELD_CHARGE, Value::Float(cond.now[0]), Value::Float(old[0])),
+        attribute_change(char_id, Value::Int(ship), ATTR_ARMOR_DAMAGE, Value::Float(max[1] - cond.now[1]), Value::Float(max[1] - old[1])),
+        attribute_change(char_id, Value::Int(ship), ATTR_HULL_DAMAGE, Value::Float(max[2] - cond.now[2]), Value::Float(max[2] - old[2])),
+    ];
+    let health = [0, 1, 2].map(|i| if max[i] > 0.0 { (cond.now[i] / max[i]).clamp(0.0, 1.0) } else { 0.0 });
+    st.condition.insert(ship, cond);
+    drop(st);
+    c.world.notify_pilot(char_id, "OnModuleAttributeChanges", vec![Value::List(changes)]);
+    c.world.set_health(system, ship, health);
+    Ok(())
+}
+fn set_damage_layers(now: [f64; 3], max: [f64; 3], layers: [bool; 3], fraction: f64) -> [f64; 3] {
+    [0, 1, 2].map(|i| if layers[i] { max[i] * (1.0 - fraction) } else { now[i].min(max[i]) })
+}
+
+
 
 fn bounty_payout(bounty: f64, multiplier: f64) -> Option<f64> {
     let payout = bounty * multiplier;
@@ -317,12 +348,19 @@ pub(super) async fn reward_kill(db: &Db, world: &World, system: i64, npc: &Ball,
     let sde = world.sde();
     let Some(npc_type) = sde.types.get(npc.type_id) else { return Ok(()) };
     let Some(wreck_type) = npc_type.group_id.and_then(|group| sde.wrecks.get(group, npc_type.race_id.unwrap_or(0))) else { return Ok(()) };
-    let radius = sde.types.get(wreck_type).and_then(|t| t.radius).unwrap_or(100.0);
     let owner = killer.unwrap_or(npc.owner_id);
-    let wreck_id = crate::dao::items::creation::positioned(db, wreck_type, owner, system, npc.pos).await.map_err(db_err)?;
+    spawn_wreck(db, world, system, wreck_type, owner, npc.corp_id, npc.pos, Some(bounty)).await?;
+    Ok(())
+}
+
+/// Create an inventory-backed wreck with the normal NPC loot selection.
+pub(crate) async fn spawn_wreck(db: &Db, world: &World, system: i64, wreck_type: i32, owner: i64, corp: i64, pos: crate::space::V3, bounty: Option<f64>) -> Result<i64, CallError> {
+    let sde = world.sde();
+    let radius = sde.types.get(wreck_type).and_then(|t| t.radius).unwrap_or(100.0);
+    let wreck_id = crate::dao::items::creation::positioned(db, wreck_type, owner, system, pos).await.map_err(db_err)?;
     // Loot: one or two modules or ammo stacks that traded on Serenity, worth up to the bounty.
     let picks = 1 + (rand01() * 2.0) as i64;
-    let mut loot: Vec<_> = crate::dao::items::combat::loot(db, bounty).await.map_err(db_err)?.into_iter()
+    let mut loot: Vec<_> = if let Some(bounty) = bounty { crate::dao::items::combat::loot(db, bounty).await.map_err(db_err)? } else { Vec::new() }.into_iter()
         .filter_map(|r| sde.types.get(r.type_id).and_then(|t| loot_category(t.published, t.category_id).map(|category| (r.type_id, category))))
         .collect();
     for i in 0..(picks as usize).min(loot.len()) {
@@ -338,7 +376,7 @@ pub(super) async fn reward_kill(db: &Db, world: &World, system: i64, npc: &Ball,
         id: wreck_id,
         type_id: wreck_type,
         owner_id: owner,
-        corp_id: npc.corp_id,
+        corp_id: corp,
         alliance_id: -1,
         char_id: None,
         signature_radius: None,
@@ -348,9 +386,9 @@ pub(super) async fn reward_kill(db: &Db, world: &World, system: i64, npc: &Ball,
         max_vel: 0.0,
         agility: 1.0,
         speed_fraction: 0.0,
-        pos: npc.pos,
+        pos,
         vel: [0.0; 3],
-        old_pos: npc.pos, old_vel: [0.0; 3], segment_acceleration: None,
+        old_pos: pos, old_vel: [0.0; 3], segment_acceleration: None,
         goto: [0.0; 3],
         follow_id: 0,
         follow_range: 0.0,
@@ -371,7 +409,7 @@ pub(super) async fn reward_kill(db: &Db, world: &World, system: i64, npc: &Ball,
     };
     world.add_ship(system, ball).await.map_err(CallError::Internal)?;
     debug!("wreck {wreck_id} ({wreck_type}) with {} loot stacks", loot.len());
-    Ok(())
+    Ok(wreck_id)
 }
 
 fn loot_category(published: Option<bool>, category: Option<i32>) -> Option<i32> {
@@ -382,3 +420,4 @@ fn loot_category(published: Option<bool>, category: Option<i32>) -> Option<i32> 
 
 
 
+#[cfg(test)] mod damage_tests;

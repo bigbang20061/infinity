@@ -3,11 +3,11 @@
 //! these spots itself (michelle.GetWarpinPoints), so they must match exactly.
 
 use super::V3;
+use crate::consts::GROUP_WRECK;
 
 const CATEGORY_CELESTIAL: i32 = 2;
 const GROUP_SUN: i32 = 6;
 const GROUP_PLANET: i32 = 7;
-const GROUP_WRECK: i32 = 186;
 /// appConst.jumpRadiusFactor.
 const JUMP_RADIUS_FACTOR: f64 = 130.0;
 
