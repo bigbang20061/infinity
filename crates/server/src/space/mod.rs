@@ -7,12 +7,11 @@
 //! carbonengine destiny `Thunkers.cpp` WriteBallToStream and `Ballpark.cpp`
 //! SetupWarpConstants. Those native sources and `IDstConstants.h` are not present
 //! in the decoded Python tree; its consumers do not validate the byte layout or
-//! native constants. The server integrates movement with exponential velocity
-//! approach (tau = mass * agility / 1e6) and warp phases; this is not a claim of
-//! complete client simulation parity.
-//! Completed-segment samples reuse the movement calculation corresponding to
-//! destiny `Ball.cpp` CalculateBallPositionVelocity and retain the old/new
-//! state described by `Ballpark.cpp`'s old/new swap.
+//! native constants. Movement uses carbonengine Ballpark::Integrate with the
+//! existing 0.1-second tau floor; native D6 mass semantics remain deferred, so
+//! this is not a claim of complete client simulation parity.
+//! Completed-segment samples reuse the same integration as whole ticks and retain
+//! the old/new state described by `Ballpark.cpp`'s old/new swap.
 //! Interpolation uses the wall-clock segment anchor independently of logical integration time.
 //! GOTO stores an absolute point; direction commands project from the current position.
 //!
@@ -83,10 +82,12 @@ const MAX_LOCK_TIME_SECONDS: f64 = 60.0;
 const DEFAULT_WARP_FACTOR: i64 = 3000;
 /// Existing server damage-state placeholder policy.
 const DAMAGE_STATE_SHIELD_RECHARGE_TAU: f64 = 100_000.0;
-/// Existing destiny mass/agility integration scale.
-const MASS_AGILITY_SCALE: f64 = 1e6;
-/// Existing server integration floor.
+/// Carbonengine Ballpark constructor friction.
+const DESTINY_FRICTION: f64 = 1e6;
+/// Existing server integration floor, retained pending native D6 mass semantics.
 const MIN_MOVEMENT_TAU_SECONDS: f64 = 0.1;
+/// Carbonengine Ballpark::Integrate Taylor-series threshold.
+const INTEGRATE_TAYLOR_THRESHOLD: f64 = 1e-10;
 /// Carbonengine Ballpark::SetupWarpConstants.
 const MAX_WARP_DECELERATION: f64 = 2.0;
 /// Existing server fallback for missing celestial radii.
@@ -221,11 +222,25 @@ pub struct Ball {
     pub slim: Vec<(&'static str, Value)>,
 }
 
-fn calculate_position_velocity(pos: V3, vel: V3, target: V3, tau: f64, dt: f64) -> (V3, V3) {
-    let decay = (-dt / tau).exp();
-    let delta = sub(vel, target);
-    (add(pos, add(scale(target, dt), scale(delta, tau * -(-dt / tau).exp_m1()))),
-        add(target, scale(delta, decay)))
+/// Carbonengine Ballpark::Integrate and Vector3d reciprocal-division ordering.
+fn integrate(position: V3, velocity: V3, acceleration: V3, mass: f64, friction: f64, time: f64) -> (V3, V3) {
+    if time == 0.0 { return (position, velocity); }
+    let time_factor = (-friction / mass * time).exp();
+    let friction2 = friction * friction;
+    let ook2 = 1.0 / friction2;
+    let ook = 1.0 / friction;
+    let position = if friction < INTEGRATE_TAYLOR_THRESHOLD * mass * time {
+        scale(add(scale(add(scale(acceleration, -friction * time),
+            scale(add(scale(acceleration, time), scale(scale(scale(velocity, friction), 1.0 / mass), time)), friction)), mass),
+            scale(position, friction2)), ook2)
+    } else {
+        scale(add(scale(add(scale(scale(acceleration, mass), time_factor - 1.0),
+            scale(sub(add(scale(acceleration, time), velocity), scale(velocity, time_factor)), friction)), mass),
+            scale(position, friction2)), ook2)
+    };
+    let velocity = scale(sub(scale(acceleration, mass),
+        scale(sub(scale(acceleration, mass), scale(velocity, friction)), time_factor)), ook);
+    (position, velocity)
 }
 
 impl Ball {
@@ -247,8 +262,9 @@ impl Ball {
             let fraction = (sample_ms.saturating_sub(w.start) as f64 / w.duration.max(1.0)).clamp(0.0, 1.0);
             return add(w.from, scale(sub(w.to, w.from), fraction));
         }
-        let tau = (self.mass * self.agility as f64 / MASS_AGILITY_SCALE).max(MIN_MOVEMENT_TAU_SECONDS);
-        calculate_position_velocity(self.old_pos, self.old_vel, self.segment_target.unwrap(), tau,
+        let mass = (self.mass * self.agility as f64).max(DESTINY_FRICTION * MIN_MOVEMENT_TAU_SECONDS);
+        let acceleration = scale(self.segment_target.unwrap(), DESTINY_FRICTION / mass);
+        integrate(self.old_pos, self.old_vel, acceleration, mass, DESTINY_FRICTION,
             ms_to_seconds(elapsed as f64)).0
     }
 
@@ -376,7 +392,7 @@ impl Ball {
             return;
         }
         let dt = ms_to_seconds((ms - self.last_ms) as f64);
-        let tau = (self.mass * self.agility as f64 / MASS_AGILITY_SCALE).max(MIN_MOVEMENT_TAU_SECONDS);
+        let mass = (self.mass * self.agility as f64).max(DESTINY_FRICTION * MIN_MOVEMENT_TAU_SECONDS);
         let speed = (self.max_vel * self.speed_fraction) as f64;
         let target = match self.mode {
             MODE_GOTO => scale(goto_norm(sub(self.goto, self.pos)), speed),
@@ -388,7 +404,8 @@ impl Ball {
             _ => V3::default(),
         };
         self.segment_target = Some(target);
-        (self.pos, self.vel) = calculate_position_velocity(self.pos, self.vel, target, tau, dt);
+        let acceleration = scale(target, DESTINY_FRICTION / mass);
+        (self.pos, self.vel) = integrate(self.pos, self.vel, acceleration, mass, DESTINY_FRICTION, dt);
         self.last_ms = ms;
     }
 }

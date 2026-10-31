@@ -32,7 +32,7 @@ fn completed_segment_samples_use_shared_drag_and_clamp() {
     for elapsed in [0, 100, 500, 900, 1000, 900, 100, 500, 0, 1000] {
         let actual = b.position_at(2_000 + elapsed);
         let expected = if elapsed == 0 { b.old_pos } else if elapsed == 1000 { endpoint } else {
-            calculate_position_velocity(b.old_pos, b.old_vel, [0.0; 3], 1.0, ms_to_seconds(elapsed as f64)).0
+            integrate(b.old_pos, b.old_vel, [0.0; 3], 1e6, DESTINY_FRICTION, ms_to_seconds(elapsed as f64)).0
         };
         assert_eq!(actual, expected);
     }
@@ -456,7 +456,7 @@ fn catchup_clamps_wall_delay_without_rebasing_logical_time() {
     assert!(b.pos[0] > before);
     assert_eq!(b.position_at(29_999), b.old_pos);
     assert_eq!(b.position_at(31_001), b.pos);
-    let midpoint = calculate_position_velocity(b.old_pos, b.old_vel, [0.0; 3], 1.0, 0.5).0;
+    let midpoint = integrate(b.old_pos, b.old_vel, [0.0; 3], 1e6, DESTINY_FRICTION, 0.5).0;
     assert_ne!(midpoint, b.pos);
     s.tick(30_500);
     assert_eq!(s.sample_position(1), Some(midpoint));
@@ -465,7 +465,7 @@ fn catchup_clamps_wall_delay_without_rebasing_logical_time() {
     let b = s.ball(1).unwrap();
     assert_eq!(b.last_ms, 17_000);
     assert_eq!(b.interpolation_anchor_ms, 31_000);
-    let midpoint = calculate_position_velocity(b.old_pos, b.old_vel, [0.0; 3], 1.0, 0.5).0;
+    let midpoint = integrate(b.old_pos, b.old_vel, [0.0; 3], 1e6, DESTINY_FRICTION, 0.5).0;
     assert_ne!(midpoint, b.pos);
     s.tick(31_500);
     assert_eq!(s.sample_position(1), Some(midpoint));
@@ -481,7 +481,7 @@ fn ordinary_catchup_anchors_to_last_deadline() {
     let b = s.ball(1).unwrap();
     assert_eq!(s.current_time(), 2);
     assert_eq!(b.interpolation_anchor_ms, 2_000);
-    let expected = calculate_position_velocity(b.old_pos, b.old_vel, [0.0; 3], 1.0, 0.5).0;
+    let expected = integrate(b.old_pos, b.old_vel, [0.0; 3], 1e6, DESTINY_FRICTION, 0.5).0;
     assert_eq!(s.sample_position(1), Some(expected));
     assert_ne!(expected, b.old_pos);
     assert_eq!(b.position_at(1_999), b.old_pos);

@@ -1,4 +1,21 @@
 use super::*;
+
+#[test]
+fn integrate_zero_time_preserves_state_before_division() {
+    let position = [1.0, -2.0, 3.0];
+    let velocity = [4.0, 5.0, -6.0];
+    assert_eq!(integrate(position, velocity, [1.0; 3], 0.0, 0.0, 0.0), (position, velocity));
+}
+
+#[test]
+fn integrate_taylor_low_drag_approaches_linear_motion() {
+    let velocity = [2.0, -3.0, 4.0];
+    let (position, actual_velocity) = integrate([0.0; 3], velocity, [0.0; 3], 1.0, 1e-11, 1.0);
+    for i in 0..3 {
+        assert!((position[i] - velocity[i]).abs() < 1e-9);
+        assert!((actual_velocity[i] - velocity[i]).abs() < 1e-9);
+    }
+}
 #[test]
 fn seconds_to_milliseconds_preserves_fractions() {
     assert_eq!(seconds_to_ms_f64(0.0015), 1.5);
