@@ -57,6 +57,8 @@ pub const CATEGORY_MODULE: i32 = 7;
 pub const CATEGORY_CHARGE: i32 = 8;
 /// SDE invCategories: Entity.
 pub const CATEGORY_ENTITY: i32 = 11;
+/// SDE invCategories: Skill.
+pub const CATEGORY_SKILL: i32 = 16;
 /// SDE invCategories: Drone.
 pub const CATEGORY_DRONE: i32 = 18;
 /// SDE invTypes: Hacking skill.

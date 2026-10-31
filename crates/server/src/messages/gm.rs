@@ -4,6 +4,10 @@
 
 /// An argument quote was not closed.
 pub(crate) const GM_ARGS_UNCLOSED_QUOTE: &str = "引号未闭合。";
+/// A command requires a selected character.
+pub(crate) const GM_ARGS_NO_CHARACTER: &str = "当前没有选择角色。";
+pub(crate) fn gm_args_missing(index: usize) -> String { format!("缺少第 {index} 个参数。") }
+pub(crate) fn gm_args_unknown_target(text: &str) -> String { format!("找不到角色：{text}") }
 
 // GM slash commands (services/slash.rs)
 /// Teleport command help.
@@ -13,7 +17,7 @@ pub(crate) const GM_HELP_WORMHOLE: &str = "/wh — teleport next to a wormhole (
 /// Scan-all command help.
 pub(crate) const GM_HELP_SCAN_ALL: &str = "/scanall — scan every signature in this system to 100%";
 /// Site listing command help.
-pub(crate) const GM_HELP_SITES: &str = "/sites — list this system's anomalies and signatures";
+pub(crate) const GM_HELP_SITES: &str = "/sites — 列出当前星系的异常和信号强度";
 /// Create command help.
 pub(crate) const GM_HELP_CREATE: &str = "/create <typeID|name> [qty] — into your hangar (docked) or cargo";
 /// Create-item command help.
@@ -129,3 +133,23 @@ pub(crate) const LUA_HELP: &str = "用法：/lua reload 或 /lua list";
 pub(crate) const LUA_RELOADED: &str = "脚本已重新加载。";
 pub(crate) fn lua_reload_failed(error: &str) -> String { format!("脚本重新加载失败：{error}") }
 pub(crate) fn lua_list(list: &str) -> String { format!("Lua 脚本：\n{list}") }
+
+// Skill administration.
+pub(crate) const GM_HELP_GIVESKILL: &str = "/giveskill <角色> <技能|all|super> [等级] — 设置技能等级";
+pub(crate) const GM_HELP_ALLSKILLS: &str = "/allskills [角色] — 设置全部已发布技能";
+pub(crate) const GM_HELP_REMOVESKILL: &str = "/removeskill <角色> <技能|all> — 移除技能";
+pub(crate) const GM_HELP_GIVESTARTERSKILLS: &str = "/givestarterskills <角色> — 补充初始技能";
+pub(crate) const GM_SKILL_LEVEL_INVALID: &str = "技能等级必须为 0 至 5。";
+pub(crate) fn gm_skill_usage(command: &str) -> String {
+    match command {
+        "giveskill" => "用法：/giveskill <角色> <技能|all|super> [等级]",
+        "allskills" => "用法：/allskills [角色]",
+        "removeskill" => "用法：/removeskill <角色> <技能|all>",
+        "givestarterskills" => "用法：/givestarterskills <角色>",
+        _ => "无效的技能指令。",
+    }.into()
+}
+pub(crate) fn gm_skill_not_skill(skill: &str) -> String { format!("{skill} 不是技能。") }
+pub(crate) fn gm_skill_done(command: &str, target: i64) -> String { format!("{command} 已应用于角色 {target}。") }
+
+
