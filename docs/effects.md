@@ -42,15 +42,38 @@ All paths below are under `crates/server/src/`.
 - `services/effects/registry.rs`: numeric classification, scope and resolved
   effect metadata; `mod.rs` defines the kinds.
 - `services/effects/lifecycle.rs`: activation, cycles, repeat and stopping;
-  `weapons.rs`, `repair.rs`, `propulsion.rs`, `mining.rs` and `hacking.rs`
-  contain the existing family-specific work; `projected.rs` constructs projected effects.
+  `weapons.rs`, `repair.rs`, `capacitor.rs`, `propulsion.rs`, `mining.rs` and
+  `hacking.rs` contain the family-specific work; `projected.rs` constructs
+  projected effects.
 - `services/effects/environment.rs` and `notify.rs`: effect environment and
   notification payloads; `unsupported.rs` owns refusal diagnostics.
 - `services/combat/` retains targeting, ammunition, health, damage and NPC
   state. `services/fit.rs` evaluates attributes. Space actor timers schedule
   cycle work.
+- Capacitor transfer does not yet propagate Crimewatch assistance; neutralizers
+  and nosferatu use the existing offensive aggression path. Reloads use the
+  existing ammunition reservation and actor deadline mechanism. When an ancillary
+  repairer stops with an empty magazine, compatible cargo charges are reserved
+  for automatic reload; a running module does not reload automatically.
+- Charge-sensitive cycles check pending reloads and guard consumption against the
+  cycle-start fitted charge type. If a reload wins after capacitor discharge,
+  the refused cycle refunds that discharge through the normal capacitor injection
+  path. Recharge, intervening capacitor operations and the capacity clamp can
+  change the final level before the refund; this is not an atomic reservation.
 - `sde/dogma.rs` loads dogma data; `sde/dogma/python_effects.rs` supplements
   Python-only modifiers.
+
+## NPC capacitor assistance
+
+NPC capacitor transfers select another live NPC brain in the same system. If
+the source belongs to a spawn group, the recipient must share one of its groups;
+otherwise it must have the same ball owner. The hostile player target is never
+an assistance recipient. Among recipients with a non-full capacitor and a
+positive optimal/falloff range multiplier at sampled surface distance, the
+lowest recharged capacitor fraction wins, with item ID breaking ties. No
+eligible recipient means no transfer. The existing NPC effect timer drives the
+attempt; the commit rechecks the hostile target generation, recipient
+eligibility and range. NPC assistance does not generate Crimewatch flags.
 
 ## Wire contract
 

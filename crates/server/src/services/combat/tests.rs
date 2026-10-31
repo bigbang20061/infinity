@@ -77,7 +77,7 @@ fn reset_only_stops_owning_pilots_modules() {
     let b = 2;
     let flags: Vec<_> = (0..3).map(|_| Arc::new(AtomicBool::new(false))).collect();
     for (master, owner, flag) in [(10, a, &flags[0]), (11, a, &flags[1]), (12, b, &flags[2])] {
-        st.active.insert(master, ActiveModule { char_id: owner, stop: flag.clone() });
+        st.active.insert(master, ActiveModule { char_id: owner, stop: flag.clone(), forced_inactive: false });
         st.activation_generation.insert(master, flag.clone());
     }
     st.targets.insert(a, HashSet::from([20]));

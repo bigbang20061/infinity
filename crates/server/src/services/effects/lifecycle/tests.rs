@@ -1,5 +1,6 @@
 use super::*;
 use std::sync::Mutex;
+mod forced_retire;
 
 #[test]
 fn blocker_uses_target_modifier_source_not_scramble_identity() {
@@ -20,7 +21,7 @@ fn discarded_cycle_owners_release_only_their_generation() {
     {
         let mut st = state();
         assert!(!st.active.contains_key(&master));
-        st.active.insert(master, ActiveModule { char_id: 1, stop: generation.clone() });
+        st.active.insert(master, ActiveModule { char_id: 1, stop: generation.clone(), forced_inactive: false });
         st.activation_generation.insert(master, generation.clone());
     }
     let owner = ActivationOwner { master, generation: generation.clone(), armed: true };
@@ -31,7 +32,7 @@ fn discarded_cycle_owners_release_only_their_generation() {
         let mut st = state();
         assert!(!st.active.contains_key(&master));
         assert!(!st.activation_generation.contains_key(&master));
-        st.active.insert(master, ActiveModule { char_id: 1, stop: generation.clone() });
+        st.active.insert(master, ActiveModule { char_id: 1, stop: generation.clone(), forced_inactive: false });
         st.activation_generation.insert(master, generation.clone());
     }
     let owner = ActivationOwner { master, generation: generation.clone(), armed: true };
@@ -44,7 +45,7 @@ fn discarded_cycle_owners_release_only_their_generation() {
     }
     {
         let mut st = state();
-        st.active.insert(master, ActiveModule { char_id: 1, stop: generation.clone() });
+        st.active.insert(master, ActiveModule { char_id: 1, stop: generation.clone(), forced_inactive: false });
         st.activation_generation.insert(master, generation.clone());
     }
     let owner = ActivationOwner { master, generation: generation.clone(), armed: true };
@@ -59,7 +60,7 @@ fn discarded_cycle_owners_release_only_their_generation() {
     let replacement = Arc::new(AtomicBool::new(false));
     {
         let mut st = state();
-        st.active.insert(master, ActiveModule { char_id: 1, stop: replacement.clone() });
+        st.active.insert(master, ActiveModule { char_id: 1, stop: replacement.clone(), forced_inactive: false });
         st.activation_generation.insert(master, replacement.clone());
     }
     let owner = ActivationOwner { master, generation, armed: true };
@@ -108,7 +109,7 @@ fn cycle_deadlines_and_deactivation() {
 
     let old = Arc::new(AtomicBool::new(false));
     let replacement = Arc::new(AtomicBool::new(false));
-    let mut active = HashMap::from([(1, ActiveModule { char_id: 1, stop: replacement.clone() })]);
+    let mut active = HashMap::from([(1, ActiveModule { char_id: 1, stop: replacement.clone(), forced_inactive: false })]);
     let mut published = false;
     assert!(!retire_activation(&mut active, 1, &old, || published = true));
     assert!(!published);
@@ -153,7 +154,7 @@ fn online_dispatch_stops_current_cycle_and_notifies_actual_ship() {
     let stop = Arc::new(AtomicBool::new(false));
     {
         let mut st = state();
-        st.active.insert(module, ActiveModule { char_id: 2, stop: stop.clone() });
+        st.active.insert(module, ActiveModule { char_id: 2, stop: stop.clone(), forced_inactive: false });
         st.activation_generation.insert(module, stop.clone());
     }
     let (notify, mut rx) = tokio::sync::mpsc::unbounded_channel();

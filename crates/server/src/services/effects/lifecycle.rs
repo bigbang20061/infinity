@@ -193,36 +193,22 @@ pub(crate) async fn stop_blocked_propulsion(db: &crate::db::Db, world: &Arc<Worl
         Ok(items) => items,
         Err(error) => { warn!("loading blocked propulsion modules: {error}"); return; }
     };
-    let fit = match Fit::load_in_space(db, world, system, character, target).await {
-        Ok(fit) => fit,
-        Err(_) => { warn!("loading blocked propulsion fit for {target}"); return; }
-    };
     let modules: Vec<_> = modules.into_iter().filter(|module| {
         super::super::inventory::is_fitting_flag(module.flag_id)
             && world.sde().types.effects(module.type_id).iter().any(|effect| effect.effect_id == EFFECT_MICROWARPDRIVE)
     }).filter_map(|module| {
         let generation = state().active.get(&module.item_id).map(|active| active.stop.clone())?;
-        let duration = registry::resolve(world.sde(), EFFECT_MICROWARPDRIVE)
-            .and_then(|effect| effect.attribute(EffectAttribute::Duration))
-            .map(|attr| fit.value(Key::Module(module.item_id), attr)).unwrap_or(DEFAULT_MODULE_DURATION_MS).max(MIN_MODULE_DURATION_MS);
-        Some((module.item_id, generation, duration))
+        Some((module.item_id, generation))
     }).collect();
     let sde = world.sde().clone();
     world.post(system, move |s| {
         if !propulsion_blocked(&sde, &s.projections_on(target)) { return; }
-        for (module, generation, duration) in modules {
+        for (module, generation) in modules {
             let mut st = state();
-            if !st.active.get(&module).is_some_and(|active| active.char_id == character && Arc::ptr_eq(&active.stop, &generation)) { continue; }
+            let Some(active) = st.active.get_mut(&module).filter(|active| active.char_id == character && Arc::ptr_eq(&active.stop, &generation)) else { continue };
+            active.forced_inactive = true;
             generation.store(true, Ordering::Relaxed);
-            st.active.remove(&module);
             drop(st);
-            let now = filetime_now();
-            let effect = i64::from(EFFECT_MICROWARPDRIVE);
-            let environment = super::environment::build(module, character, target, None, None, effect);
-            s.notify_pilot(character, "OnGodmaShipEffect", vec![Value::Int(module), Value::Int(effect), Value::Int(now),
-                Value::Int(0), Value::Int(0), environment, Value::Int(now), Value::Float(duration), Value::Int(0), Value::None, Value::Int(now)]);
-            // The original cycle metadata is no longer available here; the stop
-            // event uses the current time and a zero repeat count.
             s.refresh_projection_target(target);
         }
     });
@@ -579,7 +565,7 @@ pub(crate) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
     {
         let mut st = state();
         if st.active.contains_key(&item_id) { return Ok(Value::None); }
-        st.active.insert(item_id, ActiveModule { char_id: cx.char_id, stop: stop.clone() });
+        st.active.insert(item_id, ActiveModule { char_id: cx.char_id, stop: stop.clone(), forced_inactive: false });
         st.activation_generation.insert(item_id, stop.clone());
     }
     let owner = ActivationOwner { master: item_id, generation: stop.clone(), armed: true };

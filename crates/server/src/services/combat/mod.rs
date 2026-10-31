@@ -104,6 +104,7 @@ struct Hp {
 pub(super) struct ActiveModule {
     pub(super) char_id: i64,
     pub(super) stop: Arc<AtomicBool>,
+    pub(super) forced_inactive: bool,
 }
 
 #[derive(Default)]
@@ -138,7 +139,7 @@ impl State {
 
 /// Modules currently running their activation effect (services::fit applies them).
 pub fn active_modules() -> HashSet<i64> {
-    state().active.keys().copied().collect()
+    state().active.iter().filter_map(|(&id, active)| (!active.forced_inactive).then_some(id)).collect()
 }
 
 pub(super) fn state() -> MutexGuard<'static, State> {
