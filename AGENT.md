@@ -71,7 +71,7 @@ Any other tag starts nothing.
 | Packet loop, session changes, notifications | `client.rs`, `session.rs`, `macho.rs`, `conn.rs`, `framing.rs` |
 | Remote service dispatch | `services/mod.rs` (`dispatch`), one module per feature under `services/`, and `services/fixed.rs` (constant answers for services that are not modelled) |
 | Server-side dogma | `services/fit.rs` (effective attributes), `services/dogma.rs` (dogmaIM) |
-| Space simulation and destiny | `space/mod.rs` (`World` facade, `Ball`, destiny encoding, pilot registry and jump queues), `space/system.rs` (`System`: one system's state, tick, timers), `space/actor.rs` (per-system mailbox and 100 ms tick loop), `space/npc.rs` (NPC brains, spawn groups, effects worker), `space/snapshot.rs` (periodic pilot position saves and the shutdown flush) |
+| Space simulation and destiny | `space/mod.rs` (`World` facade, `Ball`, destiny encoding, integration and interpolation, pilot registry and jump queues), `space/system.rs` (`System`: one system's state, destiny clock, action queue, tick, timers), `space/actor.rs` (per-system mailbox and the wall-aligned 100 ms loop), `space/npc.rs` (NPC brains, spawn groups, effects worker), `space/snapshot.rs` (periodic pilot position saves and the shutdown flush) |
 | Public gateway (gRPC) | `gateway/mod.rs`, `gateway/handlers.rs` |
 | Chat | `chat.rs` |
 | Image server and content CDN | `images.rs`, `cdn.rs` |
@@ -133,7 +133,8 @@ Any other tag starts nothing.
 - Build results with the helpers in `services/mod.rs` (`keyval`, `rowset`, `crowset`, `item_descriptor`) and with `marshal::Value` (`Value::instance`, `Value::reduce`, `Value::dict`, `Value::list`, `Value::tuple`).
 - `Value::str` is a Python 2 `str`. Use it for identifiers, keys and class names.
 - `Value::unicode` is a Python `unicode`. Use it for any text a player reads.
-- Client times are FILETIME values: 100 ns units since 1601, from `client::filetime_now()`. Destiny event stamps are whole unix seconds, from `space::now_tick()`. The space simulation itself runs on unix milliseconds (`space::now_ms()`); never send milliseconds as a destiny stamp.
+- Client times are FILETIME values: 100 ns units since 1601, from `client::filetime_now()`.
+- Destiny event stamps are destiny ticks, read from `System::current_time()`: each system's clock starts at the Unix second it loads and advances by one per one-second evolution. Never derive a stamp from wall-clock milliseconds (`space::now_ms()`, `System::now_ms()`); those only schedule the actor loop, timers and interpolation. Never send milliseconds as a destiny stamp.
 
 ### Errors
 
@@ -155,7 +156,7 @@ Any other tag starts nothing.
 
 - Module-level runtime state uses `static STATE: OnceLock<Mutex<State>>` behind a `state()` accessor. Keep critical sections short. Static data is not runtime state: never cache it in a module, read it from `Sde`.
 - Never hold a `std::sync::Mutex` guard across `.await`.
-- Every solar system in space is an actor: a tokio task that owns its `System` and advances it every 100 ms. Reach it only through `World`:
+- Every solar system in space is an actor: a tokio task that owns its `System`. Its loop runs on every whole 100 ms of Unix time and drives timers, NPC decisions and the mailbox; ball motion advances only on whole seconds, once per destiny tick (carbonengine `Ballpark::Evolve`). Reach it only through `World`:
   - `world.with(system, move |s| ...).await` runs a closure inside the actor and returns its value (`None` if the system is not running).
   - `world.post(system, move |s| ...)` sends a write and does not wait. It can be called from synchronous code.
   - `world.schedule(system, delay_ms, move |s| ...)` runs a closure inside the actor on the first tick after the delay. `world.after(system, delay_ms).await` waits for that tick from async code (`false` if the system is not running). Every timed effect on something in space uses one of these: target locks, module cycles and effect durations, reloads, missile flight, jump delays, scans and probes, site and belt respawns, CONCORD response. Never `tokio::spawn` + `sleep` for them.
@@ -165,6 +166,8 @@ Any other tag starts nothing.
   - Never `.await`, never touch the database, and never call `World`. Closures must be `Send + 'static`: use `move` and capture owned values.
   - Copy out only what the caller needs, such as a few balls or scalar facts. Never clone every ball of a system.
   - Hand database or other async work to `System::defer(async move { ... })`. The future runs on the system's worker, outside the actor, and may use the database and `World`.
+- Ball state that carbonengine destiny changes through an action (movement, speed, max speed, mass and agility, cloak, missile launch, and the AddBalls/RemoveBalls notices for balls entering or leaving) changes only through the system's action queue: `System::command` / `World::command`, or the `System` method for that action (`launch_missile`, `add_ship`, `remove_ball`, `uncloak`). An action issued while the system holds tick C is stamped C and applies before the step to C + 1. Never change a ball's motion state directly from a timer or a service.
+- `Ball::pos` and `Ball::vel` are the state at the current destiny tick; the state stream, position snapshots and the position saved at logout use them. Anything that runs between ticks and needs where a ball is (ranges, NPC decisions, scans, warp and gate checks, where a destroyed ball leaves its wreck or capsule) reads `System::sample_position(id)`, `System::sampled_ball(id)` or `Ball::position_at(ms)`, which interpolate the last completed tick as the client renders it; `System::destroy_ball` returns the ball at its sampled position. Never integrate in smaller steps.
 - Look pilots up through the pilot index (`System::pilots`, `System::pilot_ball`), not by scanning every ball.
 - NPCs are `NpcBrain`s owned by their system and decide inside the tick. Their shots and repairs run on the system's worker through `NpcEffects`. NPCs that must be cleared together form a spawn group (`System::spawn_group`), whose on-cleared closure runs once when the last member leaves. Do not add polling loops that watch the space.
 - Long-running background tasks (`tokio::spawn`) log failures with `warn!` and never panic.
@@ -174,7 +177,7 @@ Any other tag starts nothing.
 Helpers and constants used by more than one module, each defined once:
 
 - `services/mod.rs`: `CallError` builders (`db_err`, `user_error`, `notify_error`), random numbers (`rand01`, `rand_dir`), reading a field of a client `Value`, and other service-level queries shared by several services.
-- `space/mod.rs`: vector math on `V3` (`add`, `sub`, `scale`, `len`, `dist`) and destiny time conversions (simulation milliseconds to destiny stamps).
+- `space/mod.rs`: vector math on `V3` (`add`, `sub`, `scale`, `len`, `dist`), the wall clock (`now_ms`) and unit conversions (`ms_to_seconds`, `seconds_to_ms`). Destiny stamps are not conversions of the wall clock; they come from `System::current_time()`.
 - `client.rs`: FILETIME conversions (`filetime_now` and conversions from unix time).
 - `consts.rs`: game-data constants used by more than one module, grouped by source: FILETIME durations, distances, SDE type, group and category IDs, dogma attribute and effect IDs, inventory flags, locations and row columns, corporation roles and wallet account keys. Protocol constants that are part of one module's interface stay in that module, for example `macho::cmd` and the space ball modes and flags.
 - `dao/`: statements used by several features, in the module of their data (see Database).

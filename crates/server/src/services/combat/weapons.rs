@@ -1,5 +1,15 @@
-//! Combat mechanics; state and routing live in the parent module. Propulsion and missile
-//! launch transitions are queued for the next destiny boundary with the actor's current stamp.
+//! Weapon fire, missile launches, repairs and propulsion effects; state and
+//! routing live in the parent combat module. Client dogma calls are mirrored by
+//! `eve/client/script/dogma/clientDogmaLocation.py`, with destiny updates
+//! consumed by `eve/client/script/remote/michelle.py`. Fitting and weapon
+//! attributes use SDE data and game item state; in-flight missiles and actor
+//! timers are transient.
+//!
+//! Propulsion transitions are queued with the actor's current destiny stamp.
+//! `System::launch_missile` inserts the neutral ball immediately and queues
+//! its launch in the same FIFO; its actor-owned impact timer starts when the
+//! launch applies at the next boundary. Missile flight and impact reach use
+//! the existing approximation, not full native missile physics.
 use super::*;
 
 // ---------------------------------------------------------------- weapons fire

@@ -1,13 +1,20 @@
-//! Undocking, flying and docking: the `ship` service (bound per location) and
-//! the `beyonce` remote ballpark (bound per solar system).
-//! Movement commands apply at destiny boundaries; jump waits and arrival cloak expiry use the actor tick.
-//! Gate range and live warp targets use positions sampled at the system actor's time.
-//! Carbonengine Ballpark::WarpTo falls back to GotoPoint below 100 km measured
-//! to the raw destination; full warp timing and landing remain approximate.
+//! Undocking, flying and docking through the location-bound `ship` service and
+//! system-bound `beyonce` remote ballpark. Destiny updates are consumed by
+//! `eve/client/script/remote/michelle.py`; gate destinations are consumed by
+//! `eve/client/script/parklife/autopilot.py`. Ship attributes and celestial
+//! data come from the SDE; locations are persisted in game tables.
+//!
+//! Movement commands apply at destiny boundaries; jump waits and arrival cloak
+//! expiry use the actor tick. Gate range and live warp targets use positions
+//! sampled at the system actor's time. GOTO stores an absolute point; direction
+//! commands project a point from the current position and send the raw direction.
+//! Carbonengine `Ballpark::WarpTo` (`Ballpark.cpp:4102-4113`) falls back to
+//! GotoPoint with no WarpFX when the raw destination is strictly below 100 km;
+//! exactly 100 km takes the full-warp path. Full warp timing and landing remain
+//! approximate, as do follow and orbit; collision and bump physics are absent.
 //! Local-chat invites use an outside-space delay for session settlement.
-//! Uses ship attributes and celestial data from the SDE and persists locations in game tables.
-//! Ship loss commits before its independently best-effort killmail and insurance operations.
-//! Mirrors the client ship service and remote ballpark; NPC workers are out of scope.
+//! Ship loss commits before its independently best-effort killmail and insurance
+//! operations. NPC workers are outside this module's scope.
 
 use super::{db_err, Call, CallError, CallResult};
 use crate::client::{short, Client};

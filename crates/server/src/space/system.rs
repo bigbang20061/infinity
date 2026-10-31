@@ -1,10 +1,23 @@
-//! Actor-owned ballpark state and visibility, mirroring michelle.py and destiny.
-//! Celestials are supplied by the facade from SDE; dynamic state is in memory.
-//! Destiny actions apply at whole-second boundaries before fixed one-second motion;
-//! after bounded catchup, the next whole wall second replaces carbon's post-stall
-//! deadline while the clamped segment retains its actual execution-time anchor.
-//! Timers and NPC decisions run at 100 ms, and snapshots follow motion. DB effects
-//! use workers; timers and non-position dynamic state do not survive a restart.
+//! Actor-owned ballpark membership, visibility, actions, motion and timers,
+//! serving destiny updates consumed by `eve/client/script/remote/michelle.py`.
+//! Celestials are supplied from the SDE; dynamic state and timers are in memory.
+//! Changed pilot positions are saved to `game.items` by the snapshot worker.
+//!
+//! One FIFO holds captured AddBalls updates and mode, propulsion, cloak and
+//! missile-launch actions. Membership changes immediately, while AddBalls
+//! captures its wire state at enqueue. An action enqueued at logical time C is
+//! stamped C and applied at the next boundary before evolution to C+1.
+//! `current_time` starts at load-time Unix seconds and advances once per fixed
+//! one-second evolution, independently of the wall clock. Timers and NPC
+//! decisions run on 100 ms housekeeping ticks; snapshots follow motion.
+//! After more than five due steps, catchup clamps to one logical step and the
+//! next deadline is the next whole wall second, an intentional departure from
+//! native cadence. The clamped interpolation anchor is actual execution time;
+//! the logical counter is not reset to wall time.
+//!
+//! DB effects run on workers; timers and non-position dynamic state do not
+//! survive restart. Full native movement, collision and bump physics are not
+//! implemented.
 use super::*;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::future::Future;

@@ -1,29 +1,31 @@
-//! Solar systems in space: a server-side ballpark per system, destiny binary state
-//! and event broadcasting. `eve/client/script/remote/michelle.py:491-532` consumes
-//! destiny updates; `eve/client/script/parklife/autopilot.py:260-261,329-332`
-//! consumes gate jump destinations.
+//! Per-system ball state, destiny wire snapshots and event broadcasting.
+//! `eve/client/script/remote/michelle.py:491-532` consumes destiny updates;
+//! `eve/client/script/parklife/autopilot.py:260-261,329-332` consumes gate
+//! destinations. The binary layout follows carbonengine destiny `Thunkers.cpp`
+//! WriteBallToStream, and warp constants refer to `Ballpark.cpp` SetupWarpConstants.
 //!
-//! Inherited native attributions for the binary format and warp phases are
-//! carbonengine destiny `Thunkers.cpp` WriteBallToStream and `Ballpark.cpp`
-//! SetupWarpConstants. Those native sources and `IDstConstants.h` are not present
-//! in the decoded Python tree; its consumers do not validate the byte layout or
-//! native constants. Movement uses carbonengine Ballpark::Integrate with the
-//! existing 0.1-second tau floor; native D6 mass semantics remain deferred, so
-//! this is not a claim of complete client simulation parity.
-//! Completed-segment samples reuse the same integration as whole ticks and retain
-//! the old/new state described by `Ballpark.cpp`'s old/new swap.
-//! Interpolation uses the wall-clock segment anchor independently of logical integration time.
-//! GOTO stores an absolute point; direction commands project from the current position.
+//! Celestials come from the SDE; dynamic balls and timers are transient. Changed
+//! pilot positions are periodically saved to `game.items` and flushed at shutdown.
+//! Only player-piloted ships set the explicit interactive ball field.
 //!
-//! Celestials come from the SDE; dynamic balls stay in memory. Each system
-//! owns an actor with wall-aligned 100 ms timers and NPC decisions. Destiny actions
-//! retain the enqueue-time logical stamp and apply before fixed one-second motion.
-//! Catchup is bounded; after a clamp the next whole wall second is used, deliberately
-//! differing from carbon's post-stall deadline. NPC effects and deferred jobs run outside the actor.
-//! Timers fire on ticks in deadline and scheduling order; missile flight timers start
-//! when the launch action applies. Timers are not persistent.
-//! Changed pilot positions are periodically saved to game.items and flushed at shutdown.
-//! Other dynamic ball state is not persisted here.
+//! The actor runs wall-aligned 100 ms housekeeping, timers and NPC decisions;
+//! ball kinetics advance in fixed one-second steps. The actor-owned `current_time`
+//! is the integer destiny stamp: an action enqueued at C is stamped C and applied
+//! at the next boundary before evolution to C+1. Wire snapshots use whole integer
+//! stamps. Between boundaries `Ball::position_at`, `System::sample_position` and
+//! `System::sampled_ball` sample the completed segment from its old state and
+//! frozen inputs, using the same native `Ballpark::Integrate` arithmetic as ticks
+//! and a wall-clock anchor, not fractional destiny stamps or separate substeps.
+//!
+//! GOTO stores an absolute point; direction commands project from the current
+//! position while their events retain the raw direction. `Ballpark::WarpTo`
+//! (`Ballpark.cpp:4102-4113`) falls back to GotoPoint for a raw destination
+//! strictly below 100 km, without WarpFX.
+//!
+//! The 0.1-second tau floor limits low-effective-mass fidelity. Finite GOTO
+//! arrival scaling, follow, orbit, full warp and missile flight remain approximate;
+//! collisions and bumps are not modelled. Orientations, formations, miniballs,
+//! AddBalls2 and unsupported ball modes are not implemented.
 //! Shared vector distances are defined here for simulation and service callers.
 
 use crate::consts::{AU, DAMAGE_LAYER_COUNT, FILETIME_SECOND, SECONDS_PER_MINUTE};
@@ -85,7 +87,8 @@ const DEFAULT_WARP_FACTOR: i64 = 3000;
 const DAMAGE_STATE_SHIELD_RECHARGE_TAU: f64 = 100_000.0;
 /// Carbonengine Ballpark constructor friction.
 const DESTINY_FRICTION: f64 = 1e6;
-/// Existing server integration floor, retained pending native D6 mass semantics.
+/// ponytail: The 0.1-second floor limits low-effective-mass fidelity; replace it
+/// when native effective-mass semantics are implemented.
 const MIN_MOVEMENT_TAU_SECONDS: f64 = 0.1;
 /// Carbonengine Ballpark::Integrate Taylor-series threshold.
 const INTEGRATE_TAYLOR_THRESHOLD: f64 = 1e-10;

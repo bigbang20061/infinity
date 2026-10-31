@@ -1,6 +1,12 @@
-//! Per-system unbounded closure mailbox and wall-aligned 100 ms timer/NPC driver.
-//! Destiny motion advances only on whole-second boundaries; no database or protocol decoding.
-//! NPC effects are sequential; deferred jobs run concurrently outside the actor.
+//! Per-system closure mailbox and wall-aligned timer/NPC driver for ballparks
+//! whose destiny updates are consumed by `eve/client/script/remote/michelle.py`.
+//! The actor owns in-memory `System` state; snapshot jobs persist pilot positions
+//! to `game.items`, while NPC effects and deferred jobs run outside the actor.
+//! Its `interval_at` starts at the next whole Unix 100 ms boundary and uses
+//! `MissedTickBehavior::Skip`. Housekeeping runs every interval; destiny motion
+//! advances only on whole-second boundaries. Mailbox messages never evolve balls.
+//! This module does not decode the client protocol or perform database work
+//! inside the actor; timers and non-position dynamic state are not persistent.
 use super::*;
 use std::sync::Weak;
 use std::time::Duration;
