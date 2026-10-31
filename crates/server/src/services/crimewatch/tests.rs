@@ -2,6 +2,23 @@ use super::*;
 use crate::space::System;
 
 #[test]
+fn concord_reservation_respects_policy_without_clearing_criminal_flag() {
+    let criminal = -104;
+    state().pilots.entry(criminal).or_default().criminal_until = 10;
+
+    assert!(!reserve_concord(false, 1.0, 0.5, criminal));
+    assert!(!state().concord.contains(&criminal));
+    assert!(is_criminal(criminal, 0));
+    assert!(!reserve_concord(true, 0.4, 0.5, criminal));
+    assert!(reserve_concord(true, 0.5, 0.5, criminal));
+    assert!(!reserve_concord(true, 1.0, 0.5, criminal));
+
+    let mut st = state();
+    assert!(st.concord.remove(&criminal));
+    st.pilots.remove(&criminal);
+}
+
+#[test]
 fn discarded_concord_callback_clears_marker() {
     crate::tests::init_config();
     let criminal = -101;

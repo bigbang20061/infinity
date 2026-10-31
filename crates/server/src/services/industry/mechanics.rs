@@ -1,5 +1,6 @@
 //! Industry job calculations and lifecycle for the client industry package.
 //! Uses blueprint SDE data and game jobs, items and wallets; corporation jobs are unsupported.
+//! Job durations include the configured industry time multiplier.
 
 use super::*;
 use crate::sde::{Sde, industry::Activity};
@@ -41,6 +42,25 @@ struct Plan {
     total_cost: f64,
     probability: f64,
     product: Option<i32>,
+}
+
+fn job_seconds(seconds: f64, multiplier: f64, runs: i32, max_run_secs: f64) -> Result<i64, CallError> {
+    let seconds = seconds * multiplier;
+    let rounded = seconds.round();
+    if !seconds.is_finite()
+        || rounded < i64::MIN as f64
+        || rounded >= i64::MAX as f64
+        || seconds - seconds / runs as f64 > max_run_secs
+    {
+        return Err(notify_error(messages::INDUSTRY_PROJECT_TOO_LONG));
+    }
+    Ok(rounded as i64)
+}
+
+fn job_deadline(now: i64, seconds: i64) -> Result<i64, CallError> {
+    seconds.checked_mul(FILETIME_SECOND)
+        .and_then(|duration| now.checked_add(duration))
+        .ok_or_else(|| notify_error(messages::INDUSTRY_PROJECT_TOO_LONG))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -123,9 +143,7 @@ async fn plan(
         INVENTION => seconds *= char_attr(ATTR_INVENTION_RESEARCH_SPEED),
         _ => {}
     }
-    if seconds - seconds / runs as f64 > policy.max_run_secs {
-        return Err(notify_error(messages::INDUSTRY_PROJECT_TOO_LONG));
-    }
+    let seconds = job_seconds(seconds, policy.job_time_multiplier, runs, policy.max_run_secs)?;
 
     // Cost: the estimated item value, scaled per activity.
     let product = match activity_id {
@@ -149,7 +167,7 @@ async fn plan(
     let scc = if matches!(activity_id, RESEARCH_TIME | RESEARCH_MATERIAL) { policy.scc_surcharge_rate * 0.5 } else { policy.scc_surcharge_rate };
     let security_tax = if facility.security >= 0.45 { (base_cost * policy.highsec_security_tax).round() } else { 0.0 };
     let total_cost = (job_cost * policy.system_cost_index).round() + (base_cost * policy.npc_facility_tax).round() + (base_cost * scc).round() + security_tax;
-    Ok(Plan { materials, seconds: seconds.round() as i64, total_cost, probability, product })
+    Ok(Plan { materials, seconds, total_cost, probability, product })
 }
 
 /// Active jobs per activity of an installer (GetJobCounts).
@@ -259,6 +277,7 @@ pub(super) async fn install(c: &Client, request: &Value) -> CallResult {
                     None
                 };
                 let p = plan(tx, &sde, &fit, &skills, &bp, act, activity_id, runs, licensed_runs, product_request, optional, &fac).await?;
+                let end = job_deadline(now, p.seconds)?;
 
                 let have = available(tx, me, fac.id).await?;
                 if let Some((t, q)) = p.materials.iter().find(|(t, q)| have.get(t).copied().unwrap_or(0) < *q) {
@@ -308,7 +327,7 @@ pub(super) async fn install(c: &Client, request: &Value) -> CallResult {
                     probability: p.probability,
                     time: p.seconds,
                     start: now,
-                    end: now + p.seconds * FILETIME_SECOND,
+                    end,
                     completed: None,
                     completed_by: None,
                     status: INDUSTRY_JOB_STATUS_INSTALLED,
@@ -454,3 +473,5 @@ pub(super) async fn complete(c: &Client, id: i64) -> Result<(), CallError> {
 }
 
 
+#[cfg(test)]
+mod tests;

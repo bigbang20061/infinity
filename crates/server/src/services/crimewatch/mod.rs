@@ -4,8 +4,9 @@
 //! Activating a weapon on another pilot's ship is legal against criminals, configured outlaws,
 //! pilots you are engaged with, and anywhere outside empire space. Otherwise it is a criminal
 //! act: the aggressor loses security status and is flagged criminal; in configured high-sec
-//! CONCORD destroys their ship after a response time that grows as security falls. Aggression
-//! starts weapons and PvP timers and a mutual engagement; their durations are operator policies.
+//! CONCORD destroys their ship after a response time that grows as security falls, unless
+//! CONCORD responses are disabled. Aggression starts weapons and PvP timers and a mutual
+//! engagement regardless; their durations are operator policies.
 //!
 //! A lost player ship writes a killmail (game.killmails) naming attackers within the configured
 //! window; an illegal kill costs those aggressors more security status. Killing NPCs that carry
@@ -207,10 +208,14 @@ pub async fn aggress(db: &Db, world: &Arc<World>, system: i64, attacker: i64, at
         }
         clear_flag_later(db.clone(), world.clone(), attacker, until);
     }
-    if system_sec >= policy.highsec_threshold && state().concord.insert(attacker) {
+    if reserve_concord(policy.concord_enabled, system_sec, policy.highsec_threshold, attacker) {
         dispatch_concord(world.clone(), system, attacker, system_sec);
     }
     Ok(())
+}
+
+fn reserve_concord(enabled: bool, security: f64, highsec_threshold: f64, attacker: i64) -> bool {
+    enabled && security >= highsec_threshold && state().concord.insert(attacker)
 }
 
 /// Lift a criminal flag once it runs out, telling the system the pilot is in by then.

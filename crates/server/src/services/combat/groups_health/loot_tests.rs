@@ -9,3 +9,12 @@ fn loot_rejects_unpublished_null_and_other_categories() {
     assert_eq!(loot_category(Some(true), None), None);
     assert_eq!(loot_category(Some(true), Some(0)), None);
 }
+
+#[test]
+fn bounty_payout_scales_and_rejects_nonfinite_results() {
+    assert_eq!(bounty_payout(123.45, 1.0), Some(123.45));
+    assert_eq!(bounty_payout(123.45, 0.0), Some(0.0));
+    assert_eq!(bounty_payout(100.0, 1.5), Some(150.0));
+    assert_eq!(bounty_payout(f64::MAX, 2.0), None);
+    assert_eq!(bounty_payout(f64::NAN, 1.0), None);
+}

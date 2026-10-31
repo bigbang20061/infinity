@@ -152,6 +152,17 @@ Start-up stops with an error that names the file and the dotted key when a key i
 | `server.macho_version`, `.boot_version`, `.boot_build`, `.boot_codename`, `.boot_region`, `.node_id` | `MACHO_VERSION`, `BOOT_VERSION`, `BOOT_BUILD`, `BOOT_CODENAME`, `BOOT_REGION`, `NODE_ID` | match build 3653293 | Values the client checks during the handshake |
 | `logging.filter` | `RUST_LOG` | `info,infinity_server=debug` | Log filter |
 
+Some keys switch behaviour on or off rather than set a number:
+
+| Key | Default | Effect |
+|---|---|---|
+| `development.auto_register_accounts` | `true` | Create an account the first time an unknown name logs in. With `false`, an unknown name is refused like a wrong password. |
+| `development.auto_register_role` | `player` | Roles of accounts created that way: `player`, or `gm` for the GM roles as well |
+| `server.login_takeover` | `true` | A login to an account that is already online replaces the old session. With `false` the new login is refused and the old session stays; the client shows its generic "not accepting connections" message, because it has no "already logged in" message. |
+| `combat.bounty_multiplier` | `1.0` | Scales the ISK paid for NPC kills (`0` = none). Loot and security status gains are unaffected. |
+| `industry.job_time_multiplier` | `1.0` | Scales industry job durations (below 1 is faster). Materials and costs are unchanged; the duration the client shows before a job starts does not include it. |
+| `crimewatch.concord_enabled` | `true` | With `false`, CONCORD does not respond. Criminal flags, timers and security status penalties still apply. |
+
 ## Database
 
 The database has four schemas:

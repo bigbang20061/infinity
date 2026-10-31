@@ -6,6 +6,8 @@
 
 /// Proxy usurp reason from `carbon/common/script/net/machoNet.py`.
 pub(crate) const SESSION_USURPED: &str = "The user's connection has been usurped on the proxy";
+/// Generic connection refusal mapped by `carbon/common/script/net/ExceptionMappingGPCS.py:16`.
+pub(crate) const ACL_NOTACCEPTING: &str = "ACL_NOTACCEPTING";
 
 // Alliances (services/alliances.rs)
 /// Alliance action requires a player-corporation CEO.

@@ -36,6 +36,23 @@ pub fn usurped_close() -> Value {
     }
 }
 
+/// Raw refusal; ExceptionMappingGPCS.py:16 and machoNet.py:1664-1692 localize this code.
+pub fn not_accepting_close() -> Value {
+    Value::Reduce {
+        data: Box::new(Value::tuple([
+            Value::global("exceptions.GPSTransportClosed"),
+            Value::tuple([Value::None]),
+            Value::dict([
+                ("reason", Value::None),
+                ("reasonCode", Value::str(crate::messages::ACL_NOTACCEPTING)),
+                ("reasonArgs", Value::Dict(vec![])),
+            ]),
+        ])),
+        list: vec![],
+        dict: vec![],
+    }
+}
+
 pub struct Conn {
     pub stream: TcpStream,
     pub peer: SocketAddr,

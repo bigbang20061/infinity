@@ -3,13 +3,14 @@
 //! before a statement; Fast can race the connection task and return a termination error.
 //! Failed statements are not retried. Startup schema application can be disabled.
 //! Account and market persistence is delegated to the DAO; login and startup policy remain here.
+//! Unknown accounts are registered only when enabled by the development policy.
 
 pub mod executor;
 pub mod outbox;
 pub mod transaction;
 
-use crate::config::deployment::DatabaseConfig;
-use crate::consts::ROLE_PLAYER_LOGIN;
+use crate::config::deployment::{DatabaseConfig, DevelopmentConfig};
+use crate::consts::{GM_ROLES, ROLE_PLAYER_LOGIN};
 use crate::dao::{accounts::authentication, market::startup};
 use anyhow::{Context, Result};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -141,8 +142,8 @@ impl Db {
         self.online.fetch_add(delta, Ordering::Relaxed);
     }
 
-    /// Verify credentials. Unknown user names are registered on first login.
-    pub async fn login(&self, user_name: &str, password_hash: &[u8]) -> Result<Option<Account>> {
+    /// Verify credentials, optionally registering unknown user names on first login.
+    pub async fn login(&self, user_name: &str, password_hash: &[u8], policy: &DevelopmentConfig) -> Result<Option<Account>> {
         let row = authentication::find(self, user_name).await?;
         let (user_id, role, user_type) = match row {
             Some(r) => {
@@ -152,9 +153,13 @@ impl Db {
                 (r.user_id, r.role, r.user_type)
             }
             None => {
-                let r = authentication::register(self, user_name, password_hash, ROLE_PLAYER_LOGIN, crate::config::game().accounts.starting_plex).await?;
+                if !policy.auto_register_accounts {
+                    return Ok(None);
+                }
+                let role = ROLE_PLAYER_LOGIN | if policy.auto_register_role == "gm" { GM_ROLES } else { 0 };
+                let r = authentication::register(self, user_name, password_hash, role, crate::config::game().accounts.starting_plex).await?;
                 info!("registered new account {user_name:?}");
-                (r.user_id, ROLE_PLAYER_LOGIN, r.user_type)
+                (r.user_id, role, r.user_type)
             }
         };
         authentication::last_login(self, user_id).await?;

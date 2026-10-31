@@ -154,14 +154,17 @@ pub async fn run(mut conn: Conn, cfg: &Config, db: &Db, client_id: i64) -> Resul
             }
         }
 
-        let account = db.login(&user_name, password_hash.as_deref().unwrap()).await.context("account lookup")?;
+        let account = db.login(&user_name, password_hash.as_deref().unwrap(), &cfg.development).await.context("account lookup")?;
         let Some(account) = account else {
-            warn!("login rejected for {user_name:?}: bad password");
+            warn!("login rejected for {user_name:?}: invalid credentials or registration disabled");
             return Ok(None);
         };
         let session_id = rand_i64();
         let login = Login { user_id: account.user_id, user_name, role: account.role, client_id, session_id, language_id };
-        let mut registration = crate::live_sessions::register(login.user_id);
+        let Some(mut registration) = crate::live_sessions::register(login.user_id, cfg.server.login_takeover) else {
+            conn.send(&crate::conn::not_accepting_close()).await?;
+            return Ok(None);
+        };
         registration.wait_for_predecessor().await;
         if registration.is_cancelled() {
             return Ok(Some((conn, login, registration)));

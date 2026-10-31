@@ -6,7 +6,7 @@ bind = "0.0.0.0:26000"              # env: BIND; existing server listener
 public_host = "127.0.0.1"           # env: PUBLIC_HOST; address clients use for chat/images/CDN
 node_id = 888444                    # env: NODE_ID; node ID the client sees
 system_capacity = 0                 # env: SYSTEM_CAPACITY; pilots per system before gate jumps queue, 0 = unlimited
-login_takeover = true               # existing behavior: replace the live session; false refuses the new login
+login_takeover = true               # replace the live session; false refuses duplicates with the client's generic not-accepting-connections message (no duplicate-specific localization)
 shutdown_flush_timeout_secs = 10    # server policy: bound on the position flush at shutdown
 # Values checked by the client handshake; change only for another client build.
 macho_version = 496                 # env: MACHO_VERSION
