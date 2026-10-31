@@ -89,8 +89,6 @@ const DAMAGE_STATE_SHIELD_RECHARGE_TAU: f64 = 100_000.0;
 const DESTINY_FRICTION: f64 = 1e6;
 /// Carbonengine Ballpark::Integrate Taylor-series threshold.
 const INTEGRATE_TAYLOR_THRESHOLD: f64 = 1e-10;
-/// Existing server fallback for missing celestial radii.
-const CELESTIAL_FALLBACK_RADIUS: f64 = 1000.0;
 /// Carbonengine Potential fixed-body effective mass, also used for rigid celestials.
 const CELESTIAL_STATIC_MASS: f64 = 1e34;
 
@@ -552,15 +550,15 @@ impl World {
         let mut system = System::new(system_id, self.pilots.clone(), tick);
         for r in self.sde.map.celestials(system_id) {
             let Some(type_id) = r.type_id.and_then(|id| i32::try_from(id).ok()) else { continue };
-            let Some(ty) = self.sde.types.get(type_id) else { continue };
+            if self.sde.types.get(type_id).is_none() { continue; }
             let id = r.item_id;
             let pos: V3 = [r.x.expect("NULL celestial x"), r.y.expect("NULL celestial y"), r.z.expect("NULL celestial z")];
             let group = r.group_id.unwrap_or(0) as i32;
             let category = r.group_id.and_then(|id| i32::try_from(id).ok())
                 .and_then(|id| self.sde.types.group(id)).and_then(|g| g.category_id).unwrap_or(0);
-            let radius = r.radius.or(ty.radius).unwrap_or(CELESTIAL_FALLBACK_RADIUS);
+            let radius = self.sde.celestial_radius(r);
             let owner = self.sde.map.station(id).and_then(|s| s.owner_id).unwrap_or(1);
-            if let Some(point) = warpin::warp_in_point(id, category, group, pos, radius) {
+            if let Some(point) = warpin::warp_in_point(id, category, group, pos, f64::from(radius)) {
                 system.set_warp_in(id, point);
             }
             let mut slim = Vec::new();
@@ -588,7 +586,7 @@ impl World {
                     char_id: None,
                     signature_radius: None,
                     mode: MODE_RIGID,
-                    radius: radius as f32,
+                    radius,
                     mass: CELESTIAL_STATIC_MASS,
                     max_vel: 0.0,
                     agility: 1.0,

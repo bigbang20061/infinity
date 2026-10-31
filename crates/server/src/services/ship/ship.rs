@@ -10,7 +10,7 @@ async fn undock(c: &mut Client) -> CallResult {
     // Leave along a fixed per-station heading.
     let a = (station % 360) as f64 * std::f64::consts::PI / 180.0;
     let dir = [a.cos(), 0.0, a.sin()];
-    let dist = st.radius.unwrap_or(DEFAULT_CELESTIAL_RADIUS) + 2500.0;
+    let dist = f64::from(c.sde.celestial_radius(st)) + 2500.0;
     let pos = [spos[0] + dir[0] * dist, spos[1], spos[2] + dir[2] * dist];
     let mut ball = ship_ball(c, ship, pos).await?;
     ball.vel = [dir[0] * ball.max_vel as f64, 0.0, dir[2] * ball.max_vel as f64];

@@ -106,14 +106,14 @@ async fn tr(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
         let count = candidates().count();
         let p = candidates().nth((super::rand01() * count as f64) as usize)
             .ok_or_else(|| slash_error(messages::gm::gm_unknown_system(id)))?;
-        let p = (p.x.expect("celestial x"), p.y.expect("celestial y"), p.z.expect("celestial z"), p.radius.unwrap_or(10_000.0));
+        let p = (p.x.expect("celestial x"), p.y.expect("celestial y"), p.z.expect("celestial z"), f64::from(c.sde.celestial_radius(p)));
         let pos = [p.0 + p.3 + 100_000.0, p.1, p.2];
         super::ship::teleport(c, id, pos).await?;
         return Ok(messages::gm::gm_teleported_to_system(id));
     }
     // A station, planet, moon, gate...
     if let Some(p) = c.sde.map.celestial(id) {
-        let pos = [p.x.expect("celestial x") + p.radius.unwrap_or(5_000.0) + TELEPORT_CLEARANCE, p.y.expect("celestial y"), p.z.expect("celestial z")];
+        let pos = [p.x.expect("celestial x") + f64::from(c.sde.celestial_radius(p)) + TELEPORT_CLEARANCE, p.y.expect("celestial y"), p.z.expect("celestial z")];
         super::ship::teleport(c, p.solar_system_id.expect("celestial system"), pos).await?;
         return Ok(messages::gm::gm_teleported(id));
     }
