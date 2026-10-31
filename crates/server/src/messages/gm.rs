@@ -84,6 +84,20 @@ pub(crate) fn gm_command_list(names: &str) -> String { format!("commands: [{}]",
 /// Unknown command and help text.
 pub(crate) fn gm_unknown_command(other: &str, help: &str) -> String { format!("unknown command /{other}\n{}", help) }
 
+/// Effect diagnostics command help and usage.
+pub(crate) const GM_HELP_EFFECTS: &str = "/effects unsupported — 列出未支持的效果";
+/// Invalid effect diagnostics arguments.
+pub(crate) const GM_EFFECTS_USAGE: &str = "用法：/effects unsupported";
+/// No unsupported effects have been observed.
+pub(crate) const GM_EFFECTS_EMPTY: &str = "尚未记录未支持的效果。";
+/// Format the observed unsupported effects in snapshot order.
+pub(crate) fn gm_effects_unsupported(effects: &[(String, i32)]) -> String {
+    if effects.is_empty() {
+        return GM_EFFECTS_EMPTY.into();
+    }
+    effects.iter().map(|(name, type_id)| format!("{name}（类型 ID：{type_id}）")).collect::<Vec<_>>().join("\n")
+}
+
 // GM per-item dogma overrides.
 pub(crate) const GM_HELP_DOGMA: &str = "/dogma <ship|物品ID|flag:N> <属性ID|名称> [数值|reset]；/dogma <目标> list";
 pub(crate) const GM_DOGMA_USAGE: &str = "用法：/dogma <ship|物品ID|flag:N> <属性ID|名称> [数值|reset]，或 /dogma <目标> list。";

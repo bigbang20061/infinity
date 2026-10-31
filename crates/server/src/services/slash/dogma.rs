@@ -5,7 +5,7 @@
 use super::{slash_error, Client, CallError};
 use crate::{dao::items::{dogma as dao, fit as fit_dao, loading::{Item, ItemQuery}}, messages};
 use crate::consts::{CATEGORY_CHARGE, CATEGORY_ENTITY, CATEGORY_MODULE, CATEGORY_OWNER};
-use crate::services::{db_err, fit::{self, Fit, Key}, items::load_items, combat};
+use crate::services::{combat, db_err, fit::{self, Fit, Key}, items::load_items, effects::{notify, propulsion}};
 use marshal::Value;
 
 /// SDE invCategories: Starbase.
@@ -148,14 +148,14 @@ pub(super) async fn command(c: &mut Client, args: &[&str]) -> Result<String, Cal
     let new_effective = current_fit.zip(key).map(|(fit, key)| fit.value(key, attr));
     if changed {
         if let (Some(old), Some(new), Some(key)) = (old_fit.as_ref(), new_fit.as_ref(), key) {
-            let before = combat::weapons::kinematics(old);
-            let after = combat::weapons::kinematics(new);
+            let before = propulsion::kinematics(old);
+            let after = propulsion::kinematics(new);
             if before != after && c.session.int("stationid").is_none() {
                 if let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), ship) {
-                    c.world.post(system, move |s| combat::weapons::queue_kinematics(s, ship, after));
+                    c.world.post(system, move |s| propulsion::queue_kinematics(s, ship, after));
                 }
             }
-            let entry = combat::groups_health::attribute_change(char_id, Value::Int(id), attr, Value::Float(new.value(key, attr)), Value::Float(old.value(key, attr)));
+            let entry = notify::attribute_change(char_id, Value::Int(id), attr, Value::Float(new.value(key, attr)), Value::Float(old.value(key, attr)));
             c.world.notify_pilot(char_id, "OnModuleAttributeChanges", vec![Value::list([entry])]);
             if key == Key::Ship && new.type_has_attribute(key, attr) { crate::services::dogma::brain::update(c).await?; }
         }

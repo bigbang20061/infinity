@@ -7,6 +7,7 @@
 //! volume and radius fall back to typed SDE type columns: this is server schema
 //! behavior, not a validated client fallback. Effective fitting is the subset in
 //! `services/fit.rs`, not a complete implementation of client dogma.
+//! Module online changes use the shared effects lifecycle; fitting resource policy is unsupported.
 //! Character brains compile passive skills; implants, boosters and structures are unsupported.
 //! Brain versions are in-memory and reset when the server restarts.
 pub(crate) mod brain;
@@ -289,14 +290,12 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
         }
         "CheckSendLocationInfo" | "LogAttribute" => Ok(Value::None),
         "LaunchProbes" => exploration::launch_probes(c, call).await,
-        // SetModuleOnline(shipID, moduleID) / TakeModuleOffline(shipID, moduleID): the client
-        // runs the online effect itself (fitting checks included); we remember the state.
+        // Both RPCs use the lifecycle's fitted-subject authorization and notifications.
         "SetModuleOnline" | "TakeModuleOffline" => {
             let ship = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
             let module = call.args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
             let online = call.method == "SetModuleOnline";
-            dogma_dao::set_online(&c.db, module, ship, online).await.map_err(db_err)?;
-            Ok(Value::None)
+            super::effects::lifecycle::set_online(c, ship, module, online).await
         }
         _ => {
             warn!(

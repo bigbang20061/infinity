@@ -27,6 +27,7 @@ mod corps;
 mod corpwallet;
 mod crimewatch;
 mod dogma;
+mod effects;
 mod exploration;
 mod fit;
 mod fixed;

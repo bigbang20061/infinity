@@ -87,22 +87,9 @@ pub(super) fn recharge(level: f64, max: f64, tau_ms: f64, dt: f64) -> f64 {
     (max * c * c).min(max)
 }
 
-/// One `OnModuleAttributeChanges` entry.
-pub(crate) fn attribute_change(owner: i64, item: Value, attribute: i32, new: Value, old: Value) -> Value {
-    Value::tuple([
-        Value::str("OnModuleAttributeChange"),
-        Value::Int(owner),
-        item,
-        Value::Int(attribute as i64),
-        Value::Int(filetime_now()),
-        new,
-        old,
-        Value::None,
-    ])
-}
 
 /// Use `amount` of the ship's capacitor; false (and nothing used) when there isn't enough.
-pub(super) fn drain_capacitor(cx: &Ctx, fit: &Fit, amount: f64) -> bool {
+pub(in crate::services) fn drain_capacitor(cx: &Ctx, fit: &Fit, amount: f64) -> bool {
     if amount <= 0.0 {
         return true;
     }
@@ -268,7 +255,7 @@ pub(super) async fn damage_player(db: &Db, world: &World, system: i64, ship: i64
 
 /// Damage whatever `target` is: a player's ship or an NPC. `attacker` is the pilot
 /// responsible, if any (NPCs remember them; kills pay them).
-pub(super) async fn damage(db: &Db, world: &World, system: i64, target: i64, target_pilot: Option<i64>, raw: [f64; DAMAGE_TYPE_COUNT], attacker: Option<i64>) -> Result<f64, CallError> {
+pub(crate) async fn damage(db: &Db, world: &World, system: i64, target: i64, target_pilot: Option<i64>, raw: [f64; DAMAGE_TYPE_COUNT], attacker: Option<i64>) -> Result<f64, CallError> {
     match target_pilot {
         Some(char_id) => damage_player(db, world, system, target, char_id, raw, attacker).await,
         None => damage_npc(db, world, system, target, raw, attacker).await,
@@ -276,7 +263,7 @@ pub(super) async fn damage(db: &Db, world: &World, system: i64, target: i64, tar
 }
 
 /// Repair a player's ship layer (0 shield, 1 armor, 2 structure) by `amount`.
-pub(super) async fn repair_player(db: &Db, world: &World, system: i64, ship: i64, char_id: i64, layer: usize, amount: f64) -> Result<(), CallError> {
+pub(crate) async fn repair_player(db: &Db, world: &World, system: i64, ship: i64, char_id: i64, layer: usize, amount: f64) -> Result<(), CallError> {
     let known = state().condition.get(&ship).cloned();
     // An undamaged ship has nothing to repair.
     let Some(mut cond) = known else { return Ok(()) };
