@@ -18,6 +18,7 @@ mod repair;
 mod mining;
 mod capacitor;
 pub(crate) mod npc_capacitor;
+pub(crate) mod npc_repair;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum JammingType {
     Webify, Scramble, Disrupt, Paint, Damp, TrackingDisrupt, GuidanceDisrupt,

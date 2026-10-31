@@ -1,0 +1,22 @@
+use super::*;
+
+#[test]
+fn selects_only_damaged_targets_with_nonzero_range_strength() {
+    assert_eq!(score(Some(0.25), 10.0, 10.0, 0.0), Some(0.25));
+    assert_eq!(score(Some(1.0), 10.0, 10.0, 0.0), None);
+    assert_eq!(score(None, 0.0, 10.0, 0.0), None);
+    assert_eq!(score(Some(f64::NAN), 0.0, 10.0, 0.0), None);
+    assert_eq!(score(Some(0.25), 11.0, 10.0, 0.0), None);
+    assert_eq!(score(Some(0.25), 30.0, 10.0, 20.0), Some(0.25));
+}
+
+#[test]
+fn npc_repair_variants_exclude_unimplemented_families() {
+    assert!(supported(i64::from(EFFECT_NPC_REMOTE_ARMOR_REPAIRER)));
+    assert!(supported(i64::from(EFFECT_NPC_BEHAVIOR_REMOTE_SHIELD)));
+    assert!(supported(i64::from(crate::consts::EFFECT_NPC_REMOTE_HULL_REPAIRER)));
+    assert!(!supported(i64::from(crate::consts::EFFECT_ANCILLARY_REMOTE_ARMOR_REPAIRER)));
+    assert!(!supported(i64::from(crate::consts::EFFECT_MUTADAPTIVE_REMOTE_ARMOR_REPAIRER)));
+}
+
+mod db_smoke;

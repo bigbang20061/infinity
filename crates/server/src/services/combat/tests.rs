@@ -1,6 +1,8 @@
 use super::*;
 use crate::space::{event, System};
 
+mod remote_repair_db;
+
 #[test]
 fn npc_missile_uses_both_effective_multipliers() {
     assert_eq!(npc_missile_kinematics(3000.0, 5000.0, 1.0, 1.0), (3000.0, 15000.0));
@@ -175,7 +177,7 @@ async fn condition_persists_recharges_and_rollback_preserves_all_layers() {
     let levels = [stats.max[0] * 0.25, stats.max[1] - 3.0, stats.max[2] - 2.0];
     state().condition.insert(ship, Condition { stats: stats.clone(), now: levels, shield_at: filetime_now() });
     assert_eq!(damage_player(&db, &world, -1, ship, owner, [100.0; 4], None).await.ok(), Some(0.0));
-    assert!(repair_player(&db, &world, -1, ship, owner, 1, 1.0).await.is_ok());
+    assert!(repair_player(&db, &world, -1, ship, owner, 1, 1.0, |_| true).await.is_ok());
     assert_eq!(state().condition[&ship].now, levels);
     assert!(save_condition(&db, ship).await.is_ok());
     let rows = dogma::overrides(&db, ship).await.unwrap();

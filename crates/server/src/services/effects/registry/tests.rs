@@ -27,6 +27,18 @@ fn supported_numeric_effects_and_unknown() {
 }
 
 #[test]
+fn remote_repair_effects_select_their_health_layer() {
+    for (id, layer) in [
+        (EFFECT_REMOTE_SHIELD_BOOSTER, 0), (EFFECT_REMOTE_ARMOR_REPAIRER, 1),
+        (EFFECT_REMOTE_HULL_REPAIRER, 2), (EFFECT_ANCILLARY_REMOTE_SHIELD_BOOSTER, 0),
+        (EFFECT_ANCILLARY_REMOTE_ARMOR_REPAIRER, 1), (EFFECT_MUTADAPTIVE_REMOTE_ARMOR_REPAIRER, 1),
+        (EFFECT_NPC_BEHAVIOR_REMOTE_SHIELD, 0), (EFFECT_NPC_BEHAVIOR_REMOTE_ARMOR, 1),
+    ] {
+        assert_eq!(classify(id, false), Some(EffectKind::RemoteRepair { layer }));
+    }
+}
+
+#[test]
 fn activation_scope_rejects_unsupported_launchers_and_non_modules() {
     let module = i64::from(CATEGORY_MODULE);
     for group in [GROUP_MISSILE_LAUNCHER_FESTIVAL, GROUP_BUBBLE_PROBE_LAUNCHER, GROUP_BOMB_LAUNCHER,

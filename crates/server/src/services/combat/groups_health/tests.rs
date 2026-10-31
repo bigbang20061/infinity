@@ -1,3 +1,4 @@
+//! Health and capacitor boundary tests without a database or running system actor.
 use super::*;
 use crate::dao::items::creation;
 
@@ -41,4 +42,58 @@ fn refused_cycle_drain_leaves_stored_state_untouched() {
     let result = mutate(&mut entries, 1, 100.0, 1000.0, 0, Operation::RefuseDrain(30.0));
     assert_eq!(result.amount, 0.0);
     assert_eq!(entries.get(&1), Some(&(20.0, 0)));
+}
+
+#[test]
+fn npc_repairs_are_layer_isolated_bounded_and_never_resurrect() {
+    let mut hp = Hp { now: [20.0, 30.0, 40.0], max: [100.0; 3], resonance: [[1.0; 4]; 3] };
+    assert_eq!(repair_npc_hp(&mut hp, 1, 25.0), Some([0.2, 0.55, 0.4]));
+    assert_eq!(hp.now, [20.0, 55.0, 40.0]);
+    assert_eq!(repair_npc_hp(&mut hp, 1, f64::MAX), Some([0.2, 1.0, 0.4]));
+    for (layer, amount) in [(3, 1.0), (0, -1.0), (0, f64::NAN), (0, f64::INFINITY), (1, 1.0)] {
+        assert!(repair_npc_hp(&mut hp, layer, amount).is_none());
+    }
+    assert_eq!(hp.now, [20.0, 100.0, 40.0]);
+    hp.now[2] = 0.0;
+    assert!(repair_npc_hp(&mut hp, 2, 50.0).is_none());
+    assert_eq!(hp.now[2], 0.0);
+}
+
+#[test]
+fn npc_fraction_uses_cached_layer_and_defaults_to_full() {
+    let ball = Ball {
+        id: -8_736_421, type_id: 1, owner_id: 1, corp_id: 1, alliance_id: -1,
+        char_id: None, signature_radius: None, mode: crate::space::MODE_STOP,
+        radius: 1.0, mass: 1.0, max_vel: 0.0, agility: 1.0, speed_fraction: 0.0,
+        pos: [0.0; 3], vel: [0.0; 3], old_pos: [0.0; 3], old_vel: [0.0; 3],
+        segment_acceleration: None, goto: [0.0; 3], follow_id: 0, follow_range: 0.0,
+        free: true, global: false, massive: true, interactive: false,
+        warp: crate::space::WarpState::default(), warp_factor: 0, last_ms: 0,
+        interpolation_anchor_ms: 0, effect_stamp: 0, cloak: 0, cloak_until: 0,
+        health: [1.0; 3], launcher: 0, slim: Vec::new(),
+    };
+    assert_eq!(npc_health_fraction(&ball, 0), Some(1.0));
+    assert_eq!(npc_health_fraction(&ball, 3), None);
+    state().hp.insert(ball.id, Hp { now: [25.0, 150.0, 50.0], max: [100.0; 3], resonance: [[1.0; 4]; 3] });
+    assert_eq!(npc_health_fraction(&ball, 0), Some(0.25));
+    assert_eq!(npc_health_fraction(&ball, 1), Some(1.0));
+    state().hp.remove(&ball.id);
+}
+
+#[test]
+fn concurrent_npc_damage_does_not_overwrite_cached_updates() {
+    let target = i64::MIN + 205;
+    state().hp.remove(&target);
+    std::thread::scope(|scope| {
+        for _ in 0..2 {
+            scope.spawn(|| {
+                for _ in 0..100 {
+                    damage_npc_cached(target, || Hp {
+                        now: [1000.0; 3], max: [1000.0; 3], resonance: [[1.0; 4]; 3],
+                    }, [1.0, 0.0, 0.0, 0.0]);
+                }
+            });
+        }
+    });
+    assert_eq!(state().hp.remove(&target).unwrap().now[0], 800.0);
 }
