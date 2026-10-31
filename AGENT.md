@@ -240,6 +240,7 @@ Stay inside the existing ranges, and pick a fresh, non-overlapping range for any
 | Player characters | 90,000,000 | `game.characters_character_id_seq` |
 | Player corporations | 98,000,000 | `game.corporations_corporation_id_seq` |
 | Player items | 1,000,000,000,000 | `game.items_item_id_seq` |
+| Trade containers | 1,000,000,000,000 (shared with player items) | `game.items_item_id_seq`: a trade's ID comes from the item sequence, so it never collides with an item ID |
 | Spawned NPCs (temporary) | 9,000,000,000,000 | `missions::NEXT_NPC_ID` |
 | Exploration sites and wormholes | 9,500,000,000,000 | `game.exploration_site_seq` |
 | Probes (temporary) | 9,600,000,000,000 | `exploration::NEXT_PROBE_ID` |
