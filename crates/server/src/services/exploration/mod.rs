@@ -436,27 +436,27 @@ pub async fn launch_probes(c: &mut Client, call: &Call<'_>) -> CallResult {
 /// A pilot is warping to `belt`: unless disabled, its rats are still about, or it
 /// was cleared within the configured respawn delay, the region's pirates spawn.
 /// Other celestials and wormhole space get none.
-pub async fn belt_rats(c: &mut Client, system: i64, belt: i64, center: V3) -> Result<(), CallError> {
+pub async fn belt_rats(db: &Db, world: &Arc<World>, user_id: i64, system: i64, belt: i64, center: V3) -> Result<(), CallError> {
     if !crate::config::game().npc.belt_rats || state().belts.contains(&belt) {
         return Ok(());
     }
-    let is_belt = c.world.sde().map.celestial(belt).is_some_and(|body| body.group_id == Some(i64::from(GROUP_ASTEROID_BELT)));
-    let info = system_info(c.world.sde(), system)?;
+    let is_belt = world.sde().map.celestial(belt).is_some_and(|body| body.group_id == Some(i64::from(GROUP_ASTEROID_BELT)));
+    let info = system_info(world.sde(), system)?;
     if !is_belt || (1..=6).contains(&info.class) || !state().belts.insert(belt) {
         return Ok(());
     }
     let faction = pirate_faction(info.faction, info.region);
     let groups: Vec<String> = belt_classes(info.security).iter().map(|class| format!("{} {class}", rat_prefix(faction))).collect();
     let [min, max] = crate::config::game().npc.belt_spawn_range_m;
-    let spawned = match spawn_rats(c, system, center, faction, &groups, (min as f64, max as f64)).await {
+    let spawned = match spawn_rats(db, world, system, center, faction, &groups, (min as f64, max as f64)).await {
         Ok(s) => s,
         Err(e) => {
             state().belts.remove(&belt);
             return Err(e);
         }
     };
-    info!(user = c.login.user_id, "belt {belt} in {system}: spawned {} rats", spawned.len());
-    c.world.post(system, move |s| {
+    info!(user = user_id, "belt {belt} in {system}: spawned {} rats", spawned.len());
+    world.post(system, move |s| {
         s.spawn_group(spawned, move |s| {
             s.schedule(seconds_to_ms(crate::config::game().npc.belt_rat_respawn_secs as f64), move |_| {
                 state().belts.remove(&belt);
@@ -509,10 +509,10 @@ pub async fn warp_to_scan(c: &mut Client, target: &str, min_range: f64) -> CallR
         }
     } else if site.is_hack_site() {
         if site.containers.is_none() {
-            spawn_containers(c, &site).await?;
+            spawn_containers(&c.db, &c.world, c.login.user_id, &site).await?;
         }
     } else if site.npcs.is_none() && site.dungeon_id.is_some() {
-        spawn_site_npcs(c, &site).await?;
+        spawn_site_npcs(&c.db, &c.world, c.login.user_id, &site).await?;
     }
     super::ship::warp_to(c, None, site.pos, min_range)
 }

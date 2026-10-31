@@ -85,7 +85,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             };
             // Warping to an asteroid belt brings out its rats.
             if let (Ok(_), false, Some(system)) = (&warped, by_pilot, c.session.int("solarsystemid")) {
-                if let Err(e) = crate::services::exploration::belt_rats(c, system, id, pos).await {
+                if let Err(e) = crate::services::exploration::belt_rats(&c.db, &c.world, c.login.user_id, system, id, pos).await {
                     warn!(user = c.login.user_id, "belt rats at {}: {}", id, crate::services::exploration::err_text(e));
                 }
             }
