@@ -1,10 +1,8 @@
 use super::*;
 use crate::space::System;
 
-#[test]
-fn missile_lifecycle_preserves_exploration_site() {
-    let mut system = System::new(0, Arc::default(), 12_345);
-    let site = Ball {
+fn ball() -> Ball {
+    Ball {
         id: 9_500_000_000_000, type_id: 1, owner_id: 1, corp_id: 1, alliance_id: -1,
         char_id: None, signature_radius: None, mode: crate::space::MODE_STOP, radius: 1.0, mass: 1.0,
         max_vel: 1.0, agility: 1.0, speed_fraction: 0.0,
@@ -13,7 +11,13 @@ fn missile_lifecycle_preserves_exploration_site() {
         follow_id: 0, follow_range: 0.0, free: true, global: false, interactive: false,
         massive: true, warp: crate::space::WarpState::default(), warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0,
         cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new(),
-    };
+    }
+}
+
+#[test]
+fn missile_lifecycle_preserves_exploration_site() {
+    let mut system = System::new(0, Arc::default(), 12_345);
+    let site = ball();
     let (site_id, site_type, site_pos) = (site.id, site.type_id, site.pos);
     let missile_id = NEXT_MISSILE_ID.fetch_add(1, Ordering::Relaxed);
     let missile = Ball {
@@ -47,3 +51,125 @@ fn hit_quality_bands() {
     assert_eq!(hit_quality(3.0), 6);
 }
 
+
+#[test]
+fn turret_native_accuracy_vectors_and_guards() {
+    let mut src = ball();
+    src.id = 1;
+    src.pos = [0.0; 3];
+    src.radius = 100.0;
+    let mut dst = ball();
+    dst.id = 2;
+    dst.radius = 10.0;
+    dst.pos = [10_000.0, 0.0, 0.0];
+    dst.vel = [0.0; 3];
+    let chance = |a: &Ball, b: &Ball, optimal, falloff, tracking| {
+        turret_chance(a, b, optimal, falloff, tracking, 400.0, 40.0)
+    };
+    assert_eq!(chance(&src, &dst, 20_000.0, 10_000.0, 0.01), 1.0);
+    dst.vel = [500.0, 0.0, 0.0];
+    assert_eq!(chance(&src, &dst, 20_000.0, 10_000.0, 0.01), 1.0);
+    dst.vel = [0.0, 10.0, 0.0];
+    assert!((chance(&src, &dst, 20_000.0, 10_000.0, 0.01) - 0.5).abs() < 1e-12);
+    dst.vel = [0.0, 500.0, 0.0];
+    assert!(chance(&src, &dst, 20_000.0, 10_000.0, 0.01) < 0.2);
+    dst.vel = [0.0; 3];
+    dst.pos[0] = 30_110.0;
+    assert!((chance(&src, &dst, 20_000.0, 10_000.0, 0.01) - 0.5).abs() < 1e-12);
+    dst.vel = [0.0, 30.11, 0.0];
+    assert!((chance(&src, &dst, 20_000.0, 10_000.0, 0.01) - 0.25).abs() < 1e-12);
+    assert!((chance(&src, &dst, 20_000.0, -10_000.0, -0.01) - 0.25).abs() < 1e-12);
+    assert!((chance(&src, &dst, 20_000.0, -10_000.0, 0.01) - 0.25).abs() < 1e-12);
+    assert!((chance(&src, &dst, 20_000.0, 10_000.0, -0.01) - 0.25).abs() < 1e-12);
+    assert_eq!(chance(&src, &dst, 20_000.0, 0.0, 0.0), 0.0);
+    assert_eq!(chance(&src, &dst, 40_000.0, 0.0, 0.0), 1.0);
+    assert_eq!(chance(&src, &dst, -1.0, 10_000.0, 0.01), 0.0);
+    dst.id = src.id;
+    assert_eq!(chance(&src, &dst, 20_000.0, 10_000.0, 0.01), 0.0);
+    dst.id = 2;
+    dst.pos = src.pos;
+    assert_eq!(chance(&src, &dst, 20_000.0, 10_000.0, 0.01), 0.0);
+}
+
+#[test]
+fn missile_application_vectors() {
+    // Scourge Light: sig_f=35/40=.875; vel_f=(.875*170/400)^.604 ≈ .550.
+    let expected = (0.875_f64 * 170.0 / 400.0).powf(0.604);
+    assert!((missile_applied(35.0, 400.0, 40.0, 170.0, 0.604) - expected).abs() < 1e-12);
+    assert!((expected - 0.550).abs() < 0.001);
+    assert_eq!(missile_applied(35.0, 0.0, 40.0, 170.0, 0.604), 0.875);
+    assert_eq!(missile_applied(35.0, 400.0, 40.0, 0.0, 0.604), 0.875);
+}
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to a dedicated test database with SDE"]
+async fn signature_uses_cached_type_and_default_values() {
+    crate::tests::init_config();
+    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = Sde::load(&db).await.unwrap();
+    let data = sde.types.iter().find(|t| t.attribute(ATTR_SIGNATURE_RADIUS).is_some_and(|v| v > 0.0))
+        .expect("SDE type with signature radius");
+    let mut target = ball();
+    target.type_id = data.type_id;
+    target.signature_radius = Some(0.0);
+    assert_eq!(target_signature(&sde, &target), data.attribute(ATTR_SIGNATURE_RADIUS).unwrap());
+    target.signature_radius = Some(42.0);
+    assert_eq!(target_signature(&sde, &target), 42.0);
+    target.type_id = -1;
+    target.signature_radius = Some(0.0);
+    assert_eq!(target_signature(&sde, &target), 100.0);
+}
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to a dedicated test database with SDE"]
+async fn missile_uses_signature_and_speed_at_impact() {
+    use crate::consts::{ATTR_SHIELD_CAPACITY, ATTR_SHIELD_EM_DAMAGE_RESONANCE, CATEGORY_ENTITY};
+    use crate::services::combat::groups_health::npc_health_fraction;
+
+    crate::tests::init_config();
+    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = Arc::new(Sde::load(&db).await.unwrap());
+    let data = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_ENTITY)
+        && t.attribute(ATTR_SHIELD_CAPACITY).is_some_and(|v| v.is_finite() && v > 0.0)
+        && t.attribute(ATTR_SHIELD_EM_DAMAGE_RESONANCE).is_some_and(|v| v.is_finite() && v > 0.0))
+        .expect("SDE NPC with shield and EM resonance");
+    let (type_id, shield, resonance) = (data.type_id, data.attribute(ATTR_SHIELD_CAPACITY).unwrap(),
+        data.attribute(ATTR_SHIELD_EM_DAMAGE_RESONANCE).unwrap());
+    let charge = sde.types.iter().next().expect("SDE charge fixture type").type_id;
+    let world = World::new(db.clone(), sde, 1);
+    let system = -31_001;
+    let target_id = -NEXT_MISSILE_ID.fetch_add(1, Ordering::Relaxed);
+    let mut source = ball();
+    source.id = target_id - 1;
+    source.pos = [0.0; 3];
+    let mut target = ball();
+    target.id = target_id;
+    target.type_id = type_id;
+    target.mode = crate::space::MODE_RIGID;
+    target.free = false;
+    target.pos = [2_000.0, 0.0, 0.0];
+    target.signature_radius = Some(200.0);
+    target.vel = [0.0; 3];
+    world.system(system).await.unwrap();
+    let inserted = target.clone();
+    world.with(system, move |s| { s.insert(inserted); }).await.unwrap();
+    let missile = Missile {
+        charge, raw: [shield * 0.25 / resonance, 0.0, 0.0, 0.0],
+        aoe_cloud: 40.0, aoe_velocity: 170.0, drf: 0.604,
+        velocity: 1_000.0, flight_range: 10_000.0, weapon: charge, attacker: None,
+    };
+    launch_missile(db, world.clone(), system, source, target, 1, None, missile).await.ok().unwrap();
+    world.with(system, move |s| s.command(target_id, |ball, _, _| {
+        ball.signature_radius = Some(35.0);
+        ball.vel = [0.0, 400.0, 0.0];
+        ball.old_vel = ball.vel;
+        ball.segment_acceleration = None;
+        vec![]
+    })).await.unwrap();
+    assert!(world.after(system, 3_000).await);
+    let fraction = world.with(system, move |s| npc_health_fraction(s.ball(target_id).unwrap(), 0).unwrap()).await.unwrap();
+    let application = (0.875_f64 * 170.0 / 400.0).powf(0.604);
+    assert!((fraction - (1.0 - 0.25 * application)).abs() < 1e-9);
+    crate::services::combat::forget_ship(target_id);
+    world.remove_ball(system, target_id).await;
+}

@@ -10,6 +10,133 @@ fn npc_missile_uses_both_effective_multipliers() {
 }
 
 #[test]
+fn npc_zero_falloff_hits_inside_optimal() {
+    use crate::services::effects::weapons::turret_chance;
+    let source = remote_repair_db::ball(1, 1, 1);
+    let target = Ball { id: 2, pos: [1000.0, 0.0, 0.0], ..source.clone() };
+    assert_eq!(turret_chance(&source, &target, 2000.0, 0.0, 0.0, 1000.0, 100.0), 1.0);
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
+async fn npc_projected_weapon_attributes_change_application() {
+    use crate::consts::{ATTR_TRACKING_SPEED, ATTR_MISSILE_ENTITY_AOE_VELOCITY_MULTIPLIER,
+        ATTR_MISSILE_ENTITY_AOE_CLOUD_SIZE_MULTIPLIER, CATEGORY_ENTITY};
+    use crate::services::effects::{projection::Projection, weapons::{missile_applied, turret_chance, Missile}, EffectKind, JammingType};
+
+    crate::tests::init_config();
+    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = Arc::new(Sde::load(&db).await.unwrap());
+    let npc = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_ENTITY)
+        && t.attribute(ATTR_TRACKING_SPEED).is_some_and(|v| v > 0.0))
+        .expect("NPC with tracking").type_id;
+    let effect = sde.dogma.effects_by_name("npcEntityWeaponDisruptor").next()
+        .expect("NPC weapon disruption effect");
+    let attributes = [ATTR_TRACKING_SPEED, ATTR_MISSILE_ENTITY_AOE_VELOCITY_MULTIPLIER,
+        ATTR_MISSILE_ENTITY_AOE_CLOUD_SIZE_MULTIPLIER];
+    let values = attributes.map(|attribute| {
+        let modifier = effect.modifiers().iter().find(|m| m.modified == attribute
+            && m.target_category == Some(CATEGORY_ENTITY) && m.domain == "targetID")
+            .expect("entity weapon disruption modifier");
+        (modifier.modifying, if attribute == ATTR_MISSILE_ENTITY_AOE_CLOUD_SIZE_MULTIPLIER { 100.0 } else { -50.0 })
+    });
+    let baseline = Fit::for_space_type(sde.clone(), npc, Vec::new());
+    let projected = Fit::for_space_type(sde.clone(), npc, vec![Projection {
+        source_ship: 10, source_module: 11, source_type: npc, effect_id: effect.effect_id,
+        kind: EffectKind::Projected { jamming: JammingType::Webify }, until_ms: i64::MAX,
+        values: values.to_vec(), charge_values: Vec::new(), charge_type: None,
+    }]);
+    let base_tracking = baseline.value(Key::Ship, ATTR_TRACKING_SPEED);
+    let tracking = projected.value(Key::Ship, ATTR_TRACKING_SPEED);
+    assert!((tracking / base_tracking - 0.5).abs() < 1e-9);
+    let source = remote_repair_db::ball(1, npc, 1);
+    let target = Ball { id: 2, pos: [1000.0, 0.0, 0.0],
+        vel: [0.0, base_tracking * 100.0, 0.0], ..source.clone() };
+    let chance = |tracking| turret_chance(&source, &target, 2000.0, 0.0, tracking, 1000.0, 100.0);
+    assert!(chance(tracking) < chance(base_tracking));
+
+    let cloud = baseline.value(Key::Ship, ATTR_MISSILE_ENTITY_AOE_CLOUD_SIZE_MULTIPLIER);
+    let velocity = baseline.value(Key::Ship, ATTR_MISSILE_ENTITY_AOE_VELOCITY_MULTIPLIER);
+    assert!(cloud > 0.0 && velocity > 0.0);
+    let missile = Missile { charge: 1, raw: [1.0; 4],
+        aoe_cloud: 40.0 * projected.value(Key::Ship, ATTR_MISSILE_ENTITY_AOE_CLOUD_SIZE_MULTIPLIER),
+        aoe_velocity: 170.0 * projected.value(Key::Ship, ATTR_MISSILE_ENTITY_AOE_VELOCITY_MULTIPLIER),
+        drf: 0.604, velocity: 1.0, flight_range: 1.0, weapon: npc, attacker: None };
+    assert!((missile.aoe_cloud / (40.0 * cloud) - 2.0).abs() < 1e-9);
+    assert!((missile.aoe_velocity / (170.0 * velocity) - 0.5).abs() < 1e-9);
+    let applied = missile_applied(35.0, 400.0, missile.aoe_cloud, missile.aoe_velocity, missile.drf);
+    let unmodified = missile_applied(35.0, 400.0, 40.0 * cloud, 170.0 * velocity, missile.drf);
+    assert!(applied < unmodified);
+
+    // Non-free balls retain velocity, so impact-time application is deterministic.
+    let charge = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_CHARGE)
+        && t.attribute(ATTR_AOE_CLOUD_SIZE).is_some_and(|v| v > 0.0)
+        && t.attribute(crate::consts::ATTR_AOE_VELOCITY).is_some_and(|v| v > 0.0)
+        && ATTR_DAMAGE.iter().any(|&a| t.attribute(a).is_some_and(|v| v > 0.0)))
+        .expect("damaging missile charge").type_id;
+    let system = -481_000;
+    let (shooter_id, target_id, projector_id) = (-481_001, -481_002, -481_003);
+    let world = World::new(db.clone(), sde.clone(), 1);
+    let mut shooter = remote_repair_db::ball(shooter_id, npc, 1);
+    shooter.char_id = None;
+    let mut victim = remote_repair_db::ball(target_id, npc, 1);
+    victim.char_id = None;
+    victim.pos = [1.0, 0.0, 0.0];
+    victim.vel = [0.0, 1e5, 0.0];
+    victim.signature_radius = Some(1.0);
+    world.add_ship(system, shooter.clone()).await.unwrap();
+    world.add_ship(system, victim.clone()).await.unwrap();
+    let mut projector = shooter.clone();
+    projector.id = projector_id;
+    world.add_ship(system, projector).await.unwrap();
+    let mut stats = npc_stats(&db, &sde, npc).await.ok().unwrap();
+    stats.damage = [1.0, 0.0, 0.0, 0.0];
+    stats.opt_sig = 1000.0;
+    stats.missile = None;
+    stats.fx = None;
+    let reset_hp = || {
+        state().hp.insert(target_id, Hp { now: [1e6; 3], max: [1e6; 3], resonance: [[1.0; 4]; 3] });
+    };
+    let remaining = || state().hp[&target_id].now[0];
+    let modifier_ids = values.map(|v| v.0);
+    let effect_id = effect.effect_id;
+    let set_projection = |tracking, explosion_velocity, explosion_radius| {
+        let world = world.clone();
+        async move {
+            let p = Projection {
+                source_ship: projector_id, source_module: projector_id, source_type: npc, effect_id,
+                kind: EffectKind::Projected { jamming: JammingType::Webify }, until_ms: i64::MAX,
+                values: vec![(modifier_ids[0], tracking), (modifier_ids[1], explosion_velocity),
+                    (modifier_ids[2], explosion_radius)],
+                charge_values: Vec::new(), charge_type: None,
+            };
+            world.with(system, move |s| s.upsert_projection(shooter_id, p)).await.unwrap();
+        }
+    };
+    reset_hp();
+    set_projection(0.0, 0.0, 0.0).await;
+    npc_shot(&db, &world, system, shooter_id, npc, &stats, shooter.clone(), victim.clone()).await.ok().unwrap();
+    assert_eq!(remaining(), 1e6, "unprojected tracking must miss the fast transverse target");
+    set_projection(-100.0, 0.0, 0.0).await;
+    npc_shot(&db, &world, system, shooter_id, npc, &stats, shooter.clone(), victim.clone()).await.ok().unwrap();
+    assert!(remaining() < 1e6, "zero projected tracking uses the NPC angular-term deviation");
+
+    stats.damage = [0.0; 4];
+    stats.missile = Some((charge, 0.001));
+    let mut dealt = Vec::new();
+    for (velocity_bonus, radius_bonus) in [(0.0, 0.0), (-50.0, 0.0), (0.0, 100.0)] {
+        reset_hp();
+        set_projection(0.0, velocity_bonus, radius_bonus).await;
+        npc_shot(&db, &world, system, shooter_id, npc, &stats, shooter.clone(), victim.clone()).await.ok().unwrap();
+        assert!(world.after(system, 2000).await);
+        dealt.push(1e6 - remaining());
+    }
+    assert!(dealt[0] > 0.0 && dealt[1] < dealt[0] && dealt[2] < dealt[0],
+        "missile impact must consume each projected explosion multiplier: {dealt:?}");
+    state().hp.remove(&target_id);
+}
+
+#[test]
 fn reload_reservations_share_stacks_in_order_without_overdraw() {
     let item = |id, type_id, quantity| crate::dao::items::loading::Item {
         item_id: id, type_id, owner_id: 1, location_id: 2, flag_id: FLAG_CARGO,

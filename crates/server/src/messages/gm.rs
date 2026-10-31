@@ -109,6 +109,16 @@ pub(crate) fn gm_effects_unsupported(effects: &[(String, i32)]) -> String {
     effects.iter().map(|(name, type_id)| format!("{name}（类型 ID：{type_id}）")).collect::<Vec<_>>().join("\n")
 }
 
+/// Native turret accuracy diagnostic.
+pub(crate) const GM_HELP_HITCHANCE: &str = "/hitchance <目标ID> — 查看炮台命中率及计算输入";
+pub(crate) const GM_HITCHANCE_USAGE: &str = "用法：/hitchance <目标ID>";
+pub(crate) const GM_HITCHANCE_UNDOCK: &str = "请先驾驶飞船离开空间站。";
+pub(crate) const GM_HITCHANCE_MISSING_BALL: &str = "当前飞船或目标不在当前星系中。";
+pub(crate) const GM_HITCHANCE_EMPTY: &str = "当前飞船没有装配炮台。";
+pub(crate) fn gm_hitchance_row(item: i64, type_id: i32, center: f64, surface: f64, speed: f64, angular: f64, angular_squared: f64, tracking: f64, opt_sig: f64, target_sig: f64, optimal: f64, falloff: f64, chance: f64) -> String {
+    format!("炮台物品 {item}，类型 {type_id}：中心距离={center:.17e}，表面距离={surface:.17e}，相对速度={speed:.17e}，角速度={angular:.17e}，角速度平方={angular_squared:.17e}，追踪速度={tracking:.17e}，炮台信号半径={opt_sig:.17e}，目标信号半径={target_sig:.17e}，最佳射程={optimal:.17e}，失准范围={falloff:.17e}，命中率={chance:.17e}")
+}
+
 // GM per-item dogma overrides.
 pub(crate) const GM_HELP_DOGMA: &str = "/dogma <ship|物品ID|flag:N> <属性ID|名称> [数值|reset]；/dogma <目标> list";
 pub(crate) const GM_DOGMA_USAGE: &str = "用法：/dogma <ship|物品ID|flag:N> <属性ID|名称> [数值|reset]，或 /dogma <目标> list。";

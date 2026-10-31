@@ -142,7 +142,7 @@ while its running cycle remains owned until the normal stop publishes the real
 stop notification and performs its teardown. Ordinary deactivation continues
 to affect Fit until the cycle ends.
 
-The deterministic D7 range multiplier uses sampled surface distance: strength
+The deterministic projection range multiplier uses sampled surface distance: strength
 is 1 through inclusive optimal, then `0.5^(((distance - optimal) / falloff)^2)`.
 Optimal is clamped to zero; non-positive falloff is a step to zero beyond
 optimal, and non-finite inputs yield zero. This is strength scaling, not a hit
@@ -153,13 +153,11 @@ lost projection. Drone gameplay and new drone RPCs are not supplied. No
 real-client walkthrough is claimed by this documentation.
 
 NPC shots snapshot incoming projections from the actor and evaluate their type
-with the same Fit evaluator. Turret optimal and falloff, and missile velocity
-and flight-time multipliers, affect NPC weapon reach. Tracking speed and the
-missile explosion velocity and cloud-size multipliers are evaluated but are not
-yet consumed by NPC hit or missile application math; PR11 owns that application.
-Missing turret range attributes retain the existing NPC fallbacks. Missile
-multipliers use the type or dogma metadata default, falling back to one if
-neither exists.
+with the same Fit evaluator. Turret optimal, falloff and tracking, and missile
+velocity, flight-time, explosion velocity and cloud-size multipliers are consumed
+by NPC weapons. Missing turret range attributes retain the existing NPC
+fallbacks. Missile multipliers use the type or dogma metadata default, falling
+back to one if neither exists.
 
 Sensor damping refreshes NPC scan resolution and dogma maximum target range
 under the projection revision guard. The latter is enforced when the type
@@ -168,6 +166,32 @@ the AI aggro range. Removing a
 projection restores the base values. An existing target outside the refreshed
 limit is lost; a pending lock retains its original deadline, while later attempts
 use the refreshed scan resolution.
+
+## Weapon accuracy and application
+
+Turret accuracy follows native `Ballpark.cpp` `GetAccuracy`: with center
+distance `d`, relative position `r`, relative velocity `v`, surface distance
+`s = max(0, d - sourceRadius - targetRadius)`, and angular speed `ω` derived
+from relative motion, the chance is `0.5^((ω * optimalSigRadius / (tracking * targetSig))² +
+(max(0, s - optimal) / falloff)²)`. Identical balls, missing balls, negative
+optimal and zero center distance yield no hit. Two deliberate NPC-compatible
+deviations handle missing or zero stats: zero falloff is a step (zero
+range term inside optimal, a miss outside), and zero tracking omits the
+angular term. Target signature uses the positive cached ball value, then its
+type's signature, then the SDE attribute default.
+
+Missile application at impact uses target absolute speed and signature:
+`sig_f = signature / max(aoeCloudSize, 1)`, and
+`vel_f = (sig_f * aoeVelocity / speed)^aoeDamageReductionFactor`;
+damage fraction is `min(1, sig_f, vel_f)`. Zero speed or zero explosion
+velocity sets `vel_f` to one. The impact samples the target once.
+
+GMs can use `/hitchance <targetID>` to inspect each fitted turret's item and
+type IDs, center and surface distances, relative speed, angular speed and its
+squared value, fitted tracking, optimal signature, target signature, optimal, falloff and resulting
+chance. Values have at least 17 significant digits for hand evaluation of the
+native formula. Both balls are sampled together, and the source Fit includes
+incoming projections. This is a diagnostic, not a client UI comparison or a shot.
 
 ## SDE and Python modifiers
 

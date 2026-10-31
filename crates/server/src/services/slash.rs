@@ -21,7 +21,7 @@
 //! and exploration commands delegate to their owning services and game data.
 //! Durable job inspection and control use `game.jobs`; job payloads are not displayed.
 //! Listings are limited to 50 rows; full help remains available. Teleport
-//! extensions and hit-chance administration are not supported here.
+//! extensions are not supported here. Hit-chance diagnostics use live space snapshots.
 
 use super::{db_err, Call, CallError, CallResult};
 use super::sql_pattern::matches_pattern;
@@ -41,6 +41,7 @@ mod combat;
 mod social;
 mod info;
 mod wormholes;
+mod hitchance;
 
 /// Server design: clearance in metres when teleporting to an item.
 const TELEPORT_CLEARANCE: f64 = 5000.0;
@@ -71,6 +72,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("dogma", messages::gm::GM_HELP_DOGMA),
     ("jobs", messages::scheduler::HELP),
     ("effects", messages::gm::GM_HELP_EFFECTS),
+    ("hitchance", messages::gm::GM_HELP_HITCHANCE),
     ("giveskill", messages::gm::GM_HELP_GIVESKILL),
     ("allskills", messages::gm::GM_HELP_ALLSKILLS),
     ("removeskill", messages::gm::GM_HELP_REMOVESKILL),
@@ -338,6 +340,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "dogma" => dogma::command(c, args).await,
         "jobs" => jobs::command(&c.db, args).await,
         "effects" => effects::command(args),
+        "hitchance" => hitchance::command(c, args).await,
         "giveskill" | "allskills" | "removeskill" | "givestarterskills" => skills::command(c, &command, args).await,
         // eve/devtools/script/svc_slash.py:1310-1313 passes this item ID to ship.Board.
         "spawn" => return Some(items::spawn(c, args).await.map(Value::Int)),

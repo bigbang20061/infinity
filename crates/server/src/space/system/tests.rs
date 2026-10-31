@@ -86,6 +86,34 @@ fn completed_segment_samples_use_shared_drag_and_clamp() {
 }
 
 #[test]
+fn sampled_ball_uses_accelerating_segment_state_at_actor_clock() {
+    let mut s = System::new(0, Arc::default(), 1_000);
+    let mut moving = ball(1, None, 5.0);
+    moving.vel = [10.0, 2.0, 0.0];
+    moving.speed_fraction = 1.0;
+    moving.goto_direction([1.0, 0.0, 0.0]);
+    s.insert(moving);
+    s.tick(2_000);
+    let source = s.ball(1).unwrap().clone();
+    let acceleration = source.segment_acceleration.unwrap();
+    assert_ne!(acceleration, [0.0; 3]);
+    let expected = integrate(source.old_pos, source.old_vel, acceleration,
+        source.mass * source.agility as f64, DESTINY_FRICTION, 0.0, 0.5);
+    assert_eq!(source.state_at(2_500), expected);
+    assert_eq!(source.position_at(2_500), expected.0);
+    assert_eq!(source.state_at(2_000), (source.old_pos, source.old_vel));
+    assert_eq!(source.state_at(3_000), (source.pos, source.vel));
+    s.tick(2_500);
+    let sampled = s.sampled_ball(1).unwrap();
+    assert_eq!((sampled.pos, sampled.vel), expected);
+    assert_ne!(sampled.vel, source.vel);
+    let unchanged = s.ball(1).unwrap();
+    assert_eq!((unchanged.pos, unchanged.vel, unchanged.old_pos, unchanged.old_vel, unchanged.segment_acceleration),
+        (source.pos, source.vel, source.old_pos, source.old_vel, source.segment_acceleration));
+    assert!(s.sampled_ball(99).is_none());
+}
+
+#[test]
 fn static_modes_stay_fixed() {
     let positions = HashMap::new();
     let mut fixed = ball(2, None, 7.0);
