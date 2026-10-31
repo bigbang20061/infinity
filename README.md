@@ -55,6 +55,7 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
   - labels for personal contacts
   - LP store offers that cost Analysis Kredits: they are listed, but buying one is refused
   - module heat damage from overheating, and repairs at structures
+  - loot rights: any pilot whose ship is within 2,500 m of a wreck or cargo container in space can take from it, and taking from someone else's does not make the pilot a suspect
 - Some runtime state lives only in memory and is lost when the server restarts:
   - fleets, combat and Crimewatch timers, and in-progress hacking; a suspect flag from an activated kill right is the exception and is restored with its original deadline;
   - everything spawned into space (NPCs, wrecks, scheduled effects);
