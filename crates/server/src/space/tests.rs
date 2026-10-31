@@ -1,4 +1,21 @@
 use super::*;
+
+#[test]
+fn integrate_zero_time_preserves_state_before_division() {
+    let position = [1.0, -2.0, 3.0];
+    let velocity = [4.0, 5.0, -6.0];
+    assert_eq!(integrate(position, velocity, [1.0; 3], 0.0, 0.0, 0.0), (position, velocity));
+}
+
+#[test]
+fn integrate_taylor_low_drag_approaches_linear_motion() {
+    let velocity = [2.0, -3.0, 4.0];
+    let (position, actual_velocity) = integrate([0.0; 3], velocity, [0.0; 3], 1.0, 1e-11, 1.0);
+    for i in 0..3 {
+        assert!((position[i] - velocity[i]).abs() < 1e-9);
+        assert!((actual_velocity[i] - velocity[i]).abs() < 1e-9);
+    }
+}
 #[test]
 fn seconds_to_milliseconds_preserves_fractions() {
     assert_eq!(seconds_to_ms_f64(0.0015), 1.5);
@@ -15,3 +32,104 @@ fn lock_time_clamps_floors_and_calculates_interior() {
     let expected = (40_000.0 / (200.0 * 50.0_f64.asinh().powi(2)) * 1000.0) as u64;
     assert_eq!(lock_time_ms(200.0, 50.0), expected);
 }
+
+fn effect_stamp_balls() -> (Ball, Ball) {
+    let missile = Ball {
+        id: 123, type_id: 456, owner_id: 789, corp_id: 12, alliance_id: 34,
+        char_id: None, mode: MODE_MISSILE, radius: 2.5, signature_radius: None,
+        mass: 10.0, max_vel: 20.0, agility: 0.5, speed_fraction: 0.75,
+        pos: [1.0, 2.0, 3.0], vel: [4.0, 5.0, 6.0], goto: [7.0, 8.0, 9.0],
+        old_pos: [1.0, 2.0, 3.0], old_vel: [4.0, 5.0, 6.0], segment_target: None, segment_warp: None,
+        follow_id: 987, follow_range: 42.0, free: true, global: false, massive: false, interactive: false,
+        warp: None, warp_factor: 3, last_ms: 1_234_567, interpolation_anchor_ms: 1_234_567, effect_stamp: 1_234, cloak: 0, cloak_until: 0,
+        health: [1.0; DAMAGE_LAYER_COUNT], launcher: 654, slim: vec![],
+    };
+    let mut warp = missile.clone();
+    warp.mode = MODE_WARP;
+    warp.interactive = true;
+    warp.warp = Some(Warp {
+        from: [1.0, 2.0, 3.0], to: [7.0, 8.0, 9.0],
+        start: 2_345_678, duration: 5000.0, factor: 3,
+    });
+    warp.effect_stamp = 2_345;
+    (missile, warp)
+}
+
+#[test]
+fn missile_and_warp_wire_bytes_match_explicit_interactivity() {
+    let (missile, warp) = effect_stamp_balls();
+    for (ball, expected) in [
+        (missile, "7b000000000000000500002040000000000000f03f0000000000000040000000000000084001000000000000244000ffffffffffffffff0c000000220000000000a0410000000000001040000000000000144000000000000018400000003f0000403fffdb03000000000000000028428e02000000000000d20400000000000000001c4000000000000020400000000000002240"),
+        (warp, "7b000000000000000300002040000000000000f03f0000000000000040000000000000084009000000000000244000ffffffffffffffff0c000000220000000000a0410000000000001040000000000000144000000000000018400000003f0000403fff0000000000001c4000000000000020400000000000002240290900008039422edcc8244000000000000000000300000000000000"),
+    ] {
+        let mut bytes = Vec::new();
+        ball.write(&mut bytes);
+        let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(hex, expected);
+    }
+}
+
+#[test]
+fn wire_interactivity_is_independent_of_free() {
+    let (mut ball, _) = effect_stamp_balls();
+    ball.global = true;
+    ball.massive = true;
+    for free in [false, true] {
+        ball.free = free;
+        ball.mode = if free { MODE_STOP } else { MODE_RIGID };
+        ball.interactive = false;
+        let mut noninteractive = Vec::new();
+        ball.write(&mut noninteractive);
+        ball.interactive = true;
+        let mut interactive = Vec::new();
+        ball.write(&mut interactive);
+
+        let flag_offset = 8 + 1 + 4 + 3 * 8;
+        let other_flags = FLAG_GLOBAL | FLAG_MASSIVE | if free { FLAG_FREE } else { 0 };
+        assert_eq!(noninteractive[flag_offset], other_flags);
+        assert_eq!(interactive[flag_offset], other_flags | FLAG_INTERACTIVE);
+        noninteractive[flag_offset] |= FLAG_INTERACTIVE;
+        assert_eq!(interactive, noninteractive);
+    }
+}
+
+#[test]
+fn goto_direction_stores_absolute_point_and_serializes_it() {
+    let (_, mut ball) = effect_stamp_balls();
+    ball.pos = [1e16, 2e16, 3e16];
+    ball.goto_direction([0.0, 3.0, 0.0]);
+    assert_eq!(ball.mode, MODE_GOTO);
+    assert!(ball.warp.is_none());
+    assert_eq!(ball.goto, [1e16, 1.2e17, 3e16]);
+    let mut bytes = Vec::new();
+    ball.write(&mut bytes);
+    let expected: Vec<u8> = ball.goto.iter().flat_map(|c| c.to_le_bytes()).collect();
+    assert_eq!(&bytes[bytes.len() - expected.len()..], expected);
+
+    ball.goto_direction([0.0, 1e-10, 0.0]);
+    assert_eq!(ball.goto, [1e16, 1.2e17, 3e16]);
+    ball.goto_direction([0.0; 3]);
+    assert_eq!(ball.goto, ball.pos);
+}
+
+#[test]
+fn goto_tick_steers_toward_absolute_point_and_zero_has_no_thrust() {
+    let (_, mut ball) = effect_stamp_balls();
+    ball.pos = [1e16, 2e16, 3e16];
+    ball.vel = [0.0; 3];
+    ball.goto_direction([0.0, -2.0, 0.0]);
+    ball.evolve(ball.last_ms + 1000, 1000, &HashMap::new());
+    let target = ball.segment_target.unwrap();
+    assert_eq!(target[0], 0.0);
+    assert!((target[1] + 15.0).abs() < 1e-12);
+    assert_eq!(target[2], 0.0);
+
+    ball.vel = [0.0; 3];
+    ball.goto_direction([0.0; 3]);
+    ball.evolve(ball.last_ms + 1000, 2000, &HashMap::new());
+    assert_eq!(ball.segment_target, Some([0.0; 3]));
+    assert_eq!(ball.vel, [0.0; 3]);
+}
+
+mod destiny_reference;
+

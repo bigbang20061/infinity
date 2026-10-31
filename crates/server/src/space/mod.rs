@@ -1,23 +1,31 @@
-//! Solar systems in space: a server-side ballpark per system, destiny binary state
-//! and event broadcasting. `eve/client/script/remote/michelle.py:491-532` consumes
-//! destiny updates; `eve/client/script/parklife/autopilot.py:260-261,329-332`
-//! consumes gate jump destinations.
+//! Per-system ball state, destiny wire snapshots and event broadcasting.
+//! `eve/client/script/remote/michelle.py:491-532` consumes destiny updates;
+//! `eve/client/script/parklife/autopilot.py:260-261,329-332` consumes gate
+//! destinations. The binary layout follows carbonengine destiny `Thunkers.cpp`
+//! WriteBallToStream, and warp constants refer to `Ballpark.cpp` SetupWarpConstants.
 //!
-//! Inherited native attributions for the binary format and warp phases are
-//! carbonengine destiny `Thunkers.cpp` WriteBallToStream and `Ballpark.cpp`
-//! SetupWarpConstants. Those native sources and `IDstConstants.h` are not present
-//! in the decoded Python tree; its consumers do not validate the byte layout or
-//! native constants. The server integrates movement with exponential velocity
-//! approach (tau = mass * agility / 1e6) and warp phases; this is not a claim of
-//! complete client simulation parity.
+//! Celestials come from the SDE; dynamic balls and timers are transient. Changed
+//! pilot positions are periodically saved to `game.items` and flushed at shutdown.
+//! Only player-piloted ships set the explicit interactive ball field.
 //!
-//! Celestials come from the SDE; dynamic balls stay in memory. Each system
-//! owns an actor with a 100 ms tick and closure messages. Destiny stamps remain
-//! whole seconds. NPC decisions, spawn groups and closure timers live in the actor;
-//! NPC combat effects run sequentially and deferred jobs concurrently outside it.
-//! Timers fire on ticks in deadline and scheduling order; timers are not persistent.
-//! Changed pilot positions are periodically saved to game.items and flushed at shutdown.
-//! Other dynamic ball state is not persisted here.
+//! The actor runs wall-aligned 100 ms housekeeping, timers and NPC decisions;
+//! ball kinetics advance in fixed one-second steps. The actor-owned `current_time`
+//! is the integer destiny stamp: an action enqueued at C is stamped C and applied
+//! at the next boundary before evolution to C+1. Wire snapshots use whole integer
+//! stamps. Between boundaries `Ball::position_at`, `System::sample_position` and
+//! `System::sampled_ball` sample the completed segment from its old state and
+//! frozen inputs, using the same native `Ballpark::Integrate` arithmetic as ticks
+//! and a wall-clock anchor, not fractional destiny stamps or separate substeps.
+//!
+//! GOTO stores an absolute point; direction commands project from the current
+//! position while their events retain the raw direction. `Ballpark::WarpTo`
+//! (`Ballpark.cpp:4102-4113`) falls back to GotoPoint for a raw destination
+//! strictly below 100 km, without WarpFX.
+//!
+//! The 0.1-second tau floor limits low-effective-mass fidelity. Finite GOTO
+//! arrival scaling, follow, orbit, full warp and missile flight remain approximate;
+//! collisions and bumps are not modelled. Orientations, formations, miniballs,
+//! AddBalls2 and unsupported ball modes are not implemented.
 //! Shared vector distances are defined here for simulation and service callers.
 
 use crate::consts::{AU, DAMAGE_LAYER_COUNT, FILETIME_SECOND, SECONDS_PER_MINUTE};
@@ -65,6 +73,8 @@ const METRES_PER_KILOMETRE: f64 = 1000.0;
 const KILOGRAMS_PER_TONNE: f64 = 1000.0;
 /// Existing normalization tolerance.
 const VECTOR_LENGTH_EPSILON: f64 = 1e-9;
+/// Carbonengine Ballpark::GotoDirection projection distance.
+const GOTO_DIRECTION_REACH: f64 = 1e17;
 /// Existing player targeting formula, preserved by D17.
 const LOCK_TIME_FACTOR_SECONDS: f64 = 40_000.0;
 /// Existing player targeting minimum.
@@ -75,10 +85,13 @@ const MAX_LOCK_TIME_SECONDS: f64 = 60.0;
 const DEFAULT_WARP_FACTOR: i64 = 3000;
 /// Existing server damage-state placeholder policy.
 const DAMAGE_STATE_SHIELD_RECHARGE_TAU: f64 = 100_000.0;
-/// Existing destiny mass/agility integration scale.
-const MASS_AGILITY_SCALE: f64 = 1e6;
-/// Existing server integration floor.
+/// Carbonengine Ballpark constructor friction.
+const DESTINY_FRICTION: f64 = 1e6;
+/// ponytail: The 0.1-second floor limits low-effective-mass fidelity; replace it
+/// when native effective-mass semantics are implemented.
 const MIN_MOVEMENT_TAU_SECONDS: f64 = 0.1;
+/// Carbonengine Ballpark::Integrate Taylor-series threshold.
+const INTEGRATE_TAYLOR_THRESHOLD: f64 = 1e-10;
 /// Carbonengine Ballpark::SetupWarpConstants.
 const MAX_WARP_DECELERATION: f64 = 2.0;
 /// Existing server fallback for missing celestial radii.
@@ -95,7 +108,7 @@ const WARP_FACTOR_TO_DECELERATION: f64 = 1.0 / 3000.0;
 
 pub type V3 = [f64; 3];
 
-fn sub(a: V3, b: V3) -> V3 {
+pub(crate) fn sub(a: V3, b: V3) -> V3 {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 fn add(a: V3, b: V3) -> V3 {
@@ -120,8 +133,12 @@ fn norm(a: V3) -> V3 {
     }
 }
 
-/// Convert Unix milliseconds to a whole-second destiny stamp.
-pub fn destiny_stamp(unix_ms: i64) -> i64 { unix_ms / MILLISECONDS_PER_SECOND }
+/// Carbonengine Vector3d normalization preserves a zero vector.
+fn goto_norm(a: V3) -> V3 {
+    let l = len(a);
+    if l == 0.0 { a } else { scale(a, 1.0 / l) }
+}
+
 /// Convert milliseconds to seconds.
 pub fn ms_to_seconds(ms: f64) -> f64 { ms / MILLISECONDS_PER_SECOND as f64 }
 /// Convert minutes to seconds without discarding fractional minutes.
@@ -145,11 +162,11 @@ pub fn lock_time_ms(scan_resolution: f64, signature_radius: f64) -> u64 {
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64
 }
-
-/// Destiny event stamp in whole Unix seconds.
-pub fn now_tick() -> i64 {
-    destiny_stamp(now_ms())
+/// Strictly next wall-clock boundary for a positive interval in milliseconds.
+fn next_aligned_ms(unix_ms: i64, interval_ms: i64) -> i64 {
+    unix_ms.saturating_add(interval_ms - unix_ms.rem_euclid(interval_ms))
 }
+
 
 #[derive(Clone)]
 pub struct Warp {
@@ -180,16 +197,29 @@ pub struct Ball {
     pub speed_fraction: f32,
     pub pos: V3,
     pub vel: V3,
+    /// Start state and frozen inputs of the last completed movement segment.
+    pub old_pos: V3,
+    pub old_vel: V3,
+    pub segment_target: Option<V3>,
+    pub segment_warp: Option<Warp>,
     pub goto: V3,
     pub follow_id: i64,
     pub follow_range: f32,
     pub free: bool,
     pub global: bool,
     pub massive: bool,
+    /// Destiny isInteractive, independent of movement; Partitionable.cpp AddBall and Thunkers WriteBallToStream.
+    pub interactive: bool,
     pub warp: Option<Warp>,
     pub warp_factor: i64,
-    /// Last integration time in Unix milliseconds; missiles retain their launch time.
+    /// Last integration time in logical destiny milliseconds.
     pub last_ms: i64,
+    /// Wall-clock segment anchor, separate from logical `last_ms`; native Ball.h
+    /// lines 181-182 retain the old/new interpolation times.
+    pub interpolation_anchor_ms: i64,
+    /// carbonengine destiny AddBall, LaunchMissile and RealWarp effect stamp, in destiny ticks;
+    /// independent of integration milliseconds.
+    pub effect_stamp: i64,
     /// Cloak mode (0 = visible). Cloaked balls exist only for their owner.
     pub cloak: u8,
     /// When an arrival cloak lapses (FILETIME), to tell a lapse from a later cloak.
@@ -202,12 +232,57 @@ pub struct Ball {
     pub slim: Vec<(&'static str, Value)>,
 }
 
+/// Carbonengine Ballpark::Integrate and Vector3d reciprocal-division ordering.
+fn integrate(position: V3, velocity: V3, acceleration: V3, mass: f64, friction: f64, time: f64) -> (V3, V3) {
+    if time == 0.0 { return (position, velocity); }
+    let time_factor = (-friction / mass * time).exp();
+    let friction2 = friction * friction;
+    let ook2 = 1.0 / friction2;
+    let ook = 1.0 / friction;
+    let position = if friction < INTEGRATE_TAYLOR_THRESHOLD * mass * time {
+        scale(add(scale(add(scale(acceleration, -friction * time),
+            scale(add(scale(acceleration, time), scale(scale(scale(velocity, friction), 1.0 / mass), time)), friction)), mass),
+            scale(position, friction2)), ook2)
+    } else {
+        scale(add(scale(add(scale(scale(acceleration, mass), time_factor - 1.0),
+            scale(sub(add(scale(acceleration, time), velocity), scale(velocity, time_factor)), friction)), mass),
+            scale(position, friction2)), ook2)
+    };
+    let velocity = scale(sub(scale(acceleration, mass),
+        scale(sub(scale(acceleration, mass), scale(velocity, friction)), time_factor)), ook);
+    (position, velocity)
+}
+
 impl Ball {
+    /// Set a GOTO point from the raw direction, as in Ballpark::GotoDirection.
+    pub fn goto_direction(&mut self, dir: V3) {
+        self.mode = MODE_GOTO;
+        self.warp = None;
+        self.goto = add(self.pos, scale(goto_norm(dir), GOTO_DIRECTION_REACH));
+    }
+
+    /// Stateless view of the most recently completed logical movement segment.
+    pub fn position_at(&self, t_ms: i64) -> V3 {
+        if self.segment_target.is_none() && self.segment_warp.is_none() { return self.pos; }
+        let elapsed = t_ms.saturating_sub(self.interpolation_anchor_ms).clamp(0, MILLISECONDS_PER_SECOND);
+        if elapsed == 0 { return self.old_pos; }
+        if elapsed == MILLISECONDS_PER_SECOND { return self.pos; }
+        if let Some(w) = &self.segment_warp {
+            let sample_ms = self.last_ms.saturating_sub(MILLISECONDS_PER_SECOND).saturating_add(elapsed);
+            let fraction = (sample_ms.saturating_sub(w.start) as f64 / w.duration.max(1.0)).clamp(0.0, 1.0);
+            return add(w.from, scale(sub(w.to, w.from), fraction));
+        }
+        let mass = (self.mass * self.agility as f64).max(DESTINY_FRICTION * MIN_MOVEMENT_TAU_SECONDS);
+        let acceleration = scale(self.segment_target.unwrap(), DESTINY_FRICTION / mass);
+        integrate(self.old_pos, self.old_vel, acceleration, mass, DESTINY_FRICTION,
+            ms_to_seconds(elapsed as f64)).0
+    }
+
     fn flags(&self) -> u8 {
         (if self.free { FLAG_FREE } else { 0 })
             | (if self.global { FLAG_GLOBAL } else { 0 })
             | (if self.massive { FLAG_MASSIVE } else { 0 })
-            | if self.free { FLAG_INTERACTIVE } else { 0 }
+            | if self.interactive { FLAG_INTERACTIVE } else { 0 }
     }
 
     /// Ballpark::WriteBallToStream (no miniballs, no dynamical orientation).
@@ -249,7 +324,7 @@ impl Ball {
                 o.extend_from_slice(&self.follow_id.to_le_bytes());
                 o.extend_from_slice(&self.follow_range.to_le_bytes());
                 o.extend_from_slice(&self.launcher.to_le_bytes());
-                o.extend_from_slice(&(destiny_stamp(self.last_ms) as i32).to_le_bytes()); // effectStamp: launch tick
+                o.extend_from_slice(&(self.effect_stamp as i32).to_le_bytes()); // effectStamp: launch tick
                 for c in self.goto {
                     o.extend_from_slice(&c.to_le_bytes());
                 }
@@ -259,7 +334,7 @@ impl Ball {
                 for c in w.to {
                     o.extend_from_slice(&c.to_le_bytes());
                 }
-                o.extend_from_slice(&(destiny_stamp(w.start) as i32).to_le_bytes()); // effectStamp
+                o.extend_from_slice(&(self.effect_stamp as i32).to_le_bytes()); // effectStamp
                 o.extend_from_slice(&dist(w.to, w.from).to_le_bytes()); // total warp length
                 // minRange (a double in mFollowId's slot); 0 because `to` already includes it.
                 o.extend_from_slice(&0.0f64.to_le_bytes());
@@ -300,13 +375,18 @@ impl Ball {
     }
 
     /// Exact integration for a constant target velocity over elapsed milliseconds.
-    fn evolve(&mut self, ms: i64, others: &HashMap<i64, V3>) {
+    fn evolve(&mut self, ms: i64, interpolation_anchor_ms: i64, others: &HashMap<i64, V3>) {
         // Missile launch time is also the stream's effectStamp.
         if self.mode == MODE_MISSILE { return; }
         if !self.free || ms <= self.last_ms {
             self.last_ms = self.last_ms.max(ms);
             return;
         }
+        self.interpolation_anchor_ms = interpolation_anchor_ms;
+        self.old_pos = self.pos;
+        self.old_vel = self.vel;
+        self.segment_target = None;
+        self.segment_warp = self.warp.clone();
         if let Some(w) = &self.warp {
             let elapsed = (ms - w.start) as f64;
             if elapsed >= w.duration {
@@ -322,10 +402,10 @@ impl Ball {
             return;
         }
         let dt = ms_to_seconds((ms - self.last_ms) as f64);
-        let tau = (self.mass * self.agility as f64 / MASS_AGILITY_SCALE).max(MIN_MOVEMENT_TAU_SECONDS);
+        let mass = (self.mass * self.agility as f64).max(DESTINY_FRICTION * MIN_MOVEMENT_TAU_SECONDS);
         let speed = (self.max_vel * self.speed_fraction) as f64;
         let target = match self.mode {
-            MODE_GOTO => scale(norm(self.goto), speed),
+            MODE_GOTO => scale(goto_norm(sub(self.goto, self.pos)), speed),
             MODE_FOLLOW | MODE_ORBIT => others.get(&self.follow_id).map(|&p| {
                 let d = sub(p, self.pos);
                 if len(d) <= self.follow_range as f64 + self.radius as f64 { V3::default() }
@@ -333,10 +413,9 @@ impl Ball {
             }).unwrap_or_default(),
             _ => V3::default(),
         };
-        let decay = (-dt / tau).exp();
-        let delta = sub(self.vel, target);
-        self.pos = add(self.pos, add(scale(target, dt), scale(delta, tau * -(-dt / tau).exp_m1())));
-        self.vel = add(target, scale(delta, decay));
+        self.segment_target = Some(target);
+        let acceleration = scale(target, DESTINY_FRICTION / mass);
+        (self.pos, self.vel) = integrate(self.pos, self.vel, acceleration, mass, DESTINY_FRICTION, dt);
         self.last_ms = ms;
     }
 }
@@ -495,7 +574,7 @@ impl World {
         if systems.get(&system_id).is_some_and(|h| h.is_closed()) { systems.remove(&system_id); }
         if systems.contains_key(&system_id) { return Ok(()); }
         let tick = now_ms();
-        let mut system = System::new(system_id, self.pilots.clone());
+        let mut system = System::new(system_id, self.pilots.clone(), tick);
         for r in self.sde.map.celestials(system_id) {
             let Some(type_id) = r.type_id.and_then(|id| i32::try_from(id).ok()) else { continue };
             let Some(ty) = self.sde.types.get(type_id) else { continue };
@@ -541,15 +620,22 @@ impl World {
                     speed_fraction: 0.0,
                     pos,
                     vel: V3::default(),
+                    old_pos: pos,
+                    old_vel: V3::default(),
+                    segment_target: None,
+                    segment_warp: None,
                     goto: V3::default(),
                     follow_id: 0,
                     follow_range: 0.0,
                     free: false,
                     global: true,
                     massive: true,
+                    interactive: false,
                     warp: None,
                     warp_factor: 0,
                     last_ms: tick,
+                    interpolation_anchor_ms: tick,
+                    effect_stamp: 0,
                     cloak: 0,
                     cloak_until: 0,
                     health: [1.0; 3],
@@ -627,8 +713,8 @@ impl World {
     pub fn set_health(&self, system: i64, id: i64, health: [f64; DAMAGE_LAYER_COUNT]) {
         self.post(system, move |s| s.set_health(id, health));
     }
-    pub fn broadcast(&self, system: i64, about: i64, events: Vec<Value>) {
-        self.post(system, move |s| s.broadcast(about, events));
+    pub fn broadcast(&self, system: i64, about: i64, factory: impl FnOnce(i64) -> Vec<Value> + Send + 'static) {
+        self.post(system, move |s| s.broadcast(about, factory(s.current_time())));
     }
     pub fn command(&self, system: i64, ship: i64, f: impl FnOnce(&mut Ball, i64, &System) -> Vec<Value> + Send + 'static) {
         self.post(system, move |s| s.command(ship, f));

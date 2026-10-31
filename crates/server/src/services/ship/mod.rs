@@ -1,10 +1,20 @@
-//! Undocking, flying and docking: the `ship` service (bound per location) and
-//! the `beyonce` remote ballpark (bound per solar system).
-//! Movement and jump waits run in per-system actors; arrival cloak expiry is handled by the actor tick.
+//! Undocking, flying and docking through the location-bound `ship` service and
+//! system-bound `beyonce` remote ballpark. Destiny updates are consumed by
+//! `eve/client/script/remote/michelle.py`; gate destinations are consumed by
+//! `eve/client/script/parklife/autopilot.py`. Ship attributes and celestial
+//! data come from the SDE; locations are persisted in game tables.
+//!
+//! Movement commands apply at destiny boundaries; jump waits and arrival cloak
+//! expiry use the actor tick. Gate range and live warp targets use positions
+//! sampled at the system actor's time. GOTO stores an absolute point; direction
+//! commands project a point from the current position and send the raw direction.
+//! Carbonengine `Ballpark::WarpTo` (`Ballpark.cpp:4102-4113`) falls back to
+//! GotoPoint with no WarpFX when the raw destination is strictly below 100 km;
+//! exactly 100 km takes the full-warp path. Full warp timing and landing remain
+//! approximate, as do follow and orbit; collision and bump physics are absent.
 //! Local-chat invites use an outside-space delay for session settlement.
-//! Uses ship attributes and celestial data from the SDE and persists locations in game tables.
-//! Ship loss commits before its independently best-effort killmail and insurance operations.
-//! Mirrors the client ship service and remote ballpark; NPC workers are out of scope.
+//! Ship loss commits before its independently best-effort killmail and insurance
+//! operations. NPC workers are outside this module's scope.
 
 use super::{db_err, Call, CallError, CallResult};
 use crate::client::{short, Client};
@@ -12,12 +22,15 @@ use crate::consts::{ATTR_AGILITY, ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_SIGNATURE_R
 use crate::db::outbox::{Effect, Outbox};
 use crate::dao::{characters::{ship as character_dao, selection}, items::{ship as item_dao, creation}};
 use crate::messages;
-use crate::space::{self, event, now_ms, now_tick, seconds_to_ms_f64, warp_duration, Ball, Warp, V3, CLOAK_RESTORE, MODE_FOLLOW, MODE_GOTO, MODE_ORBIT, MODE_STOP, MODE_WARP};
+use crate::space::{self, event, now_ms, seconds_to_ms_f64, warp_duration, Ball, Warp, V3, CLOAK_RESTORE, MODE_FOLLOW, MODE_GOTO, MODE_ORBIT, MODE_STOP, MODE_WARP};
 use marshal::Value;
 use tracing::{info, warn};
 
 /// Existing gate and station radius fallback in metres.
 const DEFAULT_CELESTIAL_RADIUS: f64 = 5000.0;
+
+/// Carbonengine Ballpark::WarpTo: squared minimum warp distance in metres.
+const MIN_WARP_DISTANCE_SQUARED: f64 = 1e10;
 
 fn gate_radius(celestial: Option<f64>, type_radius: Option<f64>) -> f64 {
     celestial.or(type_radius).unwrap_or(DEFAULT_CELESTIAL_RADIUS)
@@ -92,15 +105,19 @@ pub(super) async fn ship_ball(c: &Client, ship_id: i64, pos: [f64; 3]) -> Result
         speed_fraction: 0.0,
         pos,
         vel: [0.0; 3],
+        old_pos: pos, old_vel: [0.0; 3], segment_target: None, segment_warp: None,
         goto: [0.0; 3],
         follow_id: 0,
         follow_range: 0.0,
         free: true,
         global: false,
         massive: true,
+        interactive: true,
         warp: None,
         warp_factor: ((warp_mult * base_warp * 1000.0).round() as i64).max(500),
         last_ms: now_ms(),
+        interpolation_anchor_ms: 0,
+        effect_stamp: 0,
         cloak: 0,
         cloak_until: 0,
         health: [1.0; 3],
@@ -193,11 +210,12 @@ async fn stargate_jump(c: &mut Client, from_gate: i64, to_gate: i64) -> CallResu
     let dest_system: i64 = dest.dest_solar_system_id;
 
     // In range of the gate?
-    let gap = c.world.ball(system, ship).await.zip(c.world.ball(system, from_gate).await).map(|(b, gate)| {
-        ((b.pos[0] - gate.pos[0]).powi(2) + (b.pos[1] - gate.pos[1]).powi(2) + (b.pos[2] - gate.pos[2]).powi(2)).sqrt()
+    let gap = c.world.with(system, move |s| {
+        let (b, gate) = (s.ball(ship)?, s.ball(from_gate)?);
+        Some(space::dist(b.position_at(s.now_ms()), gate.position_at(s.now_ms()))
             - gate.radius as f64
-            - b.radius as f64
-    });
+            - b.radius as f64)
+    }).await.flatten();
     if gap.is_none_or(|g| g > JUMP_RANGE) {
         return Err(CallError::User { msg: messages::MSG_NOT_CLOSE_ENOUGH_TO_JUMP.into(), dict: vec![("maxdist".into(), Value::Int(JUMP_RANGE as i64))] });
     }
@@ -285,7 +303,7 @@ pub(super) async fn jump_out_and_arrive(c: &mut Client, system: i64, ship: i64, 
         c.world.schedule(dest_system, WORMHOLE_EFFECT_STOP_DELAY_MS, move |s| {
             s.broadcast(
                 ship,
-                vec![special_fx_stop(now_tick(), ship, "effects.CloakRegardless")],
+                vec![special_fx_stop(s.current_time(), ship, "effects.CloakRegardless")],
             );
         });
     }
@@ -464,34 +482,45 @@ fn movement(c: &mut Client, f: impl FnOnce(&mut Ball, i64, &space::System) -> Ve
 /// `min_range` short of the point itself (bookmarks, mission sites, warp-in points),
 /// as Ballpark::RealWarp places it.
 pub(super) fn warp_to(c: &mut Client, object: Option<(V3, f64)>, point: V3, min_range: f64) -> CallResult {
-    movement(c, move |b, t, _| {
-        let (center, stand_off) = match object {
-            Some((pos, radius)) => (pos, radius + b.radius as f64 + min_range.max(2500.0)),
-            None => (point, min_range.max(0.0)),
-        };
-        let away = [b.pos[0] - center[0], b.pos[1] - center[1], b.pos[2] - center[2]];
-        let l = (away[0] * away[0] + away[1] * away[1] + away[2] * away[2]).sqrt().max(1.0);
-        let to = [center[0] + away[0] / l * stand_off, center[1] + away[1] / l * stand_off, center[2] + away[2] / l * stand_off];
-        let distance = ((to[0] - b.pos[0]).powi(2) + (to[1] - b.pos[1]).powi(2) + (to[2] - b.pos[2]).powi(2)).sqrt();
-        let tau = (b.mass * b.agility as f64 / 1e6).max(0.1);
-        let align = -tau * 0.25f64.ln();
-        b.mode = MODE_WARP;
-        b.goto = to;
-        b.speed_fraction = 1.0;
-        b.warp = Some(Warp { from: b.pos, to, start: b.last_ms, duration: seconds_to_ms_f64(align + warp_duration(b.warp_factor as f64, distance)), factor: b.warp_factor });
-        // Destiny only enters warp once aligned at 75% of max velocity, and thrust scales
-        // with the speed fraction (Ball::IsAlignedForWarp, GotoThrust): warp at full throttle,
-        // or a stopped ship sits aligning until the 180 s MAX_ALIGN_TICKS fallback.
-        // effects.Warping drives the tunnel, camera and audio (and WarpOut for onlookers);
-        // it follows the ball through align and warp and the client stops it on exit.
-        // `to` already includes min_range; Ballpark::RealWarp would pull the landing point
-        // back by minRange again, so the client gets 0.
-        vec![
-            event(t, "WarpTo", vec![Value::Int(b.id), Value::Float(to[0]), Value::Float(to[1]), Value::Float(to[2]), Value::Float(0.0), Value::Int(b.warp_factor)]),
-            event(t, "SetSpeedFraction", vec![Value::Int(b.id), Value::Float(1.0)]),
-            special_fx(t, b.id, None, None, "effects.Warping", None),
-        ]
-    })
+    movement(c, move |b, t, _| warp_command(b, t, object, point, min_range))
+}
+
+fn warp_command(b: &mut Ball, t: i64, object: Option<(V3, f64)>, point: V3, min_range: f64) -> Vec<Value> {
+    let delta = space::sub(point, b.pos);
+    if delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2] < MIN_WARP_DISTANCE_SQUARED {
+        b.mode = MODE_GOTO;
+        b.goto = point;
+        b.warp = None;
+        if b.speed_fraction == 0.0 { b.speed_fraction = 1.0; }
+        return vec![event(t, "GotoPoint", vec![Value::Int(b.id), Value::Float(point[0]), Value::Float(point[1]), Value::Float(point[2])])];
+    }
+    let (center, stand_off) = match object {
+        Some((pos, radius)) => (pos, radius + b.radius as f64 + min_range.max(2500.0)),
+        None => (point, min_range.max(0.0)),
+    };
+    let away = [b.pos[0] - center[0], b.pos[1] - center[1], b.pos[2] - center[2]];
+    let l = (away[0] * away[0] + away[1] * away[1] + away[2] * away[2]).sqrt().max(1.0);
+    let to = [center[0] + away[0] / l * stand_off, center[1] + away[1] / l * stand_off, center[2] + away[2] / l * stand_off];
+    let distance = ((to[0] - b.pos[0]).powi(2) + (to[1] - b.pos[1]).powi(2) + (to[2] - b.pos[2]).powi(2)).sqrt();
+    let tau = (b.mass * b.agility as f64 / 1e6).max(0.1);
+    let align = -tau * 0.25f64.ln();
+    b.mode = MODE_WARP;
+    b.goto = to;
+    b.speed_fraction = 1.0;
+    b.warp = Some(Warp { from: b.pos, to, start: b.last_ms, duration: seconds_to_ms_f64(align + warp_duration(b.warp_factor as f64, distance)), factor: b.warp_factor });
+    b.effect_stamp = t;
+    // Destiny only enters warp once aligned at 75% of max velocity, and thrust scales
+    // with the speed fraction (Ball::IsAlignedForWarp, GotoThrust): warp at full throttle,
+    // or a stopped ship sits aligning until the 180 s MAX_ALIGN_TICKS fallback.
+    // effects.Warping drives the tunnel, camera and audio (and WarpOut for onlookers);
+    // it follows the ball through align and warp and the client stops it on exit.
+    // `to` already includes min_range; Ballpark::RealWarp would pull the landing point
+    // back by minRange again, so the client gets 0.
+    vec![
+        event(t, "WarpTo", vec![Value::Int(b.id), Value::Float(to[0]), Value::Float(to[1]), Value::Float(to[2]), Value::Float(0.0), Value::Int(b.warp_factor)]),
+        event(t, "SetSpeedFraction", vec![Value::Int(b.id), Value::Float(1.0)]),
+        special_fx(t, b.id, None, None, "effects.Warping", None),
+    ]
 }
 
 /// Ensure a stationary ship starts moving when given a heading (client sends 1.0 separately too).

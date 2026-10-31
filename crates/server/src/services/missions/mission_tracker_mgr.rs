@@ -1,4 +1,5 @@
 //! Mission tracker service.
+//! Site proximity samples the ship at system-actor time against the stored mission point.
 use super::*;
 // ---------------------------------------------------------------- mission tracker
 
@@ -9,7 +10,7 @@ async fn at_site(c: &Client, m: &Mission) -> bool {
         return false;
     }
     let pos = m.pos;
-    c.world.with(system, move |s| s.ball(ship).is_some_and(|b| dist(b.pos, pos) < SITE_RADIUS)).await.unwrap_or(false)
+    c.world.with(system, move |s| s.sample_position(ship).is_some_and(|ship_pos| dist(ship_pos, pos) < SITE_RADIUS)).await.unwrap_or(false)
 }
 
 /// The steps of a kill mission, as missionObjectiveData objective items (strings).

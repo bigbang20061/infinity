@@ -1,6 +1,7 @@
 //! Hacking: the data and relic analyzer minigame (eve/client/script/ui/hacking).
 //!
 //! Activating an analyzer (`doHacking`) on a data or relic site container starts a game.
+//! Analyzer range uses ship and container positions sampled at the same system-actor time.
 //! The client sends each click (hackingMgr.ClickedOnTile, UsedUtilityElement,
 //! UsedUtilityElementOnVirus, QuitHackingAttempt) and draws the turn's results from
 //! OnHackingTurnComplete([{eventID, eventData}]) (hackingcommon.hackingConstants).
@@ -459,7 +460,7 @@ pub async fn start(c: &mut Client, module: i64, target: Option<i64>) -> CallResu
     }
     let Some(gap) = c.world.with(system, move |s| {
         let (me, can) = (s.ball(ship)?, s.ball(container)?);
-        Some(dist(me.pos, can.pos) - me.radius as f64 - can.radius as f64)
+        Some(dist(s.sample_position(ship)?, s.sample_position(container)?) - me.radius as f64 - can.radius as f64)
     }).await.flatten() else {
         return Err(CallError::User { msg: messages::MSG_DENIED_ACTIVATE_TARGET_NOT_PRESENT.into(), dict: vec![] });
     };

@@ -105,6 +105,7 @@ pub(super) async fn ensure_site(c: &mut Client, m: &Mission) -> Result<(), CallE
         let r = pool[(rand01() * pool.len() as f64) as usize % pool.len()];
         let d = rand_dir();
         let dist = 12_000.0 + rand01() * 20_000.0;
+        let pos = [m.pos[0] + d[0] * dist, m.pos[1] + d[1] * dist * 0.3, m.pos[2] + d[2] * dist];
         let ball = Ball {
             id: NEXT_NPC_ID.fetch_add(1, Ordering::Relaxed),
             type_id: r.type_id,
@@ -119,17 +120,22 @@ pub(super) async fn ensure_site(c: &mut Client, m: &Mission) -> Result<(), CallE
             max_vel: r.velocity.unwrap_or(300.0) as f32,
             agility: r.agility.unwrap_or(3.0) as f32,
             speed_fraction: 0.0,
-            pos: [m.pos[0] + d[0] * dist, m.pos[1] + d[1] * dist * 0.3, m.pos[2] + d[2] * dist],
+            pos,
             vel: [0.0; 3],
+            old_pos: pos,
+            old_vel: [0.0; 3], segment_target: None, segment_warp: None,
             goto: [0.0; 3],
             follow_id: 0,
             follow_range: 0.0,
             free: true,
             global: false,
             massive: true,
+            interactive: false,
             warp: None,
             warp_factor: 0,
             last_ms: tick,
+            interpolation_anchor_ms: tick,
+            effect_stamp: 0,
             cloak: 0,
             cloak_until: 0,
             health: [1.0; 3],

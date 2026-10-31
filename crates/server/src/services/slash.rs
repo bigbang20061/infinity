@@ -11,6 +11,7 @@
 //!
 //! Type and celestial data come from the startup SDE snapshot; item positions and
 //! wallet balances come from game data. Unsupported commands return a slash error.
+//! Teleports to live balls use the system actor's sampled position; stored positions remain unchanged.
 
 use super::{db_err, Call, CallError, CallResult};
 use super::sql_pattern::matches_pattern;
@@ -85,7 +86,7 @@ async fn tr(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
     }
     let here = c.session.int("solarsystemid").unwrap_or(0);
     // Something in this system's ballpark.
-    if let Some((ball_pos, radius)) = c.world.with(here, move |s| s.ball(id).map(|b| (b.pos, b.radius))).await.flatten() {
+    if let Some((ball_pos, radius)) = c.world.with(here, move |s| s.ball(id).map(|b| (b.position_at(s.now_ms()), b.radius))).await.flatten() {
         let pos = [ball_pos[0] + radius as f64 + TELEPORT_CLEARANCE, ball_pos[1], ball_pos[2]];
         super::ship::teleport(c, here, pos).await?;
         return Ok(messages::gm_teleported(id));
@@ -117,7 +118,7 @@ async fn tr(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
     if let Some(r) = at {
         let system = r.location_id;
         let pos = [r.x + TELEPORT_CLEARANCE, r.y, r.z];
-        let live = c.world.with(system, move |s| s.pilot_ball(id).or_else(|| s.ball(id)).map(|b| b.pos)).await.flatten();
+        let live = c.world.with(system, move |s| s.pilot_ball(id).or_else(|| s.ball(id)).map(|b| b.position_at(s.now_ms()))).await.flatten();
         let pos = live.map(|p| [p[0] + TELEPORT_CLEARANCE, p[1], p[2]]).unwrap_or(pos);
         super::ship::teleport(c, system, pos).await?;
         return Ok(messages::gm_teleported_in_system(id, system));

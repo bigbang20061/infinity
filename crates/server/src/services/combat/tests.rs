@@ -31,25 +31,63 @@ fn module_ids_preserve_scalar_and_list_shapes() {
 }
 
 #[test]
+fn propulsion_and_missile_commands_wait_for_boundary_and_use_enqueue_stamp() {
+    let mut system = System::new(0, Arc::default(), 12_345);
+    let ball = Ball {
+        id: 1, type_id: 1, owner_id: 1, corp_id: 1, alliance_id: -1,
+        char_id: None, signature_radius: None, mode: crate::space::MODE_STOP,
+        radius: 1.0, mass: 1.0, max_vel: 1.0, agility: 1.0, speed_fraction: 0.0,
+        pos: [0.0; 3], vel: [0.0; 3], goto: [0.0; 3], follow_id: 0,
+        old_pos: [0.0; 3], old_vel: [0.0; 3], segment_target: None, segment_warp: None,
+        follow_range: 0.0, free: true, global: false, massive: false, interactive: false,
+        warp: None, warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0, cloak: 0,
+        cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new(),
+    };
+    system.insert(ball.clone());
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    system.observe(1, 1, tx);
+    system.command(1, |b, stamp, _| propulsion_transition(b, stamp, 20.0, 30.0, 40.0));
+    system.launch_missile(Ball { id: 2, ..ball }, 3, 1, 500, |_| {});
+    system.tick(12_999);
+    assert_eq!(system.ball(1).unwrap().max_vel, 1.0);
+    assert_eq!(system.ball(2).unwrap().mode, crate::space::MODE_STOP);
+    assert!(rx.try_recv().is_err());
+    system.tick(13_000);
+    let ship = system.ball(1).unwrap();
+    assert_eq!((ship.max_vel, ship.mass, ship.signature_radius), (20.0, 30.0, Some(40.0)));
+    let missile = system.ball(2).unwrap();
+    assert_eq!((missile.mode, missile.effect_stamp, missile.follow_id, missile.launcher), (crate::space::MODE_MISSILE, 12, 3, 1));
+    let events = rx.try_recv().unwrap();
+    assert_eq!(events.len(), 4);
+    assert_eq!(events[0], event(12, "SetMaxSpeed", vec![Value::Int(1), Value::Float(20.0)]));
+    assert_eq!(events[1], event(12, "SetBallMass", vec![Value::Int(1), Value::Float(30.0)]));
+    assert_eq!(events[3], event(12, "LaunchMissile", vec![
+        Value::Int(2), Value::Int(3), Value::Int(1), Value::Bool(true), Value::Bool(false),
+    ]));
+    assert_eq!(system.current_time(), 13);
+}
+
+#[test]
 fn missile_lifecycle_preserves_exploration_site() {
-    let mut system = System::default();
+    let mut system = System::new(0, Arc::default(), 12_345);
     let site = Ball {
         id: 9_500_000_000_000, type_id: 1, owner_id: 1, corp_id: 1, alliance_id: -1,
         char_id: None, signature_radius: None, mode: crate::space::MODE_STOP, radius: 1.0, mass: 1.0,
         max_vel: 1.0, agility: 1.0, speed_fraction: 0.0,
         pos: [1.0, 2.0, 3.0], vel: [0.0; 3], goto: [0.0; 3],
-        follow_id: 0, follow_range: 0.0, free: true, global: false,
-        massive: true, warp: None, warp_factor: 0, last_ms: 0,
+        old_pos: [1.0, 2.0, 3.0], old_vel: [0.0; 3], segment_target: None, segment_warp: None,
+        follow_id: 0, follow_range: 0.0, free: true, global: false, interactive: false,
+        massive: true, warp: None, warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0,
         cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new(),
     };
     let (site_id, site_type, site_pos) = (site.id, site.type_id, site.pos);
     let missile_id = NEXT_MISSILE_ID.fetch_add(1, Ordering::Relaxed);
     let missile = Ball {
-        id: missile_id, type_id: 2, mode: MODE_MISSILE, pos: [4.0, 5.0, 6.0],
+        id: missile_id, type_id: 2, mode: crate::space::MODE_STOP, pos: [4.0, 5.0, 6.0],
         ..site.clone()
     };
     system.insert(site);
-    system.insert(missile);
+    system.launch_missile(missile, site_id, site_id, 500, move |s| { s.destroy_ball(missile_id); });
 
     let retained_site = system.ball(site_id).unwrap();
     assert_eq!((retained_site.id, retained_site.type_id, retained_site.pos), (site_id, site_type, site_pos));
@@ -59,7 +97,8 @@ fn missile_lifecycle_preserves_exploration_site() {
     assert_ne!(missile_id, second_id);
     assert_eq!(second_id, missile_id + 1);
 
-    system.destroy_ball(missile_id).unwrap();
+    system.tick(13_000);
+    system.tick(13_500);
     assert!(!system.contains(missile_id));
     let retained_site = system.ball(site_id).unwrap();
     assert_eq!((retained_site.id, retained_site.type_id, retained_site.pos), (site_id, site_type, site_pos));
@@ -215,8 +254,9 @@ fn reload_reservation_survives_departure_and_preserves_new_marker() {
         char_id: Some(1), signature_radius: Some(1.0), mode: crate::space::MODE_STOP, radius: 1.0, mass: 1.0,
         max_vel: 1.0, agility: 1.0, speed_fraction: 0.0,
         pos: [0.0; 3], vel: [0.0; 3], goto: [0.0; 3],
-        follow_id: 0, follow_range: 0.0, free: true, global: false,
-        massive: true, warp: None, warp_factor: 0, last_ms: 0,
+        old_pos: [0.0; 3], old_vel: [0.0; 3], segment_target: None, segment_warp: None,
+        follow_id: 0, follow_range: 0.0, free: true, global: false, interactive: true,
+        massive: true, warp: None, warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0,
         cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new(),
     });
     let result = Arc::new(Mutex::new(None));

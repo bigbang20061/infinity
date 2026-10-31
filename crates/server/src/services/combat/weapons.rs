@@ -1,4 +1,15 @@
-//! Combat mechanics; state and routing live in the parent module.
+//! Weapon fire, missile launches, repairs and propulsion effects; state and
+//! routing live in the parent combat module. Client dogma calls are mirrored by
+//! `eve/client/script/dogma/clientDogmaLocation.py`, with destiny updates
+//! consumed by `eve/client/script/remote/michelle.py`. Fitting and weapon
+//! attributes use SDE data and game item state; in-flight missiles and actor
+//! timers are transient.
+//!
+//! Propulsion transitions are queued with the actor's current destiny stamp.
+//! `System::launch_missile` inserts the neutral ball immediately and queues
+//! its launch in the same FIFO; its actor-owned impact timer starts when the
+//! launch applies at the next boundary. Missile flight and impact reach use
+//! the existing approximation, not full native missile physics.
 use super::*;
 
 // ---------------------------------------------------------------- weapons fire
@@ -50,17 +61,19 @@ pub(super) async fn apply_propulsion(cx: &Ctx, master: i64, generation: Arc<Atom
         let mut st = state();
         if !st.activation_generation.get(&master).is_some_and(|current| Arc::ptr_eq(current, &generation))
             || st.active.contains_key(&master) != active { return; }
-        s.command(ship, move |b, t, _| {
-        b.max_vel = speed as f32;
-        b.mass = mass;
-        b.signature_radius = Some(signature);
-        vec![
-            event(t, "SetMaxSpeed", vec![Value::Int(b.id), Value::Float(speed)]),
-            event(t, "SetBallMass", vec![Value::Int(b.id), Value::Float(mass)]),
-        ]
-        });
+        s.command(ship, move |b, t, _| propulsion_transition(b, t, speed, mass, signature));
         if !active { st.activation_generation.remove(&master); }
     });
+}
+
+pub(super) fn propulsion_transition(b: &mut Ball, stamp: i64, speed: f64, mass: f64, signature: f64) -> Vec<Value> {
+    b.max_vel = speed as f32;
+    b.mass = mass;
+    b.signature_radius = Some(signature);
+    vec![
+        event(stamp, "SetMaxSpeed", vec![Value::Int(b.id), Value::Float(speed)]),
+        event(stamp, "SetBallMass", vec![Value::Int(b.id), Value::Float(mass)]),
+    ]
 }
 
 #[derive(Clone)]
@@ -109,9 +122,9 @@ pub(super) fn ship_effect(cx: &Ctx, module: i64, effect: &Effect, target: Option
 
 /// A weapon firing animation (fxSequencer.OnSpecialFX) from `shooter`.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn fire_fx(shooter: i64, module: Option<(i64, i32)>, guid: &str, target: Option<i64>, charge: Option<i32>, start: bool, duration_ms: f64, repeat: i64) -> Value {
+pub(super) fn fire_fx(stamp: i64, shooter: i64, module: Option<(i64, i32)>, guid: &str, target: Option<i64>, charge: Option<i32>, start: bool, duration_ms: f64, repeat: i64) -> Value {
     event(
-        now_tick(),
+        stamp,
         "OnSpecialFX",
         vec![
             Value::Int(shooter),
@@ -130,12 +143,12 @@ pub(super) fn fire_fx(shooter: i64, module: Option<(i64, i32)>, guid: &str, targ
 }
 
 pub(super) fn weapon_fx(cx: &Ctx, modules: &[Module], effect: &Effect, target: Option<i64>, charge: Option<i32>, start: bool, duration_ms: f64, repeat: i64) {
-    let Some(guid) = effect.guid.as_deref().and_then(|g| g.split(',').next()) else { return };
-    let events = modules
-        .iter()
-        .map(|m| fire_fx(cx.ship_id, Some((m.id, m.type_id)), guid, target, charge, start, duration_ms, repeat))
-        .collect();
-    cx.world.broadcast(cx.system_id, cx.ship_id, events);
+    let Some(guid) = effect.guid.as_deref().and_then(|g| g.split(',').next()).map(str::to_owned) else { return };
+    let modules = modules.to_vec();
+    let ship = cx.ship_id;
+    cx.world.broadcast(cx.system_id, ship, move |stamp| {
+        modules.iter().map(|m| fire_fx(stamp, ship, Some((m.id, m.type_id)), &guid, target, charge, start, duration_ms, repeat)).collect()
+    });
 }
 
 /// Use one charge from a module; `None` when it is empty.
@@ -206,7 +219,7 @@ pub(super) fn report_hit(world: &World, shooter: i64, target: i64, shooter_pilot
 /// One turret shot at `target`, with the fitted module's and its charge's effective attributes.
 pub(super) async fn fire_turret(cx: &Ctx, fit: &Fit, module: &Module, target: i64) -> Result<(), CallError> {
     let ship_id = cx.ship_id;
-    let Some((ship, t)) = cx.world.with(cx.system_id, move |s| Some((s.ball(ship_id)?.clone(), s.ball(target)?.clone()))).await.flatten() else { return Ok(()) };
+    let Some((ship, t)) = cx.world.with(cx.system_id, move |s| Some((s.sampled_ball(ship_id)?, s.sampled_ball(target)?))).await.flatten() else { return Ok(()) };
     let (m, ch) = (Key::Module(module.id), Key::Charge(module.id));
     let gap = (dist(ship.pos, t.pos) - t.radius as f64 - ship.radius as f64).max(0.0);
     let multiplier = turret_roll(gap, fit.value(m, ATTR_MAX_RANGE), fit.value(m, ATTR_FALLOFF));
@@ -229,13 +242,15 @@ pub(super) struct Missile {
     pub(super) attacker: Option<i64>,
 }
 
-/// Launch a missile ball from `from` at `target`: it flies client-side; on impact it
-/// explodes and deals damage scaled by explosion radius vs. the target's signature.
+
+/// Launch from the actor-sampled source and target captured together: it flies client-side;
+/// on impact it explodes and deals damage scaled by explosion radius vs. the target's signature.
 pub(super) async fn launch_missile(db: Db, world: Arc<World>, system: i64, from: Ball, target: Ball, owner: i64, module: Option<i64>, m: Missile) -> Result<(), CallError> {
     let size = world.sde().types.get(m.charge)
         .ok_or_else(|| CallError::Internal(anyhow::anyhow!("unknown type {}", m.charge)))?;
     let mut slim = vec![("sourceShipID", Value::Int(from.id))];
     slim.push(("launchModules", Value::list(module.map(Value::Int))));
+    let launch_ms = now_ms();
     let missile = Ball {
         id: NEXT_MISSILE_ID.fetch_add(1, Ordering::Relaxed),
         type_id: m.charge,
@@ -244,31 +259,34 @@ pub(super) async fn launch_missile(db: Db, world: Arc<World>, system: i64, from:
         alliance_id: -1,
         char_id: None,
         signature_radius: None,
-        mode: MODE_MISSILE,
+        mode: crate::space::MODE_STOP,
         radius: size.radius.unwrap_or(1.0) as f32,
         mass: size.mass.unwrap_or(1.0),
         max_vel: m.velocity as f32,
         agility: 1.0,
-        speed_fraction: 1.0,
+        speed_fraction: 0.0,
         pos: from.pos,
         vel: [0.0; 3],
+        old_pos: from.pos, old_vel: [0.0; 3], segment_target: None, segment_warp: None,
         goto: target.pos,
-        follow_id: target.id,
+        follow_id: 0,
         follow_range: 0.0,
         free: true,
         global: false,
         massive: false,
+        interactive: false,
         warp: None,
         warp_factor: 0,
-        last_ms: now_ms(),
+        last_ms: launch_ms,
+        interpolation_anchor_ms: launch_ms,
+        effect_stamp: 0,
         cloak: 0,
         cloak_until: 0,
         health: [1.0; 3],
-        launcher: from.id,
+        launcher: 0,
         slim,
     };
     let missile_id = missile.id;
-    world.add_ship(system, missile).await.map_err(CallError::Internal)?;
     let signature = attr(world.sde(), target.type_id, ATTR_SIGNATURE_RADIUS, target.radius as f64);
     let distance = dist(from.pos, target.pos);
     let delay_ms = seconds_to_ms((distance / m.velocity.max(1.0)).clamp(MIN_MISSILE_FLIGHT_SECONDS, MAX_MISSILE_FLIGHT_SECONDS));
@@ -276,7 +294,8 @@ pub(super) async fn launch_missile(db: Db, world: Arc<World>, system: i64, from:
     let (target_id, target_pilot) = (target.id, target.char_id);
     let (flight_range, aoe_cloud, raw, weapon, attacker) = (m.flight_range, m.aoe_cloud, m.raw, m.weapon, m.attacker);
     let world_ref = Arc::downgrade(&world);
-    world.schedule(system, delay_ms, move |s| {
+    world.system(system).await.map_err(CallError::Internal)?;
+    world.with(system, move |s| s.launch_missile(missile, target_id, shooter_id, delay_ms, move |s| {
         s.destroy_ball(missile_id);
         let present = s.contains(target_id);
         let reached = distance <= flight_range + MISSILE_REACH_ALLOWANCE_METRES;
@@ -290,13 +309,13 @@ pub(super) async fn launch_missile(db: Db, world: Arc<World>, system: i64, from:
             };
             report_hit(&world, shooter_id, target_id, shooter_pilot, target_pilot, weapon, dealt, quality);
         });
-    });
+    })).await.ok_or_else(|| CallError::Internal(anyhow::anyhow!("system actor stopped")))?;
     Ok(())
 }
 
 pub(super) async fn fire_missile(cx: &Ctx, fit: &Fit, module: &Module, charge: i32, target: i64) -> Result<(), CallError> {
     let ship_id = cx.ship_id;
-    let Some((ship, t)) = cx.world.with(cx.system_id, move |s| Some((s.ball(ship_id)?.clone(), s.ball(target)?.clone()))).await.flatten() else { return Ok(()) };
+    let Some((ship, t)) = cx.world.with(cx.system_id, move |s| Some((s.sampled_ball(ship_id)?, s.sampled_ball(target)?))).await.flatten() else { return Ok(()) };
     let ch = Key::Charge(module.id);
     let velocity = fit.value(ch, ATTR_MAX_VELOCITY).max(1.0);
     let missile = Missile {
@@ -444,8 +463,11 @@ pub(super) async fn cycle_begin_work(mut cycle: Cycle) {
                 break 'work "target lost";
             }
             if *cycles == 0 {
-                let beam = modules.iter().map(|m| fire_fx(cx.ship_id, Some((m.id, m.type_id)), guid, Some(rock), None, true, *duration_ms, *repeat)).collect();
-                cx.world.broadcast(cx.system_id, cx.ship_id, beam);
+                let modules = modules.clone();
+                let (ship, duration, repeat) = (cx.ship_id, *duration_ms, *repeat);
+                cx.world.broadcast(cx.system_id, ship, move |stamp| {
+                    modules.iter().map(|m| fire_fx(stamp, ship, Some((m.id, m.type_id)), guid, Some(rock), None, true, duration, repeat)).collect()
+                });
             }
         }
         // Shield boosters land at the start of a cycle, armor and hull repairers at its end.
@@ -513,12 +535,12 @@ pub(super) fn cycle_stop(s: &mut System, cycle: Cycle) {
         ship_effect(&cx, master, &effect, target, false, started, duration_ms, repeat);
         if effect.weapon.is_some() {
             if let Some(guid) = effect.guid.as_deref().and_then(|g| g.split(',').next()) {
-                let events = modules.iter().map(|m| fire_fx(cx.ship_id, Some((m.id, m.type_id)), guid, target, charge_type, false, duration_ms, repeat)).collect();
+                let events = modules.iter().map(|m| fire_fx(s.current_time(), cx.ship_id, Some((m.id, m.type_id)), guid, target, charge_type, false, duration_ms, repeat)).collect();
                 s.broadcast(cx.ship_id, events);
             }
         }
         if let Some(guid) = effect.mining {
-            let events = modules.iter().map(|m| fire_fx(cx.ship_id, Some((m.id, m.type_id)), guid, target, None, false, duration_ms, repeat)).collect();
+            let events = modules.iter().map(|m| fire_fx(s.current_time(), cx.ship_id, Some((m.id, m.type_id)), guid, target, None, false, duration_ms, repeat)).collect();
             s.broadcast(cx.ship_id, events);
         }
     });
@@ -596,7 +618,7 @@ pub(super) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
         }
         let ship_id = cx.ship_id;
         let gap = cx.world.with(cx.system_id, move |s| {
-            s.ball(ship_id).zip(s.ball(t)).map(|(a, b)| dist(a.pos, b.pos) - a.radius as f64 - b.radius as f64)
+            s.ball(ship_id).zip(s.ball(t)).map(|(a, b)| dist(a.position_at(s.now_ms()), b.position_at(s.now_ms())) - a.radius as f64 - b.radius as f64)
         }).await.flatten();
         let fit = Fit::load(&cx.db, cx.world.sde().clone(), cx.char_id, cx.ship_id).await?;
         let range = fit.value(Key::Module(item_id), ATTR_MAX_RANGE);

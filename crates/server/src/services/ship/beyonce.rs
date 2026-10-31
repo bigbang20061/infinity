@@ -8,8 +8,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         ("beyonce", "CmdGotoDirection") => {
             let dir = [f(a.first()), f(a.get(1)), f(a.get(2))];
             movement(c, move |b, t, _| {
-                b.mode = MODE_GOTO;
-                b.goto = dir;
+                b.goto_direction(dir);
                 let mut ev = vec![event(t, "GotoDirection", vec![Value::Int(b.id), Value::Float(dir[0]), Value::Float(dir[1]), Value::Float(dir[2])])];
                 ensure_moving(b, t, &mut ev);
                 ev
@@ -20,8 +19,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             movement(c, move |b, t, others| {
                 let Some(tp) = target.and_then(|id| others.ball(id)).map(|o| o.pos) else { return vec![] };
                 let dir = [tp[0] - b.pos[0], tp[1] - b.pos[1], tp[2] - b.pos[2]];
-                b.mode = MODE_GOTO;
-                b.goto = dir;
+                b.goto_direction(dir);
                 let mut ev = vec![event(t, "GotoDirection", vec![Value::Int(b.id), Value::Float(dir[0]), Value::Float(dir[1]), Value::Float(dir[2])])];
                 ensure_moving(b, t, &mut ev);
                 ev
@@ -71,7 +69,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             let found = if let Some(sys) = c.session.int("solarsystemid") {
                 c.world.with(sys, move |s| {
                     if by_pilot { s.pilot_ball(target) } else { s.ball(target) }
-                        .map(|b| (b.id, b.pos, b.radius as f64, s.warp_in(b.id)))
+                        .map(|b| (b.id, b.position_at(s.now_ms()), b.radius as f64, s.warp_in(b.id)))
                 }).await.flatten()
             } else {
                 None

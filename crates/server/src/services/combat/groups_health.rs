@@ -202,14 +202,16 @@ pub(super) async fn damage_npc(db: &Db, world: &World, system: i64, target: i64,
     };
     let dealt = absorb(&mut hp.now, &hp.resonance, raw);
     if hp.now[2] <= 0.0 && (hp.max[2] > 0.0 || hp.now.iter().all(|v| *v <= 0.0)) {
-        info!("ball {target} (type {}) destroyed", ball.type_id);
-        world.destroy_ball(system, target).await;
+        let destroyed = world.destroy_ball(system, target).await;
         forget_target(world, target);
-        if let Err(e) = reward_kill(db, world, system, &ball, attacker).await {
-            warn!("wreck of {target}: {}", match e {
-                CallError::Internal(e) => format!("{e:#}"),
-                CallError::User { msg, .. } => msg,
-            });
+        if let Some(ball) = destroyed {
+            info!("ball {target} (type {}) destroyed", ball.type_id);
+            if let Err(e) = reward_kill(db, world, system, &ball, attacker).await {
+                warn!("wreck of {target}: {}", match e {
+                    CallError::Internal(e) => format!("{e:#}"),
+                    CallError::User { msg, .. } => msg,
+                });
+            }
         }
     } else {
         let health = [0, 1, 2].map(|i| if hp.max[i] > 0.0 { (hp.now[i] / hp.max[i]).clamp(0.0, 1.0) } else { 0.0 });
@@ -351,15 +353,19 @@ pub(super) async fn reward_kill(db: &Db, world: &World, system: i64, npc: &Ball,
         speed_fraction: 0.0,
         pos: npc.pos,
         vel: [0.0; 3],
+        old_pos: npc.pos, old_vel: [0.0; 3], segment_target: None, segment_warp: None,
         goto: [0.0; 3],
         follow_id: 0,
         follow_range: 0.0,
         free: false,
         global: false,
         massive: true,
+        interactive: false,
         warp: None,
         warp_factor: 0,
         last_ms: now_ms(),
+        interpolation_anchor_ms: 0,
+        effect_stamp: 0,
         cloak: 0,
         cloak_until: 0,
         health: [1.0; 3],
