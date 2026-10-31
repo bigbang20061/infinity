@@ -179,3 +179,143 @@ async fn reserved_shared_move_rolls_back_prior_writes_and_notifications() {
     assert!(!dispatched.load(Ordering::SeqCst));
     assert!(db.query_opt("SELECT item_id FROM game.items WHERE item_id = $1", &[&written_id.load(Ordering::SeqCst)]).await.unwrap().is_none());
 }
+
+async fn move_fingerprint(db: &crate::db::Db) -> Vec<String> {
+    let mut result = Vec::new();
+    for table in ["items", "module_charges", "weapon_banks", "pending_reloads"] {
+        let query = format!("SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY row_to_json(t)::text), '')) AS fingerprint FROM game.{table} t");
+        result.push(db.query_one(&query, &[]).await.unwrap().get("fingerprint"));
+    }
+    result
+}
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to a dedicated database with SDE"]
+async fn move_item_authorizes_sources_and_destinations() {
+    use std::sync::Arc;
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = Arc::new(Sde::load(&db).await.unwrap());
+    let type_id = sde.types.iter().next().unwrap().type_id;
+    let ship_type = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_SHIP)).unwrap().type_id;
+    let wreck_type = sde.types.iter().find(|t| t.group_id == Some(crate::consts::GROUP_WRECK)).unwrap().type_id;
+    let container_type = sde.types.iter().find(|t| t.group_id == Some(crate::consts::GROUP_CARGO_CONTAINER)).unwrap().type_id;
+    let account: i64 = db.query_one("INSERT INTO game.accounts (user_name, password_hash, role) VALUES ('inventory-auth-' || nextval('game.accounts_user_id_seq')::text, $1, 0) RETURNING user_id", &[&&b"fixture"[..]]).await.unwrap().get("user_id");
+    let mut chars = Vec::new();
+    for _ in 0..2 {
+        let row = db.query_one("INSERT INTO game.characters (user_id, name, race_id, bloodline_id, gender_id, corporation_id, corp_roles) VALUES ($1, 'inventory-auth-' || nextval('game.characters_character_id_seq')::text, 1, 1, 1, 1, $2) RETURNING character_id", &[&account, &ROLE_HANGAR_CAN_TAKE_1]).await.unwrap();
+        chars.push(row.get::<_, i64>("character_id"));
+    }
+    let (me, other) = (chars[0], chars[1]);
+    let station = -100_i64;
+    let system = -101_i64;
+    let insert = |type_id, owner, location, flag| {
+        let db = &db;
+        async move { crate::dao::items::transfers::insert(db, type_id, owner, location, flag, 1).await.unwrap() }
+    };
+    let own_ship = insert(ship_type, me, station, FLAG_HANGAR).await;
+    let foreign_ship = insert(ship_type, other, station, FLAG_HANGAR).await;
+    let own_container = insert(container_type, me, station, FLAG_HANGAR).await;
+    let foreign_container = insert(container_type, other, station, FLAG_HANGAR).await;
+    let office = insert(type_id, 1, station, FLAG_HANGAR).await;
+    crate::dao::offices::insert(&db, office, 1, station, 1).await.unwrap();
+    let foreign_office = insert(type_id, 2, station, FLAG_HANGAR).await;
+    crate::dao::offices::insert(&db, foreign_office, 2, station, 1).await.unwrap();
+    let wreck = insert(wreck_type, other, system, FLAG_HANGAR).await;
+    let can = insert(container_type, other, system, FLAG_HANGAR).await;
+    db.execute("UPDATE game.items SET location_id = $2, x = 0, y = 0, z = 0 WHERE item_id = ANY($1)", &[&&[wreck, can, foreign_ship][..], &system]).await.unwrap();
+    let mut foreign = Vec::new();
+    for (location, flag) in [(foreign_ship, FLAG_CARGO), (foreign_ship, FLAG_FITTING_FIRST), (foreign_ship, crate::consts::FLAG_DRONE_BAY), (foreign_container, FLAG_HANGAR), (station, FLAG_HANGAR)] {
+        foreign.push(insert(type_id, other, location, flag).await);
+    }
+    let own = insert(type_id, me, station, FLAG_HANGAR).await;
+    let corp_item = insert(type_id, 1, office, FLAG_CORP_SAG1).await;
+    let personal_office_item = insert(type_id, me, office, FLAG_CORP_SAG1).await;
+    let loot = insert(type_id, other, wreck, FLAG_CARGO).await;
+    let can_loot = insert(type_id, other, can, FLAG_CARGO).await;
+    let cfg = Arc::new(crate::config::Config::default());
+    let world = crate::space::World::new(db.clone(), sde.clone(), 1);
+    world.system(system).await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+    let (stream, address) = listener.accept().await.unwrap();
+    let login = crate::handshake::Login { user_id: account, user_name: "test".into(), role: 0, client_id: 1, session_id: 1, language_id: "EN".into() };
+    let chat = crate::chat::Hub::new(&cfg.chat.domain);
+    let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg, db.clone(), sde, chat, world.clone(), login);
+    client.session.apply(vec![("charid", Value::Int(me)), ("corpid", Value::Int(1)), ("stationid", Value::Int(station)), ("shipid", Value::Int(own_ship))]);
+    let hangar = Container::Hangar { station_id: station, owner_id: me };
+    let mut rejected = Vec::new();
+    for &id in &foreign { rejected.push((hangar.clone(), id, None)); }
+    rejected.push((hangar.clone(), foreign[4], Some(station)));
+    rejected.push((Container::Item(foreign_ship), own, None));
+    rejected.push((Container::Item(foreign_container), own, None));
+    rejected.push((Container::Item(-999), own, None));
+    rejected.push((Container::Hangar { station_id: station, owner_id: other }, own, None));
+    rejected.push((Container::Hangar { station_id: station - 1, owner_id: me }, own, None));
+    rejected.push((hangar.clone(), own, Some(station - 1)));
+    for (destination, id, source) in rejected {
+        let before = move_fingerprint(&db).await;
+        client.outbox.clear();
+        assert!(matches!(move_item(&mut client, &destination, id, source, None, None).await, Err(CallError::User { dict, .. }) if dict == vec![("notify".into(), Value::unicode(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))]));
+        assert_eq!(move_fingerprint(&db).await, before);
+        assert!(client.outbox.is_empty());
+    }
+    let before = move_fingerprint(&db).await;
+    client.outbox.clear();
+    assert!(matches!(move_item(&mut client, &Container::Item(foreign_office), own, None, None, None).await, Err(CallError::User { msg, dict }) if msg == messages::MSG_CUSTOM_NOTIFY && dict == vec![("notify".into(), Value::unicode(messages::NOT_YOUR_CORPORATION_HANGAR))]));
+    assert_eq!(move_fingerprint(&db).await, before);
+    assert!(client.outbox.is_empty());
+    db.execute("UPDATE game.characters SET corp_roles = 0 WHERE character_id = $1", &[&me]).await.unwrap();
+    for id in [corp_item, personal_office_item] {
+        let before = move_fingerprint(&db).await;
+        client.outbox.clear();
+        assert!(matches!(move_item(&mut client, &hangar, id, None, None, None).await, Err(CallError::User { msg, dict }) if msg == messages::MSG_CUSTOM_NOTIFY && dict == vec![("notify".into(), Value::unicode(messages::NO_CORPORATION_HANGAR_TAKE_ROLE))]));
+        assert_eq!(move_fingerprint(&db).await, before);
+        assert!(client.outbox.is_empty());
+    }
+    db.execute("UPDATE game.characters SET corp_roles = $2 WHERE character_id = $1", &[&me, &ROLE_HANGAR_CAN_TAKE_1]).await.unwrap();
+    for (destination, location, flag) in [(Container::Item(own_ship), own_ship, FLAG_CARGO), (Container::Item(own_container), own_container, FLAG_HANGAR), (hangar.clone(), station, FLAG_HANGAR)] {
+        assert!(move_item(&mut client, &destination, own, None, None, None).await.is_ok());
+        let moved = load_items(&db, &client.sde, ItemQuery::Id(own)).await.unwrap().pop().unwrap();
+        assert_eq!((moved.owner_id, moved.location_id, moved.flag_id), (me, location, flag));
+    }
+    assert!(move_item(&mut client, &hangar, corp_item, None, None, None).await.is_ok());
+    let moved = load_items(&db, &client.sde, ItemQuery::Id(corp_item)).await.unwrap().pop().unwrap();
+    assert_eq!((moved.owner_id, moved.location_id, moved.flag_id), (me, station, FLAG_HANGAR));
+    assert!(move_item(&mut client, &Container::Item(own_ship), own, None, Some(FLAG_FITTING_FIRST), None).await.is_ok());
+    let moved = load_items(&db, &client.sde, ItemQuery::Id(own)).await.unwrap().pop().unwrap();
+    assert_eq!((moved.owner_id, moved.location_id, moved.flag_id), (me, own_ship, FLAG_FITTING_FIRST));
+    assert!(move_item(&mut client, &hangar, own, None, None, None).await.is_ok());
+    let moved = load_items(&db, &client.sde, ItemQuery::Id(own)).await.unwrap().pop().unwrap();
+    assert_eq!((moved.owner_id, moved.location_id, moved.flag_id), (me, station, FLAG_HANGAR));
+    client.session.apply(vec![("stationid", Value::None), ("solarsystemid", Value::Int(system))]);
+    let ball = |id, x| crate::space::Ball {
+        id, type_id: 1, owner_id: me, corp_id: 1, alliance_id: 0, char_id: None,
+        mode: crate::space::MODE_STOP, radius: 50.0, signature_radius: None, mass: 1.0, max_vel: 0.0, agility: 1.0, speed_fraction: 0.0,
+        pos: [x, 0.0, 0.0], vel: [0.0; 3], old_pos: [x, 0.0, 0.0], old_vel: [0.0; 3], segment_acceleration: None,
+        goto: [0.0; 3], follow_id: 0, follow_range: 0.0, free: true, global: false, massive: false, interactive: false,
+        warp: crate::space::WarpState::default(), warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0,
+        cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: vec![],
+    };
+    let (vessel, distant, positioned_ship, cargo_can) = (ball(own_ship, 0.0), ball(wreck, 2601.0), ball(foreign_ship, 0.0), ball(can, 2600.0));
+    world.with(system, move |s| { s.insert(vessel); s.insert(distant); s.insert(positioned_ship); s.insert(cargo_can); }).await.unwrap();
+    for id in [loot, foreign[0]] {
+        let before = move_fingerprint(&db).await;
+        client.outbox.clear();
+        assert!(matches!(move_item(&mut client, &Container::Item(own_ship), id, None, None, None).await, Err(CallError::User { dict, .. }) if dict == vec![("notify".into(), Value::unicode(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))]));
+        assert_eq!(move_fingerprint(&db).await, before);
+        assert!(client.outbox.is_empty());
+    }
+    let nearby = ball(wreck, 2600.0);
+    world.with(system, move |s| { s.insert(nearby); }).await.unwrap();
+    for id in [loot, can_loot] {
+        assert!(move_item(&mut client, &Container::Item(own_ship), id, None, None, None).await.is_ok());
+        let moved = load_items(&db, &client.sde, ItemQuery::Id(id)).await.unwrap().pop().unwrap();
+        assert_eq!((moved.owner_id, moved.location_id, moved.flag_id), (me, own_ship, FLAG_CARGO));
+    }
+    crate::dao::offices::delete(&db, office).await.unwrap();
+    crate::dao::offices::delete(&db, foreign_office).await.unwrap();
+    db.execute("DELETE FROM game.items WHERE owner_id = ANY($1) OR item_id = ANY($2)", &[&&chars[..], &&[office, foreign_office, corp_item][..]]).await.unwrap();
+    db.execute("DELETE FROM game.characters WHERE user_id = $1", &[&account]).await.unwrap();
+    db.execute("DELETE FROM game.accounts WHERE user_id = $1", &[&account]).await.unwrap();
+}

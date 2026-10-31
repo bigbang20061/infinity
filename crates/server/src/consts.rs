@@ -49,6 +49,16 @@ pub const GROUP_PLANET: i32 = 7;
 pub const GROUP_ASTEROID_BELT: i32 = 9;
 /// SDE invGroups: Wreck.
 pub const GROUP_WRECK: i32 = 186;
+/// SDE invGroups: Cargo Container (groupCargoContainer).
+pub const GROUP_CARGO_CONTAINER: i32 = 12;
+/// SDE invGroups: Secure Cargo Container (groupSecureCargoContainer).
+pub const GROUP_SECURE_CARGO_CONTAINER: i32 = 340;
+/// SDE invGroups: Audit Log Secure Container (groupAuditLogSecureContainer).
+pub const GROUP_AUDIT_LOG_SECURE_CONTAINER: i32 = 448;
+/// SDE invGroups: Freight Container (groupFreightContainer).
+pub const GROUP_FREIGHT_CONTAINER: i32 = 649;
+/// Cargo-container groups recognized by inventory and repair.
+pub const CARGO_CONTAINER_GROUPS: [i32; 4] = [GROUP_CARGO_CONTAINER, GROUP_SECURE_CARGO_CONTAINER, GROUP_AUDIT_LOG_SECURE_CONTAINER, GROUP_FREIGHT_CONTAINER];
 /// SDE invCategories: Owner.
 pub const CATEGORY_OWNER: i32 = 1;
 /// SDE invCategories: Ship.

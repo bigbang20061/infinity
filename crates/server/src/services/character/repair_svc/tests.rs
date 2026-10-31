@@ -52,7 +52,7 @@ fn client_repairable_whitelist_requires_singleton() {
         assert!(repairable(true, Some(category), None));
         assert!(!repairable(false, Some(category), None));
     }
-    for group in [GROUP_CARGO_CONTAINER, GROUP_SECURE_CARGO_CONTAINER, GROUP_AUDIT_LOG_SECURE_CONTAINER, GROUP_FREIGHT_CONTAINER, GROUP_TOOL] {
+    for group in CARGO_CONTAINER_GROUPS.into_iter().chain([GROUP_TOOL]) {
         assert!(repairable(true, None, Some(group)));
         assert!(!repairable(false, None, Some(group)));
     }

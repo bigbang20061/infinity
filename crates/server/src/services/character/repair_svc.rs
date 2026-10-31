@@ -7,7 +7,7 @@
 //! Payment and full-quote comparison use wallet-cent precision; zero-cent charges are refused.
 //! Structure facilities and heat generation are not modelled.
 use super::*;
-use crate::consts::{ATTR_ARMOR_DAMAGE, ATTR_ARMOR_HP, ATTR_HULL_DAMAGE, CATEGORY_DRONE, CATEGORY_MODULE, CATEGORY_SHIP, FLAG_HANGAR};
+use crate::consts::{ATTR_ARMOR_DAMAGE, ATTR_ARMOR_HP, ATTR_HULL_DAMAGE, CARGO_CONTAINER_GROUPS, CATEGORY_DRONE, CATEGORY_MODULE, CATEGORY_SHIP, FLAG_HANGAR};
 use crate::dao::items::{dogma, repair};
 use crate::db::{executor::Executor, outbox::{dispatch_world, Outbox}};
 use crate::services::{combat, effects::notify::attribute_change, fit::{Fit, Key}, inventory::is_fitting_flag, market, notify_error, wallets};
@@ -19,20 +19,12 @@ const CATEGORY_STRUCTURE_MODULE: i32 = 66;
 const CATEGORY_DEPLOYABLE: i32 = 22;
 /// Client inventorycommon.const.categoryStarbase.
 const CATEGORY_STARBASE: i32 = 23;
-/// Client inventorycommon.const.groupCargoContainer.
-const GROUP_CARGO_CONTAINER: i32 = 12;
-/// Client inventorycommon.const.groupSecureCargoContainer.
-const GROUP_SECURE_CARGO_CONTAINER: i32 = 340;
-/// Client inventorycommon.const.groupAuditLogSecureContainer.
-const GROUP_AUDIT_LOG_SECURE_CONTAINER: i32 = 448;
-/// Client inventorycommon.const.groupFreightContainer.
-const GROUP_FREIGHT_CONTAINER: i32 = 649;
 /// Client inventorycommon.const.groupTool.
 const GROUP_TOOL: i32 = 332;
 
 fn repairable(singleton: bool, category: Option<i32>, group: Option<i32>) -> bool {
     singleton && (matches!(category, Some(CATEGORY_DEPLOYABLE | CATEGORY_SHIP | CATEGORY_DRONE | CATEGORY_STARBASE | CATEGORY_MODULE | CATEGORY_STRUCTURE_MODULE))
-        || matches!(group, Some(GROUP_CARGO_CONTAINER | GROUP_SECURE_CARGO_CONTAINER | GROUP_AUDIT_LOG_SECURE_CONTAINER | GROUP_FREIGHT_CONTAINER | GROUP_TOOL)))
+        || group.is_some_and(|id| CARGO_CONTAINER_GROUPS.contains(&id) || id == GROUP_TOOL))
 }
 
 

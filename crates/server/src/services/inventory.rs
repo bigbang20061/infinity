@@ -4,7 +4,9 @@
 //! Item quantities are stored in `game.items`; static item data comes from the loaded SDE.
 //! Merge plans are guarded against stale snapshots. Staged trade items and their
 //! descendants cannot be moved, split, merged, trashed, renamed or accessed here.
-//! Supplied station-hangar sources require matching location and owner.
+//! Moves require an owned source, an authorized corporation office, or a nearby
+//! positioned wreck or cargo container, and an owned or authorized destination.
+//! Loot rights and suspect flags are not implemented.
 //! Item capacity and contents are read from one game-item statement snapshot.
 //! Successful inventory moves queue item-move events after their writes.
 
@@ -142,6 +144,8 @@ async fn capacity(c: &Client, container: &Container) -> Result<Value, CallError>
 const FLAG_AUTOFIT: i32 = 0;
 /// appConst.corpRoleHangarCanTake1; divisions 2-7 are the next bits.
 const ROLE_HANGAR_CAN_TAKE_1: i64 = 8192;
+/// appConst.py:1475, maxCargoContainerTransferDistance, in metres.
+const MAX_CARGO_CONTAINER_TRANSFER_DISTANCE: f64 = 2500.0;
 
 /// Fitting slot flags: low, medium, high, rig and subsystem slots.
 pub fn is_fitting_flag(flag: i32) -> bool {
@@ -218,44 +222,68 @@ async fn free_slot_core(db: &(impl Executor + ?Sized), sde: &Sde, ship: i64, mod
 }
 
 
-/// Move `item_id` (all of it, or `qty` split off a stack) into `container` under `flag`.
-/// Returns the ID of the item now at the destination.
-pub(crate) async fn move_item(c: &mut Client, container: &Container, item_id: i64, source: Option<i64>, flag: Option<i32>, qty: Option<i64>) -> Result<Option<i64>, CallError> {
-    let _lock = super::market::lock().await;
-    let char_id = c.session.int("charid").unwrap_or(0);
-    let Some(item) = load_items(&c.db, &c.sde, ItemQuery::Id(item_id)).await.map_err(db_err)?.into_iter().next() else { return Ok(None) };
-    if source.is_some_and(|source| source != item.location_id) || (source.is_some() && item.flag_id == FLAG_HANGAR && c.sde.map.station(item.location_id).is_some() && item.owner_id != char_id) {
-        return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
-    }
-    if Some(item_id) == c.session.int("shipid") && matches!(container, Container::Item(_)) {
-        return Err(CallError::User { msg: messages::MSG_CAN_NOT_PLACE_ACTIVE_SHIP_IN_ANOTHER_HANGAR.into(), dict: vec![] });
-    }
-    // Out of a corporation hangar: the division's take role (or Director) is needed.
+async fn authorized_source(c: &Client, item: &Item, source: Option<i64>, char_id: i64) -> Result<bool, CallError> {
+    if source.is_some_and(|id| id != item.location_id) { return Ok(false); }
     if let Some(corp) = super::offices::office_owner(&c.db, item.location_id).await? {
         let (my_corp, roles) = super::corps::membership(&c.db, char_id).await?;
         let take = ROLE_HANGAR_CAN_TAKE_1 << (item.flag_id - FLAG_CORP_SAG1).clamp(0, MAX_CORP_HANGAR_DIVISION_INDEX);
         if my_corp != corp || roles & (take | ROLE_DIRECTOR) == 0 {
             return Err(CallError::User { msg: messages::MSG_CUSTOM_NOTIFY.into(), dict: vec![("notify".into(), Value::unicode(messages::NO_CORPORATION_HANGAR_TAKE_ROLE))] });
         }
+        return Ok(true);
     }
-    let (location, owner, flag) = match container {
-        Container::Hangar { station_id, owner_id } => (*station_id, *owner_id, flag.filter(|f| *f != FLAG_AUTOFIT).unwrap_or(FLAG_HANGAR)),
-        Container::Item(id) => match super::offices::office_owner(&c.db, *id).await? {
-            // Into a corporation hangar: the corporation owns what's in it.
-            Some(corp) => {
+    if item.owner_id == char_id { return Ok(true); }
+    let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) else { return Ok(false) };
+    if c.session.int("stationid").is_some() { return Ok(false); }
+    let Some(parent) = load_items(&c.db, &c.sde, ItemQuery::Id(item.location_id)).await.map_err(db_err)?.into_iter().next() else { return Ok(false) };
+    if parent.group_id != i64::from(crate::consts::GROUP_WRECK) && !i32::try_from(parent.group_id).ok().is_some_and(|id| crate::consts::CARGO_CONTAINER_GROUPS.contains(&id)) { return Ok(false); }
+    let Some(position) = crate::dao::items::social::position(&c.db, parent.item_id).await.map_err(db_err)? else { return Ok(false) };
+    if position.location_id != system { return Ok(false); }
+    Ok(c.world.with(system, move |s| {
+        let (ship, parent) = (s.ball(ship)?, s.ball(parent.item_id)?);
+        Some(crate::space::dist(ship.position_at(s.now_ms()), parent.position_at(s.now_ms()))
+            - ship.radius as f64 - parent.radius as f64 <= MAX_CARGO_CONTAINER_TRANSFER_DISTANCE)
+    }).await.flatten().unwrap_or(false))
+}
+
+async fn authorized_destination(c: &Client, container: &Container, flag: Option<i32>, char_id: i64) -> Result<Option<(i64, i64, i32)>, CallError> {
+    match container {
+        Container::Hangar { station_id, owner_id } => {
+            if *owner_id != char_id || c.session.int("stationid") != Some(*station_id) { return Ok(None); }
+            Ok(Some((*station_id, *owner_id, flag.filter(|f| *f != FLAG_AUTOFIT).unwrap_or(FLAG_HANGAR))))
+        }
+        Container::Item(id) => {
+            if let Some(corp) = super::offices::office_owner(&c.db, *id).await? {
                 if c.session.int("corpid") != Some(corp) {
                     return Err(CallError::User { msg: messages::MSG_CUSTOM_NOTIFY.into(), dict: vec![("notify".into(), Value::unicode(messages::NOT_YOUR_CORPORATION_HANGAR))] });
                 }
                 let sag = FLAG_CORP_SAG1;
-                (*id, corp, flag.filter(|f| (sag..sag + 7).contains(f)).unwrap_or(sag))
+                return Ok(Some((*id, corp, flag.filter(|f| (sag..sag + 7).contains(f)).unwrap_or(sag))));
             }
-            None => {
-                let is_ship = load_items(&c.db, &c.sde, ItemQuery::Id(*id)).await.map_err(db_err)?.first().is_some_and(|i| i.category_id == CATEGORY_SHIP as i64);
-                let default = if is_ship { FLAG_CARGO } else { FLAG_HANGAR };
-                (*id, char_id, flag.unwrap_or(default))
-            }
-        },
+            let Some(item) = load_items(&c.db, &c.sde, ItemQuery::Id(*id)).await.map_err(db_err)?.into_iter().next() else { return Ok(None) };
+            if item.owner_id != char_id { return Ok(None); }
+            let default = if item.category_id == CATEGORY_SHIP as i64 { FLAG_CARGO } else { FLAG_HANGAR };
+            Ok(Some((*id, char_id, flag.unwrap_or(default))))
+        }
+    }
+}
+
+/// Move `item_id` (all of it, or `qty` split off a stack) into `container` under `flag`.
+/// Returns the ID of the item now at the destination.
+pub(crate) async fn move_item(c: &mut Client, container: &Container, item_id: i64, source: Option<i64>, flag: Option<i32>, qty: Option<i64>) -> Result<Option<i64>, CallError> {
+    let _lock = super::market::lock().await;
+    let char_id = c.session.int("charid").unwrap_or(0);
+    let Some(item) = load_items(&c.db, &c.sde, ItemQuery::Id(item_id)).await.map_err(db_err)?.into_iter().next() else { return Ok(None) };
+    let allowed_source = authorized_source(c, &item, source, char_id).await?;
+    let destination = if allowed_source { authorized_destination(c, container, flag, char_id).await? } else { None };
+    let Some((location, owner, flag)) = destination else {
+        let destination = match container { Container::Hangar { station_id, .. } => *station_id, Container::Item(id) => *id };
+        warn!(char_id, item_id, destination, "inventory move authorization refused");
+        return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
     };
+    if Some(item_id) == c.session.int("shipid") && matches!(container, Container::Item(_)) {
+        return Err(CallError::User { msg: messages::MSG_CAN_NOT_PLACE_ACTIVE_SHIP_IN_ANOTHER_HANGAR.into(), dict: vec![] });
+    }
     let db = c.db.clone();
     let sde = c.sde.clone();
     db.transaction(
