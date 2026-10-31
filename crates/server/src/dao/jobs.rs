@@ -62,7 +62,7 @@ pub(crate) async fn seed(ex: &(impl Executor + ?Sized), job: &Job, now: i64) -> 
     ex.execute("INSERT INTO game.jobs (job_id,kind,due_at,payload,state,created_at,updated_at) VALUES ($1,$2,$3,$4,'scheduled',$5,$5) ON CONFLICT (job_id) DO UPDATE SET kind=EXCLUDED.kind,due_at=EXCLUDED.due_at,payload=EXCLUDED.payload,state='scheduled',attempt=0,lease_until=NULL,lease_token=NULL,last_error=NULL,updated_at=EXCLUDED.updated_at WHERE game.jobs.state='dead'", &[&job.id,&job.kind,&job.due_at,&job.payload,&now]).await
 }
 pub(crate) async fn cancel(ex: &(impl Executor + ?Sized), id: &str) -> Result<u64, Error> { ex.execute("DELETE FROM game.jobs WHERE job_id=$1", &[&id]).await }
-// ponytail: local exclusions prevent only same-process reclaim; multi-process
+// Local exclusions prevent only same-process reclaim; multi-process
 // deployments need lease renewal or a persistent owner column.
 pub(crate) async fn claim(ex: &(impl Executor + ?Sized), now: i64, lease_until: i64, limit: i64, active: &[&str]) -> Result<Vec<Claim>, Error> {
     Ok(ex.query("WITH due AS (SELECT job_id FROM game.jobs WHERE ((state='scheduled' AND due_at <= $1) OR (state='running' AND lease_until < $1)) AND job_id <> ALL($4) ORDER BY due_at,job_id LIMIT $3 FOR UPDATE SKIP LOCKED) UPDATE game.jobs j SET state='running',attempt=CASE WHEN j.attempt=$5 THEN j.attempt ELSE j.attempt+1 END,lease_token=nextval('game.jobs_lease_seq'),lease_until=$2,updated_at=$1 FROM due WHERE j.job_id=due.job_id RETURNING j.job_id,j.kind,j.due_at,j.payload,j.lease_token,j.attempt", &[&now,&lease_until,&limit,&active,&i32::MAX]).await?.iter().map(Claim::from_row).collect())

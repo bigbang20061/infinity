@@ -92,13 +92,13 @@ impl StandingsConfig {
 pub struct CombatConfig {
     /// Server design default bounty multiplier in space/npc.rs.
     pub bounty_multiplier: f64,
-    /// Existing player targeting formula preserved by D17 in space/mod.rs.
+    /// Existing player targeting formula preserved in space/mod.rs.
     pub lock_time_factor: f64,
     /// Minimum player targeting time in space/mod.rs.
     pub lock_time_min_secs: f64,
     /// Maximum player targeting time in space/mod.rs.
     pub lock_time_max_secs: f64,
-    /// D9 once-per-second NPC thinking cadence and initial staggering in space/npc.rs.
+    /// Once-per-second NPC thinking cadence and initial staggering in space/npc.rs.
     pub npc_think_ms: i64,
     /// Existing server target-loss policy in space/npc.rs.
     pub npc_target_loss_range_factor: f64,

@@ -2,7 +2,7 @@
 //! Mirrors godma item attributes and the client brain's hull preAssignment effects;
 //! overrides live in game.item_attributes and follow singleton item identity.
 //! Owned drone queries evaluate the owner's fit; no drone gameplay RPC is provided.
-//! ponytail: incoming drone projections require the in-space drone runtime in PR7.
+//! Incoming drone projections require the in-space drone runtime.
 //! Charges, characters, structures, NPCs and stacked items are not supported.
 use super::{slash_error, Client, CallError};
 use crate::{dao::items::{dogma as dao, fit as fit_dao, loading::{Item, ItemQuery}}, messages};

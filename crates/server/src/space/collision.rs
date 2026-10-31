@@ -3,7 +3,7 @@
 //! by the client destiny ballpark. Inputs are actor-owned ball state, not database
 //! records. Miniballs, force fields, collision callbacks and bump events are absent.
 //!
-//! ponytail: authoritative geometry and wire currently provide scalar spheres only;
+//! Authoritative geometry and wire currently provide scalar spheres only;
 //! upgrade both together, then add shape-discriminator fixtures.
 
 use super::*;

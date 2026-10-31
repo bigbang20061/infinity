@@ -1,4 +1,4 @@
-//! Native PR2 trajectory and Thunker byte replay through the queued System APIs.
+//! Native movement trajectory and Thunker byte replay through the queued System APIs.
 //! Fixtures are frozen carbonengine output; no native runtime or database is needed.
 
 use super::*;

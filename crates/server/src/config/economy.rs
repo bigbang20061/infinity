@@ -5,7 +5,7 @@ use anyhow::Result;
 use serde::Deserialize;
 
 /// Largest accepted starting PLEX. Native TOML integer domain is `0..=i64::MAX`.
-/// Director server policy: starting PLEX is a native i64 in that range.
+/// Server policy: starting PLEX is a native i64 in that range.
 const MAX_STARTING_PLEX: i64 = i64::MAX;
 
 /// 15 significant digits (f64 DBL_DIG): the largest two-decimal amount that survives decimal → f64 → PostgreSQL float8::numeric unchanged.

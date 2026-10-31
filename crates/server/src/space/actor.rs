@@ -14,7 +14,7 @@ use std::time::Duration;
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{trace, warn};
 
-/// D1 server simulation tick policy.
+/// Server policy: the simulation tick interval.
 const TICK_INTERVAL_MS: u64 = 100;
 /// Existing server tick-duration budget.
 const TICK_BUDGET_MS: u64 = 100;

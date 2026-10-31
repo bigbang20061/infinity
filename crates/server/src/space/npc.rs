@@ -157,7 +157,7 @@ impl System {
     pub fn add_aggressor(&mut self, id: i64, pilot: i64) {
         if let Some(brain) = self.brains.get_mut(&id) { brain.aggressors.insert(pilot); }
     }
-    /// The callback runs once INSIDE this actor (D3): no await, DB or World
+    /// The callback runs once INSIDE this actor: no await, DB or World
     /// calls. It may spawn owned asynchronous work. Missing members count as gone.
     pub fn spawn_group(&mut self, members: impl IntoIterator<Item = i64>, on_cleared: impl FnOnce(&mut System) + Send + 'static) -> u64 {
         let id = NEXT_GROUP.fetch_add(1, Ordering::Relaxed);

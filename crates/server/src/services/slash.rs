@@ -9,7 +9,7 @@
 //! `game.characters` and `game.accounts`; client wallet displays are clamped to
 //! their protocol limits. Corporation wallets and target writes are unsupported.
 //! ISK wallet events report the difference between client-projected balances.
-//! ponytail: f64 precision and the client cap can mask exact changes; a typed
+//! f64 precision and the client cap can mask exact changes; a typed
 //! event payload would be needed to expose exact decimal deltas.
 //!
 //! Type and celestial data come from the startup SDE snapshot; item positions,
