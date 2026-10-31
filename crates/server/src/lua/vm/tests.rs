@@ -1,0 +1,172 @@
+use super::*;
+
+#[test]
+fn sandbox_hides_native_and_budget_escape_paths() -> mlua::Result<()> {
+    let lua = Lua::new();
+    let root = std::env::current_dir().unwrap().canonicalize().unwrap();
+    let env = environment(&lua, &root)?;
+    let safe: bool = lua.load("return io == nil and debug == nil and package == nil and load == nil and loadfile == nil and dofile == nil and coroutine == nil and pcall == nil and getmetatable == nil and string.dump == nil and os.execute == nil and type(os.time) == 'function'").set_environment(env.clone()).eval()?;
+    assert!(safe);
+    assert!(lua.load("return require('../outside')").set_environment(env.clone()).eval::<mlua::Value>().is_err());
+    assert!(lua.load("collectgarbage('stop')").set_environment(env).exec().is_err());
+    Ok(())
+}
+
+#[test]
+fn instruction_budget_aborts_and_vm_survives() -> mlua::Result<()> {
+    let lua = Lua::new();
+    let config = LuaConfig { call_budget_instructions: 1000, instruction_hook_interval: 100, ..LuaConfig::default() };
+    let loop_fn = lua.load("while true do end").into_function()?;
+    assert!(budgeted_thread(&lua, loop_fn, &config, Instant::now() + Duration::from_secs(60))?.resume::<()>(()).is_err());
+    assert_eq!(lua.load("return 42").eval::<i64>()?, 42);
+    Ok(())
+}
+
+#[test]
+fn memory_limit_is_enforced() -> mlua::Result<()> {
+    let lua = Lua::new();
+    lua.set_memory_limit(lua.used_memory() + 64 * 1024)?;
+    assert!(lua.load("return string.rep('x', 1024 * 1024)").eval::<mlua::Value>().is_err());
+    Ok(())
+}
+
+#[test]
+fn conflicts_name_both_scripts() -> mlua::Result<()> {
+    let lua = Lua::new();
+    let claims = Arc::new(Mutex::new(Claims::default()));
+    let a = lua.create_table()?;
+    let b = lua.create_table()?;
+    register_claims(&lua, &a, claims.clone(), "first.lua".into(), Arc::new(AtomicBool::new(true)))?;
+    register_claims(&lua, &b, claims, "second.lua".into(), Arc::new(AtomicBool::new(true)))?;
+    lua.load("register.rpc('svc', 'method', function() end)").set_environment(a).exec()?;
+    let error = lua.load("register.rpc('svc', 'method', function() end)").set_environment(b).exec().unwrap_err().to_string();
+    assert!(error.contains("first.lua") && error.contains("second.lua"));
+    Ok(())
+}
+
+#[test]
+fn required_module_runs_under_callers_instruction_budget() -> mlua::Result<()> {
+    let dir = std::env::temp_dir().join(format!("lua-require-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("loop.lua"), "local x = 0; for i = 1, 10000000 do x = x + i end; return x").unwrap();
+    let lua = Lua::new();
+    let env = environment(&lua, &dir.canonicalize().unwrap())?;
+    let config = LuaConfig { call_budget_instructions: 1000, instruction_hook_interval: 100, ..LuaConfig::default() };
+    let function = lua.load("return require('loop')").set_environment(env).into_function()?;
+    let result = budgeted_thread(&lua, function, &config, Instant::now() + Duration::from_secs(60))?.resume::<mlua::Value>(());
+    std::fs::remove_dir_all(dir).unwrap();
+    assert!(result.is_err());
+    Ok(())
+}
+
+#[test]
+fn retained_registration_is_closed_for_all_claims() -> mlua::Result<()> {
+    let lua = Lua::new();
+    let env = environment(&lua, &std::env::current_dir().unwrap())?;
+    let claims = Arc::new(Mutex::new(Claims::default()));
+    let open = Arc::new(AtomicBool::new(true));
+    register_claims(&lua, &env, claims.clone(), "test".into(), open.clone())?;
+    lua.load("saved = register; register.rpc('s', 'm', function() saved.rpc('s', 'other', function() end) end)").set_environment(env.clone()).exec()?;
+    open.store(false, Ordering::Release);
+    let handler = claims.lock().unwrap().rpc.get(&("s".into(), "m".into())).unwrap().function.clone();
+    assert!(handler.call::<()>(()).unwrap_err().to_string().contains("registration is closed"));
+    for expression in [
+        "saved.command{name='other', help='', gm=false, fn=function() end}",
+        "saved.event('BallparkBound', function() end)",
+    ] {
+        assert!(lua.load(expression).set_environment(env.clone()).exec().unwrap_err().to_string().contains("registration is closed"));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn instruction_budgets_are_isolated_across_awaits() -> mlua::Result<()> {
+    let lua = Lua::new();
+    let (sender, receiver) = tokio::sync::oneshot::channel::<()>();
+    let receiver = Arc::new(tokio::sync::Mutex::new(Some(receiver)));
+    lua.globals().set("wait", lua.create_async_function(move |_, ()| {
+        let receiver = receiver.clone();
+        async move { receiver.lock().await.take().unwrap().await.map_err(mlua::Error::external) }
+    })?)?;
+    let config = LuaConfig { call_budget_instructions: 1000, instruction_hook_interval: 100, call_budget_ms: 60_000, ..LuaConfig::default() };
+    let pending = budgeted_thread(&lua, lua.load("wait(); return 42").into_function()?, &config, Instant::now() + Duration::from_secs(60))?.into_async::<i64>(())?;
+    tokio::pin!(pending);
+    tokio::select! { biased; _ = &mut pending => panic!("completed before release"), _ = tokio::task::yield_now() => {} }
+    let excessive = budgeted_thread(&lua, lua.load("while true do end").into_function()?, &config, Instant::now() + Duration::from_secs(60))?;
+    assert!(excessive.resume::<()>(()).is_err());
+    sender.send(()).unwrap();
+    assert_eq!(pending.await?, 42);
+    Ok(())
+}
+
+#[test]
+fn bundled_reference_scripts_return_expected_wire_values() -> mlua::Result<()> {
+    use marshal::Value as Wire;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("lua").canonicalize().unwrap();
+    let lua = Lua::new();
+    let env = environment(&lua, &root)?;
+    value::register(&lua, &env)?;
+    let claims = Arc::new(Mutex::new(Claims::default()));
+    let open = Arc::new(AtomicBool::new(true));
+    register_claims(&lua, &env, claims.clone(), "fixed_answers".into(), open.clone())?;
+    let source = std::fs::read(root.join("fixed_answers.lua")).unwrap();
+    lua.load(source.as_slice()).set_environment(env.clone()).exec()?;
+    open.store(false, Ordering::Release);
+    let claims = claims.lock().unwrap();
+    assert_eq!(claims.rpc.len(), 5);
+    let call = |service: &str, method: &str| -> mlua::Result<Wire> {
+        let function = &claims.rpc.get(&(service.into(), method.into())).unwrap().function;
+        value::from_lua(function.call::<mlua::Value>(())?)
+    };
+    assert_eq!(call("characterRenameMgr", "GetDetails")?, Wire::dict([("byGM", Wire::Int(0))]));
+    assert_eq!(call("localizationServer", "GetAllTextChanges")?, Wire::None);
+    assert_eq!(call("localizationServer", "UpdateLocalizationQAWrap")?, Wire::None);
+    assert_eq!(call("eveacsMgr", "IsCanary")?, Wire::Bool(false));
+    let Wire::Instance(class, state) = call("infoGatheringMgr", "GetStateAndConfig")? else { panic!("expected KeyVal") };
+    assert_eq!(*class, Wire::str("utillib.KeyVal"));
+    let Wire::Dict(fields) = *state else { panic!("expected KeyVal state") };
+    for (name, expected) in [
+        ("isEnabled", Wire::Bool(false)), ("infoTypes", Wire::List(vec![])),
+        ("clientWorkerInterval", Wire::Int(0)), ("infoTypesOncePerRun", Wire::List(vec![])),
+        ("infoTypeAggregates", Wire::Dict(vec![])), ("infoTypeParameters", Wire::Dict(vec![])),
+    ] {
+        assert_eq!(fields.iter().find(|(key, _)| *key == Wire::str(name)).map(|(_, value)| value), Some(&expected));
+    }
+    assert_eq!(fields.len(), 6);
+    Ok(())
+}
+
+#[test]
+fn bundled_motd_uses_current_command_and_notification_protocol() -> mlua::Result<()> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("lua").canonicalize().unwrap();
+    let lua = Lua::new();
+    let env = environment(&lua, &root)?;
+    value::register(&lua, &env)?;
+    let claims = Arc::new(Mutex::new(Claims::default()));
+    let open = Arc::new(AtomicBool::new(true));
+    register_claims(&lua, &env, claims.clone(), "motd".into(), open.clone())?;
+    let messages = lua.create_table()?;
+    messages.set("motd_help", crate::messages::lua::LUA_MOTD_HELP)?;
+    messages.set("motd_saved", crate::messages::lua::LUA_MOTD_SAVED)?;
+    messages.set("motd_empty", crate::messages::lua::LUA_MOTD_EMPTY)?;
+    messages.set("custom_notify", crate::messages::MSG_CUSTOM_NOTIFY)?;
+    env.set("messages", messages)?;
+    lua.load("local data = {}; store = { get = function(k) return data[k] end, set = function(k,v) data[k]=v end }; ctx = { notify = function(self, event, name, fields) notification = {event, name, fields} end }").set_environment(env.clone()).exec()?;
+    let source = std::fs::read(root.join("motd.lua")).unwrap();
+    lua.load(source.as_slice()).set_environment(env.clone()).exec()?;
+    open.store(false, Ordering::Release);
+    let claims = claims.lock().unwrap();
+    let command = &claims.commands.get("motd").unwrap();
+    assert!(command.gm);
+    let ctx: Table = env.get("ctx")?;
+    assert_eq!(command.handler.function.call::<String>((ctx.clone(), lua.create_table()?))?, crate::messages::lua::LUA_MOTD_EMPTY);
+    let args = lua.create_sequence_from(["set", "测试", "公告"])?;
+    assert_eq!(command.handler.function.call::<String>((ctx.clone(), args))?, crate::messages::lua::LUA_MOTD_SAVED);
+    assert_eq!(command.handler.function.call::<String>((ctx.clone(), lua.create_table()?))?, "测试 公告");
+    claims.events[0].function.call::<()>(ctx)?;
+    let notification: Table = env.get("notification")?;
+    assert_eq!(notification.get::<String>(1)?, "OnRemoteMessage");
+    assert_eq!(value::from_lua(notification.get(2)?)?, marshal::Value::str(crate::messages::MSG_CUSTOM_NOTIFY));
+    assert_eq!(value::from_lua(notification.get(3)?)?, marshal::Value::dict([("notify", marshal::Value::unicode("测试 公告"))]));
+    Ok(())
+}

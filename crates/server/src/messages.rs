@@ -7,6 +7,7 @@
 pub(crate) mod effects;
 pub(crate) mod gm;
 pub(crate) mod scheduler;
+pub(crate) mod lua;
 pub(crate) mod standings;
 
 /// Proxy usurp reason from `carbon/common/script/net/machoNet.py`.

@@ -21,6 +21,7 @@ mod handshake;
 mod images;
 mod live_sessions;
 mod macho;
+mod lua;
 mod messages;
 mod scheduler;
 mod sde;
@@ -62,6 +63,7 @@ async fn main() -> Result<()> {
     }
     let hub = chat::Hub::new(&cfg.chat.domain);
     let world = space::World::new(db.clone(), sde.clone(), cfg.server.system_capacity);
+    lua::start(&cfg, &db, &sde, &world).await?;
     let (scheduler_stop, scheduler_shutdown) = tokio::sync::watch::channel(false);
     let mut scheduler_task = scheduler::runner::start(db.clone(), world.clone(), services::scheduler_registrations(), cfg.scheduler.clone(), scheduler_shutdown)?;
     scheduler::seed(&db).await?;

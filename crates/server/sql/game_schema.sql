@@ -887,3 +887,10 @@ CREATE TABLE IF NOT EXISTS game.jobs (
     updated_at bigint NOT NULL
 );
 CREATE INDEX IF NOT EXISTS jobs_due ON game.jobs (state, due_at);
+-- Lua script-owned typed persistent values.
+CREATE TABLE IF NOT EXISTS game.lua_store (
+    script text NOT NULL,
+    key text NOT NULL,
+    value jsonb NOT NULL,
+    PRIMARY KEY (script, key)
+);

@@ -187,7 +187,7 @@ pub(crate) mod groups_health;
 use groups_health::*;
 use super::effects::notify::attribute_change;
 use super::effects::lifecycle;
-pub(super) mod npc;
+pub(crate) mod npc;
 use npc::*;
 
 pub(super) fn quantity_change(owner: i64, ship: i64, flag: i32, type_id: i32, new: i64, old: i64) -> Value {

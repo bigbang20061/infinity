@@ -40,7 +40,7 @@ pub(crate) enum ItemQuery<'a> {
     Id(i64), Ids(&'a [i64]), IdAt(i64, i64), IdsOwner(&'a [i64], i64),
     IdsOwnerLocations(&'a [i64], i64, i64, i64),
     Location(i64), IdOrLocation(i64), LocationFlags(i64, &'a [i32]), LocationOwnerFlags(i64, i64, &'a [i32]),
-    LocationOwner(i64, i64), OwnerExceptSelf(i64), LocationExceptFlag(i64, i32),
+    LocationOwner(i64, i64), Owner(i64), OwnerExceptSelf(i64), LocationExceptFlag(i64, i32),
     IdOrLocationExceptFlag(i64, i32), OwnerLocation(i64, i64), OwnerLocationFlag(i64, i64, i32),
     LocationFlagTypeOwnerStack(i64, i32, i32, i64),
     OwnerLocationFlagTypeDescending(i64, i64, i32, i32),
@@ -61,6 +61,7 @@ pub(crate) async fn load_items(ex: &(impl Executor + ?Sized), query: ItemQuery<'
         LocationFlags(..) => "i.location_id = $1 AND i.flag_id = ANY($2)",
         LocationOwnerFlags(..) => "i.location_id = $1 AND i.owner_id = $2 AND i.flag_id = ANY($3)",
         LocationOwner(..) => "i.location_id = $1 AND i.owner_id = $2",
+        Owner(..) => "i.owner_id = $1",
         OwnerExceptSelf(..) => "i.owner_id = $1 AND i.item_id <> $1",
         LocationExceptFlag(..) => "i.location_id = $1 AND i.flag_id <> $2",
         IdOrLocationExceptFlag(..) => "i.item_id = $1 OR (i.location_id = $1 AND i.flag_id <> $2)",
@@ -79,7 +80,7 @@ pub(crate) async fn load_items(ex: &(impl Executor + ?Sized), query: ItemQuery<'
     let sql = format!("SELECT i.item_id, i.type_id, i.owner_id, i.location_id, i.flag_id, i.quantity, i.singleton,
                         i.custom_info FROM game.items i WHERE {filter} ORDER BY {order}");
     let rows = match &query {
-        Id(a) | Location(a) | IdOrLocation(a) | OwnerExceptSelf(a) => ex.query(&sql, &[a]).await?,
+        Id(a) | Location(a) | IdOrLocation(a) | Owner(a) | OwnerExceptSelf(a) => ex.query(&sql, &[a]).await?,
         Ids(a) => ex.query(&sql, &[a]).await?,
         IdAt(a,b) | LocationOwner(a,b) | OwnerLocation(a,b) => ex.query(&sql, &[a,b]).await?,
         IdsOwner(a,b) => ex.query(&sql, &[a,b]).await?,

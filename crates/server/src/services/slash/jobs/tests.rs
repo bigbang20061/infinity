@@ -16,7 +16,7 @@ fn grammar_requires_exact_arguments() {
 #[tokio::test]
 #[ignore = "requires an empty dedicated INFINITY_TEST_DATABASE_URL; run serially"]
 async fn cancelled_periodic_job_is_restored_by_seed() {
-    let db = Db::connect(&crate::config::tests::scheduler_database()).await.unwrap();
+    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
     assert!(jobs::counts(&db).await.unwrap().is_empty());
     scheduler::seed(&db).await.unwrap();
     assert!(command(&db, &["cancel", scheduler::BILLS]).await.is_ok());
@@ -34,7 +34,7 @@ async fn cancelled_periodic_job_is_restored_by_seed() {
 #[tokio::test]
 #[ignore = "requires an empty dedicated INFINITY_TEST_DATABASE_URL; run serially"]
 async fn operator_stats_retry_and_cancel() {
-    let db = Db::connect(&crate::config::tests::scheduler_database()).await.unwrap();
+    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
     assert!(jobs::next_due(&db, &[]).await.unwrap().is_none());
     let now = filetime_now();
     let id = format!("jobs-command-test:{now}");

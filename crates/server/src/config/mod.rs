@@ -5,6 +5,7 @@
 pub mod deployment;
 pub mod game;
 pub mod scheduler;
+pub mod lua;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -26,6 +27,7 @@ pub struct Config {
     pub gateway: deployment::GatewayConfig,
     pub cdn: deployment::CdnConfig,
     pub scheduler: scheduler::SchedulerConfig,
+    pub lua: lua::LuaConfig,
     pub accounts: game::economy::AccountsConfig,
     pub characters: game::economy::CharactersConfig,
     pub market: game::economy::MarketConfig,
@@ -60,6 +62,7 @@ impl PartialEq for Config {
             && self.gateway == other.gateway
             && self.cdn == other.cdn
             && self.scheduler == other.scheduler
+            && self.lua == other.lua
             && self.accounts == other.accounts
             && self.characters == other.characters
             && self.market == other.market
@@ -187,6 +190,7 @@ impl Config {
         self.gateway.validate()?;
         self.cdn.validate()?;
         self.scheduler.validate()?;
+        self.lua.validate()?;
         self.game_config().validate()?;
         Ok(())
     }
