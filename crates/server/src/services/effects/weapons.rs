@@ -1,13 +1,14 @@
-//! Turret shots and missile launches using fitted dogma and charge data.
-//! Mirrors clientDogmaLocation and michelle; missiles use the existing approximate
-//! flight and explosion-radius application rather than native missile physics.
+//! Turret accuracy and missile launches using fitted dogma and charge data.
+//! Mirrors clientDogmaLocation and michelle, with accuracy from native GetAccuracy
+//! and SDE attributes; missile flight remains an approximation of native physics.
 use super::lifecycle::Module;
-use crate::services::combat::{attr, groups_health::damage, quantity_change, Ctx, ATTR_DAMAGE};
+use crate::services::combat::{groups_health::damage, quantity_change, Ctx, ATTR_DAMAGE};
 use crate::services::fit::{Fit, Key};
 use crate::services::{db_err, rand01, CallError};
-use crate::consts::{ATTR_AOE_CLOUD_SIZE, ATTR_DAMAGE_MULTIPLIER, ATTR_EXPLOSION_DELAY, ATTR_FALLOFF, ATTR_MAX_RANGE, ATTR_MAX_VELOCITY, ATTR_MISSILE_DAMAGE_MULTIPLIER, ATTR_SIGNATURE_RADIUS};
+use crate::consts::{ATTR_AOE_CLOUD_SIZE, ATTR_AOE_DAMAGE_REDUCTION_FACTOR, ATTR_AOE_VELOCITY, ATTR_DAMAGE_MULTIPLIER, ATTR_EXPLOSION_DELAY, ATTR_FALLOFF, ATTR_MAX_RANGE, ATTR_MAX_VELOCITY, ATTR_MISSILE_DAMAGE_MULTIPLIER, ATTR_OPTIMAL_SIG_RADIUS, ATTR_SIGNATURE_RADIUS, ATTR_TRACKING_SPEED};
 use crate::db::Db;
 use crate::db::outbox::{dispatch_world, Outbox};
+use crate::sde::Sde;
 use crate::space::{dist, ms_to_seconds, now_ms, seconds_to_ms, Ball, World};
 use marshal::Value;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -19,6 +20,8 @@ const MIN_MISSILE_FLIGHT_SECONDS: f64 = 0.5;
 const MAX_MISSILE_FLIGHT_SECONDS: f64 = 30.0;
 /// Existing missile reach tolerance.
 const MISSILE_REACH_ALLOWANCE_METRES: f64 = 2000.0;
+/// SDE signatureRadius default when the attribute metadata is unavailable.
+const DEFAULT_SIGNATURE_RADIUS: f64 = 100.0;
 /// Existing turret falloff hit-chance formula.
 const TURRET_FALLOFF_CHANCE: f64 = 0.5;
 /// Existing turret wrecking-hit probability.
@@ -114,11 +117,49 @@ pub(crate) fn hit_quality(multiplier: f64) -> i64 {
     }
 }
 
-/// A turret's damage multiplier for one shot: miss (0), 0.49..1.49, or a 1% wrecking 3x,
-/// with the hit chance falling off past optimal range.
-pub(crate) fn turret_roll(gap: f64, optimal: f64, falloff: f64) -> f64 {
-    let ratio = (gap - optimal).max(0.0) / falloff.max(1.0);
-    let chance = TURRET_FALLOFF_CHANCE.powf(ratio * ratio);
+/// Center distance, clamped surface distance, relative speed and squared angular velocity.
+pub(crate) fn turret_geometry(src: &Ball, dst: &Ball) -> (f64, f64, f64, f64) {
+    let r = [dst.pos[0] - src.pos[0], dst.pos[1] - src.pos[1], dst.pos[2] - src.pos[2]];
+    let distance = dist(src.pos, dst.pos);
+    let surface = ((distance - dst.radius as f64) - src.radius as f64).max(0.0);
+    let v = [dst.vel[0] - src.vel[0], dst.vel[1] - src.vel[1], dst.vel[2] - src.vel[2]];
+    let speed_squared = v.iter().map(|x| x * x).sum::<f64>();
+    let angular_squared = if distance == 0.0 { 0.0 } else {
+        let radial_speed = v.iter().zip(r).map(|(a, b)| a * b).sum::<f64>() / distance;
+        ((speed_squared - radial_speed * radial_speed) / (distance * distance)).max(0.0)
+    };
+    (distance, surface, speed_squared.sqrt(), angular_squared)
+}
+
+/// Native GetAccuracy uses center-distance angular velocity and surface range.
+/// NPC deviations: zero falloff is a range step, and zero tracking ignores angular velocity.
+pub(crate) fn turret_chance(src: &Ball, dst: &Ball, optimal: f64, falloff: f64, tracking: f64, opt_sig: f64, dst_sig: f64) -> f64 {
+    let (distance, surface, _, angular_squared) = turret_geometry(src, dst);
+    if src.id == dst.id || optimal < 0.0 || distance == 0.0 { return 0.0; }
+    let angular = if tracking == 0.0 { 0.0 } else { angular_squared * (opt_sig / (tracking * dst_sig)).powi(2) };
+    let excess = (surface - optimal).max(0.0);
+    if falloff == 0.0 && excess > 0.0 { return 0.0; }
+    let range = if falloff == 0.0 { 0.0 } else { excess / falloff };
+    TURRET_FALLOFF_CHANCE.powf(angular + range * range)
+}
+
+/// Resolve the effective cached signature, or the type and SDE attribute default.
+pub(crate) fn target_signature(sde: &Sde, target: &Ball) -> f64 {
+    target.signature_radius.filter(|v| *v > 0.0)
+        .or_else(|| sde.types.attribute(target.type_id, ATTR_SIGNATURE_RADIUS).filter(|v| *v > 0.0))
+        .or_else(|| sde.dogma.attribute(ATTR_SIGNATURE_RADIUS).and_then(|a| a.default_value).filter(|v| *v > 0.0))
+        .unwrap_or(DEFAULT_SIGNATURE_RADIUS)
+}
+
+/// Missile damage fraction using the target's absolute impact-time speed.
+pub(crate) fn missile_applied(dst_sig: f64, dst_speed: f64, aoe_cloud: f64, aoe_velocity: f64, drf: f64) -> f64 {
+    let sig = dst_sig / aoe_cloud.max(1.0);
+    let velocity = if dst_speed == 0.0 || aoe_velocity == 0.0 { 1.0 } else { (sig * aoe_velocity / dst_speed).powf(drf) };
+    1.0_f64.min(sig).min(velocity)
+}
+
+/// A turret's damage multiplier: miss (0), 0.49..1.49, or a 1% wrecking 3x.
+pub(crate) fn turret_roll(chance: f64) -> f64 {
     let roll = rand01();
     if roll >= chance {
         0.0
@@ -159,8 +200,9 @@ pub(super) async fn fire_turret(cx: &Ctx, fit: &Fit, module: &Module, target: i6
     let ship_id = cx.ship_id;
     let Some((ship, t)) = cx.world.with(cx.system_id, move |s| Some((s.sampled_ball(ship_id)?, s.sampled_ball(target)?))).await.flatten() else { return Ok(()) };
     let (m, ch) = (Key::Module(module.id), Key::Charge(module.id));
-    let gap = (dist(ship.pos, t.pos) - t.radius as f64 - ship.radius as f64).max(0.0);
-    let multiplier = turret_roll(gap, fit.value(m, ATTR_MAX_RANGE), fit.value(m, ATTR_FALLOFF));
+    let chance = turret_chance(&ship, &t, fit.value(m, ATTR_MAX_RANGE), fit.value(m, ATTR_FALLOFF),
+        fit.value(m, ATTR_TRACKING_SPEED), fit.value(m, ATTR_OPTIMAL_SIG_RADIUS), target_signature(cx.world.sde(), &t));
+    let multiplier = turret_roll(chance);
     let base = fit.value(m, ATTR_DAMAGE_MULTIPLIER).max(0.0) * multiplier;
     let raw = ATTR_DAMAGE.map(|id| fit.value(ch, id) * base);
     let dealt = if multiplier > 0.0 { damage(&cx.db, &cx.world, cx.system_id, target, t.char_id, raw, Some(cx.char_id)).await? } else { 0.0 };
@@ -173,6 +215,8 @@ pub(crate) struct Missile {
     pub(crate) charge: i32,
     pub(crate) raw: [f64; 4],
     pub(crate) aoe_cloud: f64,
+    pub(crate) aoe_velocity: f64,
+    pub(crate) drf: f64,
     pub(crate) velocity: f64,
     pub(crate) flight_range: f64,
     pub(crate) weapon: i32,
@@ -182,7 +226,7 @@ pub(crate) struct Missile {
 
 
 /// Launch a native-steered missile actor; the separate gameplay impact timer
-/// applies damage scaled by explosion radius versus the target's signature.
+/// applies explosion radius and velocity against the impact-time target state.
 pub(crate) async fn launch_missile(db: Db, world: Arc<World>, system: i64, from: Ball, target: Ball, owner: i64, module: Option<i64>, m: Missile) -> Result<(), CallError> {
     let size = world.sde().types.get(m.charge)
         .ok_or_else(|| CallError::Internal(anyhow::anyhow!("unknown type {}", m.charge)))?;
@@ -225,22 +269,24 @@ pub(crate) async fn launch_missile(db: Db, world: Arc<World>, system: i64, from:
         slim,
     };
     let missile_id = missile.id;
-    let signature = attr(world.sde(), target.type_id, ATTR_SIGNATURE_RADIUS, target.radius as f64);
     let distance = dist(from.pos, target.pos);
     let delay_ms = seconds_to_ms((distance / m.velocity.max(1.0)).clamp(MIN_MISSILE_FLIGHT_SECONDS, MAX_MISSILE_FLIGHT_SECONDS));
     let (shooter_id, shooter_pilot) = (from.id, from.char_id);
     let (target_id, target_pilot) = (target.id, target.char_id);
-    let (flight_range, aoe_cloud, raw, weapon, attacker) = (m.flight_range, m.aoe_cloud, m.raw, m.weapon, m.attacker);
+    let (flight_range, aoe_cloud, aoe_velocity, drf, raw, weapon, attacker) =
+        (m.flight_range, m.aoe_cloud, m.aoe_velocity, m.drf, m.raw, m.weapon, m.attacker);
+    let sde = world.sde().clone();
     let world_ref = Arc::downgrade(&world);
     world.system(system).await.map_err(CallError::Internal)?;
     world.with(system, move |s| s.launch_missile(missile, target_id, shooter_id, delay_ms, move |s| {
         s.destroy_ball(missile_id);
-        let present = s.contains(target_id);
+        let application = s.sampled_ball(target_id).map(|target| {
+            missile_applied(target_signature(&sde, &target), dist(target.vel, [0.0; 3]), aoe_cloud, aoe_velocity, drf)
+        });
         let reached = distance <= flight_range + MISSILE_REACH_ALLOWANCE_METRES;
         s.defer(async move {
             let Some(world) = world_ref.upgrade() else { return };
-            let (dealt, quality) = if reached && present {
-                let application = (signature / aoe_cloud.max(1.0)).min(1.0);
+            let (dealt, quality) = if let Some(application) = application.filter(|_| reached) {
                 (damage(&db, &world, system, target_id, target_pilot, raw.map(|d| d * application), attacker).await.unwrap_or(0.0), HIT_NORMAL)
             } else {
                 (0.0, HIT_MISS)
@@ -260,6 +306,8 @@ pub(super) async fn fire_missile(cx: &Ctx, fit: &Fit, module: &Module, charge: i
         charge,
         raw: ATTR_DAMAGE.map(|id| fit.value(ch, id) * fit.value(Key::Char, ATTR_MISSILE_DAMAGE_MULTIPLIER).max(0.0)),
         aoe_cloud: fit.value(ch, ATTR_AOE_CLOUD_SIZE),
+        aoe_velocity: fit.value(ch, ATTR_AOE_VELOCITY),
+        drf: fit.value(ch, ATTR_AOE_DAMAGE_REDUCTION_FACTOR),
         velocity,
         flight_range: velocity * ms_to_seconds(fit.value(ch, ATTR_EXPLOSION_DELAY)),
         weapon: module.type_id,

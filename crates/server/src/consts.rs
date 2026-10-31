@@ -360,6 +360,12 @@ pub const ATTR_MAX_TARGET_RANGE: i32 = 76;
 pub const ATTR_MAX_LOCKED_TARGETS: i32 = 192;
 /// SDE dgmAttributeTypes: aoe_cloud_size.
 pub const ATTR_AOE_CLOUD_SIZE: i32 = 654;
+/// SDE dgmAttributeTypes: aoeVelocity.
+pub const ATTR_AOE_VELOCITY: i32 = 653;
+/// SDE dgmAttributeTypes: aoeDamageReductionFactor.
+pub const ATTR_AOE_DAMAGE_REDUCTION_FACTOR: i32 = 1353;
+/// SDE dgmAttributeTypes: optimalSigRadius.
+pub const ATTR_OPTIMAL_SIG_RADIUS: i32 = 620;
 /// SDE dgmAttributeTypes: recharge_rate.
 pub const ATTR_RECHARGE_RATE: i32 = 55;
 /// SDE dgmAttributeTypes: capacitor_need.
