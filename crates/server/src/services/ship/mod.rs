@@ -10,8 +10,8 @@
 //! commands project a point from the current position and send the raw direction.
 //! Carbonengine `Ballpark::WarpTo` (`Ballpark.cpp:4102-4113`) falls back to
 //! GotoPoint with no WarpFX when the raw destination is strictly below 100 km;
-//! exactly 100 km takes the full-warp path. Full warp timing and landing remain
-//! approximate, as do follow and orbit; collision and bump physics are absent.
+//! exactly 100 km takes the full-warp path. Exit callbacks are transient and
+//! cancelled by replacement movement or restart; collision and bump physics are absent.
 //! Local-chat invites use an outside-space delay for session settlement.
 //! Ship loss commits before its independently best-effort killmail and insurance
 //! operations. NPC workers are outside this module's scope.
@@ -22,15 +22,16 @@ use crate::consts::{ATTR_AGILITY, ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_SIGNATURE_R
 use crate::db::outbox::{Effect, Outbox};
 use crate::dao::{characters::{ship as character_dao, selection}, items::{ship as item_dao, creation}};
 use crate::messages;
-use crate::space::{self, event, now_ms, seconds_to_ms_f64, warp_duration, Ball, Warp, V3, CLOAK_RESTORE, MODE_FOLLOW, MODE_GOTO, MODE_ORBIT, MODE_STOP, MODE_WARP};
+use crate::space::{self, event, now_ms, Ball, V3, CLOAK_RESTORE, MODE_STOP};
+use crate::space::system::Timer;
 use marshal::Value;
 use tracing::{info, warn};
 
 /// Existing gate and station radius fallback in metres.
 const DEFAULT_CELESTIAL_RADIUS: f64 = 5000.0;
 
-/// Carbonengine Ballpark::WarpTo: squared minimum warp distance in metres.
-const MIN_WARP_DISTANCE_SQUARED: f64 = 1e10;
+/// Server gameplay policy: minimum clearance from an object when warping to it (m).
+const MIN_OBJECT_WARP_CLEARANCE: f64 = 2500.0;
 
 fn gate_radius(celestial: Option<f64>, type_radius: Option<f64>) -> f64 {
     celestial.or(type_radius).unwrap_or(DEFAULT_CELESTIAL_RADIUS)
@@ -105,7 +106,7 @@ pub(super) async fn ship_ball(c: &Client, ship_id: i64, pos: [f64; 3]) -> Result
         speed_fraction: 0.0,
         pos,
         vel: [0.0; 3],
-        old_pos: pos, old_vel: [0.0; 3], segment_target: None, segment_warp: None,
+        old_pos: pos, old_vel: [0.0; 3], segment_acceleration: None,
         goto: [0.0; 3],
         follow_id: 0,
         follow_range: 0.0,
@@ -113,7 +114,7 @@ pub(super) async fn ship_ball(c: &Client, ship_id: i64, pos: [f64; 3]) -> Result
         global: false,
         massive: true,
         interactive: true,
-        warp: None,
+        warp: space::WarpState::default(),
         warp_factor: ((warp_mult * base_warp * 1000.0).round() as i64).max(500),
         last_ms: now_ms(),
         interpolation_anchor_ms: 0,
@@ -258,9 +259,7 @@ pub(super) async fn jump_out_and_arrive(c: &mut Client, system: i64, ship: i64, 
     // Jump out where everyone can see it, and let the gate animation run.
     c.world.uncloak(system, ship).await;
     c.world.command(system, ship, move |b, t, _| {
-        b.mode = MODE_STOP;
-        b.speed_fraction = 0.0;
-        b.vel = [0.0; 3];
+        b.stop();
         vec![
             event(t, "Stop", vec![Value::Int(b.id)]),
             special_fx(t, b.id, Some(through), other_type, guid, Some(Value::tuple([Value::Int(dest_system)]))),
@@ -481,52 +480,52 @@ fn movement(c: &mut Client, f: impl FnOnce(&mut Ball, i64, &space::System) -> Ve
 /// `min_range` (at least 2.5 km) off that object's surface on the near side; without,
 /// `min_range` short of the point itself (bookmarks, mission sites, warp-in points),
 /// as Ballpark::RealWarp places it.
-pub(super) fn warp_to(c: &mut Client, object: Option<(V3, f64)>, point: V3, min_range: f64) -> CallResult {
-    movement(c, move |b, t, _| warp_command(b, t, object, point, min_range))
+pub(super) fn warp_to(c: &mut Client, object: Option<(V3, f64)>, point: V3, min_range: f64, on_exit: Option<Timer>) -> CallResult {
+    if !point.iter().all(|v| v.is_finite()) || !min_range.is_finite()
+        || object.is_some_and(|(pos, radius)| !pos.iter().all(|v| v.is_finite()) || !radius.is_finite()) {
+        return Ok(Value::None);
+    }
+    let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) else { return Ok(Value::None) };
+    let pilot = c.session.int("charid");
+    c.world.post(system, move |s| {
+        if s.uncloak(ship) {
+            if let Some(pilot) = pilot {
+                s.notify_pilot(pilot, "OnJumpCloakCancelled", vec![Value::Int(ship)]);
+            }
+        }
+        s.clear_warp_exit(ship);
+        s.command(ship, move |b, t, _| warp_command(b, t, object, point, min_range));
+        if let Some(callback) = on_exit {
+            s.on_warp_exit(ship, callback);
+        }
+    });
+    Ok(Value::None)
 }
 
 fn warp_command(b: &mut Ball, t: i64, object: Option<(V3, f64)>, point: V3, min_range: f64) -> Vec<Value> {
-    let delta = space::sub(point, b.pos);
-    if delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2] < MIN_WARP_DISTANCE_SQUARED {
-        b.mode = MODE_GOTO;
-        b.goto = point;
-        b.warp = None;
-        if b.speed_fraction == 0.0 { b.speed_fraction = 1.0; }
-        return vec![event(t, "GotoPoint", vec![Value::Int(b.id), Value::Float(point[0]), Value::Float(point[1]), Value::Float(point[2])])];
-    }
-    let (center, stand_off) = match object {
-        Some((pos, radius)) => (pos, radius + b.radius as f64 + min_range.max(2500.0)),
-        None => (point, min_range.max(0.0)),
+    let stand_off = match object {
+        Some((_, radius)) => radius + b.radius as f64 + min_range.max(MIN_OBJECT_WARP_CLEARANCE),
+        None => min_range.max(0.0),
     };
-    let away = [b.pos[0] - center[0], b.pos[1] - center[1], b.pos[2] - center[2]];
-    let l = (away[0] * away[0] + away[1] * away[1] + away[2] * away[2]).sqrt().max(1.0);
-    let to = [center[0] + away[0] / l * stand_off, center[1] + away[1] / l * stand_off, center[2] + away[2] / l * stand_off];
-    let distance = ((to[0] - b.pos[0]).powi(2) + (to[1] - b.pos[1]).powi(2) + (to[2] - b.pos[2]).powi(2)).sqrt();
-    let tau = (b.mass * b.agility as f64 / 1e6).max(0.1);
-    let align = -tau * 0.25f64.ln();
-    b.mode = MODE_WARP;
-    b.goto = to;
-    b.speed_fraction = 1.0;
-    b.warp = Some(Warp { from: b.pos, to, start: b.last_ms, duration: seconds_to_ms_f64(align + warp_duration(b.warp_factor as f64, distance)), factor: b.warp_factor });
-    b.effect_stamp = t;
-    // Destiny only enters warp once aligned at 75% of max velocity, and thrust scales
-    // with the speed fraction (Ball::IsAlignedForWarp, GotoThrust): warp at full throttle,
-    // or a stopped ship sits aligning until the 180 s MAX_ALIGN_TICKS fallback.
-    // effects.Warping drives the tunnel, camera and audio (and WarpOut for onlookers);
-    // it follows the ball through align and warp and the client stops it on exit.
-    // `to` already includes min_range; Ballpark::RealWarp would pull the landing point
-    // back by minRange again, so the client gets 0.
-    vec![
-        event(t, "WarpTo", vec![Value::Int(b.id), Value::Float(to[0]), Value::Float(to[1]), Value::Float(to[2]), Value::Float(0.0), Value::Int(b.warp_factor)]),
-        event(t, "SetSpeedFraction", vec![Value::Int(b.id), Value::Float(1.0)]),
-        special_fx(t, b.id, None, None, "effects.Warping", None),
-    ]
+    let factor = b.warp_factor.max(1);
+    match b.warp_to(point, stand_off, factor) {
+        space::WarpOutcome::Ignored => vec![],
+        space::WarpOutcome::Approach => vec![event(t, "GotoPoint", vec![Value::Int(b.id), Value::Float(point[0]), Value::Float(point[1]), Value::Float(point[2])])],
+        space::WarpOutcome::Align => {
+            b.set_speed_fraction(1.0);
+            vec![
+                event(t, "WarpTo", vec![Value::Int(b.id), Value::Float(point[0]), Value::Float(point[1]), Value::Float(point[2]), Value::Float(stand_off), Value::Int(factor)]),
+                event(t, "SetSpeedFraction", vec![Value::Int(b.id), Value::Float(1.0)]),
+                special_fx(t, b.id, None, None, "effects.Warping", None),
+            ]
+        }
+    }
 }
 
 /// Ensure a stationary ship starts moving when given a heading (client sends 1.0 separately too).
 fn ensure_moving(b: &mut Ball, tick: i64, ev: &mut Vec<Value>) {
     if b.speed_fraction <= 0.0 {
-        b.speed_fraction = 1.0;
+        b.set_speed_fraction(1.0);
         ev.push(event(tick, "SetSpeedFraction", vec![Value::Int(b.id), Value::Float(1.0)]));
     }
 }

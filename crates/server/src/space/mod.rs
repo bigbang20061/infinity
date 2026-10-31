@@ -23,10 +23,9 @@
 //! (`Ballpark.cpp:4102-4113`) falls back to GotoPoint for a raw destination
 //! strictly below 100 km, without WarpFX.
 //!
-//! The 0.1-second tau floor limits low-effective-mass fidelity. Finite GOTO
-//! arrival scaling, follow, orbit, full warp and missile flight remain approximate;
-//! collisions and bumps are not modelled. Orientations, formations, miniballs,
-//! AddBalls2 and unsupported ball modes are not implemented.
+//! Missile flight uses native steering; the gameplay impact timer is separate.
+//! Warp follows native alignment and acceleration. Collisions, bumps, orientations,
+//! formations, miniballs, AddBalls2 and unsupported ball modes are not implemented.
 //! Shared vector distances are defined here for simulation and service callers.
 
 use crate::consts::{AU, DAMAGE_LAYER_COUNT, FILETIME_SECOND, SECONDS_PER_MINUTE};
@@ -40,10 +39,17 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 mod actor;
-mod system;
+pub(crate) mod system;
 mod npc;
 mod warpin;
 mod snapshot;
+mod stop;
+mod goto;
+mod follow;
+mod orbit;
+mod missile;
+mod warp;
+pub use warp::{WarpOutcome, WarpState};
 pub use npc::{HOSTILE_TO_ALL, NpcAction, NpcBrain, NpcConfig, NpcEffects, NpcFuture};
 pub use system::System;
 use actor::SystemHandle;
@@ -72,36 +78,29 @@ const MILLISECONDS_PER_SECOND: i64 = 1000;
 const METRES_PER_KILOMETRE: f64 = 1000.0;
 /// SI mass conversion: kilograms per tonne.
 const KILOGRAMS_PER_TONNE: f64 = 1000.0;
-/// Existing normalization tolerance.
-const VECTOR_LENGTH_EPSILON: f64 = 1e-9;
 /// Carbonengine Ballpark::GotoDirection projection distance.
 const GOTO_DIRECTION_REACH: f64 = 1e17;
-/// Existing missing-warp-state serialization default.
-const DEFAULT_WARP_FACTOR: i64 = 3000;
+ 
 /// Existing server damage-state placeholder policy.
 const DAMAGE_STATE_SHIELD_RECHARGE_TAU: f64 = 100_000.0;
 /// Carbonengine Ballpark constructor friction.
 const DESTINY_FRICTION: f64 = 1e6;
-/// ponytail: The 0.1-second floor limits low-effective-mass fidelity; replace it
-/// when native effective-mass semantics are implemented.
-const MIN_MOVEMENT_TAU_SECONDS: f64 = 0.1;
 /// Carbonengine Ballpark::Integrate Taylor-series threshold.
 const INTEGRATE_TAYLOR_THRESHOLD: f64 = 1e-10;
-/// Carbonengine Ballpark::SetupWarpConstants.
-const MAX_WARP_DECELERATION: f64 = 2.0;
 /// Existing server fallback for missing celestial radii.
 const CELESTIAL_FALLBACK_RADIUS: f64 = 1000.0;
 /// Existing server rigid-celestial representation.
 const CELESTIAL_STATIC_MASS: f64 = 1e34;
 
-/// Carbonengine warp factor to AU per second.
-const WARP_FACTOR_TO_AU_PER_SECOND: f64 = 0.001;
-/// Carbonengine warp factor to acceleration.
-const WARP_FACTOR_TO_ACCELERATION: f64 = 1.0 / 1000.0;
-/// Carbonengine warp factor to deceleration.
-const WARP_FACTOR_TO_DECELERATION: f64 = 1.0 / 3000.0;
 
 pub type V3 = [f64; 3];
+#[derive(Clone, Copy)]
+struct TargetState {
+    pos: V3,
+    vel: V3,
+    radius: f32,
+}
+
 
 pub(crate) fn sub(a: V3, b: V3) -> V3 {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
@@ -119,17 +118,8 @@ fn len(a: V3) -> f64 {
 pub fn dist(a: V3, b: V3) -> f64 {
     len(sub(a, b))
 }
-fn norm(a: V3) -> V3 {
-    let l = len(a);
-    if l < VECTOR_LENGTH_EPSILON {
-        [1.0, 0.0, 0.0]
-    } else {
-        scale(a, 1.0 / l)
-    }
-}
-
 /// Carbonengine Vector3d normalization preserves a zero vector.
-fn goto_norm(a: V3) -> V3 {
+fn norm(a: V3) -> V3 {
     let l = len(a);
     if l == 0.0 { a } else { scale(a, 1.0 / l) }
 }
@@ -164,16 +154,7 @@ fn next_aligned_ms(unix_ms: i64, interval_ms: i64) -> i64 {
 }
 
 
-#[derive(Clone)]
-pub struct Warp {
-    pub from: V3,
-    pub to: V3,
-    /// Unix milliseconds.
-    pub start: i64,
-    /// Milliseconds.
-    pub duration: f64,
-    pub factor: i64,
-}
+ 
 
 #[derive(Clone)]
 pub struct Ball {
@@ -196,8 +177,7 @@ pub struct Ball {
     /// Start state and frozen inputs of the last completed movement segment.
     pub old_pos: V3,
     pub old_vel: V3,
-    pub segment_target: Option<V3>,
-    pub segment_warp: Option<Warp>,
+    pub segment_acceleration: Option<V3>,
     pub goto: V3,
     pub follow_id: i64,
     pub follow_range: f32,
@@ -206,7 +186,7 @@ pub struct Ball {
     pub massive: bool,
     /// Destiny isInteractive, independent of movement; Partitionable.cpp AddBall and Thunkers WriteBallToStream.
     pub interactive: bool,
-    pub warp: Option<Warp>,
+    pub warp: WarpState,
     pub warp_factor: i64,
     /// Last integration time in logical destiny milliseconds.
     pub last_ms: i64,
@@ -231,7 +211,7 @@ pub struct Ball {
 /// Carbonengine Ballpark::Integrate and Vector3d reciprocal-division ordering.
 fn integrate(position: V3, velocity: V3, acceleration: V3, mass: f64, friction: f64, time: f64) -> (V3, V3) {
     if time == 0.0 { return (position, velocity); }
-    let time_factor = (-friction / mass * time).exp();
+    let time_factor = if mass <= 0.0 { 0.0 } else { (-friction / mass * time).exp() };
     let friction2 = friction * friction;
     let ook2 = 1.0 / friction2;
     let ook = 1.0 / friction;
@@ -250,26 +230,20 @@ fn integrate(position: V3, velocity: V3, acceleration: V3, mass: f64, friction: 
 }
 
 impl Ball {
-    /// Set a GOTO point from the raw direction, as in Ballpark::GotoDirection.
-    pub fn goto_direction(&mut self, dir: V3) {
-        self.mode = MODE_GOTO;
-        self.warp = None;
-        self.goto = add(self.pos, scale(goto_norm(dir), GOTO_DIRECTION_REACH));
-    }
 
     /// Stateless view of the most recently completed logical movement segment.
     pub fn position_at(&self, t_ms: i64) -> V3 {
-        if self.segment_target.is_none() && self.segment_warp.is_none() { return self.pos; }
         let elapsed = t_ms.saturating_sub(self.interpolation_anchor_ms).clamp(0, MILLISECONDS_PER_SECOND);
+        if self.is_warping() {
+            let t = (self.last_ms / MILLISECONDS_PER_SECOND - self.effect_stamp - 1) as f64
+                + ms_to_seconds(elapsed as f64);
+            return self.warp_distance(self.old_pos, self.old_vel, t, true).0;
+        }
+        if self.segment_acceleration.is_none() { return self.pos; }
         if elapsed == 0 { return self.old_pos; }
         if elapsed == MILLISECONDS_PER_SECOND { return self.pos; }
-        if let Some(w) = &self.segment_warp {
-            let sample_ms = self.last_ms.saturating_sub(MILLISECONDS_PER_SECOND).saturating_add(elapsed);
-            let fraction = (sample_ms.saturating_sub(w.start) as f64 / w.duration.max(1.0)).clamp(0.0, 1.0);
-            return add(w.from, scale(sub(w.to, w.from), fraction));
-        }
-        let mass = (self.mass * self.agility as f64).max(DESTINY_FRICTION * MIN_MOVEMENT_TAU_SECONDS);
-        let acceleration = scale(self.segment_target.unwrap(), DESTINY_FRICTION / mass);
+        let mass = self.mass * self.agility as f64;
+        let acceleration = self.segment_acceleration.unwrap();
         integrate(self.old_pos, self.old_vel, acceleration, mass, DESTINY_FRICTION,
             ms_to_seconds(elapsed as f64)).0
     }
@@ -326,15 +300,13 @@ impl Ball {
                 }
             }
             MODE_WARP => {
-                let w = self.warp.clone().unwrap_or(Warp { from: self.pos, to: self.goto, start: now_ms(), duration: 0.0, factor: DEFAULT_WARP_FACTOR });
-                for c in w.to {
+                for c in self.goto {
                     o.extend_from_slice(&c.to_le_bytes());
                 }
-                o.extend_from_slice(&(self.effect_stamp as i32).to_le_bytes()); // effectStamp
-                o.extend_from_slice(&dist(w.to, w.from).to_le_bytes()); // total warp length
-                // minRange (a double in mFollowId's slot); 0 because `to` already includes it.
-                o.extend_from_slice(&0.0f64.to_le_bytes());
-                o.extend_from_slice(&w.factor.to_le_bytes());
+                o.extend_from_slice(&(self.effect_stamp as i32).to_le_bytes());
+                o.extend_from_slice(&self.warp.length.to_le_bytes());
+                o.extend_from_slice(&self.warp.min_range.to_le_bytes());
+                o.extend_from_slice(&self.warp.factor.to_le_bytes());
             }
             _ => {}
         }
@@ -370,62 +342,61 @@ impl Ball {
         Value::instance("eve.common.script.util.slimItem.SlimItem", fields)
     }
 
-    /// Exact integration for a constant target velocity over elapsed milliseconds.
-    fn evolve(&mut self, ms: i64, interpolation_anchor_ms: i64, others: &HashMap<i64, V3>) {
-        // Missile launch time is also the stream's effectStamp.
-        if self.mode == MODE_MISSILE { return; }
+    fn evolve_behavior_for_ball(&mut self, ms: i64, anchor: i64, others: &HashMap<i64, TargetState>, current_time: i64) {
+        if !self.free || ms <= self.last_ms { return; }
+        self.interpolation_anchor_ms = anchor;
+        if matches!(self.mode, MODE_FOLLOW | MODE_ORBIT | MODE_MISSILE) && !others.contains_key(&self.follow_id) {
+            if self.mode == MODE_MISSILE {
+                self.massive = false;
+                self.goto_direction(self.vel);
+            } else if self.mode == MODE_ORBIT && self.interactive { self.goto_direction(self.vel); } else { self.stop(); }
+        }
+        if self.mode == MODE_STOP { self.evolve_stop(); }
+        self.old_pos = self.pos;
+        self.old_vel = self.vel;
+        self.segment_acceleration = None;
+        let mass = self.mass * self.agility as f64;
+        let acceleration = if mass <= 0.0 { V3::default() } else {
+            match self.mode {
+                MODE_GOTO => self.evolve_goto(),
+                MODE_FOLLOW => self.evolve_follow(&others[&self.follow_id]),
+                MODE_ORBIT => self.evolve_old_style_orbit(&others[&self.follow_id], current_time),
+                MODE_MISSILE => self.evolve_missile(&others[&self.follow_id], current_time),
+                MODE_WARP => self.evolve_warp(current_time),
+                _ => V3::default(),
+            }
+        };
+        self.segment_acceleration = Some(acceleration);
+    }
+
+    fn evolve_position(&mut self, ms: i64) {
         if !self.free || ms <= self.last_ms {
             self.last_ms = self.last_ms.max(ms);
             return;
         }
-        self.interpolation_anchor_ms = interpolation_anchor_ms;
-        self.old_pos = self.pos;
-        self.old_vel = self.vel;
-        self.segment_target = None;
-        self.segment_warp = self.warp.clone();
-        if let Some(w) = &self.warp {
-            let elapsed = (ms - w.start) as f64;
-            if elapsed >= w.duration {
-                self.pos = w.to;
-                self.vel = V3::default();
-                self.warp = None;
-                self.mode = MODE_STOP;
-                self.speed_fraction = 0.0;
-            } else {
-                self.pos = add(w.from, scale(sub(w.to, w.from), (elapsed / w.duration.max(1.0)).clamp(0.0, 1.0)));
+        if self.is_warping() {
+            let t = (self.last_ms / MILLISECONDS_PER_SECOND - self.effect_stamp) as f64;
+            let (pos, vel, exit) = self.warp_distance(self.pos, self.vel, t, false);
+            self.pos = pos;
+            self.vel = vel;
+            if exit {
+                self.massive = true;
+                self.stop();
+                self.old_pos = pos;
+                self.old_vel = vel;
+                let mass = self.mass * self.agility as f64;
+                (self.pos, self.vel) = integrate(pos, vel, self.segment_acceleration.unwrap_or_default(),
+                    mass, DESTINY_FRICTION, ms_to_seconds((ms - self.last_ms) as f64));
             }
-            self.last_ms = ms;
-            return;
+        } else if let Some(acceleration) = self.segment_acceleration {
+            let dt = ms_to_seconds((ms - self.last_ms) as f64);
+            let mass = self.mass * self.agility as f64;
+            (self.pos, self.vel) = integrate(self.pos, self.vel, acceleration, mass, DESTINY_FRICTION, dt);
         }
-        let dt = ms_to_seconds((ms - self.last_ms) as f64);
-        let mass = (self.mass * self.agility as f64).max(DESTINY_FRICTION * MIN_MOVEMENT_TAU_SECONDS);
-        let speed = (self.max_vel * self.speed_fraction) as f64;
-        let target = match self.mode {
-            MODE_GOTO => scale(goto_norm(sub(self.goto, self.pos)), speed),
-            MODE_FOLLOW | MODE_ORBIT => others.get(&self.follow_id).map(|&p| {
-                let d = sub(p, self.pos);
-                if len(d) <= self.follow_range as f64 + self.radius as f64 { V3::default() }
-                else { scale(norm(d), speed) }
-            }).unwrap_or_default(),
-            _ => V3::default(),
-        };
-        self.segment_target = Some(target);
-        let acceleration = scale(target, DESTINY_FRICTION / mass);
-        (self.pos, self.vel) = integrate(self.pos, self.vel, acceleration, mass, DESTINY_FRICTION, dt);
         self.last_ms = ms;
     }
 }
 
-/// Ballpark::SetupWarpConstants -> total warp duration in seconds.
-pub fn warp_duration(factor: f64, distance: f64) -> f64 {
-    let accel = factor * WARP_FACTOR_TO_ACCELERATION;
-    let decel = (factor * WARP_FACTOR_TO_DECELERATION).min(MAX_WARP_DECELERATION);
-    let speed = (factor * WARP_FACTOR_TO_AU_PER_SECOND * AU).min((distance + 1.0) * accel * decel / (accel + decel));
-    let accel_t = (speed / accel).ln() / accel;
-    let cruise_t = (distance / speed) - (1.0 / accel) - (1.0 / decel) + (1.0 / speed);
-    let decel_t = (speed / decel).ln() / decel;
-    (accel_t + cruise_t.max(0.0) + decel_t).max(1.0) + 1.0
-}
 
 pub type DestinyTx = mpsc::UnboundedSender<Vec<Value>>;
 /// A client's notification channel: (event, args) scattered on its client.
@@ -618,8 +589,7 @@ impl World {
                     vel: V3::default(),
                     old_pos: pos,
                     old_vel: V3::default(),
-                    segment_target: None,
-                    segment_warp: None,
+                    segment_acceleration: None,
                     goto: V3::default(),
                     follow_id: 0,
                     follow_range: 0.0,
@@ -627,7 +597,7 @@ impl World {
                     global: true,
                     massive: true,
                     interactive: false,
-                    warp: None,
+                    warp: WarpState::default(),
                     warp_factor: 0,
                     last_ms: tick,
                     interpolation_anchor_ms: tick,

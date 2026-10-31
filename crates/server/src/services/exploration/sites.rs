@@ -45,10 +45,10 @@ pub(super) fn sleeper_groups(difficulty: i64) -> [&'static str; 3] {
 }
 
 /// Spawn a combat site's NPCs (once) and register its clearance callback.
-pub(super) async fn spawn_site_npcs(c: &mut Client, site: &Site) -> Result<(), CallError> {
+pub(super) async fn spawn_site_npcs(db: &Db, world: &Arc<World>, user_id: i64, site: &Site) -> Result<(), CallError> {
     let faction = site.faction.unwrap_or(FACTION_GURISTAS);
     let sleepers = faction == 500021 && site.name_id.is_some() && site.archetype == Some(24) && site.strength_attr == STRENGTH_ALL && {
-        let class = system_info(c.world.sde(), site.system)?.class;
+        let class = system_info(world.sde(), site.system)?.class;
         (1..=6).contains(&class)
     };
     let groups: Vec<String> = if sleepers {
@@ -65,12 +65,12 @@ pub(super) async fn spawn_site_npcs(c: &mut Client, site: &Site) -> Result<(), C
         site_classes(site.difficulty).iter().map(|class| format!("{} {class}", rat_prefix(faction))).collect()
     };
     let [min, max] = crate::config::game().npc.site_spawn_range_m;
-    let spawned = spawn_rats(c, site.system, site.pos, faction, &groups, (min as f64, max as f64)).await?;
-    info!(user = c.login.user_id, "site {} ({}) in {}: spawned {} NPCs", site.target, site.id, site.system, spawned.len());
+    let spawned = spawn_rats(db, world, site.system, site.pos, faction, &groups, (min as f64, max as f64)).await?;
+    info!(user = user_id, "site {} ({}) in {}: spawned {} NPCs", site.target, site.id, site.system, spawned.len());
     if let Some(s) = state().sites.get_mut(&site.id) {
         s.npcs = Some(spawned.clone());
     }
-    track_site_clearance(c.db.clone(), c.world.clone(), site.id, site.system, spawned);
+    track_site_clearance(db.clone(), world.clone(), site.id, site.system, spawned);
     Ok(())
 }
 
@@ -92,13 +92,13 @@ pub(super) fn track_site_clearance(db: Db, world: Arc<World>, site_id: i64, syst
 
 /// Put one hostile NPC of each of `groups` (a random type of the group) in space for
 /// `faction`, between `spread.0` and `spread.1` metres from `center`.
-pub(super) async fn spawn_rats(c: &mut Client, system: i64, center: V3, faction: i64, groups: &[String], spread: (f64, f64)) -> Result<Vec<i64>, CallError> {
-    let corp = c.world.sde().factions.get(faction).and_then(|f| f.corporation_id).unwrap_or(1000127);
+pub(super) async fn spawn_rats(db: &Db, world: &Arc<World>, system: i64, center: V3, faction: i64, groups: &[String], spread: (f64, f64)) -> Result<Vec<i64>, CallError> {
+    let corp = world.sde().factions.get(faction).and_then(|f| f.corporation_id).unwrap_or(1000127);
     let ms = now_ms();
     let mut spawned = vec![];
     for group in groups {
-        let candidates: Vec<_> = c.world.sde().types.iter().filter(|t| {
-            t.group_id.and_then(|id| c.world.sde().types.group(id))
+        let candidates: Vec<_> = world.sde().types.iter().filter(|t| {
+            t.group_id.and_then(|id| world.sde().types.group(id))
                 .is_some_and(|g| g.category_id == Some(CATEGORY_ENTITY) && g.name.as_deref() == Some(group.as_str()))
         }).collect();
         let Some(r) = pick(&candidates) else { continue };
@@ -122,7 +122,7 @@ pub(super) async fn spawn_rats(c: &mut Client, system: i64, center: V3, faction:
             pos,
             vel: [0.0; 3],
             old_pos: pos,
-            old_vel: [0.0; 3], segment_target: None, segment_warp: None,
+            old_vel: [0.0; 3], segment_acceleration: None,
             goto: [0.0; 3],
             follow_id: 0,
             follow_range: 0.0,
@@ -130,7 +130,7 @@ pub(super) async fn spawn_rats(c: &mut Client, system: i64, center: V3, faction:
             global: false,
             massive: true,
             interactive: false,
-            warp: None,
+            warp: crate::space::WarpState::default(),
             warp_factor: 0,
             last_ms: ms,
             interpolation_anchor_ms: ms,
@@ -142,8 +142,8 @@ pub(super) async fn spawn_rats(c: &mut Client, system: i64, center: V3, faction:
             slim: vec![("corpID", Value::Int(corp))],
         };
         let (id, type_id) = (ball.id, ball.type_id);
-        c.world.add_ship(system, ball).await.map_err(CallError::Internal)?;
-        crate::services::combat::spawn_npc(c.db.clone(), c.world.clone(), system, id, type_id, Some(crate::space::HOSTILE_TO_ALL)).await?;
+        world.add_ship(system, ball).await.map_err(CallError::Internal)?;
+        crate::services::combat::spawn_npc(db.clone(), world.clone(), system, id, type_id, Some(crate::space::HOSTILE_TO_ALL)).await?;
         spawned.push(id);
     }
     Ok(spawned)
@@ -260,7 +260,7 @@ pub(super) fn wormhole_ball(s: &Site, w: &Wormhole) -> Ball {
         speed_fraction: 0.0,
         pos: s.pos,
         vel: [0.0; 3],
-        old_pos: s.pos, old_vel: [0.0; 3], segment_target: None, segment_warp: None,
+        old_pos: s.pos, old_vel: [0.0; 3], segment_acceleration: None,
         goto: [0.0; 3],
         follow_id: 0,
         follow_range: 0.0,
@@ -268,7 +268,7 @@ pub(super) fn wormhole_ball(s: &Site, w: &Wormhole) -> Ball {
         global: false,
         massive: false,
         interactive: false,
-        warp: None,
+        warp: crate::space::WarpState::default(),
         warp_factor: 0,
         last_ms: now_ms(),
         interpolation_anchor_ms: 0,
@@ -471,7 +471,7 @@ pub(super) fn container_ball(id: i64, type_id: i32, pos: V3, radius: f32, securi
         speed_fraction: 0.0,
         pos,
         vel: [0.0; 3],
-        old_pos: pos, old_vel: [0.0; 3], segment_target: None, segment_warp: None,
+        old_pos: pos, old_vel: [0.0; 3], segment_acceleration: None,
         goto: [0.0; 3],
         follow_id: 0,
         follow_range: 0.0,
@@ -479,7 +479,7 @@ pub(super) fn container_ball(id: i64, type_id: i32, pos: V3, radius: f32, securi
         global: false,
         massive: true,
         interactive: false,
-        warp: None,
+        warp: crate::space::WarpState::default(),
         warp_factor: 0,
         last_ms: now_ms(),
         interpolation_anchor_ms: 0,
@@ -510,13 +510,13 @@ fn select_loot<T>(mut rows: Vec<T>, limit: usize, eligible: impl Fn(&T) -> bool,
 }
 
 /// Spawn a data or relic site's containers with their loot (once).
-pub(super) async fn spawn_containers(c: &mut Client, site: &Site) -> Result<(), CallError> {
+pub(super) async fn spawn_containers(db: &Db, world: &Arc<World>, user_id: i64, site: &Site) -> Result<(), CallError> {
     let relic = site.strength_attr == STRENGTH_MAGNETOMETRIC;
     let faction = site.faction.unwrap_or(FACTION_GURISTAS);
     let prefix = container_prefix(faction);
     let sleeper = prefix == "Sleeper";
     let skill = if relic { SKILL_ARCHAEOLOGY } else { SKILL_HACKING };
-    let sde = c.world.sde();
+    let sde = world.sde();
     let mut tiers = sde.dogma.attributes_by_name("tierDifficulty");
     let tier = tiers.next().map(|a| a.attribute_id);
     let duplicate_tier = tiers.next().is_some();
@@ -543,24 +543,24 @@ pub(super) async fn spawn_containers(c: &mut Client, site: &Site) -> Result<(), 
         let d = 2_000.0 + rand01() * 18_000.0;
         let v = rand_dir();
         let pos = [site.pos[0] + v[0] * d, site.pos[1] + v[1] * d * 0.3, site.pos[2] + v[2] * d];
-        let id = crate::dao::exploration::insert_container(&c.db, type_id, site.system, pos).await.map_err(db_err)?;
+        let id = crate::dao::exploration::insert_container(db, type_id, site.system, pos).await.map_err(db_err)?;
         let stacks = 2 + (rand01() * 2.0) as i64;
-        let rows = crate::dao::exploration::loot(&c.db, value).await.map_err(db_err)?;
-        let loot = select_loot(rows, stacks as usize, |r| c.world.sde().types.get(r.type_id)
+        let rows = crate::dao::exploration::loot(db, value).await.map_err(db_err)?;
+        let loot = select_loot(rows, stacks as usize, |r| world.sde().types.get(r.type_id)
             .is_some_and(|t| t.published == Some(true) && t.group_id.is_some_and(|g| groups.contains(&g))), rand01);
         for r in &loot {
             let (loot_type, price) = (r.type_id, r.average);
             let quantity = ((value / stacks as f64 / price.max(1.0)) * (0.5 + rand01())).round().clamp(1.0, 500.0) as i32;
-            crate::dao::exploration::insert_loot(&c.db, loot_type, id, quantity).await.map_err(db_err)?;
+            crate::dao::exploration::insert_loot(db, loot_type, id, quantity).await.map_err(db_err)?;
         }
-        c.world.add_ship(site.system, container_ball(id, type_id, pos, radius as f32, 0)).await.map_err(CallError::Internal)?;
+        world.add_ship(site.system, container_ball(id, type_id, pos, radius as f32, 0)).await.map_err(CallError::Internal)?;
         ids.push(id);
     }
-    info!(user = c.login.user_id, "site {} ({}) in {}: {} containers", site.target, site.id, site.system, ids.len());
+    info!(user = user_id, "site {} ({}) in {}: {} containers", site.target, site.id, site.system, ids.len());
     if let Some(s) = state().sites.get_mut(&site.id) {
         s.containers = Some(ids);
     }
-    persist(&c.db, site.id).await
+    persist(db, site.id).await
 }
 
 /// Put a stored site's containers back in space after a restart.

@@ -5,7 +5,7 @@
 //! client tree; `eve/client/script/parklife/dungeonTracking.py:104-110` consumes room
 //! entries. This server instead places a site off a planet's surface and ties it to
 //! one of the build's dungeons for its name, faction and difficulty.
-//! Combat sites fill with that faction's NPCs when first warped to and are replaced
+//! Combat sites fill with their faction's NPCs on first actual warp exit and are replaced
 //! elsewhere after their spawn group clears and the site lingers briefly. Data and relic
 //! sites hold hackable containers (services/hacking) with loot. A wormhole leads to a
 //! random system of its target class, where a K162 leads back; both ends share one mass
@@ -17,8 +17,8 @@
 //! memory holds the systems loaded since startup. Wormholes and spawned containers are put
 //! back in space when their system is loaded again. Startup moves legacy exploration and
 //! mission sites out of planets, along with exploration overlays and asteroids.
-//! Scan completion, probe recovery and site respawns use transient system actor timers;
-//! pending timers do not survive a restart.
+//! Scan completion, probe recovery, site respawns and warp-exit callbacks are transient;
+//! pending work does not survive cancellation or restart.
 //! Probe charges are consumed atomically before transient probes are created.
 //! Probe origins, directional scans and wormhole range use actor-time sampled positions.
 //!
@@ -39,6 +39,7 @@ mod wormhole_mgr;
 mod generation;
 mod scanning;
 mod sites;
+mod landing;
 
 use generation::*;
 use scanning::*;
@@ -182,12 +183,12 @@ struct Site {
     overlay_pos: V3,
     deviation: f64,
     wormhole: Option<Wormhole>,
-    /// NPCs spawned at the site (None until someone first warps there; not kept over a
-    /// restart, they spawn again on the next visit).
+    /// NPCs spawned on first arrival, or an empty reservation while spawning;
+    /// not kept over a restart.
     npcs: Option<Vec<i64>>,
     /// The wormhole is in space (it appears once someone warps to it).
     in_space: bool,
-    /// Hackable containers (game.items) of a data or relic site, once spawned.
+    /// Hackable containers or mining rocks, with an empty reservation while spawning.
     containers: Option<Vec<i64>>,
     hacked: Vec<i64>,
 }
@@ -433,30 +434,30 @@ pub async fn launch_probes(c: &mut Client, call: &Call<'_>) -> CallResult {
 
 
 
-/// A pilot is warping to `belt`: unless disabled, its rats are still about, or it
+/// A pilot arrived at `belt`: unless disabled, its rats are still about, or it
 /// was cleared within the configured respawn delay, the region's pirates spawn.
 /// Other celestials and wormhole space get none.
-pub async fn belt_rats(c: &mut Client, system: i64, belt: i64, center: V3) -> Result<(), CallError> {
+pub async fn belt_rats(db: &Db, world: &Arc<World>, user_id: i64, system: i64, belt: i64, center: V3) -> Result<(), CallError> {
     if !crate::config::game().npc.belt_rats || state().belts.contains(&belt) {
         return Ok(());
     }
-    let is_belt = c.world.sde().map.celestial(belt).is_some_and(|body| body.group_id == Some(i64::from(GROUP_ASTEROID_BELT)));
-    let info = system_info(c.world.sde(), system)?;
+    let is_belt = world.sde().map.celestial(belt).is_some_and(|body| body.group_id == Some(i64::from(GROUP_ASTEROID_BELT)));
+    let info = system_info(world.sde(), system)?;
     if !is_belt || (1..=6).contains(&info.class) || !state().belts.insert(belt) {
         return Ok(());
     }
     let faction = pirate_faction(info.faction, info.region);
     let groups: Vec<String> = belt_classes(info.security).iter().map(|class| format!("{} {class}", rat_prefix(faction))).collect();
     let [min, max] = crate::config::game().npc.belt_spawn_range_m;
-    let spawned = match spawn_rats(c, system, center, faction, &groups, (min as f64, max as f64)).await {
+    let spawned = match spawn_rats(db, world, system, center, faction, &groups, (min as f64, max as f64)).await {
         Ok(s) => s,
         Err(e) => {
             state().belts.remove(&belt);
             return Err(e);
         }
     };
-    info!(user = c.login.user_id, "belt {belt} in {system}: spawned {} rats", spawned.len());
-    c.world.post(system, move |s| {
+    info!(user = user_id, "belt {belt} in {system}: spawned {} rats", spawned.len());
+    world.post(system, move |s| {
         s.spawn_group(spawned, move |s| {
             s.schedule(seconds_to_ms(crate::config::game().npc.belt_rat_respawn_secs as f64), move |_| {
                 state().belts.remove(&belt);
@@ -494,27 +495,21 @@ pub async fn warp_to_scan(c: &mut Client, target: &str, min_range: f64) -> CallR
     }
     if site.wormhole.is_some() {
         ensure_wormhole_ball(&c.db, &c.world, site.id).await?;
-        return super::ship::warp_to(c, Some((site.pos, 3000.0)), site.pos, min_range);
+        return super::ship::warp_to(c, Some((site.pos, 3000.0)), site.pos, min_range, None);
     }
-    if let Some(field) = site.mining_field() {
-        if site.containers.is_none() {
-            let info = system_info(c.world.sde(), system)?;
-            let jspace = (1..=6).contains(&info.class);
-            let rocks = super::mining::grow_field(&c.db, &c.world, system, site.id, site.pos, field, info.security, jspace).await?;
-            if let Some(s) = state().sites.get_mut(&site.id) {
-                s.containers = Some(rocks.clone());
+    let db = c.db.clone();
+    let world = Arc::downgrade(&c.world);
+    let user = c.login.user_id;
+    let site_id = site.id;
+    let on_exit: crate::space::system::Timer = Box::new(move |s| {
+        s.defer(async move {
+            let Some(world) = world.upgrade() else { return };
+            if let Err(e) = landing::arrive(&db, &world, user, system, site_id).await {
+                warn!(user, "site {site_id} landing: {}", err_text(e));
             }
-            persist(&c.db, site.id).await?;
-            track_site_clearance(c.db.clone(), c.world.clone(), site.id, system, rocks);
-        }
-    } else if site.is_hack_site() {
-        if site.containers.is_none() {
-            spawn_containers(c, &site).await?;
-        }
-    } else if site.npcs.is_none() && site.dungeon_id.is_some() {
-        spawn_site_npcs(c, &site).await?;
-    }
-    super::ship::warp_to(c, None, site.pos, min_range)
+        });
+    });
+    super::ship::warp_to(c, None, site.pos, min_range, Some(on_exit))
 }
 
 

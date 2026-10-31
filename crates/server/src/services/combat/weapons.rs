@@ -84,13 +84,17 @@ pub(super) async fn apply_propulsion(cx: &Ctx, master: i64, generation: Arc<Atom
 }
 
 pub(super) fn propulsion_transition(b: &mut Ball, stamp: i64, speed: f64, mass: f64, signature: f64) -> Vec<Value> {
-    b.max_vel = speed as f32;
-    b.mass = mass;
+    b.set_max_speed(speed as f32);
+    b.set_ball_mass(mass);
     b.signature_radius = Some(signature);
-    vec![
-        event(stamp, "SetMaxSpeed", vec![Value::Int(b.id), Value::Float(speed)]),
-        event(stamp, "SetBallMass", vec![Value::Int(b.id), Value::Float(mass)]),
-    ]
+    let mut events = Vec::new();
+    if (speed as f32).is_finite() && speed >= 0.0 {
+        events.push(event(stamp, "SetMaxSpeed", vec![Value::Int(b.id), Value::Float(speed)]));
+    }
+    if mass.is_finite() && mass > 0.0 {
+        events.push(event(stamp, "SetBallMass", vec![Value::Int(b.id), Value::Float(mass)]));
+    }
+    events
 }
 
 #[derive(Clone)]
@@ -260,8 +264,8 @@ pub(super) struct Missile {
 }
 
 
-/// Launch from the actor-sampled source and target captured together: it flies client-side;
-/// on impact it explodes and deals damage scaled by explosion radius vs. the target's signature.
+/// Launch a native-steered missile actor; the separate gameplay impact timer
+/// applies damage scaled by explosion radius versus the target's signature.
 pub(super) async fn launch_missile(db: Db, world: Arc<World>, system: i64, from: Ball, target: Ball, owner: i64, module: Option<i64>, m: Missile) -> Result<(), CallError> {
     let size = world.sde().types.get(m.charge)
         .ok_or_else(|| CallError::Internal(anyhow::anyhow!("unknown type {}", m.charge)))?;
@@ -284,7 +288,7 @@ pub(super) async fn launch_missile(db: Db, world: Arc<World>, system: i64, from:
         speed_fraction: 0.0,
         pos: from.pos,
         vel: [0.0; 3],
-        old_pos: from.pos, old_vel: [0.0; 3], segment_target: None, segment_warp: None,
+        old_pos: from.pos, old_vel: [0.0; 3], segment_acceleration: None,
         goto: target.pos,
         follow_id: 0,
         follow_range: 0.0,
@@ -292,7 +296,7 @@ pub(super) async fn launch_missile(db: Db, world: Arc<World>, system: i64, from:
         global: false,
         massive: false,
         interactive: false,
-        warp: None,
+        warp: crate::space::WarpState::default(),
         warp_factor: 0,
         last_ms: launch_ms,
         interpolation_anchor_ms: launch_ms,

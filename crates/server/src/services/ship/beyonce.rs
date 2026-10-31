@@ -1,4 +1,5 @@
-//! The beyonce remote ballpark service; uses the space actor and SDE gate data. NPC workers are outside its scope.
+//! The beyonce remote ballpark service uses the space actor and SDE gate data.
+//! Belt rats spawn after actual warp exit; pending callbacks do not survive cancellation or restart.
 use super::*;
 
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
@@ -7,8 +8,9 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         ("beyonce", "UpdateStateRequest") => send_state(c).await.map(|_| Value::None),
         ("beyonce", "CmdGotoDirection") => {
             let dir = [f(a.first()), f(a.get(1)), f(a.get(2))];
+            if !dir.iter().all(|v| v.is_finite()) { return Some(Ok(Value::None)); }
             movement(c, move |b, t, _| {
-                b.goto_direction(dir);
+                if !b.goto_direction(dir) { return vec![]; }
                 let mut ev = vec![event(t, "GotoDirection", vec![Value::Int(b.id), Value::Float(dir[0]), Value::Float(dir[1]), Value::Float(dir[2])])];
                 ensure_moving(b, t, &mut ev);
                 ev
@@ -19,7 +21,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             movement(c, move |b, t, others| {
                 let Some(tp) = target.and_then(|id| others.ball(id)).map(|o| o.pos) else { return vec![] };
                 let dir = [tp[0] - b.pos[0], tp[1] - b.pos[1], tp[2] - b.pos[2]];
-                b.goto_direction(dir);
+                if !b.goto_direction(dir) { return vec![]; }
                 let mut ev = vec![event(t, "GotoDirection", vec![Value::Int(b.id), Value::Float(dir[0]), Value::Float(dir[1]), Value::Float(dir[2])])];
                 ensure_moving(b, t, &mut ev);
                 ev
@@ -28,28 +30,28 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         ("beyonce", "CmdStop") => {
             if let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) {
                 c.world.command(system, ship, |b, t, _| {
-                    b.mode = MODE_STOP;
-                    b.speed_fraction = 0.0;
+                    b.stop();
                     vec![event(t, "Stop", vec![Value::Int(b.id)])]
                 });
             }
             Ok(Value::None)
         }
         ("beyonce", "CmdSetSpeedFraction") => {
-            let frac = f(a.first()).clamp(0.0, 1.0) as f32;
+            let frac = f(a.first()) as f32;
+            if !frac.is_finite() { return Some(Ok(Value::None)); }
             movement(c, move |b, t, _| {
-                b.speed_fraction = frac;
-                vec![event(t, "SetSpeedFraction", vec![Value::Int(b.id), Value::Float(frac as f64)])]
+                b.set_speed_fraction(frac);
+                vec![event(t, "SetSpeedFraction", vec![Value::Int(b.id), Value::Float(b.speed_fraction as f64)])]
             })
         }
         ("beyonce", "CmdFollowBall") | ("beyonce", "CmdOrbit") => {
             let target = a.first().and_then(|v| v.as_int()).unwrap_or(0);
             let range = f(a.get(1)) as f32;
             let orbit = call.method == "CmdOrbit";
-            movement(c, move |b, t, _| {
-                b.mode = if orbit { MODE_ORBIT } else { MODE_FOLLOW };
-                b.follow_id = target;
-                b.follow_range = range;
+            if !range.is_finite() { return Some(Ok(Value::None)); }
+            movement(c, move |b, t, others| {
+                let Some(target_ball) = others.ball(target) else { return vec![] };
+                if !(if orbit { b.orbit(target_ball, range) } else { b.follow_ball(target_ball, range) }) { return vec![]; }
                 let name = if orbit { "Orbit" } else { "FollowBall" };
                 let mut ev = vec![event(t, name, vec![Value::Int(b.id), Value::Int(target), Value::Float(range as f64)])];
                 ensure_moving(b, t, &mut ev);
@@ -77,18 +79,26 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             let Some((id, pos, radius, warp_in)) = found else {
                 return Some(Ok(Value::None));
             };
+            let on_exit: Option<Timer> = if !by_pilot {
+                c.session.int("solarsystemid").map(|system| {
+                    let db = c.db.clone();
+                    let world = std::sync::Arc::downgrade(&c.world);
+                    let user = c.login.user_id;
+                    Box::new(move |s: &mut space::System| {
+                        s.defer(async move {
+                            let Some(world) = world.upgrade() else { return };
+                            if let Err(e) = crate::services::exploration::belt_rats(&db, &world, user, system, id, pos).await {
+                                warn!(user, "belt rats at {}: {}", id, crate::services::exploration::err_text(e));
+                            }
+                        });
+                    }) as Timer
+                })
+            } else { None };
             // Suns, planets, moons and belts land at their warp-in point, not off the surface.
-            let warped = match warp_in {
-                Some(point) => warp_to(c, None, point, min_range),
-                None => warp_to(c, Some((pos, radius)), pos, min_range),
-            };
-            // Warping to an asteroid belt brings out its rats.
-            if let (Ok(_), false, Some(system)) = (&warped, by_pilot, c.session.int("solarsystemid")) {
-                if let Err(e) = crate::services::exploration::belt_rats(c, system, id, pos).await {
-                    warn!(user = c.login.user_id, "belt rats at {}: {}", id, crate::services::exploration::err_text(e));
-                }
+            match warp_in {
+                Some(point) => warp_to(c, None, point, min_range, on_exit),
+                None => warp_to(c, Some((pos, radius)), pos, min_range, on_exit),
             }
-            warped
         }
         ("beyonce", "CmdStargateJump") => {
             let from_gate = a.first().and_then(|v| v.as_int()).unwrap_or(0);
