@@ -3,6 +3,7 @@
 //! Session state uses the game database and in-memory world; account ownership
 //! is process-local and does not coordinate separate server processes.
 //! A successful disconnect cleanup hands off the selected character's logoff event.
+//! Actor-timed transitions flush queued notifications and forward destiny batches while waiting.
 
 use crate::conn::{Conn, Writer};
 use crate::consts::{FILETIME_SECOND, FILETIME_UNIX_EPOCH};
@@ -140,13 +141,22 @@ impl Client {
         Ok(())
     }
 
-    /// Send pending destiny updates and queued packets now, in the middle of a call
-    /// (a handler that waits, like a stargate jump, would otherwise hold them back).
-    pub async fn pump(&mut self) -> Result<()> {
-        while let Ok(events) = self.destiny_rx.try_recv() {
-            self.notify("DoDestinyUpdate", vec![Value::List(events), Value::Bool(false)]);
+    /// Wait on the system actor while forwarding destiny updates and queued packets.
+    /// Returns `Ok(false)` if the actor stops and `Err` if a transport flush fails.
+    pub async fn wait_pumping(&mut self, system: i64, delay_ms: u64) -> Result<bool> {
+        self.flush().await?;
+        let world = self.world.clone();
+        let timer = world.after(system, delay_ms);
+        tokio::pin!(timer);
+        loop {
+            tokio::select! {
+                result = &mut timer => return Ok(result),
+                Some(events) = self.destiny_rx.recv() => {
+                    self.notify("DoDestinyUpdate", vec![Value::List(events), Value::Bool(false)]);
+                    self.flush().await?;
+                }
+            }
         }
-        self.flush().await
     }
 
     pub async fn run(mut self, registration: &mut crate::live_sessions::Registration) -> Result<()> {
