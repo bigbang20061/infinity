@@ -30,7 +30,8 @@ inventory of every unsupported SDE effect.
 | Turret, missile, local shield/armour/hull repair, propulsion, mining | Existing behaviour uses the shared lifecycle. |
 | Modifier-only and online effects | Supported through the modifier and online paths, subject to validation and scope. |
 | Hacking and probe launch | Classified for existing exploration paths; classification alone does not guarantee every item or call path. |
-| Projected effects, ECM, capacitor warfare and transfer, fueled and remote repair | Known later families, visibly refused until their behaviour is implemented. |
+| Projected web, warp disruption and scrambling, target painting, sensor damping, tracking and guidance disruption, remote sensor and tracking enhancement | Runtime projections use the shared Fit evaluator and actor-owned lifetimes. Warp scramble status refuses warp entry; a scram that blocks propulsion stops a running microwarpdrive and refuses a new activation, without stopping afterburners. |
+| ECM, capacitor warfare and transfer, fueled and remote repair | Classified separately; classification alone does not imply projected modifier support. |
 | Smartbomb, Vorton, cloak, micro jump drive, salvage, tractor, scans, target assistance and bombs | Known later families, visibly refused until implemented. |
 | Explicitly excluded capital, industrial, structure and other out-of-scope groups | Refused even when an effect has modifiers. |
 
@@ -42,7 +43,7 @@ All paths below are under `crates/server/src/`.
   effect metadata; `mod.rs` defines the kinds.
 - `services/effects/lifecycle.rs`: activation, cycles, repeat and stopping;
   `weapons.rs`, `repair.rs`, `propulsion.rs`, `mining.rs` and `hacking.rs`
-  contain the existing family-specific work.
+  contain the existing family-specific work; `projected.rs` constructs projected effects.
 - `services/effects/environment.rs` and `notify.rs`: effect environment and
   notification payloads; `unsupported.rs` owns refusal diagnostics.
 - `services/combat/` retains targeting, ammunition, health, damage and NPC
@@ -66,6 +67,11 @@ same sublocation tuple as its item. `OnSpecialFX` carries fourteen arguments:
 `(shipID, moduleID, moduleTypeID, targetID, chargeTypeID, guid, isOffensive,
 start, active, duration, repeat, startTime, graphicInfo, area)`.
 
+`OnEwarStart` and `OnEwarEnd` each carry four arguments
+`(sourceBallID, moduleID, targetBallID, jammingType)`. The last argument is a
+client string slot, selected from effect chance flags and the effect-ID slot
+table, not a numeric effect kind. A blocked warp returns `CustomNotify`.
+
 ## Fit evaluator data and scope
 
 Fit evaluates character, ship, module, charge and skill nodes alongside active
@@ -88,14 +94,49 @@ Ordinary numeric evaluation retains per-fit memoization, not a persistent
 keyed cache with invalidation. Client stacking penalties independently truncate
 the strongest upward and downward modifiers to eight each.
 
-`Fit::load_projected` is the single loading implementation and accepts
-source-effective values for a specific incoming effect, its source module and
-type, and optional charge or script type. Only that effect's target modifiers
-reach the victim; the evaluator does not load the source ship. `Fit::load` is
-an unprojected convenience. PR3 owns runtime projection storage and expiry and
-must migrate all in-space callers to provide system projections. This evaluator
-support does not implement runtime electronic warfare, drone gameplay or new
-RPCs.
+`Fit::load_projected` is the single loading implementation. Each incoming
+effect carries source-effective module operands and separate charge/script
+operands, so equal attribute IDs on the two nodes do not collide. The target
+evaluates only that effect's target modifiers; it does not load the source
+ship. In space, `Fit::load_in_space` atomically snapshots incoming projections
+and the target revision from the system actor; `Fit::load` remains for
+non-space and character-only loads. Deferred fit and kinematic commits check
+the revision, including at destiny application; warp entry retries when its
+snapshot becomes stale rather than committing an obsolete permission.
+
+Projections are transient, target-keyed system-actor state, indexed by source
+module: each cycle replaces that module's contribution. Stop, target loss,
+expiry and source or target departure remove the relevant contribution.
+Finite cycles expire after their duration plus exactly one destiny tick of
+grace; an indefinite duration has no expiry. Refreshes reevaluate Fit outside
+the actor and queue kinematics through destiny. Runtime state is lost on restart.
+
+The deterministic D7 range multiplier uses sampled surface distance: strength
+is 1 through inclusive optimal, then `0.5^(((distance - optimal) / falloff)^2)`.
+Optimal is clamped to zero; non-positive falloff is a step to zero beyond
+optimal, and non-finite inputs yield zero. This is strength scaling, not a hit
+roll. Player and NPC projections share this path and the Fit modifier evaluator.
+Generic NPC effect modules have distinct process-local identities and independent
+actor timers; target generations prevent stale queued cycles from restoring a
+lost projection. Drone gameplay and new drone RPCs are not supplied. No
+real-client walkthrough is claimed by this documentation.
+
+NPC shots snapshot incoming projections from the actor and evaluate their type
+with the same Fit evaluator. Turret optimal and falloff, and missile velocity
+and flight-time multipliers, affect NPC weapon reach. Tracking speed and the
+missile explosion velocity and cloud-size multipliers are evaluated but are not
+yet consumed by NPC hit or missile application math; PR11 owns that application.
+Missing turret range attributes retain the existing NPC fallbacks. Missile
+multipliers use the type or dogma metadata default, falling back to one if
+neither exists.
+
+Sensor damping refreshes NPC scan resolution and dogma maximum target range
+under the projection revision guard. The latter is enforced when the type
+supplies it or dogma metadata supplies a positive default, independently of
+the AI aggro range. Removing a
+projection restores the base values. An existing target outside the refreshed
+limit is lost; a pending lock retains its original deadline, while later attempts
+use the refreshed scan resolution.
 
 ## SDE and Python modifiers
 

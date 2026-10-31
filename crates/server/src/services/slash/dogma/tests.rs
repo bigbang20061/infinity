@@ -16,3 +16,34 @@ fn drone_queries_select_only_the_session_owners_drone() {
     item.category_id = i64::from(CATEGORY_MODULE);
     assert_eq!(drone_query_key(&item, Action::Query("speed"), Some(7)), None);
 }
+
+#[test]
+fn late_gm_snapshot_requests_refresh_without_overwriting_newer_projection() {
+    use crate::space::{Ball, System, WarpState, MODE_STOP};
+    use std::sync::Arc;
+
+    let mut system = System::new(0, Arc::default(), 12_345);
+    system.insert(Ball {
+        id: 1, type_id: 1, owner_id: 1, corp_id: 1, alliance_id: -1,
+        char_id: None, signature_radius: None, mode: MODE_STOP, radius: 1.0,
+        mass: 1.0, max_vel: 1.0, agility: 1.0, speed_fraction: 0.0,
+        pos: [0.0; 3], vel: [0.0; 3], goto: [0.0; 3], follow_id: 0,
+        old_pos: [0.0; 3], old_vel: [0.0; 3], segment_acceleration: None,
+        follow_range: 0.0, free: true, global: false, massive: false, interactive: false,
+        warp: WarpState::default(), warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0,
+        effect_stamp: 0, cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new(),
+    });
+    let old = system.projection_revision(1);
+    system.refresh_projection_target(1);
+    let newer = system.projection_revision(1);
+    assert!(current_projection(&mut system, 1, newer));
+    system.command(1, |ball, _, _| { ball.set_max_speed(10.0); Vec::new() });
+    system.tick(13_000);
+    assert_eq!(system.ball(1).unwrap().max_vel, 10.0);
+    if current_projection(&mut system, 1, old) {
+        system.command(1, |ball, _, _| { ball.set_max_speed(100.0); Vec::new() });
+    }
+    assert!(system.projection_revision(1) > newer);
+    system.tick(14_000);
+    assert_eq!(system.ball(1).unwrap().max_vel, 10.0);
+}

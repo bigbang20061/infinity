@@ -1,5 +1,18 @@
 use super::*;
 use std::sync::Mutex;
+
+#[test]
+fn blocker_uses_target_modifier_source_not_scramble_identity() {
+    let mut row = crate::sde::dogma::Modifier {
+        func: "LocationRequiredSkillModifier".into(), domain: "targetID".into(), op: 2,
+        modified: ATTR_ACTIVATION_BLOCKED, modifying: 2509, group: None, skill: None, target_category: None,
+    };
+    assert!(!blocker_rows(&[(2509, 0.0)], std::slice::from_ref(&row)));
+    assert!(blocker_rows(&[(2509, 1.0)], std::slice::from_ref(&row)));
+    assert!(!blocker_rows(&[(1350, 1.0)], std::slice::from_ref(&row)));
+    row.domain = "shipID".into();
+    assert!(!blocker_rows(&[(2509, 1.0)], &[row]));
+}
 #[test]
 fn discarded_cycle_owners_release_only_their_generation() {
     let master = -9011;

@@ -1,8 +1,9 @@
 //! Actor-owned activation cycles for supported dogma effects.
 //! Mirrors clientDogmaLocation and godma; effect metadata comes from the SDE.
 //! Subject authorization is shared by activation, deactivation, analyzers and online changes.
-//! Later-wave behavior families are refused; resource fitting policy is not implemented.
-use super::{EffectKind, registry, unsupported, repair, mining};
+//! Projected effects require a locked, present target and use transient system state;
+//! later-wave behavior families and resource fitting policy are not implemented.
+use super::{EffectKind, registry, unsupported, repair, mining, projected, range};
 use super::registry::{Effect, EffectAttribute, EffectFlag};
 use super::notify::{attribute_change, fire_fx, ship_effect};
 use super::propulsion::apply_propulsion;
@@ -15,9 +16,9 @@ use crate::services::items::load_items;
 use crate::services::{db_err, notify_error, user_error, Call, CallError, CallResult};
 use crate::dao::items::loading::{Item, ItemQuery};
 use crate::client::{filetime_now, Client};
-use crate::consts::{ATTR_CAPACITOR_NEED, ATTR_IS_ONLINE, CATEGORY_MODULE, CATEGORY_SHIP, EFFECT_ONLINE, FLAG_HANGAR};
+use crate::consts::{ATTR_ACTIVATION_BLOCKED, ATTR_CAPACITOR_NEED, ATTR_IS_ONLINE, CATEGORY_MODULE, CATEGORY_SHIP, EFFECT_MICROWARPDRIVE, EFFECT_ONLINE, FLAG_HANGAR};
 use crate::messages;
-use crate::space::{ms_to_seconds, seconds_to_ms, System, MODE_WARP};
+use crate::space::{ms_to_seconds, seconds_to_ms, System, World, MODE_WARP};
 use marshal::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
@@ -174,9 +175,72 @@ pub(super) fn retire_activation(active: &mut HashMap<i64, ActiveModule>, master:
     active.remove(&master);
     true
 }
+fn blocker_rows(values: &[(i32, f64)], rows: &[crate::sde::dogma::Modifier]) -> bool {
+    rows.iter().any(|row| row.domain == "targetID" && row.modified == ATTR_ACTIVATION_BLOCKED
+        && values.iter().any(|&(attribute, value)| attribute == row.modifying && value > 0.0))
+}
+
+fn propulsion_blocked(sde: &crate::sde::Sde, projections: &[super::projection::Projection]) -> bool {
+    projections.iter().any(|p| sde.dogma.effect(p.effect_id)
+        .is_some_and(|effect| blocker_rows(&p.values, effect.modifiers())))
+}
+
+/// Stop running microwarpdrives after a blocking scrambler lands. Database work
+/// runs outside the actor; the actor rechecks the blocker and activation generation.
+pub(crate) async fn stop_blocked_propulsion(db: &crate::db::Db, world: &Arc<World>, system: i64, target: i64) {
+    let Some(character) = world.with(system, move |s| s.ball(target).and_then(|b| b.char_id)).await.flatten() else { return };
+    let modules = match load_items(db, world.sde(), ItemQuery::Location(target)).await {
+        Ok(items) => items,
+        Err(error) => { warn!("loading blocked propulsion modules: {error}"); return; }
+    };
+    let fit = match Fit::load_in_space(db, world, system, character, target).await {
+        Ok(fit) => fit,
+        Err(_) => { warn!("loading blocked propulsion fit for {target}"); return; }
+    };
+    let modules: Vec<_> = modules.into_iter().filter(|module| {
+        super::super::inventory::is_fitting_flag(module.flag_id)
+            && world.sde().types.effects(module.type_id).iter().any(|effect| effect.effect_id == EFFECT_MICROWARPDRIVE)
+    }).filter_map(|module| {
+        let generation = state().active.get(&module.item_id).map(|active| active.stop.clone())?;
+        let duration = registry::resolve(world.sde(), EFFECT_MICROWARPDRIVE)
+            .and_then(|effect| effect.attribute(EffectAttribute::Duration))
+            .map(|attr| fit.value(Key::Module(module.item_id), attr)).unwrap_or(DEFAULT_MODULE_DURATION_MS).max(MIN_MODULE_DURATION_MS);
+        Some((module.item_id, generation, duration))
+    }).collect();
+    let sde = world.sde().clone();
+    world.post(system, move |s| {
+        if !propulsion_blocked(&sde, &s.projections_on(target)) { return; }
+        for (module, generation, duration) in modules {
+            let mut st = state();
+            if !st.active.get(&module).is_some_and(|active| active.char_id == character && Arc::ptr_eq(&active.stop, &generation)) { continue; }
+            generation.store(true, Ordering::Relaxed);
+            st.active.remove(&module);
+            drop(st);
+            let now = filetime_now();
+            let effect = i64::from(EFFECT_MICROWARPDRIVE);
+            let environment = super::environment::build(module, character, target, None, None, effect);
+            s.notify_pilot(character, "OnGodmaShipEffect", vec![Value::Int(module), Value::Int(effect), Value::Int(now),
+                Value::Int(0), Value::Int(0), environment, Value::Int(now), Value::Float(duration), Value::Int(0), Value::None, Value::Int(now)]);
+            // The original cycle metadata is no longer available here; the stop
+            // event uses the current time and a zero repeat count.
+            s.refresh_projection_target(target);
+        }
+    });
+}
+
 
 
 pub(super) fn cycle_start(s: &mut System, mut cycle: Cycle, nominal_start: i64) {
+    if cycle.effect.id == i64::from(EFFECT_MICROWARPDRIVE) && propulsion_blocked(cycle.cx.world.sde(), &s.projections_on(cycle.cx.ship_id)) {
+        cycle.stop.store(true, Ordering::Relaxed);
+        cycle_stop(s, cycle);
+        return;
+    }
+    if matches!(cycle.effect.kind, EffectKind::Projected { .. })
+        && s.ball(cycle.cx.ship_id).is_some_and(|ball| ball.mode == MODE_WARP) {
+        cycle_stop(s, cycle);
+        return;
+    }
     if !cycle_valid(s, &cycle) {
         cycle_stop(s, cycle);
         return;
@@ -222,9 +286,18 @@ async fn on_cycle_start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<CycleO
             Ok(CycleOutcome::Continue)
         }
         Mining => Ok(mining::start(cx, cycle)),
+        Projected { .. } => {
+            let target = cycle.target.unwrap_or(0);
+            if !targets_of(cx.char_id).contains(&target) { return Ok(CycleOutcome::Stop("target lost")); }
+            for module in &cycle.modules {
+                let charge = fit.source_type(Key::Charge(module.id));
+                projected::apply(cx, fit, module.id, module.type_id, &cycle.effect, target, cycle.duration_ms, charge).await?;
+            }
+            Ok(CycleOutcome::Continue)
+        }
         Propulsion | Modifiers => Ok(CycleOutcome::Continue),
         Smartbomb | Vorton | FueledLocalRepair { .. } | RemoteRepair { .. } | CapTransfer |
-        Neutralizer | Nosferatu | CapBooster | Projected { .. } | Ecm | BurstJammer |
+        Neutralizer | Nosferatu | CapBooster | Ecm | BurstJammer |
         Cloak | MicroJumpDrive | Salvage | Tractor | CargoScan | ShipScan | SurveyScan |
         AutoTarget | PassiveTarget | Bomb | ProbeLaunch | Hacking | Online => unreachable!("unsupported cycle kind"),
     }
@@ -238,9 +311,9 @@ async fn on_cycle_end(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<CycleOut
             Ok(CycleOutcome::Continue)
         }
         Mining => Ok(mining::end(cx, fit, cycle).await),
-        Modifiers | Turret | Missile | Propulsion => Ok(CycleOutcome::Continue),
+        Modifiers | Turret | Missile | Propulsion | Projected { .. } => Ok(CycleOutcome::Continue),
         Smartbomb | Vorton | FueledLocalRepair { .. } | RemoteRepair { .. } | CapTransfer |
-        Neutralizer | Nosferatu | CapBooster | Projected { .. } | Ecm | BurstJammer |
+        Neutralizer | Nosferatu | CapBooster | Ecm | BurstJammer |
         Cloak | MicroJumpDrive | Salvage | Tractor | CargoScan | ShipScan | SurveyScan |
         AutoTarget | PassiveTarget | Bomb | ProbeLaunch | Hacking | Online => unreachable!("unsupported cycle kind"),
     }
@@ -256,6 +329,9 @@ fn on_stop(s: &mut System, cx: &Ctx, cycle: &Cycle) {
             }
         }
         Mining => mining::stop(s, cx, cycle),
+        Projected { .. } => {
+            for module in &cycle.modules { s.remove_projection(module.id); }
+        }
         Propulsion => {
             let cx = cx.clone();
             let master = cycle.modules[0].id;
@@ -264,7 +340,7 @@ fn on_stop(s: &mut System, cx: &Ctx, cycle: &Cycle) {
         }
         Modifiers | LocalRepair { .. } => {}
         Smartbomb | Vorton | FueledLocalRepair { .. } | RemoteRepair { .. } | CapTransfer |
-        Neutralizer | Nosferatu | CapBooster | Projected { .. } | Ecm | BurstJammer |
+        Neutralizer | Nosferatu | CapBooster | Ecm | BurstJammer |
         Cloak | MicroJumpDrive | Salvage | Tractor | CargoScan | ShipScan | SurveyScan |
         AutoTarget | PassiveTarget | Bomb | ProbeLaunch | Hacking | Online => unreachable!("unsupported cycle kind"),
     }
@@ -277,7 +353,7 @@ pub(super) async fn cycle_begin_work(mut cycle: Cycle) {
         apply_propulsion(&cx, master, cycle.stop.clone(), true).await;
     }
     let result = async {
-        let fit = match Fit::load(&cx.db, cx.world.sde().clone(), cx.char_id, cx.ship_id).await {
+        let fit = match Fit::load_in_space(&cx.db, &cx.world, cx.system_id, cx.char_id, cx.ship_id).await {
             Ok(fit) => fit,
             Err(_) => return Err("fit unavailable"),
         };
@@ -335,12 +411,12 @@ pub(super) fn cycle_stop(s: &mut System, mut cycle: Cycle) {
     let retired = retire_activation(&mut st.active, master, &cycle.stop, || {
         ship_effect(&cx, master, cycle.effect.id, cycle.target, cycle.other.clone(), false, cycle.started, cycle.duration_ms, cycle.repeat);
     });
-    if retired { on_stop(s, &cx, &cycle); }
     if retired && cycle.effect.kind != EffectKind::Propulsion && st.activation_generation.get(&master).is_some_and(|current| Arc::ptr_eq(current, &cycle.stop)) {
         st.activation_generation.remove(&master);
     }
     if retired { cycle.owner.armed = false; }
     drop(st);
+    if retired { on_stop(s, &cx, &cycle); }
 }
 
 struct Activation {
@@ -367,10 +443,35 @@ async fn on_activate(cx: &Ctx, fit: &Fit, activation: &Activation) -> Result<(),
             }
             Ok(())
         }
+        Projected { .. } => {
+            let Some(target) = activation.target.filter(|t| targets_of(cx.char_id).contains(t)) else {
+                return Err(user_error(messages::MSG_DENIED_ACTIVATE_TARGET_NOT_PRESENT, vec![]));
+            };
+            let ship = cx.ship_id;
+            let sample = cx.world.with(cx.system_id, move |s| {
+                s.sampled_ball(ship).zip(s.sampled_ball(target)).map(|(a, b)| {
+                    (a.mode == MODE_WARP, crate::space::dist(a.pos, b.pos) - a.radius as f64 - b.radius as f64)
+                })
+            }).await.flatten();
+            let Some((in_warp, gap)) = sample else { return Err(user_error(messages::MSG_DENIED_ACTIVATE_TARGET_NOT_PRESENT, vec![])); };
+            if in_warp { return Err(user_error(messages::MSG_DENIED_ACTIVATE_IN_WARP, vec![])); }
+            let optimal = activation.effect.attribute(EffectAttribute::Range).map(|a| fit.value(Key::Module(activation.module.id), a)).unwrap_or(0.0);
+            let falloff = activation.effect.attribute(EffectAttribute::Falloff).map(|a| fit.value(Key::Module(activation.module.id), a)).unwrap_or(0.0);
+            if range::range_multiplier(gap.max(0.0), optimal, falloff) <= 0.0 {
+                return Err(user_error(messages::MSG_DENIED_ACTIVATE_TARGET_NOT_PRESENT, vec![]));
+            }
+            Ok(())
+        }
         Mining => mining::validate(cx, fit, &activation.module, activation.target).await,
+        Propulsion if activation.effect.id == i64::from(EFFECT_MICROWARPDRIVE) => {
+            if fit.value(Key::Module(activation.module.id), ATTR_ACTIVATION_BLOCKED) > 0.0 {
+                return Err(user_error(messages::MSG_MODULE_IS_BLOCKED, vec![]));
+            }
+            Ok(())
+        }
         Modifiers | LocalRepair { .. } | Propulsion => Ok(()),
         Smartbomb | Vorton | FueledLocalRepair { .. } | RemoteRepair { .. } | CapTransfer |
-        Neutralizer | Nosferatu | CapBooster | Projected { .. } | Ecm | BurstJammer |
+        Neutralizer | Nosferatu | CapBooster | Ecm | BurstJammer |
         Cloak | MicroJumpDrive | Salvage | Tractor | CargoScan | ShipScan | SurveyScan |
         AutoTarget | PassiveTarget | Bomb | ProbeLaunch | Hacking | Online => unreachable!("unsupported activation kind"),
     }
@@ -435,10 +536,10 @@ pub(crate) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
         EffectKind::Hacking => return super::super::hacking::start(c, item_id, target).await,
         EffectKind::Online => return set_online(c, cx.ship_id, item_id, true).await,
         EffectKind::Modifiers | EffectKind::Turret | EffectKind::Missile |
-        EffectKind::LocalRepair { .. } | EffectKind::Propulsion | EffectKind::Mining => {}
+        EffectKind::LocalRepair { .. } | EffectKind::Propulsion | EffectKind::Mining | EffectKind::Projected { .. } => {}
         EffectKind::Smartbomb | EffectKind::Vorton | EffectKind::FueledLocalRepair { .. } |
         EffectKind::RemoteRepair { .. } | EffectKind::CapTransfer | EffectKind::Neutralizer |
-        EffectKind::Nosferatu | EffectKind::CapBooster | EffectKind::Projected { .. } |
+        EffectKind::Nosferatu | EffectKind::CapBooster |
         EffectKind::Ecm | EffectKind::BurstJammer | EffectKind::Cloak |
         EffectKind::MicroJumpDrive | EffectKind::Salvage | EffectKind::Tractor |
         EffectKind::CargoScan | EffectKind::ShipScan | EffectKind::SurveyScan |
@@ -448,7 +549,7 @@ pub(crate) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
     if state().reloading.get(&item_id).is_some_and(|until| *until > filetime_now()) {
         return Err(user_error(messages::MSG_CANT_ACTIVATE_RELOADING_MODULE, vec![("moduleTypeID".into(), Value::tuple([Value::Int(UE_TYPEID), Value::Int(module.type_id as i64)]))]));
     }
-    let fit = Fit::load(&cx.db, cx.world.sde().clone(), cx.char_id, cx.ship_id).await?;
+    let fit = Fit::load_in_space(&cx.db, &cx.world, cx.system_id, cx.char_id, cx.ship_id).await?;
     let activation = Activation { effect: effect.clone(), module: Module { id: item_id, type_id: module.type_id, flag: module.flag_id }, target };
     on_activate(&cx, &fit, &activation).await?;
     if matches!(kind, EffectKind::Turret | EffectKind::Missile) {
@@ -537,6 +638,14 @@ pub(crate) async fn deactivate(c: &mut Client, call: &Call<'_>) -> CallResult {
     if kind == EffectKind::Online { return set_online(c, cx.ship_id, item_id, false).await; }
     if let Some(stop) = state().active.get(&item_id) {
         stop.stop.store(true, Ordering::Relaxed);
+    }
+    if matches!(kind, EffectKind::Projected { .. }) {
+        let generation = state().active.get(&item_id).map(|active| active.stop.clone());
+        cx.world.post(cx.system_id, move |s| {
+            if generation.as_ref().is_some_and(|generation| state().active.get(&item_id).is_some_and(|active| Arc::ptr_eq(&active.stop, generation))) {
+                s.remove_projection(item_id);
+            }
+        });
     }
     Ok(Value::None)
 }

@@ -75,7 +75,11 @@ pub(super) async fn ship_ball(c: &Client, ship_id: i64, pos: [f64; 3]) -> Result
     let char_id = c.session.int("charid").unwrap_or(0);
     let corp = c.session.int("corpid").unwrap_or(0);
     // Movement and signature attributes as fitted (skills, modules), when the ship is the pilot's.
-    let fit = super::fit::Fit::load(&c.db, c.sde.clone(), char_id, ship_id).await?;
+    let fit = if let Some(system) = c.session.int("solarsystemid") {
+        super::fit::Fit::load_in_space(&c.db, &c.world, system, char_id, ship_id).await?
+    } else {
+        super::fit::Fit::load(&c.db, c.sde.clone(), char_id, ship_id).await?
+    };
     let fitted = |attr: i32, base: f64| match fit.value(super::fit::Key::Ship, attr) {
         v if v > 0.0 => v,
         _ => base,
@@ -473,26 +477,51 @@ fn movement(c: &mut Client, f: impl FnOnce(&mut Ball, i64, &space::System) -> Ve
 /// `min_range` (at least 2.5 km) off that object's surface on the near side; without,
 /// `min_range` short of the point itself (bookmarks, mission sites, warp-in points),
 /// as Ballpark::RealWarp places it.
-pub(super) fn warp_to(c: &mut Client, object: Option<(V3, f64)>, point: V3, min_range: f64, on_exit: Option<Timer>) -> CallResult {
+pub(super) async fn warp_to(c: &mut Client, object: Option<(V3, f64)>, point: V3, min_range: f64, on_exit: Option<Timer>) -> CallResult {
     if !point.iter().all(|v| v.is_finite()) || !min_range.is_finite()
         || object.is_some_and(|(pos, radius)| !pos.iter().all(|v| v.is_finite()) || !radius.is_finite()) {
         return Ok(Value::None);
     }
     let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) else { return Ok(Value::None) };
+    let char_id = c.session.int("charid").unwrap_or(0);
     let pilot = c.session.int("charid");
-    c.world.post(system, move |s| {
-        if s.uncloak(ship) {
-            if let Some(pilot) = pilot {
-                s.notify_pilot(pilot, "OnJumpCloakCancelled", vec![Value::Int(ship)]);
-            }
+    let mut on_exit = on_exit;
+    loop {
+        let fit = super::fit::Fit::load_in_space(&c.db, &c.world, system, char_id, ship).await?;
+        let Some(revision) = fit.projection_revision() else { return Ok(Value::None) };
+        let scrambled = fit.value(super::fit::Key::Ship, crate::consts::ATTR_WARP_SCRAMBLE_STATUS) > 0.0;
+        let result = c.world.with(system, move |s| {
+            commit_warp(s, ship, pilot, revision, scrambled, object, point, min_range, on_exit)
+        }).await;
+        let Some((current, callback)) = result else { return Ok(Value::None) };
+        if !current {
+            on_exit = callback;
+            continue;
         }
-        s.clear_warp_exit(ship);
-        s.command(ship, move |b, t, _| warp_command(b, t, object, point, min_range));
-        if let Some(callback) = on_exit {
-            s.on_warp_exit(ship, callback);
+        if scrambled {
+            return Err(super::notify_error(messages::effects::WARP_SCRAMBLED));
         }
-    });
+        break;
+    }
     Ok(Value::None)
+}
+
+fn commit_warp(s: &mut space::System, ship: i64, pilot: Option<i64>, revision: u64, scrambled: bool,
+    object: Option<(V3, f64)>, point: V3, min_range: f64, on_exit: Option<Timer>) -> (bool, Option<Timer>) {
+    if s.projection_revision(ship) != revision || scrambled {
+        return (s.projection_revision(ship) == revision, on_exit);
+    }
+    if s.uncloak(ship) {
+        if let Some(pilot) = pilot {
+            s.notify_pilot(pilot, "OnJumpCloakCancelled", vec![Value::Int(ship)]);
+        }
+    }
+    s.clear_warp_exit(ship);
+    s.command(ship, move |b, t, _| warp_command(b, t, object, point, min_range));
+    if let Some(callback) = on_exit {
+        s.on_warp_exit(ship, callback);
+    }
+    (true, None)
 }
 
 fn warp_command(b: &mut Ball, t: i64, object: Option<(V3, f64)>, point: V3, min_range: f64) -> Vec<Value> {

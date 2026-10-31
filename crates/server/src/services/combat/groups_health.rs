@@ -126,8 +126,8 @@ pub(super) struct Condition {
     pub(super) shield_at: i64,
 }
 
-pub(super) async fn ship_stats(db: &Db, world: &World, char_id: i64, ship: i64) -> Result<ShipStats, CallError> {
-    let fit = Fit::load(db, world.sde().clone(), char_id, ship).await?;
+pub(super) async fn ship_stats(db: &Db, world: &World, system: i64, char_id: i64, ship: i64) -> Result<ShipStats, CallError> {
+    let fit = Fit::load_in_space(db, world, system, char_id, ship).await?;
     Ok(ShipStats {
         max: ATTR_HP.map(|a| fit.value(Key::Ship, a)),
         resonance: ATTR_RESONANCE.map(|layer| layer.map(|a| fit.value(Key::Ship, a))),
@@ -213,7 +213,7 @@ pub(super) async fn damage_npc(db: &Db, world: &World, system: i64, target: i64,
 /// (`__ship_destroyed`, handled by the pilot's connection).
 pub(super) async fn damage_player(db: &Db, world: &World, system: i64, ship: i64, char_id: i64, raw: [f64; 4], attacker: Option<i64>) -> Result<f64, CallError> {
     // Resistances and hit points as fitted right now (hardeners running, modules offline...).
-    let stats = ship_stats(db, world, char_id, ship).await?;
+    let stats = ship_stats(db, world, system, char_id, ship).await?;
     let known = state().condition.get(&ship).cloned();
     let mut cond = match known {
         Some(mut c) => {
@@ -287,7 +287,7 @@ pub(crate) async fn repair_player(db: &Db, world: &World, system: i64, ship: i64
 }
 /// Set the damage fraction of selected layers of the active player ship.
 pub(crate) async fn set_damage(c: &Client, system: i64, ship: i64, char_id: i64, layers: [bool; 3], fraction: f64) -> Result<(), CallError> {
-    let stats = ship_stats(&c.db, &c.world, char_id, ship).await?;
+    let stats = ship_stats(&c.db, &c.world, system, char_id, ship).await?;
     let now = filetime_now();
     let mut st = state();
     let mut cond = st.condition.get(&ship).cloned().unwrap_or_else(|| Condition {

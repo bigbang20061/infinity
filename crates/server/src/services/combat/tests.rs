@@ -2,6 +2,12 @@ use super::*;
 use crate::space::{event, System};
 
 #[test]
+fn npc_missile_uses_both_effective_multipliers() {
+    assert_eq!(npc_missile_kinematics(3000.0, 5000.0, 1.0, 1.0), (3000.0, 15000.0));
+    assert_eq!(npc_missile_kinematics(3000.0, 5000.0, 0.5, 0.5), (1500.0, 3750.0));
+}
+
+#[test]
 fn reload_reservations_share_stacks_in_order_without_overdraw() {
     let item = |id, type_id, quantity| crate::dao::items::loading::Item {
         item_id: id, type_id, owner_id: 1, location_id: 2, flag_id: FLAG_CARGO,

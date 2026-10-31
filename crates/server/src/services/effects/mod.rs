@@ -1,10 +1,12 @@
 //! Numeric classification of dogma effects for the shared effects lifecycle.
 //!
 //! IDs and modifier rows come from the SDE; client dogma effect constants and
-//! pythonEffects supply corresponding behavior names. Later-wave kinds are
-//! classified here but are not implemented by this registry.
+//! pythonEffects supply corresponding behavior names. Projected effects use the
+//! shared lifecycle and transient system-owned projections; later families are refused.
 pub(crate) mod registry;
 pub(crate) mod projection;
+pub(crate) mod projected;
+pub(crate) mod range;
 pub(crate) mod environment;
 pub(crate) mod notify;
 pub(crate) mod unsupported;

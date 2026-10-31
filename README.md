@@ -15,6 +15,7 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
 - **Space.** Undock and dock, approach, align, orbit and follow, warp, and stargate jumps. Each solar system runs as its own actor, so systems advance independently and never block each other. Ships move on the client's one-second destiny tick: a command is stamped with the tick the system is on and takes effect before the next step, as on the client. Go-to and align, the slow-down on arrival, approach, follow, orbit, stop, missile flight, and warp alignment and flight use carbonengine destiny's mechanics and integration, so other pilots see the same course. Ships bump off each other and off stations, gates and asteroids with destiny's sphere collision, and undocking, gate arrival and GM teleports place a ship outside the collision sphere the client is sent. Belt rats and the contents of a scan site appear when the ship actually lands from warp. Timers and NPCs run every 100 ms and read positions interpolated between ticks, as the client draws them. A per-system pilot cap with a jump queue is optional.
 - **Combat.**
   - Targeting, ammunition, weapon groups, turrets and missiles, and capacitor.
+  - Electronic warfare from ships and NPCs: stasis webifiers, warp scramblers and disruptors, target painters, sensor dampeners, tracking and guidance disruptors, remote sensor boosters and remote tracking computers, including their scripts. A scrambled ship cannot warp, and scrambling shuts off microwarpdrives. Tracking and guidance disruption already shorten an NPC's range, but do not yet change its hit chance or missile damage.
   - NPC AI, bounties, wrecks and loot.
   - Crimewatch: timers, criminal flags, security status, CONCORD and killmails.
   - Player bounties on characters, corporations and alliances, with contributions, leaderboards and search. A pilot who destroys a target's ship is paid from the matching bounty pools, at most 20% of the destroyed value, once per killmail.
@@ -46,7 +47,7 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
   - fleet warps, boosts and the fleet finder
   - shared bookmark folders
   - plugging in implants and consuming boosters; implants and boosters already in a character's slots do apply
-  - modules whose effect is not implemented yet, among them electronic warfare, capacitor warfare and transfer, remote repair, smartbombs, micro jump drives, salvagers, tractor beams and bombs. Activating one is refused with a message, and `/effects unsupported` lists the effects tried since the server started.
+  - modules whose effect is not implemented yet, among them capacitor warfare and transfer, remote repair, ECM, smartbombs, micro jump drives, salvagers, tractor beams and bombs. Activating one is refused with a message, and `/effects unsupported` lists the effects tried since the server started.
   - game events for Lua scripts other than the ballpark being bound, and vetoes from scripts
   - in direct trades: items from cargo, from inside a container or from a corporation hangar, the active ship, fitted modules and charges, and PLEX; types that cannot be traded are refused anywhere in an offered container or ship
   - the GM bounty reimbursement and bounty cache calls

@@ -1,14 +1,11 @@
 //! Python effect modifier data from `eve/common/script/dogma/pythonEffects/`.
 //! Only empty SDE modifier lists are supplemented; effect lifecycle is not represented.
-//! Projected modifier rows describe ship targets only; other target categories require
-//! the later projected-dogma evaluator.
+//! Weapon disruption includes ship, entity and drone target categories; fighter
+//! ability targets are not represented by the current fit nodes.
 use super::{Effect, Modifier};
-use crate::consts::{ATTR_AOE_CLOUD_SIZE, ATTR_ARMOR_DAMAGE_AMOUNT, ATTR_ARMOR_EM_DAMAGE_RESONANCE, ATTR_ARMOR_EXPLOSIVE_DAMAGE_RESONANCE, ATTR_ARMOR_KINETIC_DAMAGE_RESONANCE, ATTR_ARMOR_THERMAL_DAMAGE_RESONANCE, ATTR_DAMAGE_MULTIPLIER, ATTR_EM_DAMAGE, ATTR_EXPLOSION_DELAY, ATTR_EXPLOSIVE_DAMAGE, ATTR_FALLOFF, ATTR_KINETIC_DAMAGE, ATTR_MASS, ATTR_MAX_LOCKED_TARGETS, ATTR_MAX_RANGE, ATTR_MAX_TARGET_RANGE, ATTR_MAX_VELOCITY, ATTR_RATE_OF_FIRE, ATTR_SCAN_RESOLUTION, ATTR_SHIELD_BONUS, ATTR_SHIELD_EM_DAMAGE_RESONANCE, ATTR_SHIELD_EXPLOSIVE_DAMAGE_RESONANCE, ATTR_SHIELD_KINETIC_DAMAGE_RESONANCE, ATTR_SHIELD_THERMAL_DAMAGE_RESONANCE, ATTR_SIGNATURE_RADIUS, ATTR_SPEED_FACTOR, ATTR_STRUCTURE_EM_DAMAGE_RESONANCE, ATTR_STRUCTURE_EXPLOSIVE_DAMAGE_RESONANCE, ATTR_STRUCTURE_KINETIC_DAMAGE_RESONANCE, ATTR_STRUCTURE_THERMAL_DAMAGE_RESONANCE, ATTR_THERMAL_DAMAGE};
+use crate::consts::{ATTR_ACTIVATION_BLOCKED, ATTR_ACTIVATION_BLOCKED_STRENGTH, ATTR_AOE_CLOUD_SIZE, ATTR_ARMOR_DAMAGE_AMOUNT, ATTR_ARMOR_EM_DAMAGE_RESONANCE, ATTR_ARMOR_EXPLOSIVE_DAMAGE_RESONANCE, ATTR_ARMOR_KINETIC_DAMAGE_RESONANCE, ATTR_ARMOR_THERMAL_DAMAGE_RESONANCE, ATTR_DAMAGE_MULTIPLIER, ATTR_EM_DAMAGE, ATTR_EXPLOSION_DELAY, ATTR_EXPLOSIVE_DAMAGE, ATTR_FALLOFF, ATTR_KINETIC_DAMAGE, ATTR_MASS, ATTR_MAX_LOCKED_TARGETS, ATTR_MAX_RANGE, ATTR_MAX_TARGET_RANGE, ATTR_MAX_VELOCITY, ATTR_RATE_OF_FIRE, ATTR_SCAN_RESOLUTION, ATTR_SHIELD_BONUS, ATTR_SHIELD_EM_DAMAGE_RESONANCE, ATTR_SHIELD_EXPLOSIVE_DAMAGE_RESONANCE, ATTR_SHIELD_KINETIC_DAMAGE_RESONANCE, ATTR_SHIELD_THERMAL_DAMAGE_RESONANCE, ATTR_SIGNATURE_RADIUS, ATTR_SPEED_FACTOR, ATTR_SPEED_FACTOR_INTERIM, ATTR_STRUCTURE_EM_DAMAGE_RESONANCE, ATTR_STRUCTURE_EXPLOSIVE_DAMAGE_RESONANCE, ATTR_STRUCTURE_KINETIC_DAMAGE_RESONANCE, ATTR_STRUCTURE_THERMAL_DAMAGE_RESONANCE, ATTR_THERMAL_DAMAGE, ATTR_WARP_SCRAMBLE_STATUS};
+use crate::consts::{CATEGORY_DRONE, CATEGORY_ENTITY, CATEGORY_SHIP, ATTR_MISSILE_ENTITY_VELOCITY_MULTIPLIER, ATTR_MISSILE_ENTITY_FLIGHT_TIME_MULTIPLIER, ATTR_MISSILE_ENTITY_AOE_VELOCITY_MULTIPLIER, ATTR_MISSILE_ENTITY_AOE_CLOUD_SIZE_MULTIPLIER, ATTR_TRACKING_SPEED};
 
-/// Client dogma/const.py: attributeActivationBlocked.
-const ATTR_ACTIVATION_BLOCKED: i32 = 1349;
-/// Client dogma/const.py: attributeActivationBlockedStrenght.
-const ATTR_ACTIVATION_BLOCKED_STRENGHT: i32 = 1350;
 /// Client dogma/const.py: attributeAoeCloudSizeBonus.
 const ATTR_AOE_CLOUD_SIZE_BONUS: i32 = 848;
 /// Client dogma/const.py: attributeAoeFalloff.
@@ -89,14 +86,8 @@ const ATTR_SIGNATURE_RADIUS_BONUS: i32 = 554;
 const ATTR_SIGNATURE_RADIUS_BONUS_INTERIM: i32 = 2147;
 /// Client dogma/const.py: attributeSignatureRadiusBonusPercent.
 const ATTR_SIGNATURE_RADIUS_BONUS_PERCENT: i32 = 973;
-/// Client dogma/const.py: attributeSpeedFactorInterim.
-const ATTR_SPEED_FACTOR_INTERIM: i32 = 2148;
-/// Client dogma/const.py: attributeTrackingSpeed.
-const ATTR_TRACKING_SPEED: i32 = 160;
 /// Client dogma/const.py: attributeTrackingSpeedBonus.
 const ATTR_TRACKING_SPEED_BONUS: i32 = 767;
-/// Client dogma/const.py: attributeWarpScrambleStatus.
-const ATTR_WARP_SCRAMBLE_STATUS: i32 = 104;
 
 /// Client dogma/const.py modifier operations.
 const PRE_MUL: i32 = 0;
@@ -142,6 +133,28 @@ const BASTION_SKILL_21802: i32 = 21802;
 const BASTION_SKILL_21803: i32 = 21803;
 /// Client bastionMode.py required skill type 32435.
 const BASTION_SKILL_32435: i32 = 32435;
+/// Client dogma/const.py: raw source attributes for sensor falloff.
+const ATTR_MAX_TARGET_RANGE_BONUS: i32 = 309;
+const ATTR_SCAN_RESOLUTION_BONUS: i32 = 566;
+const ATTR_SCAN_GRAVIMETRIC_STRENGTH_PERCENT: i32 = 1027;
+const ATTR_SCAN_LADAR_STRENGTH_PERCENT: i32 = 1028;
+const ATTR_SCAN_MAGNETOMETRIC_STRENGTH_PERCENT: i32 = 1029;
+const ATTR_SCAN_RADAR_STRENGTH_PERCENT: i32 = 1030;
+
+/// Resolve falloff-effect interim attributes to their raw source attributes.
+pub(crate) fn projected_interim_source(attr: i32) -> Option<i32> {
+    match attr {
+        ATTR_SPEED_FACTOR_INTERIM => Some(ATTR_SPEED_FACTOR),
+        ATTR_SIGNATURE_RADIUS_BONUS_INTERIM => Some(ATTR_SIGNATURE_RADIUS_BONUS),
+        ATTR_MAX_TARGET_RANGE_BONUS_INTERIM => Some(ATTR_MAX_TARGET_RANGE_BONUS),
+        ATTR_SCAN_RESOLUTION_BONUS_INTERIM => Some(ATTR_SCAN_RESOLUTION_BONUS),
+        ATTR_SCAN_GRAVIMETRIC_STRENGTH_PERCENT_INTERIM => Some(ATTR_SCAN_GRAVIMETRIC_STRENGTH_PERCENT),
+        ATTR_SCAN_LADAR_STRENGTH_PERCENT_INTERIM => Some(ATTR_SCAN_LADAR_STRENGTH_PERCENT),
+        ATTR_SCAN_MAGNETOMETRIC_STRENGTH_PERCENT_INTERIM => Some(ATTR_SCAN_MAGNETOMETRIC_STRENGTH_PERCENT),
+        ATTR_SCAN_RADAR_STRENGTH_PERCENT_INTERIM => Some(ATTR_SCAN_RADAR_STRENGTH_PERCENT),
+        _ => None,
+    }
+}
 
 #[derive(Clone, Copy)]
 struct Row { func: &'static str, domain: &'static str, op: i32, modified: i32, modifying: i32, skill: Option<i32> }
@@ -150,15 +163,15 @@ pub(super) fn supplement(effect: &mut Effect) {
     if !effect.modifiers.is_empty() { return; }
     let rows: &[Row] = match effect.name.as_deref() {
         // eve/common/script/dogma/pythonEffects/remoteWebifierFalloff.py: BaseRemoteWebifierFalloff.
-        Some("remoteWebifierFalloff") => &[
+        Some("remoteWebifierFalloff" | "remoteWebifierEntity" | "npcBehaviorWebifier") => &[
             Row { func: "ItemModifier", domain: "targetID", op: POST_PERCENT, modified: ATTR_MAX_VELOCITY, modifying: ATTR_SPEED_FACTOR_INTERIM, skill: None },
         ],
         // eve/common/script/dogma/pythonEffects/remoteTargetPaintFalloff.py: BaseRemoteTargetPaintFalloff.
-        Some("remoteTargetPaintFalloff") => &[
+        Some("remoteTargetPaintFalloff" | "remoteTargetPaintEntity" | "behaviorTargetPainter") => &[
             Row { func: "ItemModifier", domain: "targetID", op: POST_PERCENT, modified: ATTR_SIGNATURE_RADIUS, modifying: ATTR_SIGNATURE_RADIUS_BONUS_INTERIM, skill: None },
         ],
         // eve/common/script/dogma/pythonEffects/sensorFalloff.py: BaseSensorFalloffEffect.
-        Some("remoteSensorDampFalloff") => &[
+        Some("remoteSensorDampFalloff" | "remoteSensorDampEntity" | "behaviorSensorDampener") => &[
             Row { func: "ItemModifier", domain: "targetID", op: POST_PERCENT, modified: ATTR_SCAN_GRAVIMETRIC_STRENGTH, modifying: ATTR_SCAN_GRAVIMETRIC_STRENGTH_PERCENT_INTERIM, skill: None },
             Row { func: "ItemModifier", domain: "targetID", op: POST_PERCENT, modified: ATTR_SCAN_LADAR_STRENGTH, modifying: ATTR_SCAN_LADAR_STRENGTH_PERCENT_INTERIM, skill: None },
             Row { func: "ItemModifier", domain: "targetID", op: POST_PERCENT, modified: ATTR_SCAN_MAGNETOMETRIC_STRENGTH, modifying: ATTR_SCAN_MAGNETOMETRIC_STRENGTH_PERCENT_INTERIM, skill: None },
@@ -227,7 +240,7 @@ pub(super) fn supplement(effect: &mut Effect) {
             Row { func: "LocationRequiredSkillModifier", domain: "shipID", op: POST_PERCENT, modified: ATTR_FALLOFF, modifying: ATTR_FALLOFF_BONUS, skill: Some(BASTION_SKILL_3308) },
             Row { func: "LocationRequiredSkillModifier", domain: "shipID", op: POST_PERCENT, modified: ATTR_ARMOR_DAMAGE_AMOUNT, modifying: ATTR_ARMOR_DAMAGE_AMOUNT_BONUS, skill: Some(BASTION_SKILL_3393) },
             Row { func: "LocationRequiredSkillModifier", domain: "shipID", op: POST_PERCENT, modified: ATTR_SHIELD_BONUS, modifying: ATTR_SHIELD_BOOST_MULTIPLIER, skill: Some(BASTION_SKILL_3416) },
-            Row { func: "LocationRequiredSkillModifier", domain: "shipID", op: MOD_ADD, modified: ATTR_ACTIVATION_BLOCKED, modifying: ATTR_ACTIVATION_BLOCKED_STRENGHT, skill: Some(BASTION_SKILL_4385) },
+            Row { func: "LocationRequiredSkillModifier", domain: "shipID", op: MOD_ADD, modified: ATTR_ACTIVATION_BLOCKED, modifying: ATTR_ACTIVATION_BLOCKED_STRENGTH, skill: Some(BASTION_SKILL_4385) },
             Row { func: "OwnerRequiredSkillModifier", domain: "charID", op: POST_PERCENT, modified: ATTR_MAX_VELOCITY, modifying: ATTR_MISSILE_VELOCITY_BONUS, skill: Some(BASTION_SKILL_3324) },
             Row { func: "OwnerRequiredSkillModifier", domain: "charID", op: POST_PERCENT, modified: ATTR_AOE_VELOCITY, modifying: ATTR_AOE_VELOCITY_BONUS, skill: Some(BASTION_SKILL_32435) },
             Row { func: "OwnerRequiredSkillModifier", domain: "charID", op: POST_PERCENT, modified: ATTR_KINETIC_DAMAGE, modifying: ATTR_DAMAGE_MULTIPLIER_BONUS, skill: Some(BASTION_SKILL_32435) },
@@ -262,13 +275,23 @@ pub(super) fn supplement(effect: &mut Effect) {
             Row { func: "LocationRequiredSkillModifier", domain: "targetID", op: POST_PERCENT, modified: ATTR_TRACKING_SPEED, modifying: ATTR_TRACKING_SPEED_BONUS, skill: Some(TYPE_GUNNERY) },
         ],
         // eve/common/script/dogma/pythonEffects/weaponDisruptionUtil.py: GetTrackingDisruptionAttributes.
-        Some("shipModuleTrackingDisruptor") => &[
+        Some("shipModuleTrackingDisruptor" | "npcBehaviorTrackingDisruptor" | "npcEntityTrackingDisruptor") => &[
             Row { func: "LocationRequiredSkillModifier", domain: "targetID", op: POST_PERCENT, modified: ATTR_MAX_RANGE, modifying: ATTR_MAX_RANGE_BONUS, skill: Some(TYPE_GUNNERY) },
             Row { func: "LocationRequiredSkillModifier", domain: "targetID", op: POST_PERCENT, modified: ATTR_FALLOFF, modifying: ATTR_FALLOFF_BONUS, skill: Some(TYPE_GUNNERY) },
             Row { func: "LocationRequiredSkillModifier", domain: "targetID", op: POST_PERCENT, modified: ATTR_TRACKING_SPEED, modifying: ATTR_TRACKING_SPEED_BONUS, skill: Some(TYPE_GUNNERY) },
         ],
         // eve/common/script/dogma/pythonEffects/weaponDisruptionUtil.py: GetGuidanceDisruptionAttributes.
-        Some("shipModuleGuidanceDisruptor") => &[
+        Some("shipModuleGuidanceDisruptor" | "npcBehaviorGuidanceDisruptor") => &[
+            Row { func: "LocationRequiredSkillModifier", domain: "targetID", op: POST_PERCENT, modified: ATTR_MAX_VELOCITY, modifying: ATTR_MISSILE_VELOCITY_BONUS, skill: Some(TYPE_MISSILE_LAUNCHER_OPERATION) },
+            Row { func: "LocationRequiredSkillModifier", domain: "targetID", op: POST_PERCENT, modified: ATTR_EXPLOSION_DELAY, modifying: ATTR_EXPLOSION_DELAY_BONUS, skill: Some(TYPE_MISSILE_LAUNCHER_OPERATION) },
+            Row { func: "LocationRequiredSkillModifier", domain: "targetID", op: POST_PERCENT, modified: ATTR_AOE_VELOCITY, modifying: ATTR_AOE_VELOCITY_BONUS, skill: Some(TYPE_MISSILE_LAUNCHER_OPERATION) },
+            Row { func: "LocationRequiredSkillModifier", domain: "targetID", op: POST_PERCENT, modified: ATTR_AOE_CLOUD_SIZE, modifying: ATTR_AOE_CLOUD_SIZE_BONUS, skill: Some(TYPE_MISSILE_LAUNCHER_OPERATION) },
+        ],
+        // weaponDisruptionUtil.py: GetWeaponDisruptionAttributes (ship target).
+        Some("npcEntityWeaponDisruptor") => &[
+            Row { func: "LocationRequiredSkillModifier", domain: "targetID", op: POST_PERCENT, modified: ATTR_MAX_RANGE, modifying: ATTR_MAX_RANGE_BONUS, skill: Some(TYPE_GUNNERY) },
+            Row { func: "LocationRequiredSkillModifier", domain: "targetID", op: POST_PERCENT, modified: ATTR_FALLOFF, modifying: ATTR_FALLOFF_BONUS, skill: Some(TYPE_GUNNERY) },
+            Row { func: "LocationRequiredSkillModifier", domain: "targetID", op: POST_PERCENT, modified: ATTR_TRACKING_SPEED, modifying: ATTR_TRACKING_SPEED_BONUS, skill: Some(TYPE_GUNNERY) },
             Row { func: "LocationRequiredSkillModifier", domain: "targetID", op: POST_PERCENT, modified: ATTR_MAX_VELOCITY, modifying: ATTR_MISSILE_VELOCITY_BONUS, skill: Some(TYPE_MISSILE_LAUNCHER_OPERATION) },
             Row { func: "LocationRequiredSkillModifier", domain: "targetID", op: POST_PERCENT, modified: ATTR_EXPLOSION_DELAY, modifying: ATTR_EXPLOSION_DELAY_BONUS, skill: Some(TYPE_MISSILE_LAUNCHER_OPERATION) },
             Row { func: "LocationRequiredSkillModifier", domain: "targetID", op: POST_PERCENT, modified: ATTR_AOE_VELOCITY, modifying: ATTR_AOE_VELOCITY_BONUS, skill: Some(TYPE_MISSILE_LAUNCHER_OPERATION) },
@@ -304,10 +327,30 @@ pub(super) fn supplement(effect: &mut Effect) {
         ],
         _ => &[],
     };
-    effect.modifiers.extend(rows.iter().map(|r| Modifier {
-        func: r.func.into(), domain: r.domain.into(), op: r.op, modified: r.modified,
-        modifying: r.modifying, group: None, skill: r.skill,
-    }));
+    let disruption = matches!(effect.name.as_deref(), Some("shipModuleTrackingDisruptor" | "npcBehaviorTrackingDisruptor" | "npcEntityTrackingDisruptor" | "shipModuleGuidanceDisruptor" | "npcBehaviorGuidanceDisruptor" | "npcEntityWeaponDisruptor"));
+    for r in rows {
+        effect.modifiers.push(Modifier {
+            func: r.func.into(), domain: r.domain.into(), op: r.op, modified: r.modified,
+            modifying: r.modifying, group: None, skill: r.skill,
+            target_category: disruption.then_some(CATEGORY_SHIP),
+        });
+        if disruption {
+            let modified = match r.modifying {
+                ATTR_MISSILE_VELOCITY_BONUS => ATTR_MISSILE_ENTITY_VELOCITY_MULTIPLIER,
+                ATTR_EXPLOSION_DELAY_BONUS => ATTR_MISSILE_ENTITY_FLIGHT_TIME_MULTIPLIER,
+                ATTR_AOE_VELOCITY_BONUS => ATTR_MISSILE_ENTITY_AOE_VELOCITY_MULTIPLIER,
+                ATTR_AOE_CLOUD_SIZE_BONUS => ATTR_MISSILE_ENTITY_AOE_CLOUD_SIZE_MULTIPLIER,
+                _ => r.modified,
+            };
+            for category in [CATEGORY_ENTITY, CATEGORY_DRONE] {
+                effect.modifiers.push(Modifier {
+                    func: "ItemModifier".into(), domain: "targetID".into(), op: r.op,
+                    modified, modifying: r.modifying, group: None, skill: None,
+                    target_category: Some(category),
+                });
+            }
+        }
+    }
 }
 
 #[cfg(test)] mod tests;

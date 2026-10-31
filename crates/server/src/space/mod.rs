@@ -43,6 +43,7 @@ use tracing::info;
 
 mod actor;
 pub(crate) mod system;
+mod projections;
 mod npc;
 mod warpin;
 mod snapshot;
@@ -560,6 +561,7 @@ impl World {
         if systems.contains_key(&system_id) { return Ok(()); }
         let tick = now_ms();
         let mut system = System::new(system_id, self.pilots.clone(), tick);
+        system.projection_sde = Some(self.sde.clone());
         for r in self.sde.map.celestials(system_id) {
             let Some(type_id) = r.type_id.and_then(|id| i32::try_from(id).ok()) else { continue };
             if self.sde.types.get(type_id).is_none() { continue; }

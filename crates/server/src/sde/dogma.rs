@@ -4,13 +4,13 @@
 //! Python-only modifier rows are supplemented at load time; runtime calculations are elsewhere.
 use std::collections::HashMap;
 use crate::{dao::sde::dogma as dao, db::Db};
-mod python_effects;
+pub(crate) mod python_effects;
 
 pub(crate) struct Attribute {
     pub(crate) attribute_id: i32,
     pub(crate) default_value: Option<f64>, pub(crate) stackable: Option<bool>
 }
-pub(crate) struct Modifier { pub(crate) func: String, pub(crate) domain: String, pub(crate) op: i32, pub(crate) modified: i32, pub(crate) modifying: i32, pub(crate) group: Option<i32>, pub(crate) skill: Option<i32> }
+pub(crate) struct Modifier { pub(crate) func: String, pub(crate) domain: String, pub(crate) op: i32, pub(crate) modified: i32, pub(crate) modifying: i32, pub(crate) group: Option<i32>, pub(crate) skill: Option<i32>, pub(crate) target_category: Option<i32> }
 pub(crate) struct Effect {
     pub(crate) effect_id: i32,
     pub(crate) name: Option<String>,
@@ -43,7 +43,7 @@ impl Dogma {
         }
         for r in modifiers {
             if let Some(&i) = result.effect_ids.get(&r.effect_id) {
-                result.effects[i].modifiers.push(Modifier { func: r.func, domain: r.domain, op: r.op, modified: r.modified, modifying: r.modifying, group: r.group, skill: r.skill });
+                result.effects[i].modifiers.push(Modifier { func: r.func, domain: r.domain, op: r.op, modified: r.modified, modifying: r.modifying, group: r.group, skill: r.skill, target_category: None });
             }
         }
         for effect in &mut result.effects {

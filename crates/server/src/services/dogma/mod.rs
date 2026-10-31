@@ -222,7 +222,11 @@ async fn ship_info(c: &Client) -> Result<Vec<(Value, Value)>, CallError> {
     // armor and structure as combat left them.
     combat::refill_capacitor(ship_id);
     let char_id = c.session.int("charid").unwrap_or(0);
-    let fit = fit::Fit::load(&c.db, c.sde.clone(), char_id, ship_id).await?;
+    let fit = if let Some(system) = c.session.int("solarsystemid") {
+        fit::Fit::load_in_space(&c.db, &c.world, system, char_id, ship_id).await?
+    } else {
+        fit::Fit::load(&c.db, c.sde.clone(), char_id, ship_id).await?
+    };
     let (cap, shield_max) = (fit.value(fit::Key::Ship, ATTR_CAPACITOR_CAPACITY), fit.value(fit::Key::Ship, ATTR_SHIELD_CAPACITY));
     let (shield, armor_damage, hull_damage) = combat::ship_condition(ship_id).unwrap_or((shield_max, 0.0, 0.0));
     for item in items {

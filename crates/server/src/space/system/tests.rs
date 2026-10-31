@@ -16,6 +16,34 @@ fn ball(id: i64, pilot: Option<i64>, x: f64) -> Ball {
 }
 
 #[test]
+fn projection_replacement_expiry_and_departure_cleanup() {
+    use crate::services::effects::{projection::Projection, EffectKind, JammingType};
+    let mut system = System::new(1, Arc::default(), 1000);
+    for id in 1..=3 { system.insert(ball(id, None, 0.0)); }
+    let projection = |module, deadline| Projection {
+        source_ship: 1, source_module: module, source_type: 1, effect_id: 1,
+        kind: EffectKind::Projected { jamming: JammingType::Webify }, until_ms: deadline,
+        values: Vec::new(), charge_values: Vec::new(), charge_type: None,
+    };
+    system.upsert_projection(2, projection(10, 1500));
+    system.upsert_projection(3, projection(10, 2000));
+    assert!(system.projections_on(2).is_empty());
+    assert_eq!(system.projections_on(3).len(), 1);
+    let revision = system.projection_revision(3);
+    system.tick(1500);
+    assert_eq!(system.projections_on(3).len(), 1);
+    assert_eq!(system.projection_revision(3), revision);
+    system.tick(2000);
+    assert!(system.projections_on(3).is_empty());
+    assert_ne!(system.projection_revision(3), revision);
+    system.upsert_projection(2, projection(10, 3000));
+    system.upsert_projection(3, projection(11, 3000));
+    system.remove_ball(1);
+    assert!(system.projections_on(2).is_empty());
+    assert!(system.projections_on(3).is_empty());
+}
+
+#[test]
 fn completed_segment_samples_use_shared_drag_and_clamp() {
     let mut s = System::new(0, Arc::default(), 1_000);
     let mut moving = ball(1, None, 5.0);

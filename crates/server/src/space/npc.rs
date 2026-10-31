@@ -1,18 +1,21 @@
 //! Actor-owned NPC decisions and spawn groups, mirroring entity targeting and
 //! destiny Orbit/Stop events. Combat attributes are loaded by services from SDE;
-//! Weapon and repair effects use a sequential worker; deferred jobs run concurrently.
-//! Neither runs inside the actor.
-//! Targeting uses positions sampled at the actor's clock; shot jobs capture those
-//! positions before the effects worker runs.
-//! Think intervals and target-loss range are controlled by the combat configuration.
+//! Weapon, repair and projected effects use a sequential worker outside the actor.
+//! Projected cycles have independent actor timers and capture sampled positions;
+//! target generations prevent queued jobs from restoring an obsolete projection.
+//! Think intervals and AI target-loss range use combat configuration; projected
+//! scan resolution and dogma target range refresh separately under actor revisions.
 //! Brains and groups are transient; persistent NPC simulation is not supported.
 use super::*;
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 static NEXT_GROUP: AtomicU64 = AtomicU64::new(1);
+
+/// Process-local NPC effect identities occupy the negative, non-item ID namespace.
+static NEXT_NPC_MODULE: AtomicI64 = AtomicI64::new(-1);
 
 /// Server NPC targeting policy: sentinel owner permitting targets among all pilots.
 pub const HOSTILE_TO_ALL: i64 = -1;
@@ -23,6 +26,7 @@ pub type NpcEffects = Arc<dyn Fn(NpcAction) -> NpcFuture + Send + Sync>;
 
 pub enum NpcAction {
     Shot { me: Ball, victim: Ball },
+    Effect { me: Ball, victim: Ball, effect_id: i32, source_module: i64, duration_ms: f64, generation: u64 },
     Repair,
 }
 
@@ -44,14 +48,31 @@ pub struct NpcBrain {
     pub next_repair_ms: i64,
     pub next_think_ms: i64,
     pub config: NpcConfig,
+    /// Dogma targeting limit, independent of the AI's acquisition policy.
+    pub(crate) max_target_range: Option<f64>,
     effects: NpcEffects,
+    modules: Vec<NpcModule>,
+    target_generation: u64,
     aggressors: HashSet<i64>,
+}
+
+struct NpcModule {
+    effect_id: i32,
+    source_module: i64,
+    duration_ms: f64,
 }
 impl NpcBrain {
     pub fn new(owner: Option<i64>, config: NpcConfig, effects: NpcEffects) -> Self {
         Self { owner, config, effects, target: None, announced: false,
             next_shot_ms: 0, next_repair_ms: 0, next_think_ms: 0,
-            aggressors: HashSet::new() }
+            max_target_range: None, aggressors: HashSet::new(), modules: Vec::new(), target_generation: 0 }
+    }
+    /// Register an SDE effect instance with a process-unique negative module ID.
+    pub(crate) fn add_effect(&mut self, effect_id: i32, duration_ms: f64) {
+        if !duration_ms.is_finite() || (duration_ms < 1.0 && duration_ms != -1.0) { return; }
+        let source_module = NEXT_NPC_MODULE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_sub(1))
+            .expect("NPC effect identity space exhausted");
+        self.modules.push(NpcModule { effect_id, source_module, duration_ms });
     }
 }
 
@@ -155,6 +176,8 @@ impl System {
         self.due_brains = due;
     }
     fn lose_npc_target(&mut self, id: i64, brain: &mut NpcBrain) {
+        self.remove_projections_from(id);
+        brain.target_generation = brain.target_generation.checked_add(1).expect("NPC target generation exhausted");
         if let Some((_, pilot, _)) = brain.target.take() {
             self.notify_pilot(pilot, "OnTarget", vec![Value::str("otherlost"), Value::Int(id), Value::None]);
             self.command(id, |b, stamp, _| {
@@ -164,12 +187,24 @@ impl System {
         }
         brain.announced = false;
     }
+    pub(super) fn refresh_npc_targeting(&mut self, id: i64, scan_resolution: f64, max_target_range: Option<f64>) {
+        let Some(mut brain) = self.brains.remove(&id) else { return };
+        brain.config.scan_resolution = scan_resolution;
+        brain.max_target_range = max_target_range;
+        let out_of_range = brain.target.is_some_and(|(ship, _, _)| {
+            self.ball(id).zip(self.ball(ship)).is_some_and(|(me, victim)|
+                max_target_range.is_some_and(|range| len(sub(victim.position_at(self.ms), me.position_at(self.ms))) > range))
+        });
+        if out_of_range { self.lose_npc_target(id, &mut brain); }
+        self.brains.insert(id, brain);
+    }
     fn think_npc(&mut self, id: i64, brain: &mut NpcBrain) {
         let Some(me) = self.ball(id) else { return };
         let pos = me.position_at(self.ms);
         let current = brain.target.and_then(|(ship, _, _)| self.ball(ship))
             .filter(|b| b.cloak == 0 && b.mode != MODE_WARP && b.signature_radius.is_some()
-                && len(sub(b.position_at(self.ms), pos)) < brain.config.aggro_range * crate::config::game().combat.npc_target_loss_range_factor);
+                && len(sub(b.position_at(self.ms), pos)) < brain.config.aggro_range * crate::config::game().combat.npc_target_loss_range_factor
+                && brain.max_target_range.is_none_or(|range| len(sub(b.position_at(self.ms), pos)) <= range));
         let victim_id = current.map(|b| b.id);
         let (shield, armor, cycle) = brain.config.repairs;
         if (shield > 0.0 || armor > 0.0) && self.ms >= brain.next_repair_ms {
@@ -182,7 +217,7 @@ impl System {
                 brain.owner == Some(HOSTILE_TO_ALL) || brain.owner == Some(pilot) || brain.aggressors.contains(&pilot))
                 && b.signature_radius.is_some() && b.cloak == 0 && b.mode != MODE_WARP)
                 .map(|b| (b, len(sub(b.position_at(self.ms), pos))))
-                .filter(|(_, distance)| *distance <= brain.config.aggro_range)
+                .filter(|(_, distance)| *distance <= brain.config.aggro_range && brain.max_target_range.is_none_or(|range| *distance <= range))
                 .min_by(|(_, a), (_, b)| a.total_cmp(b))
                 .map(|(b, _)| (b.id, b.char_id.unwrap(), b.signature_radius.unwrap()));
             if let Some((ship, pilot, signature)) = nearest {
@@ -208,13 +243,40 @@ impl System {
             brain.next_shot_ms = self.ms + brain.config.rate_of_fire_ms as i64;
         }
     }
+    /// Validate a queued NPC projection in the actor immediately before insertion.
+    pub(crate) fn npc_projection_valid(&self, id: i64, target: i64, generation: u64) -> bool {
+        let Some(brain) = self.brains.get(&id) else { return false };
+        brain.target_generation == generation && brain.announced
+            && brain.target.is_some_and(|(ship, _, _)| ship == target)
+            && self.ball(id).zip(self.ball(target)).is_some_and(|(me, victim)|
+                victim.cloak == 0 && victim.mode != MODE_WARP && victim.signature_radius.is_some()
+                    && len(sub(victim.position_at(self.ms), me.position_at(self.ms)))
+                        < brain.config.aggro_range * crate::config::game().combat.npc_target_loss_range_factor
+                    && brain.max_target_range.is_none_or(|range| len(sub(victim.position_at(self.ms), me.position_at(self.ms))) <= range))
+    }
+    fn npc_effect_cycle(&mut self, id: i64, target: i64, generation: u64, index: usize) {
+        if !self.npc_projection_valid(id, target, generation) { return; }
+        let brain = &self.brains[&id];
+        let Some(module) = brain.modules.get(index) else { return };
+        let duration_ms = module.duration_ms;
+        let action = NpcAction::Effect {
+            me: self.sampled_ball(id).unwrap(), victim: self.sampled_ball(target).unwrap(),
+            effect_id: module.effect_id, source_module: module.source_module, duration_ms, generation,
+        };
+        self.npc_effect(brain, action);
+        if duration_ms > 0.0 {
+            self.schedule_at(self.ms.saturating_add(duration_ms as i64), move |s|
+                s.npc_effect_cycle(id, target, generation, index));
+        }
+    }
     fn complete_npc_lock(&mut self, id: i64, ship: i64, pilot: i64, deadline: i64) {
         let Some(mut brain) = self.brains.remove(&id) else { return };
         let current = brain.target == Some((ship, pilot, deadline)) && !brain.announced;
         let valid = current && self.ball(id).zip(self.ball(ship)).is_some_and(|(me, victim)|
                 victim.char_id == Some(pilot) && victim.signature_radius.is_some()
                 && victim.cloak == 0 && victim.mode != MODE_WARP
-                && len(sub(victim.position_at(self.ms), me.position_at(self.ms))) < brain.config.aggro_range * crate::config::game().combat.npc_target_loss_range_factor);
+                && len(sub(victim.position_at(self.ms), me.position_at(self.ms))) < brain.config.aggro_range * crate::config::game().combat.npc_target_loss_range_factor
+                && brain.max_target_range.is_none_or(|range| len(sub(victim.position_at(self.ms), me.position_at(self.ms))) <= range));
         if valid {
             self.notify_pilot(pilot, "OnTarget", vec![Value::str("otheradd"), Value::Int(id)]);
             brain.announced = true;
@@ -224,6 +286,11 @@ impl System {
             self.lose_npc_target(id, &mut brain);
         }
         self.brains.insert(id, brain);
+        if valid {
+            let generation = self.brains[&id].target_generation;
+            let count = self.brains[&id].modules.len();
+            for index in 0..count { self.npc_effect_cycle(id, ship, generation, index); }
+        }
     }
 }
 

@@ -118,6 +118,14 @@ pub const ATTR_RADIUS: i32 = 162;
 pub const ATTR_MAX_VELOCITY: i32 = 37;
 /// SDE dgmAttributeTypes: speedFactor.
 pub const ATTR_SPEED_FACTOR: i32 = 20;
+/// Client dogma/const.py: attributeSpeedFactorInterim.
+pub const ATTR_SPEED_FACTOR_INTERIM: i32 = 2148;
+/// Client dogma/const.py: attributeWarpScrambleStatus.
+pub const ATTR_WARP_SCRAMBLE_STATUS: i32 = 104;
+/// Client dogma/const.py: attributeActivationBlocked.
+pub const ATTR_ACTIVATION_BLOCKED: i32 = 1349;
+/// Client dogma/const.py: attributeActivationBlockedStrenght (client spelling).
+pub const ATTR_ACTIVATION_BLOCKED_STRENGTH: i32 = 1350;
 /// SDE dgmAttributeTypes: agility.
 pub const ATTR_AGILITY: i32 = 70;
 /// SDE dgmAttributeTypes: signatureRadius.
@@ -343,6 +351,16 @@ pub const ATTR_RELOAD_TIME: i32 = 1795;
 pub const ATTR_NEXT_ACTIVATION_TIME: i32 = 2729;
 /// SDE dgmAttributeTypes: missile_damage_multiplier.
 pub const ATTR_MISSILE_DAMAGE_MULTIPLIER: i32 = 212;
+/// Client dogma/const.py: attributeMissileEntityVelocityMultiplier.
+pub const ATTR_MISSILE_ENTITY_VELOCITY_MULTIPLIER: i32 = 645;
+/// Client dogma/const.py: attributeMissileEntityFlightTimeMultiplier.
+pub const ATTR_MISSILE_ENTITY_FLIGHT_TIME_MULTIPLIER: i32 = 646;
+/// Client dogma/const.py: attributeMissileEntityAoeVelocityMultiplier.
+pub const ATTR_MISSILE_ENTITY_AOE_VELOCITY_MULTIPLIER: i32 = 859;
+/// Client dogma/const.py: attributeMissileEntityAoeCloudSizeMultiplier.
+pub const ATTR_MISSILE_ENTITY_AOE_CLOUD_SIZE_MULTIPLIER: i32 = 858;
+/// Client dogma/const.py: attributeTrackingSpeed.
+pub const ATTR_TRACKING_SPEED: i32 = 160;
 /// SDE dgmAttributeTypes: entity_fly_range.
 pub const ATTR_ENTITY_FLY_RANGE: i32 = 416;
 /// SDE dgmAttributeTypes: entity_attack_range.
