@@ -15,10 +15,11 @@ pub(crate) struct Trade {
     pub(crate) accepted_a: bool,
     pub(crate) accepted_b: bool,
     pub(crate) state: String,
+    pub(crate) updated_at: i64,
 }
 impl Trade {
     fn from_row(row: &Row) -> Self {
-        Self { id: row.get("trade_id"), station: row.get("station_id"), a: row.get("char_a"), b: row.get("char_b"), money_a: row.get("money_a"), money_b: row.get("money_b"), accepted_a: row.get("accepted_a"), accepted_b: row.get("accepted_b"), state: row.get("state") }
+        Self { id: row.get("trade_id"), station: row.get("station_id"), a: row.get("char_a"), b: row.get("char_b"), money_a: row.get("money_a"), money_b: row.get("money_b"), accepted_a: row.get("accepted_a"), accepted_b: row.get("accepted_b"), state: row.get("state"), updated_at: row.get("updated_at") }
     }
 }
 
@@ -35,7 +36,7 @@ impl TradeItem {
     }
 }
 
-const COLUMNS: &str = "trade_id, station_id, char_a, char_b, money_a::float8 AS money_a, money_b::float8 AS money_b, accepted_a, accepted_b, state";
+const COLUMNS: &str = "trade_id, station_id, char_a, char_b, money_a::float8 AS money_a, money_b::float8 AS money_b, accepted_a, accepted_b, state, updated_at";
 
 pub(crate) async fn get(ex: &(impl Executor + ?Sized), id: i64) -> Result<Option<Trade>, Error> {
     Ok(ex.query_opt(&format!("SELECT {COLUMNS} FROM game.trades WHERE trade_id = $1"), &[&id]).await?.as_ref().map(Trade::from_row))

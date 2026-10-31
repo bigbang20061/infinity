@@ -29,7 +29,7 @@ fn jump_cooldown(base_hours: i64, reduction_per_level: i64, level: i64) -> i128 
 }
 
 enum JumpEffect {
-    Trade(Outbox<crate::services::trade::CacheEffect>),
+    Trade(Outbox<crate::services::trade::TradeEffect>),
     Session { station: i64, system: i64, constellation: i64, region: i64, capsule: i64 },
 }
 

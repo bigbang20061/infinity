@@ -7,7 +7,7 @@ use marshal::Value;
 mod protocol_tests;
 
 fn trade() -> Trade {
-    Trade { id: 100, station: 1, a: 2, b: 3, money_a: 1.25, money_b: 0.0, accepted_a: false, accepted_b: false, state: "open".into() }
+    Trade { id: 100, station: 1, a: 2, b: 3, money_a: 1.25, money_b: 0.0, accepted_a: false, accepted_b: false, state: "open".into(), updated_at: 0 }
 }
 fn manifest(rows: Vec<Value>) -> Value {
     keyval([("tradeContainerID", Value::Int(100)), ("money", Value::list([Value::Float(1.25), Value::Float(0.0)])), ("tradeItems", Value::list(rows))])
@@ -94,11 +94,14 @@ async fn settlement_abort_and_rollback_preserve_item_trees() {
     trade.accepted_a = true;
     trade.accepted_b = true;
     trades::update(&tx, &trade, 1).await.unwrap();
-    let mut rejected: Outbox<super::CacheEffect> = Outbox::default();
+    let mut rejected: Outbox<super::TradeEffect> = Outbox::default();
     assert!(matches!(super::settle::complete(&tx, &sde, &mut rejected, &mut trade).await, Ok(super::settle::Settled::Underfunded)));
     let stored = trades::get(&tx, trade.id).await.unwrap().unwrap();
     assert!(!stored.accepted_a && !stored.accepted_b);
     assert_eq!(stored.state, "open");
+    let job_id = format!("trade-timeout:{}", trade.id);
+    let due: i64 = tx.query_one("SELECT due_at FROM game.jobs WHERE job_id=$1", &[&job_id]).await.unwrap().get("due_at");
+    assert_eq!(due, stored.updated_at + crate::client::filetime_ticks_from_seconds(crate::config::game().trade.idle_timeout_secs));
     assert_eq!(characters::balance(&tx, a).await.unwrap(), 100.0);
     assert_eq!(characters::balance(&tx, b).await.unwrap(), 100.0);
     let before = tx.query("SELECT owner_id, location_id FROM game.items WHERE item_id = ANY($1) ORDER BY item_id", &[&vec![root, child, leaf]]).await.unwrap();
@@ -116,8 +119,9 @@ async fn settlement_abort_and_rollback_preserve_item_trees() {
     assert!(resets.iter().any(|(id, _)| *id == b));
     assert!(resets.iter().all(|(_, args)| args == &vec![Value::Int(trade.id), Value::Bool(false)]));
     trade.money_a = 10.0;
-    let mut outbox: Outbox<super::CacheEffect> = Outbox::default();
+    let mut outbox: Outbox<super::TradeEffect> = Outbox::default();
     assert!(matches!(super::settle::complete(&tx, &sde, &mut outbox, &mut trade).await, Ok(super::settle::Settled::Done)));
+    assert!(tx.query_opt("SELECT job_id FROM game.jobs WHERE job_id=$1", &[&job_id]).await.unwrap().is_none());
     assert_eq!(characters::balance(&tx, a).await.unwrap(), 90.0);
     assert_eq!(characters::balance(&tx, b).await.unwrap(), 110.0);
     let events: Vec<_> = outbox.into_entries().into_iter().filter_map(|entry| match entry {
@@ -137,7 +141,9 @@ async fn settlement_abort_and_rollback_preserve_item_trees() {
     let mut cancelled = trades::create(&tx, 1, a, b, 1).await.unwrap();
     let restored = transfers::insert(&tx, type_id, a, cancelled.id, 7, 1).await.unwrap();
     trades::add_item(&tx, cancelled.id, &TradeItem { id: restored, owner: a, origin: 123, flag: 9 }).await.unwrap();
+    assert!(super::timeout::refresh(&tx, &mut Outbox::default(), &cancelled).await.is_ok());
     assert!(super::settle::abort(&tx, &sde, &mut Outbox::default(), &mut cancelled, false).await.is_ok());
+    assert!(tx.query_opt("SELECT job_id FROM game.jobs WHERE job_id=$1", &[&format!("trade-timeout:{}", cancelled.id)]).await.unwrap().is_none());
     let row = tx.query_one("SELECT location_id, flag_id FROM game.items WHERE item_id = $1", &[&restored]).await.unwrap();
     assert_eq!(row.get::<_, i64>("location_id"), 123);
     assert_eq!(row.get::<_, i32>("flag_id"), 9);
@@ -169,8 +175,10 @@ async fn startup_recovery_restores_open_trade_without_notifications() {
     let trade = trades::create(&db, 1, 2, 3, 1).await.unwrap();
     let root = transfers::insert(&db, type_id, 2, trade.id, 7, 1).await.unwrap();
     trades::add_item(&db, trade.id, &TradeItem { id: root, owner: 2, origin: 123, flag: 9 }).await.unwrap();
+    assert!(super::timeout::refresh(&db, &mut crate::db::outbox::Outbox::default(), &trade).await.is_ok());
     let world = World::new(db.clone(), sde.clone(), 1);
     assert!(super::recover(&db, &world, sde.clone()).await.is_ok());
+    assert!(db.query_opt("SELECT job_id FROM game.jobs WHERE job_id=$1", &[&format!("trade-timeout:{}", trade.id)]).await.unwrap().is_none());
     let row = db.query_one("SELECT location_id, flag_id FROM game.items WHERE item_id = $1", &[&root]).await.unwrap();
     assert_eq!(row.get::<_, i64>("location_id"), 123);
     assert_eq!(row.get::<_, i32>("flag_id"), 9);

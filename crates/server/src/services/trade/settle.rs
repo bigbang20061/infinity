@@ -1,16 +1,16 @@
 //! Atomic trade settlement and cancellation over `game.trades`, `game.trade_items`
 //! and character wallets. `pvptradesvc.py` consumes the emitted events.
-//! Idle timeout scheduling is not part of this module.
+//! Terminal transitions cancel durable idle jobs in the same transaction.
 use crate::{consts::{FLAG_HANGAR, IX_LOCATION_ID, IX_OWNER_ID}, dao::{items::{loading::ItemQuery, transfers}, trades::{self, Trade}}, db::{executor::Executor, outbox::Outbox, Db}, sde::Sde, services::{db_err, items::load_items, market, wallets, CallError}, space::World};
 use std::sync::Arc;
 use marshal::Value;
-use super::{CacheEffect, dispatch};
+use super::{TradeEffect, dispatch, timeout};
 
-pub(super) fn tell(outbox: &mut Outbox<CacheEffect>, trade: &Trade, event: &str, args: Vec<Value>) {
+pub(super) fn tell(outbox: &mut Outbox<TradeEffect>, trade: &Trade, event: &str, args: Vec<Value>) {
     for char_id in [trade.a, trade.b] { outbox.notify_pilot(char_id, event, args.clone()); }
 }
 
-async fn changes(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<CacheEffect>, trade: &Trade, before: &[crate::dao::items::loading::Item]) -> Result<(), CallError> {
+async fn changes(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<TradeEffect>, trade: &Trade, before: &[crate::dao::items::loading::Item]) -> Result<(), CallError> {
     let ids: Vec<_> = before.iter().map(|item| item.item_id).collect();
     let after = load_items(ex, sde, ItemQuery::Ids(&ids)).await.map_err(db_err)?;
     for (old, new) in before.iter().zip(after.iter()) {
@@ -26,7 +26,7 @@ async fn changes(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<C
     Ok(())
 }
 
-pub(super) async fn abort(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<CacheEffect>, trade: &mut Trade, notify: bool) -> Result<(), CallError> {
+pub(super) async fn abort(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<TradeEffect>, trade: &mut Trade, notify: bool) -> Result<(), CallError> {
     let roots = trades::items(ex, trade.id).await.map_err(db_err)?;
     let ids: Vec<_> = roots.iter().map(|item| item.id).collect();
     let before = load_items(ex, sde, ItemQuery::Ids(&ids)).await.map_err(db_err)?;
@@ -42,7 +42,8 @@ pub(super) async fn abort(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut
     trade.state = "cancelled".into();
     if !trades::update(ex, trade, crate::client::filetime_now()).await.map_err(db_err)? { return Err(CallError::Internal(anyhow::anyhow!("trade is no longer open"))); }
     trades::clear_items(ex, trade.id).await.map_err(db_err)?;
-    outbox.operation(CacheEffect::Remove(trade.id));
+    timeout::cancel(ex, trade.id).await?;
+    outbox.operation(TradeEffect::Remove(trade.id));
     if notify { tell(outbox, trade, "OnTradeCancel", vec![Value::Int(trade.id)]); }
     Ok(())
 }
@@ -50,13 +51,15 @@ pub(super) async fn abort(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut
 pub(super) enum Settled { Done, Underfunded }
 
 
-pub(super) async fn complete(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<CacheEffect>, trade: &mut Trade) -> Result<Settled, CallError> {
+pub(super) async fn complete(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<TradeEffect>, trade: &mut Trade) -> Result<Settled, CallError> {
     for (char_id, amount) in [(trade.a, trade.money_a), (trade.b, trade.money_b)] {
         if !crate::dao::wallets::characters::covers(ex, char_id, amount).await.map_err(db_err)? {
             trade.accepted_a = false;
             trade.accepted_b = false;
-            if !trades::update(ex, trade, crate::client::filetime_now()).await.map_err(db_err)? { return Err(CallError::Internal(anyhow::anyhow!("trade is no longer open"))); }
-            outbox.operation(CacheEffect::Put(trade.clone()));
+            trade.updated_at = crate::client::filetime_now();
+            if !trades::update(ex, trade, trade.updated_at).await.map_err(db_err)? { return Err(CallError::Internal(anyhow::anyhow!("trade is no longer open"))); }
+            timeout::refresh(ex, outbox, trade).await?;
+            outbox.operation(TradeEffect::Put(trade.clone()));
             tell(outbox, trade, "OnTradeOfferReset", vec![Value::Int(trade.id), Value::Bool(false)]);
             return Ok(Settled::Underfunded);
         }
@@ -85,12 +88,13 @@ pub(super) async fn complete(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &
     trade.state = "done".into();
     if !trades::update(ex, trade, crate::client::filetime_now()).await.map_err(db_err)? { return Err(CallError::Internal(anyhow::anyhow!("trade is no longer open"))); }
     trades::clear_items(ex, trade.id).await.map_err(db_err)?;
-    outbox.operation(CacheEffect::Remove(trade.id));
+    timeout::cancel(ex, trade.id).await?;
+    outbox.operation(TradeEffect::Remove(trade.id));
     tell(outbox, trade, "OnTradeComplete", vec![Value::Int(trade.id), Value::list(ids.into_iter().map(Value::Int))]);
     Ok(Settled::Done)
 }
 
-pub(super) async fn abort_for_char(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<CacheEffect>, char_id: i64) -> Result<(), CallError> {
+pub(super) async fn abort_for_char(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<TradeEffect>, char_id: i64) -> Result<(), CallError> {
     if let Some(mut trade) = trades::open_for(ex, char_id).await.map_err(db_err)? {
         abort(ex, sde, outbox, &mut trade, true).await?;
     }

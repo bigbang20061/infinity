@@ -2,10 +2,11 @@
 //! `pvptradewnd.py`. Durable state is stored in `game.trades` and
 //! `game.trade_items`; the in-memory index is a post-commit cache only.
 //! Corporation items, fitted modules, charges and PLEX-vault transfers are not
-//! supported. Idle timeouts require the durable scheduler and are not active.
+//! supported. Idle trades are cancelled by the durable scheduler.
 mod session;
 mod settle;
 mod trade_mgr;
+mod timeout;
 
 use std::{collections::HashMap, sync::{Mutex, OnceLock}};
 use crate::{client::Client, dao::trades::Trade, db::outbox::{Effect, Outbox}, services::{Call, CallError, CallResult}, space::World};
@@ -15,24 +16,27 @@ fn state() -> &'static Mutex<HashMap<i64, Trade>> { STATE.get_or_init(|| Mutex::
 
 pub(crate) fn is_trade_container(id: i64) -> bool { state().lock().unwrap().contains_key(&id) }
 
-pub(crate) enum CacheEffect { Put(Trade), Remove(i64) }
+pub(crate) enum TradeEffect { Put(Trade), Remove(i64), WakeScheduler }
 
-pub(crate) fn dispatch<T>(value: T, outbox: Outbox<CacheEffect>, world: &World) -> Result<T, CallError> {
+pub(crate) fn dispatch<T>(value: T, outbox: Outbox<TradeEffect>, world: &World) -> Result<T, CallError> {
     for effect in outbox.into_entries() {
         match effect {
             Effect::Notification(notification) => notification.dispatch(world, None)?,
-            Effect::Operation(CacheEffect::Put(trade)) => { state().lock().unwrap().insert(trade.id, trade); }
-            Effect::Operation(CacheEffect::Remove(id)) => { state().lock().unwrap().remove(&id); }
+            Effect::Operation(TradeEffect::Put(trade)) => { state().lock().unwrap().insert(trade.id, trade); }
+            Effect::Operation(TradeEffect::Remove(id)) => { state().lock().unwrap().remove(&id); }
+            Effect::Operation(TradeEffect::WakeScheduler) => crate::scheduler::wake(),
         }
     }
     Ok(value)
 }
 
+pub(super) fn timeout_registration() -> crate::scheduler::Registration { timeout::registration() }
+
 pub(super) async fn route(c: &mut Client, call: &Call<'_>) -> CallResult {
     trade_mgr::dispatch(c, call).await
 }
 
-pub(crate) async fn abort_for_char(ex: &(impl crate::db::executor::Executor + ?Sized), sde: &crate::sde::Sde, outbox: &mut Outbox<CacheEffect>, char_id: i64) -> Result<(), CallError> {
+pub(crate) async fn abort_for_char(ex: &(impl crate::db::executor::Executor + ?Sized), sde: &crate::sde::Sde, outbox: &mut Outbox<TradeEffect>, char_id: i64) -> Result<(), CallError> {
     settle::abort_for_char(ex, sde, outbox, char_id).await
 }
 

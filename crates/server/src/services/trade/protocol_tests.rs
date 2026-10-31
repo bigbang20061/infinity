@@ -18,6 +18,19 @@ async fn call(c: &mut Client, method: &str, args: &[Value], id: Option<i64>, kwa
     super::super::route(c, &Call { service: "trademgr", method, args, kwargs, bound: id.is_some(), bind_params: bind.as_ref() }).await
 }
 
+async fn assert_timeout(db: &Db, id: i64) -> i64 {
+    let trade = trades::get(db, id).await.unwrap().unwrap();
+    let row = db.query_one("SELECT due_at, payload FROM game.jobs WHERE job_id = $1", &[&format!("trade-timeout:{id}")]).await.unwrap();
+    let due: i64 = row.get("due_at");
+    assert_eq!(due, trade.updated_at + crate::client::filetime_ticks_from_seconds(crate::config::game().trade.idle_timeout_secs));
+    assert_eq!(row.get::<_, String>("payload"), id.to_string());
+    due
+}
+
+async fn assert_no_timeout(db: &Db, id: i64) {
+    assert!(db.query_opt("SELECT job_id FROM game.jobs WHERE job_id = $1", &[&format!("trade-timeout:{id}")]).await.unwrap().is_none());
+}
+
 #[tokio::test]
 #[ignore]
 async fn staging_rejects_restricted_and_foreign_descendants_atomically() {
@@ -178,6 +191,7 @@ async fn two_clients_settle_through_service_routes() {
     db.execute("DELETE FROM game.trades WHERE trade_id = $1", &[&busy.id]).await.unwrap();
     let moniker = call(&mut ca, "InitiateTrade", &[Value::Int(b)], None, &empty).await.ok().expect("initiation");
     let trade = trades::open_for(&db, a).await.unwrap().unwrap();
+    let initial_due = assert_timeout(&db, trade.id).await;
     assert_eq!(moniker, Value::Instance(Box::new(Value::str("util.Moniker")), Box::new(Value::tuple([Value::str("trademgr"), Value::Int(ca.cfg.server.node_id), Value::Int(trade.id), Value::None]))));
     assert_eq!(call(&mut ca, "InitiateTrade", &[Value::Int(b)], None, &empty).await.ok().expect("same-pair initiation"), moniker);
     assert_eq!(trades::open_for(&db, b).await.unwrap().unwrap().id, trade.id);
@@ -193,12 +207,15 @@ async fn two_clients_settle_through_service_routes() {
     assert!(matches!(callback, Value::Callback(_)));
     assert_eq!(crate::services::value_field(list, "tradeContainerID").and_then(Value::as_int), Some(trade.id));
     assert!(call(&mut cb, "GetItem", &[], Some(trade.id), &empty).await.is_ok());
+    assert_eq!(assert_timeout(&db, trade.id).await, initial_due);
     let stack = transfers::insert(&db, normal, a, station, crate::consts::FLAG_HANGAR, 5).await.unwrap();
     let root = transfers::insert(&db, normal, a, station, crate::consts::FLAG_HANGAR, 3).await.unwrap();
     let child = transfers::insert(&db, normal, a, root, 5, 3).await.unwrap();
     let qty = Value::dict([("qty", Value::Int(2))]);
     assert!(call(&mut ca, "Add", &[Value::Int(stack), Value::Int(station)], Some(trade.id), &qty).await.is_ok());
-    assert!(call(&mut ca, "Add", &[Value::Int(root), Value::Int(station)], Some(trade.id), &empty).await.is_ok());
+    assert_timeout(&db, trade.id).await;
+    assert!(call(&mut ca, "MultiAdd", &[Value::list([Value::Int(root)]), Value::Int(station)], Some(trade.id), &empty).await.is_ok());
+    assert_timeout(&db, trade.id).await;
     let staged = trades::items(&db, trade.id).await.unwrap();
     assert_eq!(staged.len(), 2);
     let bind = Value::tuple([Value::Int(station), Value::Int(10004), Value::Int(a)]);
@@ -235,12 +252,16 @@ async fn two_clients_settle_through_service_routes() {
         assert!(crate::services::inventory::inventory(&mut ca, &stack_all).await.is_err());
     }
     assert!(call(&mut ca, "OfferMoney", &[Value::Float(10.0)], Some(trade.id), &empty).await.is_ok());
+    assert_timeout(&db, trade.id).await;
     let bad = crate::services::keyval([("tradeContainerID", Value::Int(trade.id)), ("money", Value::list([Value::Float(0.0), Value::Float(0.0)])), ("tradeItems", Value::list([]))]);
     assert!(matches!(call(&mut ca, "MakeOffer", &[bad], Some(trade.id), &empty).await, Ok(Value::Bool(false))));
+    assert_timeout(&db, trade.id).await;
     let rows = crate::services::items::load_items(&db, &sde, crate::dao::items::loading::ItemQuery::Location(trade.id)).await.unwrap();
     let manifest = crate::services::keyval([("tradeContainerID", Value::Int(trade.id)), ("money", Value::list([Value::Float(10.0), Value::Float(0.0)])), ("tradeItems", Value::list(rows.iter().map(|i| i.row())))]);
     assert!(matches!(call(&mut ca, "MakeOffer", &[manifest.clone()], Some(trade.id), &empty).await, Ok(Value::Bool(true))));
+    assert_timeout(&db, trade.id).await;
     assert!(matches!(call(&mut cb, "MakeOffer", &[manifest], Some(trade.id), &empty).await, Ok(Value::Bool(true))));
+    assert_no_timeout(&db, trade.id).await;
     assert!(call(&mut ca, "Abort", &[], Some(trade.id), &empty).await.is_ok());
     assert_eq!(trades::get(&db, trade.id).await.unwrap().unwrap().state, "done");
     assert_eq!(db.query_one("SELECT owner_id FROM game.items WHERE item_id = $1", &[&child]).await.unwrap().get::<_, i64>("owner_id"), b);
@@ -265,6 +286,7 @@ async fn two_clients_settle_through_service_routes() {
     ca.leave_world().await.unwrap();
     assert!(!world.is_online(a));
     assert_eq!(trades::get(&db, disconnect_trade.id).await.unwrap().unwrap().state, "cancelled");
+    assert_no_timeout(&db, disconnect_trade.id).await;
     assert!(trades::items(&db, disconnect_trade.id).await.unwrap().is_empty());
     let restored = db.query_one("SELECT owner_id, location_id, flag_id, quantity FROM game.items WHERE item_id = $1", &[&stack]).await.unwrap();
     assert_eq!(restored.get::<_, i64>("owner_id"), a);

@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use marshal::Value;
 use crate::{client::Client, consts::{FLAG_HANGAR, IX_LOCATION_ID, IX_STACK_SIZE}, dao::{items::{loading::{Item, ItemQuery}, quantities::{self, QuantityChange}, transfers}, trades::{self, Trade, TradeItem}}, db::{executor::Executor, outbox::Outbox}, messages, sde::Sde, services::{db_err, items::load_items, keyval, market, notify_error, user_error, wallets, Call, CallError, CallResult}};
-use super::{dispatch as dispatch_outbox, session, settle, CacheEffect};
+use super::{dispatch as dispatch_outbox, session, settle, timeout, TradeEffect};
 
 /// `eveexceptions.const.UE_TYPEIDL`: list of type IDs in a UserError argument.
 const UE_TYPEIDL: i64 = 29;
@@ -16,12 +16,12 @@ fn moniker(node: i64, id: i64) -> Value {
 fn pair(trade: &Trade, caller: i64, target: i64) -> bool { (trade.a == caller && trade.b == target) || (trade.b == caller && trade.a == target) }
 fn acceptance(trade: &Trade) -> Value { Value::list([Value::Bool(trade.accepted_a), Value::Bool(trade.accepted_b)]) }
 fn amounts(trade: &Trade) -> Value { Value::list([Value::Float(trade.money_a), Value::Float(trade.money_b)]) }
-pub(super) fn reset(outbox: &mut Outbox<CacheEffect>, trade: &mut Trade) {
+pub(super) fn reset(outbox: &mut Outbox<TradeEffect>, trade: &mut Trade) {
     trade.accepted_a = false;
     trade.accepted_b = false;
     settle::tell(outbox, trade, "OnTradeOffer", vec![Value::Int(trade.id), acceptance(trade)]);
 }
-fn item_notice(outbox: &mut Outbox<CacheEffect>, trade: &Trade, item: &Item, changes: Vec<(i64, Value)>) {
+fn item_notice(outbox: &mut Outbox<TradeEffect>, trade: &Trade, item: &Item, changes: Vec<(i64, Value)>) {
     settle::tell(outbox, trade, "OnItemChange", vec![item.row(), Value::Dict(changes.into_iter().map(|(i, v)| (Value::Int(i), v)).collect()), Value::None]);
 }
 
@@ -34,7 +34,7 @@ async fn initiate(c: &Client, target: i64) -> CallResult {
     if !c.world.is_online(me) || !c.world.is_online(target) { return Err(notify_error(messages::trade::TRADE_TARGET_NOT_HERE)); }
     let node = c.cfg.server.node_id;
     let world = &*c.world;
-    c.db.transaction(|tx, outbox: &mut Outbox<CacheEffect>| Box::pin(async move {
+    c.db.transaction(|tx, outbox: &mut Outbox<TradeEffect>| Box::pin(async move {
         if transfers::docked(tx, me).await.map_err(db_err)? != Some(station) || transfers::docked(tx, target).await.map_err(db_err)? != Some(station) {
             return Err(notify_error(messages::trade::TRADE_TARGET_NOT_HERE));
         }
@@ -43,14 +43,15 @@ async fn initiate(c: &Client, target: i64) -> CallResult {
         }
         if trades::open_for(tx, target).await.map_err(db_err)?.is_some() { return Err(notify_error(messages::trade::TRADE_BUSY)); }
         let trade = trades::create(tx, station, me, target, crate::client::filetime_now()).await.map_err(db_err)?;
+        timeout::refresh(tx, outbox, &trade).await?;
         let result = moniker(node, trade.id);
-        outbox.operation(CacheEffect::Put(trade));
+        outbox.operation(TradeEffect::Put(trade));
         outbox.notify_pilot(target, "OnTradeInitiate", vec![Value::Int(me), result.clone()]);
         Ok(result)
     }), |value, outbox| async move { dispatch_outbox(value, outbox, world) }).await
 }
 
-async fn stage(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<CacheEffect>, trade: &mut Trade, me: i64, ship: Option<i64>, ids: &[i64], source: i64, quantity: Option<i64>) -> Result<(), CallError> {
+async fn stage(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<TradeEffect>, trade: &mut Trade, me: i64, ship: Option<i64>, ids: &[i64], source: i64, quantity: Option<i64>) -> Result<(), CallError> {
     if source != trade.station { return Err(notify_error(messages::trade::TRADE_SOURCE_NOT_HANGAR)); }
     let unique: BTreeSet<_> = ids.iter().copied().collect();
     if unique.len() != ids.len() || ids.is_empty() { return Err(notify_error(messages::trade::TRADE_SOURCE_NOT_HANGAR)); }
@@ -107,7 +108,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
     let sde = c.sde.clone();
     let world = c.world.clone();
     let _lock = market::lock().await;
-    c.db.transaction(move |tx, outbox: &mut Outbox<CacheEffect>| {
+    c.db.transaction(move |tx, outbox: &mut Outbox<TradeEffect>| {
         let (method, args, kwargs, sde) = (method.clone(), args.clone(), kwargs.clone(), sde.clone());
         Box::pin(async move {
             let Some(mut trade) = trades::get(tx, id).await.map_err(db_err)? else {
@@ -173,8 +174,10 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
                 _ => Value::None,
             };
             if changed {
-                if !trades::update(tx, &trade, crate::client::filetime_now()).await.map_err(db_err)? { return Err(notify_error(messages::trade::TRADE_BUSY)); }
-                outbox.operation(CacheEffect::Put(trade));
+                trade.updated_at = crate::client::filetime_now();
+                if !trades::update(tx, &trade, trade.updated_at).await.map_err(db_err)? { return Err(notify_error(messages::trade::TRADE_BUSY)); }
+                timeout::refresh(tx, outbox, &trade).await?;
+                outbox.operation(TradeEffect::Put(trade));
             }
             Ok(value)
         })

@@ -100,7 +100,7 @@ transaction_history_days = 30       # server default transaction-history period
 price_history_days = 365            # server market price-history retention
 
 [trade]
-idle_timeout_secs = 1800            # reserved for durable trade timeout scheduling
+idle_timeout_secs = 1800            # durable idle trade cancellation, in seconds
 
 [store]
 plex_price_isk_fallback = 23500000  # server fallback ISK per PLEX when no retail price is known

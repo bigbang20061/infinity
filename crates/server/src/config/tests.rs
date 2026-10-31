@@ -49,6 +49,7 @@ fn trade_timeout_is_parsed_and_must_be_positive() {
     let config = Config::load_with(&fixture.path(), |_| None).unwrap();
     assert_eq!(config.game_config().trade.idle_timeout_secs, 42);
     assert!(load_error("[trade]\nidle_timeout_secs = 0").contains("trade.idle_timeout_secs"));
+    assert!(load_error("[trade]\nidle_timeout_secs = 9223372036854775807").contains("trade.idle_timeout_secs"));
 }
 
 #[test]
