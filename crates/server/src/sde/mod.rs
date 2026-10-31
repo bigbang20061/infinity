@@ -5,6 +5,7 @@
 //! `eve/client/script/parklife/autopilot.py:260-261,329-332`.
 //! Sources are typed SDE, including races, bloodlines and NPC characters, and selected native
 //! projections, including localization and schools, via `dao::sde`.
+//! Celestial collision radii are resolved here for the wire and placement callers.
 //! Typed dogma_effect_modifiers and build_info are intentionally unused: modifiers come from dogma_effects instead.
 //! Native blueprints and stationoperations are unused under the typed-table ruling.
 pub(crate) mod characters;
@@ -23,6 +24,9 @@ pub(crate) mod wrecks;
 use crate::db::Db;
 use std::time::Instant;
 
+/// Existing World wire policy for celestial radii missing from both SDE rows.
+const CELESTIAL_FALLBACK_RADIUS: f64 = 1000.0;
+
 pub(crate) struct Sde {
     pub(crate) types: types::Types,
     pub(crate) dogma: dogma::Dogma,
@@ -38,6 +42,12 @@ pub(crate) struct Sde {
     pub(crate) characters: characters::Characters,
 }
 impl Sde {
+    pub(crate) fn celestial_radius(&self, celestial: &map::Celestial) -> f32 {
+        celestial.radius.or_else(|| celestial.type_id.and_then(|id| i32::try_from(id).ok())
+            .and_then(|id| self.types.get(id)).and_then(|ty| ty.radius))
+            .unwrap_or(CELESTIAL_FALLBACK_RADIUS) as f32
+    }
+
     pub(crate) async fn load(db: &Db) -> anyhow::Result<Self> {
         let started = Instant::now();
         let (mut types, dogma, map, factions, npc_corporations, localization, wrecks, industry, store, missions, mut dungeons, characters) = tokio::try_join!(

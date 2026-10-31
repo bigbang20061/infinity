@@ -1,7 +1,7 @@
 //! Native warp alignment, motion and interpolation for transient destiny balls.
 //! Mirrors carbonengine Ballpark::WarpTo, EvolveWarp and WarpDistance and
-//! Ball::IsAlignedForWarp, consumed by the client destiny ballpark. Collision
-//! handling and warp sensors are not implemented.
+//! Ball::IsAlignedForWarp, consumed by the client destiny ballpark. Ball state
+//! is transient; warp sensors are not implemented.
 
 use super::*;
 

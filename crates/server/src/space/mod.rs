@@ -24,8 +24,9 @@
 //! strictly below 100 km, without WarpFX.
 //!
 //! Missile flight uses native steering; the gameplay impact timer is separate.
-//! Warp follows native alignment and acceleration. Collisions, bumps, orientations,
-//! formations, miniballs, AddBalls2 and unsupported ball modes are not implemented.
+//! Warp follows native alignment and acceleration. Legacy scalar-sphere collisions
+//! are authoritative; bump events, orientations, formations, miniballs, AddBalls2
+//! and unsupported ball modes are not implemented.
 //! Shared vector distances are defined here for simulation and service callers.
 
 use crate::consts::{AU, DAMAGE_LAYER_COUNT, FILETIME_SECOND, SECONDS_PER_MINUTE};
@@ -48,6 +49,7 @@ mod goto;
 mod follow;
 mod orbit;
 mod missile;
+mod collision;
 mod warp;
 pub use warp::{WarpOutcome, WarpState};
 pub use npc::{HOSTILE_TO_ALL, NpcAction, NpcBrain, NpcConfig, NpcEffects, NpcFuture};
@@ -87,9 +89,7 @@ const DAMAGE_STATE_SHIELD_RECHARGE_TAU: f64 = 100_000.0;
 const DESTINY_FRICTION: f64 = 1e6;
 /// Carbonengine Ballpark::Integrate Taylor-series threshold.
 const INTEGRATE_TAYLOR_THRESHOLD: f64 = 1e-10;
-/// Existing server fallback for missing celestial radii.
-const CELESTIAL_FALLBACK_RADIUS: f64 = 1000.0;
-/// Existing server rigid-celestial representation.
+/// Carbonengine Potential fixed-body effective mass, also used for rigid celestials.
 const CELESTIAL_STATIC_MASS: f64 = 1e34;
 
 
@@ -208,10 +208,15 @@ pub struct Ball {
     pub slim: Vec<(&'static str, Value)>,
 }
 
+/// Native cached whole-tick exponential factor.
+fn integration_factor(mass: f64, friction: f64) -> f64 {
+    if mass <= 0.0 { 0.0 } else { (-friction / mass).exp() }
+}
+
 /// Carbonengine Ballpark::Integrate and Vector3d reciprocal-division ordering.
-fn integrate(position: V3, velocity: V3, acceleration: V3, mass: f64, friction: f64, time: f64) -> (V3, V3) {
+fn integrate(position: V3, velocity: V3, acceleration: V3, mass: f64, friction: f64, factor: f64, time: f64) -> (V3, V3) {
     if time == 0.0 { return (position, velocity); }
-    let time_factor = if mass <= 0.0 { 0.0 } else { (-friction / mass * time).exp() };
+    let time_factor = if time == 1.0 { factor } else if mass <= 0.0 { 0.0 } else { (-friction / mass * time).exp() };
     let friction2 = friction * friction;
     let ook2 = 1.0 / friction2;
     let ook = 1.0 / friction;
@@ -245,7 +250,7 @@ impl Ball {
         let mass = self.mass * self.agility as f64;
         let acceleration = self.segment_acceleration.unwrap();
         integrate(self.old_pos, self.old_vel, acceleration, mass, DESTINY_FRICTION,
-            ms_to_seconds(elapsed as f64)).0
+            0.0, ms_to_seconds(elapsed as f64)).0
     }
 
     fn flags(&self) -> u8 {
@@ -369,7 +374,7 @@ impl Ball {
         self.segment_acceleration = Some(acceleration);
     }
 
-    fn evolve_position(&mut self, ms: i64) {
+    fn evolve_position(&mut self, ms: i64, full_factor: f64) {
         if !self.free || ms <= self.last_ms {
             self.last_ms = self.last_ms.max(ms);
             return;
@@ -386,12 +391,13 @@ impl Ball {
                 self.old_vel = vel;
                 let mass = self.mass * self.agility as f64;
                 (self.pos, self.vel) = integrate(pos, vel, self.segment_acceleration.unwrap_or_default(),
-                    mass, DESTINY_FRICTION, ms_to_seconds((ms - self.last_ms) as f64));
+                    mass, DESTINY_FRICTION, full_factor, ms_to_seconds((ms - self.last_ms) as f64));
             }
         } else if let Some(acceleration) = self.segment_acceleration {
             let dt = ms_to_seconds((ms - self.last_ms) as f64);
             let mass = self.mass * self.agility as f64;
-            (self.pos, self.vel) = integrate(self.pos, self.vel, acceleration, mass, DESTINY_FRICTION, dt);
+            (self.pos, self.vel) = integrate(self.pos, self.vel, acceleration, mass, DESTINY_FRICTION,
+                full_factor, dt);
         }
         self.last_ms = ms;
     }
@@ -544,15 +550,15 @@ impl World {
         let mut system = System::new(system_id, self.pilots.clone(), tick);
         for r in self.sde.map.celestials(system_id) {
             let Some(type_id) = r.type_id.and_then(|id| i32::try_from(id).ok()) else { continue };
-            let Some(ty) = self.sde.types.get(type_id) else { continue };
+            if self.sde.types.get(type_id).is_none() { continue; }
             let id = r.item_id;
             let pos: V3 = [r.x.expect("NULL celestial x"), r.y.expect("NULL celestial y"), r.z.expect("NULL celestial z")];
             let group = r.group_id.unwrap_or(0) as i32;
             let category = r.group_id.and_then(|id| i32::try_from(id).ok())
                 .and_then(|id| self.sde.types.group(id)).and_then(|g| g.category_id).unwrap_or(0);
-            let radius = r.radius.or(ty.radius).unwrap_or(CELESTIAL_FALLBACK_RADIUS);
+            let radius = self.sde.celestial_radius(r);
             let owner = self.sde.map.station(id).and_then(|s| s.owner_id).unwrap_or(1);
-            if let Some(point) = warpin::warp_in_point(id, category, group, pos, radius) {
+            if let Some(point) = warpin::warp_in_point(id, category, group, pos, f64::from(radius)) {
                 system.set_warp_in(id, point);
             }
             let mut slim = Vec::new();
@@ -580,7 +586,7 @@ impl World {
                     char_id: None,
                     signature_radius: None,
                     mode: MODE_RIGID,
-                    radius: radius as f32,
+                    radius,
                     mass: CELESTIAL_STATIC_MASS,
                     max_vel: 0.0,
                     agility: 1.0,

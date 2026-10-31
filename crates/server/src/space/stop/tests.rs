@@ -1,6 +1,6 @@
 use super::*;
 use crate::consts::DAMAGE_LAYER_COUNT;
-use crate::space::{MODE_GOTO, MODE_WARP, WarpState};
+use crate::space::{DESTINY_FRICTION, MODE_GOTO, MODE_WARP, WarpState, integration_factor};
 use std::collections::HashMap;
 
 fn ball() -> Ball {
@@ -40,7 +40,7 @@ fn stop_damps_y_before_tick_and_interpolation() {
     let mut b = ball();
     b.stop();
     b.evolve_behavior_for_ball(1000, 1000, &HashMap::new(), 0);
-    b.evolve_position(1000);
+    b.evolve_position(1000, integration_factor(b.mass * b.agility as f64, DESTINY_FRICTION));
     let damped = (20.0 - STOP_VERTICAL_DAMPING * 20.0) * STOP_VERTICAL_RETAIN;
     assert_eq!(b.old_vel, [10.0, damped, 30.0]);
     let factor = (-1.0_f64).exp();
@@ -74,7 +74,7 @@ fn low_effective_mass_is_unfloored_for_tick_and_interpolation() {
     b.vel = [10.0, 0.0, 0.0];
     b.stop();
     b.evolve_behavior_for_ball(1000, 1000, &HashMap::new(), 0);
-    b.evolve_position(1000);
+    b.evolve_position(1000, integration_factor(b.mass * b.agility as f64, DESTINY_FRICTION));
     let expected = 10.0 * 0.05 * (1.0 - (-20.0_f64).exp());
     let half = 10.0 * 0.05 * (1.0 - (-10.0_f64).exp());
     assert!((b.pos[0] - expected).abs() < 1e-12);
@@ -88,7 +88,7 @@ fn nonpositive_effective_mass_does_not_produce_nan() {
     b.mass = 0.0;
     b.stop();
     b.evolve_behavior_for_ball(1000, 1000, &HashMap::new(), 0);
-    b.evolve_position(1000);
+    b.evolve_position(1000, integration_factor(b.mass * b.agility as f64, DESTINY_FRICTION));
     assert_eq!(b.pos, [0.0; 3]);
     assert_eq!(b.vel, [0.0; 3]);
     assert_eq!(b.position_at(1500), [0.0; 3]);

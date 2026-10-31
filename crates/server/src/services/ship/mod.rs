@@ -27,15 +27,8 @@ use crate::space::system::Timer;
 use marshal::Value;
 use tracing::{info, warn};
 
-/// Existing gate and station radius fallback in metres.
-const DEFAULT_CELESTIAL_RADIUS: f64 = 5000.0;
-
 /// Server gameplay policy: minimum clearance from an object when warping to it (m).
 const MIN_OBJECT_WARP_CLEARANCE: f64 = 2500.0;
-
-fn gate_radius(celestial: Option<f64>, type_radius: Option<f64>) -> f64 {
-    celestial.or(type_radius).unwrap_or(DEFAULT_CELESTIAL_RADIUS)
-}
 
 fn required<T>(value: Option<T>, field: &str) -> Result<T, CallError> {
     value.ok_or_else(|| CallError::Internal(anyhow::anyhow!("missing SDE {field}")))
@@ -54,11 +47,11 @@ fn gate_destination(sde: &crate::sde::Sde, from: i64, to: i64, system: i64) -> R
     let Some(dest_system) = gate.dest_solar_system_id else { return Ok(None); };
     if sde.map.system(dest_system).is_none() { return Ok(None); }
     let Some(celestial) = sde.map.celestial(to) else { return Ok(None); };
-    let Some(ty) = celestial.type_id.and_then(|id| i32::try_from(id).ok()).and_then(|id| sde.types.get(id)) else { return Ok(None); };
+    if celestial.type_id.and_then(|id| i32::try_from(id).ok()).and_then(|id| sde.types.get(id)).is_none() { return Ok(None); }
     Ok(Some(GateRow {
         dest_solar_system_id: dest_system,
         x: required(celestial.x, "gate x")?, y: required(celestial.y, "gate y")?, z: required(celestial.z, "gate z")?,
-        radius: gate_radius(celestial.radius, ty.radius),
+        radius: f64::from(sde.celestial_radius(celestial)),
     }))
 }
 

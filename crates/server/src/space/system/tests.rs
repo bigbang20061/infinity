@@ -33,7 +33,7 @@ fn completed_segment_samples_use_shared_drag_and_clamp() {
     for elapsed in [0, 100, 500, 900, 1000, 900, 100, 500, 0, 1000] {
         let actual = b.position_at(2_000 + elapsed);
         let expected = if elapsed == 0 { b.old_pos } else if elapsed == 1000 { endpoint } else {
-            integrate(b.old_pos, b.old_vel, [0.0; 3], 1e6, DESTINY_FRICTION, ms_to_seconds(elapsed as f64)).0
+            integrate(b.old_pos, b.old_vel, [0.0; 3], 1e6, DESTINY_FRICTION, 0.0, ms_to_seconds(elapsed as f64)).0
         };
         assert_eq!(actual, expected);
     }
@@ -63,7 +63,7 @@ fn static_modes_stay_fixed() {
     fixed.mode = MODE_RIGID;
     fixed.free = false;
     fixed.evolve_behavior_for_ball(1000, 1000, &positions, 0);
-    fixed.evolve_position(1000);
+    fixed.evolve_position(1000, integration_factor(fixed.mass * fixed.agility as f64, DESTINY_FRICTION));
     assert_eq!(fixed.position_at(1500), [7.0, 0.0, 0.0]);
 }
 
@@ -338,10 +338,10 @@ fn constant_target_integration_is_step_size_independent() {
     let mut ten = one.clone();
     let positions = HashMap::new();
     one.evolve_behavior_for_ball(1000, 1000, &positions, 0);
-    one.evolve_position(1000);
+    one.evolve_position(1000, integration_factor(one.mass * one.agility as f64, DESTINY_FRICTION));
     for ms in (100..=1000).step_by(100) {
         ten.evolve_behavior_for_ball(ms, ms, &positions, 0);
-        ten.evolve_position(ms);
+        ten.evolve_position(ms, integration_factor(ten.mass * ten.agility as f64, DESTINY_FRICTION));
     }
     for (a, b) in one.pos.into_iter().zip(ten.pos).chain(one.vel.into_iter().zip(ten.vel)) {
         assert!((a - b).abs() <= 1e-6 * a.abs().max(1.0));
@@ -444,7 +444,7 @@ fn catchup_clamps_wall_delay_without_rebasing_logical_time() {
     assert!(b.pos[0] > before);
     assert_eq!(b.position_at(29_999), b.old_pos);
     assert_eq!(b.position_at(31_001), b.pos);
-    let midpoint = integrate(b.old_pos, b.old_vel, [0.0; 3], 1e6, DESTINY_FRICTION, 0.5).0;
+    let midpoint = integrate(b.old_pos, b.old_vel, [0.0; 3], 1e6, DESTINY_FRICTION, 0.0, 0.5).0;
     assert_ne!(midpoint, b.pos);
     s.tick(30_500);
     assert_eq!(s.sample_position(1), Some(midpoint));
@@ -453,7 +453,7 @@ fn catchup_clamps_wall_delay_without_rebasing_logical_time() {
     let b = s.ball(1).unwrap();
     assert_eq!(b.last_ms, 17_000);
     assert_eq!(b.interpolation_anchor_ms, 31_000);
-    let midpoint = integrate(b.old_pos, b.old_vel, [0.0; 3], 1e6, DESTINY_FRICTION, 0.5).0;
+    let midpoint = integrate(b.old_pos, b.old_vel, [0.0; 3], 1e6, DESTINY_FRICTION, 0.0, 0.5).0;
     assert_ne!(midpoint, b.pos);
     s.tick(31_500);
     assert_eq!(s.sample_position(1), Some(midpoint));
@@ -472,7 +472,7 @@ fn nonaligned_stall_resumes_on_next_wall_second() {
     let b = s.ball(1).unwrap();
     assert_eq!(b.last_ms, 16_000);
     assert_eq!(b.interpolation_anchor_ms, 30_123);
-    let midpoint = integrate(b.old_pos, b.old_vel, [0.0; 3], 1e6, DESTINY_FRICTION, 0.5).0;
+    let midpoint = integrate(b.old_pos, b.old_vel, [0.0; 3], 1e6, DESTINY_FRICTION, 0.0, 0.5).0;
     assert_ne!(midpoint, b.old_pos);
     s.tick(30_623);
     assert_eq!(s.sample_position(1), Some(midpoint));
@@ -508,7 +508,7 @@ fn ordinary_catchup_anchors_to_last_deadline() {
     let b = s.ball(1).unwrap();
     assert_eq!(s.current_time(), 2);
     assert_eq!(b.interpolation_anchor_ms, 2_000);
-    let expected = integrate(b.old_pos, b.old_vel, [0.0; 3], 1e6, DESTINY_FRICTION, 0.5).0;
+    let expected = integrate(b.old_pos, b.old_vel, [0.0; 3], 1e6, DESTINY_FRICTION, 0.0, 0.5).0;
     assert_eq!(s.sample_position(1), Some(expected));
     assert_ne!(expected, b.old_pos);
     assert_eq!(b.position_at(1_999), b.old_pos);
@@ -707,9 +707,9 @@ fn warp_exit_callback_sees_completed_extra_step_and_fractional_segment() {
         let b = s.ball(1).unwrap();
         assert_eq!(b.mode, MODE_STOP);
         let mass = b.mass * b.agility as f64;
-        assert_eq!((b.pos, b.vel), integrate(b.old_pos, b.old_vel, [0.0; 3], mass, DESTINY_FRICTION, 1.0));
+        assert_eq!((b.pos, b.vel), integrate(b.old_pos, b.old_vel, [0.0; 3], mass, DESTINY_FRICTION, integration_factor(mass, DESTINY_FRICTION), 1.0));
         assert_eq!(b.position_at(b.interpolation_anchor_ms + 500),
-            integrate(b.old_pos, b.old_vel, [0.0; 3], mass, DESTINY_FRICTION, 0.5).0);
+            integrate(b.old_pos, b.old_vel, [0.0; 3], mass, DESTINY_FRICTION, 0.0, 0.5).0);
         assert_eq!(s.ball(2).unwrap().last_ms, b.last_ms);
         tx.send(()).unwrap();
     });

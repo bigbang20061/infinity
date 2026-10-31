@@ -185,6 +185,7 @@ Helpers and constants used by more than one module, each defined once:
 - `client.rs`: FILETIME conversions (`filetime_now` and conversions from unix time).
 - `consts.rs`: game-data constants used by more than one module, grouped by source: FILETIME durations, distances, SDE type, group and category IDs, dogma attribute and effect IDs, inventory flags, locations and row columns, corporation roles and wallet account keys. Protocol constants that are part of one module's interface stay in that module, for example `macho::cmd` and the space ball modes and flags.
 - `dao/`: statements used by several features, in the module of their data (see Database).
+- `sde/mod.rs`: `Sde::celestial_radius`, the one collision radius of a celestial (its own radius, then its type's, then one documented fallback), as the `f32` destiny sends. Static balls and every placement next to a celestial widen that value; never apply a separate fallback or cast.
 - Game formulas used by several callers (such as lock time) are one function in the module that owns the mechanic, called by every user, players and NPCs alike.
 
 ### Database
