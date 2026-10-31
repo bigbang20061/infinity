@@ -1,6 +1,8 @@
 use super::*;
 mod jamming;
 mod jump_cloak;
+#[path = "../effects/tests.rs"]
+mod effect_actions;
 
 fn ball(id: i64, pilot: Option<i64>, x: f64) -> Ball {
     crate::tests::init_config();
@@ -252,6 +254,7 @@ fn command_stamps_seconds_and_borrows_other_balls() {
     assert_eq!(parts[0].as_int(), Some(12));
     assert_eq!(s.ball(1).unwrap().goto, [10.0, 0.0, 0.0]);
 }
+
 
 #[test]
 fn missile_impact_delay_starts_at_launch_boundary() {

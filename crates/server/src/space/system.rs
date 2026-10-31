@@ -26,6 +26,8 @@
 use super::*;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::future::Future;
+#[path = "effects.rs"] mod effects;
+use effects::Tractor;
 
 /// carbonengine destiny Ballpark.cpp tick catchup policy.
 const MAX_CATCHUP_STEPS: i64 = 5;
@@ -40,6 +42,19 @@ const MISSILE_MASSIVE: bool = false;
 const UNCLOAK_FX_DURATION_MS: i64 = 5;
 pub(crate) type Timer = Box<dyn FnOnce(&mut System) + Send>;
 type Action = Box<dyn FnOnce(&mut System, i64) + Send>;
+
+struct Compressor {
+    generation: Arc<std::sync::atomic::AtomicBool>,
+    list: i64,
+    range: f64,
+}
+
+struct ModuleCloak {
+    module: i64,
+    generation: Arc<std::sync::atomic::AtomicBool>,
+    reactivation_ms: i64,
+    targeting_ms: i64,
+}
 
 #[derive(Default)]
 pub struct System {
@@ -63,6 +78,12 @@ pub struct System {
     next_tick_ms: Option<i64>,
     actions: VecDeque<(i64, Action)>,
     pending_uncloak: HashSet<i64>,
+    compressors: HashMap<i64, HashMap<i64, Compressor>>,
+    module_cloaks: HashMap<i64, ModuleCloak>,
+    cloak_reactivation: HashMap<i64, i64>,
+    cloak_targeting: HashMap<i64, i64>,
+    tractors: HashMap<i64, Tractor>,
+    tractor_epochs: HashMap<i64, Arc<()>>,
     pub(super) brains: HashMap<i64, NpcBrain>,
     pub(super) effect_jobs: Option<mpsc::UnboundedSender<npc::EffectJob>>,
     pub(super) deferred_jobs: Option<mpsc::UnboundedSender<npc::NpcFuture>>,
@@ -154,6 +175,10 @@ impl System {
     pub fn pilot_ball(&self, char_id: i64) -> Option<&Ball> {
         self.pilots.get(&char_id).and_then(|id| self.ball(*id))
     }
+    /// Identity of the current pilot-ball membership, invalidated on replacement.
+    pub(crate) fn pilot_generation(&self, ship: i64) -> Option<u64> {
+        self.snapshot_positions.get(&ship).map(|(generation, _)| *generation)
+    }
 
     pub fn contains(&self, id: i64) -> bool {
         self.balls.contains_key(&id)
@@ -178,11 +203,15 @@ impl System {
     }
 
     pub fn take(&mut self, id: i64) -> Option<Ball> {
+        self.cleanup_tractors(id);
         self.warp_exits.remove(&id);
         if self.balls.contains_key(&id) {
             crate::services::combat::jamming::clear(self, id);
         }
         let ball = self.balls.remove(&id)?;
+        self.compressors.remove(&id);
+        self.module_cloaks.remove(&id);
+        self.cloak_targeting.remove(&id);
         self.remove_projections_from(id);
         self.remove_projections_on_departure(id);
         self.stop_all_followers(id);
@@ -221,7 +250,7 @@ impl System {
     pub(super) fn is_cold(&self) -> bool {
         self.actions.is_empty()
             && !self.timers.first_key_value().is_some_and(|(&(due, _), _)| due <= self.ms)
-            && self.brains.is_empty() && self.observers.is_empty() && !self.balls.values().any(|b|
+            && self.module_cloaks.is_empty() && self.brains.is_empty() && self.observers.is_empty() && !self.balls.values().any(|b|
             (b.free && (b.mode != MODE_STOP || b.vel != [0.0; 3]))
             || (b.cloak != 0 && b.cloak_until > 0))
             && !collision::stationary_contact(&self.balls)
@@ -303,6 +332,8 @@ impl System {
         let expired: Vec<_> = self.balls.values().filter(|b|
             b.cloak != 0 && b.cloak_until > 0 && b.cloak_until <= filetime).map(|b| b.id).collect();
         for id in expired { self.uncloak(id); }
+        let obstructed: Vec<_> = self.module_cloaks.keys().copied().filter(|&ship| self.cloak_obstructed(ship)).collect();
+        for ship in obstructed { self.uncloak(ship); }
         while self.timers.first_key_value().is_some_and(|(&(due, _), _)| due <= ms) {
             let (_, timer) = self.timers.pop_first().unwrap();
             timer(self);
@@ -396,13 +427,115 @@ impl System {
         let update = event(self.current_time, "OnDamageStateChange", vec![Value::Int(id), b.damage_state()]);
         self.broadcast(id, vec![update]);
     }
+    /// Advertise the union of active compressor lists on the ship's slim item.
+    pub(crate) fn set_compressor(&mut self, ship: i64, module: i64, generation: Arc<std::sync::atomic::AtomicBool>, list: i64, range: f64) {
+        if self.ball(ship).is_none() || list <= 0 || !range.is_finite() || range <= 0.0 { return; }
+        self.compressors.entry(ship).or_default().insert(module, Compressor { generation, list, range });
+        self.publish_compressors(ship);
+    }
+    pub(crate) fn remove_compressor(&mut self, ship: i64, module: i64, generation: &Arc<std::sync::atomic::AtomicBool>) {
+        let Some(modules) = self.compressors.get_mut(&ship) else { return };
+        if !modules.get(&module).is_some_and(|entry| Arc::ptr_eq(&entry.generation, generation)) { return; }
+        modules.remove(&module);
+        if modules.is_empty() { self.compressors.remove(&ship); }
+        self.publish_compressors(ship);
+    }
+    fn publish_compressors(&mut self, ship: i64) {
+        let mut ranges = std::collections::BTreeMap::<i64, f64>::new();
+        if let Some(modules) = self.compressors.get(&ship) {
+            for entry in modules.values() {
+                ranges.entry(entry.list).and_modify(|range| *range = range.max(entry.range)).or_insert(entry.range);
+            }
+        }
+        let Some(ball) = self.balls.get_mut(&ship) else { return };
+        ball.slim.retain(|(key, _)| *key != "compression_facility_typelists");
+        if !ranges.is_empty() {
+            ball.slim.push(("compression_facility_typelists", Value::Dict(ranges.into_iter().map(|(list, range)| (Value::Int(list), Value::Float(range))).collect())));
+        }
+        let slim = ball.slim_item();
+        self.broadcast(ship, vec![event(self.current_time, "OnSlimItemChange", vec![Value::Int(ship), slim])]);
+    }
+    pub(crate) fn cloak_reactivation_ready(&self, module: i64) -> bool {
+        self.cloak_reactivation.get(&module).is_none_or(|&until| until <= self.ms)
+    }
+    pub(crate) fn cloak_targeting_ready(&self, ship: i64) -> bool {
+        self.cloak_targeting.get(&ship).is_none_or(|&until| until <= self.ms)
+    }
+    pub(crate) fn has_module_cloak(&self, ship: i64) -> bool {
+        self.module_cloaks.contains_key(&ship)
+    }
+    pub(crate) fn cloak_obstructed(&self, ship: i64) -> bool {
+        let Some(me) = self.sampled_ball(ship) else { return true };
+        self.balls.values().filter(|other| other.id != ship && other.cloak == 0).any(|other|
+            dist(me.pos, other.position_at(self.ms)) - f64::from(me.radius) - f64::from(other.radius) < MIN_CLOAKING_DISTANCE)
+    }
+    pub(crate) fn begin_module_cloak(&mut self, ship: i64, module: i64, generation: Arc<std::sync::atomic::AtomicBool>, reactivation_ms: i64, targeting_ms: i64, guard: impl FnOnce(&System) -> bool + Send + 'static, on_success: Option<Box<dyn FnOnce(&mut System) + Send>>) -> bool {
+        if self.module_cloaks.contains_key(&ship) || !self.cloak_reactivation_ready(module)
+            || self.ball(ship).is_none_or(|b| b.cloak != 0) { return false; }
+        self.module_cloaks.insert(ship, ModuleCloak { module, generation: generation.clone(), reactivation_ms, targeting_ms });
+        self.actions.push_back((self.current_time, Box::new(move |s, stamp| {
+            let current = s.module_cloaks.get(&ship).is_some_and(|cloak| Arc::ptr_eq(&cloak.generation, &generation));
+            if !current || !guard(s) || s.ball(ship).is_none_or(|b| b.cloak != 0) {
+                if current {
+                    s.module_cloaks.remove(&ship);
+                    generation.store(true, std::sync::atomic::Ordering::Relaxed);
+                    if crate::services::effects::lifecycle::force_inactive(module, &generation) {
+                        s.refresh_projection_target(ship);
+                    }
+                }
+                return;
+            }
+            s.deliver(None, vec![event(stamp, "CloakBall", vec![Value::Int(ship)])]);
+            if let Some(ball) = s.balls.get_mut(&ship) {
+                ball.cloak = 1;
+                ball.cloak_until = 0;
+            }
+            if let Some(on_success) = on_success { on_success(s); }
+        })));
+        true
+    }
+    pub(crate) fn stop_module_cloak(&mut self, ship: i64, module: i64, generation: &Arc<std::sync::atomic::AtomicBool>) {
+        if self.module_cloaks.get(&ship).is_some_and(|cloak| cloak.module == module && Arc::ptr_eq(&cloak.generation, generation)) {
+            self.uncloak(ship);
+        }
+    }
+    /// Destiny has no orientation state: reuse its documented stationary missile fallback.
+    pub(crate) fn heading(&self, ship: i64) -> Option<V3> {
+        let ball = self.sampled_ball(ship)?;
+        let direction = if len(ball.vel) > 0.0 { ball.vel }
+            else if ball.mode == MODE_GOTO { sub(ball.goto, ball.pos) }
+            else { [0.0, 0.0, -1.0] };
+        let magnitude = len(direction);
+        Some(if magnitude > 0.0 && magnitude.is_finite() { scale(direction, 1.0 / magnitude) } else { [0.0, 0.0, -1.0] })
+    }
+    /// Queue carbonengine's SetBallPosition without replacing the ball.
+    pub(crate) fn set_ball_position(&mut self, ship: i64, position: V3, guard: impl FnOnce(&Ball, &System) -> bool + Send + 'static) {
+        if !position.iter().all(|v| v.is_finite()) { return; }
+        self.command(ship, move |ball, stamp, system| {
+            if !guard(ball, system) { return Vec::new(); }
+            ball.pos = position;
+            vec![event(stamp, "SetBallPosition", vec![
+                Value::Int(ship), Value::Float(position[0]), Value::Float(position[1]), Value::Float(position[2]),
+            ])]
+        });
+    }
     pub fn uncloak(&mut self, ship: i64) -> bool {
-        if self.balls.get(&ship).is_none_or(|ball| ball.cloak == 0) || !self.pending_uncloak.insert(ship) { return false; }
+        if self.balls.get(&ship).is_none() || (self.balls[&ship].cloak == 0 && !self.module_cloaks.contains_key(&ship)) || !self.pending_uncloak.insert(ship) { return false; }
+        if let Some(cloak) = self.module_cloaks.remove(&ship) {
+            cloak.generation.store(true, std::sync::atomic::Ordering::Relaxed);
+            if crate::services::effects::lifecycle::force_inactive(cloak.module, &cloak.generation) {
+                self.refresh_projection_target(ship);
+            }
+            if self.balls[&ship].cloak != 0 {
+                self.cloak_reactivation.insert(cloak.module, self.ms.saturating_add(cloak.reactivation_ms));
+                self.cloak_targeting.insert(ship, self.ms.saturating_add(cloak.targeting_ms));
+            }
+        }
         self.actions.push_back((self.current_time, Box::new(move |s, stamp| s.apply_uncloak(ship, stamp))));
         true
     }
     pub(crate) fn drop_jump_cloak(&mut self, ship: i64) -> bool {
-        let pilot = self.balls.get(&ship).and_then(|ball| ball.char_id);
+        let pilot = self.balls.get(&ship).filter(|ball| ball.cloak == CLOAK_RESTORE).and_then(|ball| ball.char_id);
         if !self.uncloak(ship) { return false; }
         if let Some(pilot) = pilot {
             self.notify_pilot(pilot, "OnJumpCloakCancelled", vec![Value::Int(ship)]);

@@ -1,10 +1,10 @@
-//! Effect-specific activation, cycle and stop behavior for the shared lifecycle.
-//!
-//! Uses SDE dogma data and mirrors client dogma activation behavior.
-//! Unsupported effect families remain refused by the lifecycle.
-use super::{EffectKind, repair, mining, capacitor, projected, range, ecm};
-use super::lifecycle::{charge_kind, weapon_fx, Cycle, CycleOutcome, Module, UE_TYPEID};
+//! Cycle-family validation, execution and cleanup for dogma effects.
+//! Mirrors clientDogmaLocation and godma using SDE effect metadata.
+//! Unsupported effects are refused before reaching these dispatchers; unexpected
+//! invalid dispatch returns internal errors, and unexpected cleanup logs a warning.
+use super::{EffectKind, repair, mining, capacitor, projected, range, ecm, aoe, bombs, vorton, cloak, mjd, compression, tractor, scan, targeting, salvage};
 use super::registry::{Effect, EffectAttribute, EffectFlag};
+use super::lifecycle::{Module, Cycle, CycleOutcome, weapon_fx, charge_kind, UE_TYPEID};
 use super::notify::fire_fx;
 use super::propulsion::apply_propulsion;
 use super::weapons::{consume_charge, empty_charge, fire_missile, fire_turret};
@@ -18,7 +18,6 @@ use crate::space::{System, MODE_WARP};
 use marshal::Value;
 use std::sync::Arc;
 use tracing::warn;
-
 fn repair_ranges(fit: &Fit, cycle: &Cycle) -> (f64, f64) {
     let module = Key::Module(cycle.modules[0].id);
     (cycle.effect.attribute(EffectAttribute::Range).map(|a| fit.value(module, a)).unwrap_or(0.0),
@@ -138,9 +137,17 @@ pub(super) async fn on_cycle_start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle, charg
         }
         Ecm | BurstJammer => ecm::start(cx, fit, cycle).await,
         Propulsion | Modifiers => Ok(CycleOutcome::Continue),
-        Smartbomb | Vorton |
-        Cloak | MicroJumpDrive | Salvage | Tractor | CargoScan | ShipScan | SurveyScan |
-        AutoTarget | PassiveTarget | Bomb | ProbeLaunch | Hacking | Online => unreachable!("unsupported cycle kind"),
+        Smartbomb => aoe::start(cx, fit, cycle).await,
+        Bomb => bombs::start(cx, fit, cycle).await,
+        Vorton => vorton::start(cx, fit, cycle).await,
+        Cloak => cloak::start(cx, fit, cycle).await,
+        MicroJumpDrive => mjd::start(cx, fit, cycle).await,
+        Compression => compression::start(cx, fit, cycle).await,
+        Tractor => tractor::start(cx, fit, cycle).await,
+        CargoScan | ShipScan | SurveyScan => scan::start(cx, fit, cycle).await,
+        AutoTarget | PassiveTarget => targeting::start(cx, fit, cycle).await,
+        Salvage => salvage::start(cx, fit, cycle).await,
+        kind @ (ProbeLaunch | Hacking | Online) => Err(CallError::Internal(anyhow::anyhow!("unsupported cycle start kind: {kind:?}"))),
     }
 }
 
@@ -155,17 +162,18 @@ pub(super) async fn on_cycle_end(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Resu
             if repair::applies_at_start(layer) { Ok(CycleOutcome::Continue) } else { remote_repair(cx, fit, cycle, layer).await }
         }
         Mining => Ok(mining::end(cx, fit, cycle).await),
-        Modifiers | Turret | Missile | Propulsion | Projected { .. } | CapTransfer | Neutralizer | Nosferatu | CapBooster | Ecm | BurstJammer => Ok(CycleOutcome::Continue),
-        Smartbomb | Vorton |
-        Cloak | MicroJumpDrive | Salvage | Tractor | CargoScan | ShipScan | SurveyScan |
-        AutoTarget | PassiveTarget | Bomb | ProbeLaunch | Hacking | Online => unreachable!("unsupported cycle kind"),
+        MicroJumpDrive => mjd::end(cx, fit, cycle).await,
+        Salvage => salvage::end(cx, fit, cycle).await,
+        CargoScan | ShipScan | SurveyScan => scan::end(cx, fit, cycle).await,
+        Modifiers | Turret | Missile | Propulsion | Projected { .. } | CapTransfer | Neutralizer | Nosferatu | CapBooster | Ecm | BurstJammer | Smartbomb | Vorton | Cloak | Tractor | AutoTarget | PassiveTarget | Bomb | Compression => Ok(CycleOutcome::Continue),
+        kind @ (ProbeLaunch | Hacking | Online) => Err(CallError::Internal(anyhow::anyhow!("unsupported cycle end kind: {kind:?}"))),
     }
 }
 
 pub(super) fn on_stop(s: &mut System, cx: &Ctx, cycle: &Cycle) {
     use EffectKind::*;
     match cycle.effect.kind {
-        Turret | Missile | FueledLocalRepair { .. } | RemoteRepair { .. } | CapTransfer | Neutralizer | Nosferatu | CapBooster | Ecm | BurstJammer => {
+        Turret | Missile | FueledLocalRepair { .. } | RemoteRepair { .. } | CapTransfer | Neutralizer | Nosferatu | CapBooster | Ecm | BurstJammer | Smartbomb | Bomb | Vorton => {
             if let Some(guid) = cycle.effect.guid.as_deref().and_then(|g| g.split(',').next()) {
                 let events = cycle.modules.iter().map(|m| fire_fx(s.current_time(), cx.ship_id, Some((m.id, m.type_id)), guid, cycle.target, cycle.charge_type, cycle.effect.has(EffectFlag::Offensive), false, cycle.duration_ms, cycle.repeat)).collect();
                 s.broadcast(cx.ship_id, events);
@@ -181,10 +189,13 @@ pub(super) fn on_stop(s: &mut System, cx: &Ctx, cycle: &Cycle) {
             let generation = cycle.stop.clone();
             s.defer(async move { apply_propulsion(&cx, master, generation, false).await; });
         }
-        Modifiers | LocalRepair { .. } => {}
-        Smartbomb | Vorton |
-        Cloak | MicroJumpDrive | Salvage | Tractor | CargoScan | ShipScan | SurveyScan |
-        AutoTarget | PassiveTarget | Bomb | ProbeLaunch | Hacking | Online => unreachable!("unsupported cycle kind"),
+        Cloak => cloak::stop(s, cx, cycle),
+        Compression => compression::stop(s, cx, cycle),
+        Tractor => tractor::stop(s, cx, cycle),
+        CargoScan | ShipScan | SurveyScan => scan::stop(s, cx, cycle),
+        Salvage => salvage::stop(s, cx, cycle),
+        Modifiers | LocalRepair { .. } | MicroJumpDrive | AutoTarget | PassiveTarget => {}
+        kind @ (ProbeLaunch | Hacking | Online) => warn!(?kind, "unexpected unsupported effect cleanup"),
     }
 }
 
@@ -247,9 +258,16 @@ pub(super) async fn on_activate(cx: &Ctx, fit: &Fit, activation: &Activation) ->
             Ok(())
         }
         Modifiers | LocalRepair { .. } | FueledLocalRepair { .. } | Propulsion => Ok(()),
-        Smartbomb | Vorton |
-        Cloak | MicroJumpDrive | Salvage | Tractor | CargoScan | ShipScan | SurveyScan |
-        AutoTarget | PassiveTarget | Bomb | ProbeLaunch | Hacking | Online => unreachable!("unsupported activation kind"),
+        Smartbomb => aoe::validate(cx, fit, &activation.module, &activation.effect, activation.target).await,
+        Bomb => bombs::validate(cx, fit, &activation.module, &activation.effect, activation.target).await,
+        Vorton => vorton::validate(cx, fit, &activation.module, &activation.effect, activation.target).await,
+        Cloak => cloak::validate(cx, fit, &activation.module, &activation.effect, activation.target).await,
+        MicroJumpDrive => mjd::validate(cx, fit, &activation.module, &activation.effect, activation.target).await,
+        Compression => compression::validate(cx, fit, &activation.module, &activation.effect, activation.target).await,
+        Tractor => tractor::validate(cx, fit, &activation.module, &activation.effect, activation.target).await,
+        CargoScan | ShipScan | SurveyScan => scan::validate(cx, fit, &activation.module, &activation.effect, activation.target).await,
+        AutoTarget | PassiveTarget => targeting::validate(cx, fit, &activation.module, &activation.effect, activation.target).await,
+        Salvage => salvage::validate(cx, fit, &activation.module, &activation.effect, activation.target).await,
+        kind @ (ProbeLaunch | Hacking | Online) => Err(CallError::Internal(anyhow::anyhow!("unsupported activation kind: {kind:?}"))),
     }
 }
-

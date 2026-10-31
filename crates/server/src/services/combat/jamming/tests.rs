@@ -12,7 +12,15 @@ fn jam_clears_locks_and_overlaps_expire_independently() {
     let other = ship + 4;
     let locked = ship + 5;
     let pending = ship + 6;
-    let mut system = System::new(ship, Arc::default(), 1000);
+    let silent = ship + 7;
+    let recipient = ship + 8;
+    let silent_recipient = ship + 9;
+    let registry = Arc::new(crate::space::Pilots::default());
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (silent_tx, mut silent_rx) = tokio::sync::mpsc::unbounded_channel();
+    registry.register_pilot(recipient, tx);
+    registry.register_pilot(silent_recipient, silent_tx);
+    let mut system = System::new(ship, registry, 1000);
     system.insert(Ball {
         id: ship, type_id: 1, owner_id: pilot, corp_id: 1, alliance_id: 1,
         char_id: Some(pilot), signature_radius: None, mode: MODE_STOP, radius: 1.0,
@@ -26,11 +34,20 @@ fn jam_clears_locks_and_overlaps_expire_independently() {
     {
         let mut st = state();
         st.targets.entry(pilot).or_default().insert(locked);
+        st.targets.entry(pilot).or_default().insert(silent);
+        st.announced_locks.insert((pilot, locked), (ship, recipient));
         st.locking.insert((pilot, pending), 1);
     }
     apply(&mut system, source, module, ship, 100.0);
     assert!(is_jammed(ship, 1000));
     assert!(!state().targets.contains_key(&pilot));
+    let (event, args) = rx.try_recv().unwrap();
+    assert_eq!(event, "OnTarget");
+    assert_eq!(args[0].as_bytes(), Some(b"otherlost".as_slice()));
+    assert_eq!(args[1].as_int(), Some(ship));
+    assert!(rx.try_recv().is_err());
+    assert!(silent_rx.try_recv().is_err());
+    assert!(!state().announced_locks.contains_key(&(pilot, locked)));
     {
         let mut st = state();
         assert!(!st.begin_lock(ship, pilot, pending, 2, 1000));

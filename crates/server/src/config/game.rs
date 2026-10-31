@@ -27,6 +27,33 @@ fn milliseconds(key: &str, seconds: i64) -> Result<()> {
     Ok(())
 }
 
+/// Server substitute for wreck salvage yields, which do not ship with the client.
+#[derive(Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SalvageConfig {
+    /// Server substitute: one random published salvage-material stack per successful wreck salvage because no yield table ships.
+    pub salvage_material_stacks: u32,
+    /// Server substitute salvage stack minimum.
+    pub salvage_quantity_min: u32,
+    /// Server substitute salvage stack maximum.
+    pub salvage_quantity_max: u32,
+}
+
+impl Default for SalvageConfig {
+    fn default() -> Self {
+        Self { salvage_material_stacks: 1, salvage_quantity_min: 1, salvage_quantity_max: 3 }
+    }
+}
+
+impl SalvageConfig {
+    fn validate(&self) -> Result<()> {
+        anyhow::ensure!(self.salvage_material_stacks > 0, "salvage.salvage_material_stacks={} must be positive", self.salvage_material_stacks);
+        anyhow::ensure!(self.salvage_quantity_min > 0, "salvage.salvage_quantity_min={} must be positive", self.salvage_quantity_min);
+        anyhow::ensure!(self.salvage_quantity_max >= self.salvage_quantity_min && self.salvage_quantity_max <= i32::MAX as u32, "salvage.salvage_quantity_max={} must be at least the minimum and fit an item quantity", self.salvage_quantity_max);
+        Ok(())
+    }
+}
+
 /// Immutable gameplay policy captured at startup.
 #[derive(Default, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -59,6 +86,8 @@ pub struct GameConfig {
     pub crimewatch: world::CrimewatchConfig,
     /// Mining policy.
     pub mining: world::MiningConfig,
+    /// Salvage yield policy.
+    pub salvage: SalvageConfig,
     /// Exploration policy.
     pub exploration: world::ExplorationConfig,
     /// Corporations policy.
@@ -93,6 +122,7 @@ impl GameConfig {
         self.npc.validate()?;
         self.crimewatch.validate()?;
         self.mining.validate()?;
+        self.salvage.validate()?;
         self.exploration.validate()?;
         self.corporations.validate()?;
         self.contracts.validate()?;

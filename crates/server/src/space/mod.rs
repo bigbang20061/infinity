@@ -76,6 +76,8 @@ const FLAG_MASSIVE: u8 = 0x04;
 const FLAG_INTERACTIVE: u8 = 0x08;
 // DSTCLOAKMODE (IDstConstants.h): the session-change cloak a ship arrives with.
 pub const CLOAK_RESTORE: u8 = 2;
+/// appConst.py: minCloakingDistance, metres from a surrounding surface.
+pub(crate) const MIN_CLOAKING_DISTANCE: f64 = 2_000.0;
 const DESTINY_FULLSTATE: u8 = 0;
 const DESTINY_BALLS: u8 = 1;
 
@@ -110,10 +112,10 @@ struct TargetState {
 pub(crate) fn sub(a: V3, b: V3) -> V3 {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
-fn add(a: V3, b: V3) -> V3 {
+pub(crate) fn add(a: V3, b: V3) -> V3 {
     [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
 }
-fn scale(a: V3, s: f64) -> V3 {
+pub(crate) fn scale(a: V3, s: f64) -> V3 {
     [a[0] * s, a[1] * s, a[2] * s]
 }
 fn len(a: V3) -> f64 {

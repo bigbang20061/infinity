@@ -60,6 +60,11 @@ const MISSILE_ID_START: i64 = 9_800_000_000_000;
 /// Temporary item IDs for missiles in flight.
 static NEXT_MISSILE_ID: AtomicI64 = AtomicI64::new(MISSILE_ID_START);
 
+/// Allocate from the shared temporary projectile namespace.
+pub(super) fn next_missile_id() -> i64 {
+    NEXT_MISSILE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Use one charge from a module; `None` when it is empty.
 pub(super) async fn consume_charge(cx: &Ctx, module: &Module, expected: Option<i32>) -> Result<Option<i32>, CallError> {
     let (ship, flag, char_id) = (cx.ship_id, module.flag, cx.char_id);
@@ -234,7 +239,7 @@ pub(crate) async fn launch_missile(db: Db, world: Arc<World>, system: i64, from:
     slim.push(("launchModules", Value::list(module.map(Value::Int))));
     let launch_ms = now_ms();
     let missile = Ball {
-        id: NEXT_MISSILE_ID.fetch_add(1, Ordering::Relaxed),
+        id: next_missile_id(),
         type_id: m.charge,
         owner_id: owner,
         corp_id: from.corp_id,

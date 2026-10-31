@@ -67,6 +67,18 @@ fn trade_timeout_is_parsed_and_must_be_positive() {
 }
 
 #[test]
+fn salvage_policy_parses_and_rejects_invalid_bounds() {
+    let fixture = Fixture::new();
+    fixture.write("[salvage]\nsalvage_material_stacks = 2\nsalvage_quantity_min = 4\nsalvage_quantity_max = 5");
+    let config = Config::load_with(&fixture.path(), |_| None).unwrap().game_config();
+    assert_eq!((config.salvage.salvage_material_stacks, config.salvage.salvage_quantity_min, config.salvage.salvage_quantity_max), (2, 4, 5));
+    assert!(load_error("[salvage]\nsalvage_material_stacks = 0").contains("salvage.salvage_material_stacks"));
+    assert!(load_error("[salvage]\nsalvage_quantity_min = 0").contains("salvage.salvage_quantity_min"));
+    assert!(load_error("[salvage]\nsalvage_quantity_min = 4\nsalvage_quantity_max = 3").contains("salvage.salvage_quantity_max"));
+    assert!(load_error("[salvage]\nsalvage_quantity_max = 2147483648").contains("salvage.salvage_quantity_max"));
+}
+
+#[test]
 fn unknown_fields_are_rejected_at_every_level() {
     for (contents, key) in [
         ("surprise = 1", "surprise"),

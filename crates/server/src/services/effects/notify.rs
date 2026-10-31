@@ -76,10 +76,38 @@ pub(in crate::services) fn ship_effect_args(module: i64, effect_id: i64, environ
     ]
 }
 
+fn scan_rows(rows: Vec<(i32, i64)>) -> Value {
+    Value::list(rows.into_iter().map(|(type_id, quantity)| Value::tuple([Value::Int(i64::from(type_id)), Value::Int(quantity)])))
+}
+
+fn cargo_scan_args(target: i64, rows: Vec<(i32, i64)>) -> Vec<Value> {
+    vec![Value::Int(target), scan_rows(rows)]
+}
+
+fn ship_scan_args(target: i64, charge: f64, capacity: f64, rows: Vec<(i32, i64)>) -> Vec<Value> {
+    vec![Value::Int(target), Value::Float(charge), Value::Float(capacity), scan_rows(rows)]
+}
+
+/// shipUI.OnCargoScanComplete(shipID, cargoList).
+pub(in crate::services) fn cargo_scan_complete(cx: &Ctx, target: i64, rows: Vec<(i32, i64)>) {
+    cx.notify("OnCargoScanComplete", cargo_scan_args(target, rows));
+}
+
+/// shipUI.OnShipScanCompleted(shipID, charge, capacity, hardwareList).
+pub(in crate::services) fn ship_scan_completed(cx: &Ctx, target: i64, charge: f64, capacity: f64, rows: Vec<(i32, i64)>) {
+    cx.notify("OnShipScanCompleted", ship_scan_args(target, charge, capacity, rows));
+}
+
 /// A weapon firing animation (fxSequencer.OnSpecialFX) from `shooter`.
 /// `is_offensive` precedes the start flag and comes from the source effect.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fire_fx(stamp: i64, shooter: i64, module: Option<(i64, i32)>, guid: &str, target: Option<i64>, charge: Option<i32>, is_offensive: bool, start: bool, duration_ms: f64, repeat: i64) -> Value {
+    fire_fx_with_info(stamp, shooter, module, guid, target, charge, is_offensive, start, duration_ms, repeat, Value::None)
+}
+
+/// As `fire_fx`, with client-specific graphic information.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fire_fx_with_info(stamp: i64, shooter: i64, module: Option<(i64, i32)>, guid: &str, target: Option<i64>, charge: Option<i32>, is_offensive: bool, start: bool, duration_ms: f64, repeat: i64, graphic_info: Value) -> Value {
     event(
         stamp,
         "OnSpecialFX",
@@ -97,7 +125,7 @@ pub(crate) fn fire_fx(stamp: i64, shooter: i64, module: Option<(i64, i32)>, guid
             Value::Int(repeat),
             Value::None,
             Value::Int(0),
-            Value::None,
+            graphic_info,
         ],
     )
 }
