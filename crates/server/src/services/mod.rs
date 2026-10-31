@@ -52,6 +52,7 @@ mod slash;
 mod sql_pattern;
 mod station;
 mod store;
+pub(crate) mod trade;
 mod universe;
 pub(crate) mod wallets;
 
@@ -306,6 +307,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
         (_, "MachoBindObject") => bind_object(c, call).await,
 
 
+        ("trademgr", _) => trade::route(c, call).await,
         (inventory::INVENTORY, _) => inventory::inventory(c, call).await,
 
         ("config", _) => config::dispatch(c, call).await,

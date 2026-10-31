@@ -452,6 +452,10 @@ impl Pilots {
         }
     }
 
+    pub fn is_online(&self, char_id: i64) -> bool {
+        self.notify.lock().unwrap().get(&char_id).is_some_and(|tx| !tx.is_closed())
+    }
+
     pub fn notify_pilot(&self, char_id: i64, event: &str, args: Vec<Value>) {
         if let Some(tx) = self.notify.lock().unwrap().get(&char_id) {
             let _ = tx.send((event.to_string(), args));
@@ -539,6 +543,7 @@ impl World {
     pub fn sde(&self) -> &Arc<Sde> { &self.sde }
     pub fn register_pilot(&self, char_id: i64, tx: NotifyTx) { self.pilots.register_pilot(char_id, tx); }
     pub fn unregister_pilot(&self, char_id: i64) { self.pilots.unregister_pilot(char_id); }
+    pub fn is_online(&self, char_id: i64) -> bool { self.pilots.is_online(char_id) }
     pub fn notify_pilot(&self, char_id: i64, name: &str, args: Vec<Value>) { self.pilots.notify_pilot(char_id, name, args); }
     /// Start the destination before removing a jumping ship from its source.
     /// Construction is serialized with the live-handle check.

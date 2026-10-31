@@ -14,6 +14,8 @@ async fn undock(c: &mut Client) -> CallResult {
     let pos = [spos[0] + dir[0] * dist, spos[1], spos[2] + dir[2] * dist];
     let mut ball = ship_ball(c, ship, pos).await?;
     ball.vel = [dir[0] * ball.max_vel as f64, 0.0, dir[2] * ball.max_vel as f64];
+    let _lock = crate::services::market::lock().await;
+    crate::services::trade::on_leave_locked(c).await?;
     item_dao::undock(&c.db, ship, system, pos).await.map_err(db_err)?;
     character_dao::undock(&c.db, c.session.int("charid").unwrap_or(0), system).await.map_err(db_err)?;
     c.world.add_ship(system, ball).await.map_err(CallError::Internal)?;

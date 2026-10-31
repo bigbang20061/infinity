@@ -63,6 +63,10 @@ async fn main() -> Result<()> {
     }
     let hub = chat::Hub::new(&cfg.chat.domain);
     let world = space::World::new(db.clone(), sde.clone(), cfg.server.system_capacity);
+    services::trade::recover(&db, &world, sde.clone()).await.map_err(|error| match error {
+        services::CallError::Internal(error) => error,
+        services::CallError::User { msg, .. } => anyhow::anyhow!(msg),
+    })?;
     lua::start(&cfg, &db, &sde, &world).await?;
     let (scheduler_stop, scheduler_shutdown) = tokio::sync::watch::channel(false);
     let mut scheduler_task = scheduler::runner::start(db.clone(), world.clone(), services::scheduler_registrations(), cfg.scheduler.clone(), scheduler_shutdown)?;

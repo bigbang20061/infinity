@@ -894,3 +894,32 @@ CREATE TABLE IF NOT EXISTS game.lua_store (
     value jsonb NOT NULL,
     PRIMARY KEY (script, key)
 );
+-- Direct station trades (services/trade): container IDs share the item sequence.
+CREATE TABLE IF NOT EXISTS game.trades (
+    trade_id bigint PRIMARY KEY DEFAULT nextval('game.items_item_id_seq'),
+    station_id bigint NOT NULL,
+    char_a bigint NOT NULL,
+    char_b bigint NOT NULL,
+    money_a numeric NOT NULL DEFAULT 0,
+    money_b numeric NOT NULL DEFAULT 0,
+    accepted_a boolean NOT NULL DEFAULT false,
+    accepted_b boolean NOT NULL DEFAULT false,
+    state text NOT NULL CHECK (state IN ('open', 'done', 'cancelled')),
+    created_at bigint NOT NULL,
+    updated_at bigint NOT NULL
+);
+CREATE TABLE IF NOT EXISTS game.trade_items (
+    item_id bigint PRIMARY KEY,
+    trade_id bigint NOT NULL REFERENCES game.trades(trade_id),
+    owner_id bigint NOT NULL,
+    origin_location bigint NOT NULL,
+    origin_flag integer NOT NULL
+);
+CREATE INDEX IF NOT EXISTS trade_items_trade_id ON game.trade_items (trade_id);
+-- Preserve synthetic container IDs across the earlier item-sequence reset.
+SELECT setval('game.items_item_id_seq', GREATEST(
+    (SELECT last_value FROM game.items_item_id_seq),
+    (SELECT max(item_id) FROM game.items),
+    (SELECT max(trade_id) FROM game.trades),
+    1000000000000
+), true);

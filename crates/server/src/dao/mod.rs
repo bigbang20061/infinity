@@ -32,4 +32,5 @@ pub(crate) mod sde;
 pub(crate) mod skills;
 pub(crate) mod slash;
 pub(crate) mod store;
+pub(crate) mod trades;
 pub(crate) mod wallets;

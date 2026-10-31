@@ -99,6 +99,9 @@ order_history_days = 90             # server closed-order history retention
 transaction_history_days = 30       # server default transaction-history period
 price_history_days = 365            # server market price-history retention
 
+[trade]
+idle_timeout_secs = 1800            # reserved for durable trade timeout scheduling
+
 [store]
 plex_price_isk_fallback = 23500000  # server fallback ISK per PLEX when no retail price is known
 daily_gift = { type_id = 52520, quantity = 1 } # daily free gift: one token grants 10,000 skill points

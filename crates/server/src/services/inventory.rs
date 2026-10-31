@@ -2,7 +2,9 @@
 //! bound inventories, which list and describe the items in a container
 //! (eve/client/script/environment/invCache.py, invCacheContainer).
 //! Item quantities are stored in `game.items`; static item data comes from the loaded SDE.
-//! Merge plans are guarded against stale snapshots. Other inventory operations retain their existing semantics.
+//! Merge plans are guarded against stale snapshots. Staged trade items and their
+//! descendants cannot be moved, split, merged, trashed, renamed or accessed here.
+//! Supplied station-hangar sources require matching location and owner.
 //! Item capacity and contents are read from one game-item statement snapshot.
 
 use crate::dao::items::loading::{Item, ItemQuery};
@@ -161,30 +163,42 @@ pub(super) fn notify_item_removed<X: Send>(outbox: &mut Outbox<X>, item: Item) {
 }
 
 pub(super) async fn split_stack(db: &(impl Executor + ?Sized), item: &Item, quantity: i32, owner: i64, location: i64, flag: i32, singleton: bool) -> Result<i64, CallError> {
+    if !crate::dao::trades::reserved(db, &[item.item_id]).await.map_err(db_err)?.is_empty() {
+        return Err(notify_error(messages::trade::TRADE_ITEM_RESERVED));
+    }
     inventory_dao::split(db, item, quantity, owner, location, flag, singleton).await.map_err(db_err)?
         .ok_or_else(|| notify_error(messages::STACK_CANNOT_BE_SPLIT))
 }
 
-/// Tell the client an item is gone (moved to the junkyard), then delete it.
-pub(crate) async fn destroy_item(c: &mut Client, item: Item) -> Result<(), CallError> {
-    inventory_dao::delete(&c.db, item.item_id).await.map_err(db_err)?;
-    let old_location = item.location_id;
-    let gone = Item { location_id: LOCATION_JUNKYARD, ..item };
-    let change = Value::Dict(vec![(Value::Int(IX_LOCATION_ID), Value::Int(old_location))]);
-    c.notify("OnItemChange", vec![gone.row(), change, Value::None]);
-    Ok(())
-}
-
 /// Apply the same ownership and active-ship policy as TrashItems.
 pub(crate) async fn trash_items(c: &mut Client, ids: &[i64]) -> Result<(), CallError> {
+    let _lock = super::market::lock().await;
     let char_id = c.session.int("charid").unwrap_or(0);
-    let items = load_items(&c.db, &c.sde, ItemQuery::IdsOwner(ids, char_id)).await.map_err(db_err)?;
-    for item in items {
-        if Some(item.item_id) != c.session.int("shipid") {
-            destroy_item(c, item).await?;
-        }
-    }
-    Ok(())
+    let ship = c.session.int("shipid");
+    let db = c.db.clone();
+    let sde = c.sde.clone();
+    let ids = ids.to_vec();
+    db.transaction(
+        move |tx, outbox: &mut Outbox| {
+            let ids = ids.clone();
+            let sde = sde.clone();
+            Box::pin(async move {
+                if !crate::dao::trades::reserved(tx, &ids).await.map_err(db_err)?.is_empty() {
+                    return Err(notify_error(messages::trade::TRADE_ITEM_RESERVED));
+                }
+                let mut items = load_items(tx, &sde, ItemQuery::IdsOwner(&ids, char_id)).await.map_err(db_err)?;
+                items.sort_by_key(|item| item.item_id);
+                for item in items {
+                    if Some(item.item_id) != ship {
+                        inventory_dao::delete(tx, item.item_id).await.map_err(db_err)?;
+                        notify_item_removed(outbox, item);
+                    }
+                }
+                Ok(())
+            })
+        },
+        |value, outbox| async move { dispatch_client(value, outbox, c) },
+    ).await
 }
 
 /// The first free slot on `ship` for a module, from the module's slot effect and the
@@ -203,9 +217,15 @@ async fn free_slot(c: &Client, ship: i64, module_type: i32) -> Result<Option<i32
 
 /// Move `item_id` (all of it, or `qty` split off a stack) into `container` under `flag`.
 /// Returns the ID of the item now at the destination.
-pub(crate) async fn move_item(c: &mut Client, container: &Container, item_id: i64, flag: Option<i32>, qty: Option<i64>) -> Result<Option<i64>, CallError> {
+pub(crate) async fn move_item(c: &mut Client, container: &Container, item_id: i64, source: Option<i64>, flag: Option<i32>, qty: Option<i64>) -> Result<Option<i64>, CallError> {
+    let _lock = super::market::lock().await;
+    let mut ids = vec![item_id];
+    if let Container::Item(id) = container { ids.push(*id); }
     let char_id = c.session.int("charid").unwrap_or(0);
     let Some(item) = load_items(&c.db, &c.sde, ItemQuery::Id(item_id)).await.map_err(db_err)?.into_iter().next() else { return Ok(None) };
+    if source.is_some_and(|source| source != item.location_id) || (source.is_some() && item.flag_id == FLAG_HANGAR && c.sde.map.station(item.location_id).is_some() && item.owner_id != char_id) {
+        return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
+    }
     if Some(item_id) == c.session.int("shipid") && matches!(container, Container::Item(_)) {
         return Err(CallError::User { msg: messages::MSG_CAN_NOT_PLACE_ACTIVE_SHIP_IN_ANOTHER_HANGAR.into(), dict: vec![] });
     }
@@ -250,7 +270,11 @@ pub(crate) async fn move_item(c: &mut Client, container: &Container, item_id: i6
         move |tx, outbox: &mut Outbox| {
             let item = item.clone();
             let sde = sde.clone();
+            let ids = ids.clone();
             Box::pin(async move {
+                if !crate::dao::trades::reserved(tx, &ids).await.map_err(db_err)?.is_empty() {
+                    return Err(notify_error(messages::trade::TRADE_ITEM_RESERVED));
+                }
                 let moved_id = if let Some(q) = take {
                     let id = split_stack(tx, &item, q as i32, owner, location, flag, fitting).await?;
                     notify_item_change(tx, &sde, outbox, item_id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
@@ -306,6 +330,7 @@ async fn apply_merges<X: Send>(db: &(impl Executor + ?Sized), sde: &Sde, outbox:
 }
 
 async fn merge_operations(c: &mut Client, ops: Vec<(i64, i64, i64)>) -> Result<(), CallError> {
+    let _lock = super::market::lock().await;
     let db = c.db.clone();
     let sde = c.sde.clone();
     db.transaction(
@@ -314,6 +339,9 @@ async fn merge_operations(c: &mut Client, ops: Vec<(i64, i64, i64)>) -> Result<(
             let sde = sde.clone();
             Box::pin(async move {
                 let ids: Vec<i64> = ops.iter().flat_map(|&(source, dest, _)| [source, dest]).collect();
+                if !crate::dao::trades::reserved(tx, &ids).await.map_err(db_err)?.is_empty() {
+                    return Err(notify_error(messages::trade::TRADE_ITEM_RESERVED));
+                }
                 let items = load_items(tx, &sde, ItemQuery::Ids(&ids)).await.map_err(db_err)?;
                 apply_merges(tx, &sde, outbox, items, &ops).await
             })
@@ -324,6 +352,7 @@ async fn merge_operations(c: &mut Client, ops: Vec<(i64, i64, i64)>) -> Result<(
 
 /// `StackAll([flag])`: merge every unassembled stack of the same type in the container.
 async fn stack_all(c: &mut Client, container: &Container, flag: Option<i64>) -> Result<(), CallError> {
+    let _lock = super::market::lock().await;
     if let Container::Item(id) = container {
         if super::offices::office_owner(&c.db, *id).await?.is_some_and(|corp| c.session.int("corpid") != Some(corp)) {
             return Ok(());
@@ -348,6 +377,10 @@ async fn stack_all(c: &mut Client, container: &Container, flag: Option<i64>) -> 
                         None => load_items(tx, &sde, ItemQuery::Location(id)).await.map_err(db_err)?,
                     },
                 };
+                let ids: Vec<i64> = items.iter().map(|item| item.item_id).collect();
+                if !crate::dao::trades::reserved(tx, &ids).await.map_err(db_err)?.is_empty() {
+                    return Err(notify_error(messages::trade::TRADE_ITEM_RESERVED));
+                }
                 let mut first: std::collections::HashMap<(i32, i32), i64> = Default::default();
                 let mut ops = Vec::new();
                 for item in items.iter().filter(|i| !i.singleton) {
@@ -369,6 +402,14 @@ pub async fn broker(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     Some(Ok(match call.method {
         "GetInventoryFromId" => {
             let id = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
+            if super::trade::is_trade_container(id) {
+                return Some(Err(notify_error(messages::trade::TRADE_CONTAINER_RESERVED)));
+            }
+            match crate::dao::trades::reserved(&c.db, &[id]).await {
+                Ok(ids) if !ids.is_empty() => return Some(Err(notify_error(messages::trade::TRADE_CONTAINER_RESERVED))),
+                Err(error) => return Some(Err(db_err(error))),
+                _ => {}
+            }
             if super::exploration::container_locked(id) {
                 let msg = Value::unicode(messages::CONTAINER_LOCKED_NEEDS_ANALYZER);
                 return Some(Err(CallError::User { msg: messages::MSG_CUSTOM_NOTIFY.into(), dict: vec![("notify".into(), msg)] }));
@@ -389,6 +430,7 @@ pub async fn broker(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "IsMyItemAtDockableLocation" => Value::Bool(true),
         // SplitStack(locationID, itemID, qty, ownerID): a new stack beside the old one.
         "SplitStack" => {
+            let _lock = super::market::lock().await;
             let item_id = call.args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
             let qty = call.args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as i32;
             let Some(item) = (match load_items(&c.db, &c.sde, ItemQuery::Id(item_id)).await.map_err(db_err) {
@@ -426,12 +468,27 @@ pub async fn broker(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         }
         // SetLabel(itemID, name): ship and container names.
         "SetLabel" => {
+            let _lock = super::market::lock().await;
             let item_id = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
             let name = call.args.get(1).and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
-            if let Err(e) = inventory_dao::rename(&c.db, item_id, &name, char_id).await {
-                return Some(Err(db_err(e)));
-            }
-            Value::None
+            let db = c.db.clone();
+            let r = db.transaction(
+                move |tx, _outbox: &mut Outbox| {
+                    let name = name.clone();
+                    Box::pin(async move {
+                        if !crate::dao::trades::reserved(tx, &[item_id]).await.map_err(db_err)?.is_empty() {
+                            return Err(notify_error(messages::trade::TRADE_ITEM_RESERVED));
+                        }
+                        inventory_dao::rename(tx, item_id, &name, char_id).await.map_err(db_err)?;
+                        Ok(Value::None)
+                    })
+                },
+                |value, outbox| async move { dispatch_client(value, outbox, c) },
+            ).await;
+            return Some(r);
+        }
+        "WithdrawPlexFromVault" if call.args.get(2).and_then(Value::as_text).is_some_and(|v| v == "VaultToDirectTrade") => {
+            return Some(Err(notify_error(messages::trade::TRADE_PLEX_UNSUPPORTED)));
         }
         _ => return None,
     }))
@@ -442,6 +499,14 @@ pub async fn inventory(c: &mut Client, call: &Call<'_>) -> CallResult {
     let Some(container) = container_of(call.bind_params) else {
         return Err(CallError::Internal(anyhow::anyhow!("bad inventory bind params {:?}", call.bind_params)));
     };
+    if let Container::Item(id) = &container {
+        if super::trade::is_trade_container(*id) {
+            return Err(notify_error(messages::trade::TRADE_CONTAINER_RESERVED));
+        }
+        if !crate::dao::trades::reserved(&c.db, &[*id]).await.map_err(db_err)?.is_empty() {
+            return Err(notify_error(messages::trade::TRADE_CONTAINER_RESERVED));
+        }
+    }
     match call.method {
         "List" => {
             let flag = kw_or_arg(call, "flag", 0).and_then(|v| v.as_int());
@@ -462,13 +527,13 @@ pub async fn inventory(c: &mut Client, call: &Call<'_>) -> CallResult {
             let item_id = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
             let flag = call.kwargs.get("flag").and_then(|v| v.as_int()).map(|f| f as i32);
             let qty = call.kwargs.get("qty").or_else(|| call.kwargs.get("quantity")).and_then(|v| v.as_int());
-            move_item(c, &container, item_id, flag, qty).await.map(|id| id.map(Value::Int).unwrap_or(Value::None))
+            move_item(c, &container, item_id, call.args.get(1).and_then(Value::as_int), flag, qty).await.map(|id| id.map(Value::Int).unwrap_or(Value::None))
         }
         // MultiAdd(itemIDs, sourceID, flag=)
         "MultiAdd" => {
             let flag = call.kwargs.get("flag").and_then(|v| v.as_int()).map(|f| f as i32);
             for item_id in value_id_list(call.args.first()) {
-                move_item(c, &container, item_id, flag, None).await?;
+                move_item(c, &container, item_id, call.args.get(1).and_then(Value::as_int), flag, None).await?;
             }
             Ok(Value::None)
         }
