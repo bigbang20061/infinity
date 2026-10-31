@@ -32,7 +32,9 @@ inventory of every unsupported SDE effect.
 | Modifier-only and online effects | Supported through the modifier and online paths, subject to validation and scope. |
 | Hacking and probe launch | Classified for existing exploration paths; classification alone does not guarantee every item or call path. |
 | Projected web, warp disruption and scrambling, target painting, sensor damping, tracking and guidance disruption, remote sensor and tracking enhancement | Runtime projections use the shared Fit evaluator and actor-owned lifetimes. Warp scramble status refuses warp entry; a scram that blocks propulsion stops a running microwarpdrive and refuses a new activation, without stopping afterburners. |
-| ECM and remote repair | Known later families, visibly refused until their behaviour is implemented. |
+| Remote shield, armor and hull repair | Locked ships and NPCs use fitted amounts and range/falloff, rechecked at application. Server policy applies shield at cycle start and armor and hull at cycle end. Ancillary variants use the same charge, reload and capacitor rules as local ancillary repairs. Mutadaptive remote armor repair is refused. No Crimewatch assistance flags are applied. |
+| ECM | A known later family, visibly refused until implemented. |
+| NPC remote shield, armor and hull repair | NPCs assist the most damaged eligible ally in their spawn group or ownership set, using fitted SDE repair amounts. |
 | Smartbomb, Vorton, cloak, micro jump drive, salvage, tractor, scans, target assistance and bombs | Known later families, visibly refused until implemented. |
 | Explicitly excluded capital, industrial, structure and other out-of-scope groups | Refused even when an effect has modifiers. |
 

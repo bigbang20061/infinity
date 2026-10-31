@@ -366,12 +366,16 @@ pub async fn spawn_npc(db: Db, world: Arc<World>, system: i64, id: i64, type_id:
                                     super::effects::npc_capacitor::apply_npc(
                                         &db, &world, system, source_module, &me, &victim, &effect, duration_ms, generation,
                                     ).await,
+                                super::effects::EffectKind::RemoteRepair { .. } =>
+                                    super::effects::npc_repair::apply_npc(
+                                        &db, &world, system, source_module, &me, &victim, &effect, duration_ms, generation,
+                                    ).await,
                                 _ => return,
                             };
                             match result {
                                 Err(CallError::Internal(error)) => warn!("npc {id} effect {effect_id}: {error:#}"),
                                 Err(CallError::User { msg, .. }) if !matches!(effect.kind, super::effects::EffectKind::Projected { .. }) =>
-                                    warn!("npc {id} capacitor effect {effect_id}: {msg}"),
+                                    warn!("npc {id} effect {effect_id}: {msg}"),
                                 _ => {}
                             }
                         }
@@ -386,7 +390,12 @@ pub async fn spawn_npc(db: Db, world: Arc<World>, system: i64, id: i64, type_id:
         .or_else(|| world.sde().dogma.attribute(ATTR_MAX_TARGET_RANGE).and_then(|a| a.default_value).filter(|value| *value > 0.0));
     for entry in world.sde().types.effects(type_id) {
         let Some(effect) = super::effects::registry::resolve(world.sde(), entry.effect_id) else { continue };
-        if !matches!(effect.kind, super::effects::EffectKind::Projected { .. } | super::effects::EffectKind::Neutralizer | super::effects::EffectKind::Nosferatu | super::effects::EffectKind::CapTransfer) { continue; }
+        if !matches!(effect.kind, super::effects::EffectKind::Projected { .. } | super::effects::EffectKind::Neutralizer | super::effects::EffectKind::Nosferatu | super::effects::EffectKind::CapTransfer | super::effects::EffectKind::RemoteRepair { .. }) { continue; }
+        if matches!(effect.kind, super::effects::EffectKind::RemoteRepair { .. }) && !super::effects::npc_repair::supported_for_type(world.sde(), type_id, &effect) {
+            let name = world.sde().dogma.effect(entry.effect_id).and_then(|row| row.name.as_deref()).unwrap_or("unknown");
+            let _ = super::effects::unsupported::refusal(Some(entry.effect_id), name, type_id);
+            continue;
+        }
         let duration = match effect.attribute(super::effects::registry::EffectAttribute::Duration) {
             Some(id) => match world.sde().types.attribute(type_id, id) {
                 Some(duration) => duration,

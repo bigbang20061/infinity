@@ -1,11 +1,48 @@
-//! Local repair phase handlers for SDE repair effects.
-//! Client dogma applies shield at cycle start and armor and hull at cycle end.
-//! Amounts use the cycle-start fitted snapshot. Fueled ancillary armor repair applies
-//! its multiplier and pays normal capacitor; fueled ancillary shield repair bypasses
-//! capacitor without an amount multiplier. Remote repair is unsupported.
+//! Local and remote shield, armor and hull repair phases.
+//! Local phases mirror client dogma; remote phases use the server's matching
+//! per-layer policy. Fitted SDE attributes determine amounts and range.
+//! Fueled ancillary armor uses its charge multiplier; fueled shield bypasses
+//! capacitor discharge. Mutadaptive remote repair remains unsupported.
 use crate::services::{combat::{Ctx, groups_health::repair_player}, fit::{Fit, Key}};
+use crate::consts::{ATTR_SHIELD_BONUS, ATTR_ARMOR_DAMAGE_AMOUNT, ATTR_STRUCTURE_DAMAGE_AMOUNT};
 
-fn applies_at_start(layer: usize) -> bool { layer == 0 }
+pub(super) fn amount_attribute(layer: usize) -> i32 {
+    match layer {
+        0 => ATTR_SHIELD_BONUS,
+        1 => ATTR_ARMOR_DAMAGE_AMOUNT,
+        2 => ATTR_STRUCTURE_DAMAGE_AMOUNT,
+        _ => unreachable!("invalid repair layer"),
+    }
+}
+
+pub(super) fn scaled_amount(base: f64, gap: f64, optimal: f64, falloff: f64) -> f64 {
+    base * super::range::range_multiplier(gap, optimal, falloff)
+}
+
+/// Validate a locked target against one interpolated system snapshot.
+pub(super) async fn target(cx: &Ctx, target: Option<i64>, optimal: f64, falloff: f64) -> Result<(i64, Option<i64>, f64), crate::services::CallError> {
+    use crate::services::{combat::targeting_charges::targets_of, user_error};
+    use crate::consts::{CATEGORY_ENTITY, CATEGORY_SHIP};
+    use crate::messages;
+    use crate::space::{dist, MODE_WARP};
+    let missing = || user_error(messages::MSG_DENIED_ACTIVATE_TARGET_NOT_PRESENT, vec![]);
+    let id = target.filter(|id| *id != cx.ship_id && targets_of(cx.char_id).contains(id)).ok_or_else(missing)?;
+    let source = cx.ship_id;
+    let Some((ship, victim, npc)) = cx.world.with(cx.system_id, move |s| {
+        Some((s.sampled_ball(source)?, s.sampled_ball(id)?, s.is_npc(id)))
+    }).await.flatten() else { return Err(missing()); };
+    if ship.mode == MODE_WARP || victim.mode == MODE_WARP {
+        return Err(user_error(messages::MSG_DENIED_ACTIVATE_IN_WARP, vec![]));
+    }
+    let category = cx.world.sde().types.get(victim.type_id).and_then(|t| t.category_id);
+    if category != Some(CATEGORY_SHIP) && !(category == Some(CATEGORY_ENTITY) && npc) { return Err(missing()); }
+    let gap = (dist(ship.pos, victim.pos) - f64::from(ship.radius) - f64::from(victim.radius)).max(0.0);
+    let multiplier = super::range::range_multiplier(gap, optimal, falloff);
+    if multiplier <= 0.0 || !multiplier.is_finite() { return Err(missing()); }
+    Ok((id, victim.char_id, multiplier))
+}
+
+pub(super) fn applies_at_start(layer: usize) -> bool { layer == 0 }
 
 pub(super) fn amount(fit: &Fit, module: i64, amount_attr: i32) -> f64 {
     fit.value(Key::Module(module), amount_attr)
@@ -21,7 +58,7 @@ pub(super) fn fueled(fit: &Fit, module: i64, amount_attr: i32, bonus_attr: Optio
 
 pub(super) async fn apply(cx: &Ctx, layer: usize, amount: f64, start: bool) {
     if applies_at_start(layer) != start { return; }
-    let _ = repair_player(&cx.db, &cx.world, cx.system_id, cx.ship_id, cx.char_id, layer, amount).await;
+    let _ = repair_player(&cx.db, &cx.world, cx.system_id, cx.ship_id, cx.char_id, layer, amount, |_| true).await;
 }
 
 #[cfg(test)] mod tests;

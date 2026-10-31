@@ -3,6 +3,9 @@
 //! from fitted dogma and NPC attributes from the SDE. Capacitor state is not persisted;
 //! NPC projections are checked in the system actor before capacitor changes commit.
 //! Confirmed NPC destruction emits a kill event for a known attacker before rewards are attempted.
+//! NPC repairs use the damage cache in the system actor and are not persisted; missing
+//! cache entries represent undamaged NPCs. Player repairs use fitted ship attributes
+//! and remain in memory until the normal condition save.
 use super::*;
 use crate::consts::CATEGORY_MODULE;
 
@@ -415,32 +418,87 @@ pub(crate) async fn damage(db: &Db, world: &World, system: i64, target: i64, tar
         None => damage_npc(db, world, system, target, raw, attacker).await,
     }
 }
+/// NPC layer health for assistance selection; an uncached NPC is undamaged.
+pub(crate) fn npc_health_fraction(ball: &Ball, layer: usize) -> Option<f64> {
+    if layer >= 3 { return None; }
+    let st = state();
+    let Some(hp) = st.hp.get(&ball.id) else { return Some(1.0) };
+    let (now, max) = (hp.now[layer], hp.max[layer]);
+    if !now.is_finite() || !max.is_finite() || max <= 0.0 { return None; }
+    Some((now / max).clamp(0.0, 1.0))
+}
+
+/// Apply a repair only to a live, valid cached NPC health record.
+fn repair_npc_hp(hp: &mut Hp, layer: usize, amount: f64) -> Option<[f64; 3]> {
+    if layer >= 3 || !amount.is_finite() || amount <= 0.0
+        || !hp.now[2].is_finite() || hp.now[2] <= 0.0
+        || hp.now.iter().chain(hp.max.iter()).any(|v| !v.is_finite())
+        || hp.max[layer] <= 0.0 || hp.now[layer] >= hp.max[layer]
+    {
+        return None;
+    }
+    hp.now[layer] += amount.min(hp.max[layer] - hp.now[layer]);
+    Some([0, 1, 2].map(|i| if hp.max[i] > 0.0 { (hp.now[i] / hp.max[i]).clamp(0.0, 1.0) } else { 0.0 }))
+}
+
+/// Repair a present unpiloted NPC or ship and publish health in the actor turn.
+pub(crate) fn repair_npc_in_system(s: &mut crate::space::System, sde: &crate::sde::Sde, target: i64, layer: usize, amount: f64) -> bool {
+    let Some(ball) = s.ball(target) else { return false };
+    let category = sde.types.get(ball.type_id).and_then(|ty| ty.category_id);
+    if ball.char_id.is_some()
+        || !(category == Some(crate::consts::CATEGORY_SHIP)
+            || (category == Some(crate::consts::CATEGORY_ENTITY) && s.is_npc(target)))
+    {
+        return false;
+    }
+    let health = {
+        let mut st = state();
+        st.hp.get_mut(&target).and_then(|hp| repair_npc_hp(hp, layer, amount))
+    };
+    if let Some(health) = health {
+        s.set_health(target, health);
+        true
+    } else {
+        false
+    }
+}
 
 /// Repair a player's ship layer (0 shield, 1 armor, 2 structure) by `amount`.
-pub(crate) async fn repair_player(db: &Db, world: &World, system: i64, ship: i64, char_id: i64, layer: usize, amount: f64) -> Result<(), CallError> {
+pub(crate) async fn repair_player(
+    db: &Db, world: &World, system: i64, ship: i64, char_id: i64, layer: usize,
+    amount: f64, guard: impl FnOnce(&crate::space::System) -> bool + Send + 'static,
+) -> Result<(), CallError> {
     let _lock = super::super::market::lock().await;
+    if layer >= 3 || !amount.is_finite() || amount <= 0.0 { return Ok(()); }
     if world.ball(system, ship).await.is_none_or(|ball| ball.char_id != Some(char_id)) {
         return Ok(());
     }
-    let known = state().condition.get(&ship).cloned();
-    // An undamaged ship has nothing to repair.
-    let Some(mut cond) = known else { return Ok(()) };
-    let now = filetime_now();
-    let old = cond.now;
-    cond.now[0] = recharge(cond.now[0], cond.stats.max[0], cond.stats.shield_tau_ms, (now - cond.shield_at) as f64 / FILETIME_SECOND as f64);
-    cond.shield_at = now;
-    cond.now[layer] = (cond.now[layer] + amount).min(cond.stats.max[layer]);
-    let max = cond.stats.max;
-    let changes = vec![
-        attribute_change(char_id, Value::Int(ship), ATTR_SHIELD_CHARGE, Value::Float(cond.now[0]), Value::Float(old[0])),
-        attribute_change(char_id, Value::Int(ship), ATTR_ARMOR_DAMAGE, Value::Float(max[1] - cond.now[1]), Value::Float(max[1] - old[1])),
-        attribute_change(char_id, Value::Int(ship), ATTR_HULL_DAMAGE, Value::Float(max[2] - cond.now[2]), Value::Float(max[2] - old[2])),
-    ];
-    world.notify_pilot(char_id, "OnModuleAttributeChanges", vec![Value::List(changes)]);
-    let health = [0, 1, 2].map(|i| if max[i] > 0.0 { (cond.now[i] / max[i]).clamp(0.0, 1.0) } else { 0.0 });
-    state().condition.insert(ship, cond);
-    world.set_health(system, ship, health);
-    let _ = db;
+    let stats = ship_stats(db, world, system, char_id, ship).await?;
+    world.with(system, move |s| {
+        if s.ball(ship).is_none_or(|ball| ball.char_id != Some(char_id)) || !guard(s) {
+            return;
+        }
+        let mut st = state();
+        let Some(cond) = st.condition.get_mut(&ship) else { return };
+        let old_max = cond.stats.max;
+        let old = cond.now;
+        cond.now = [0, 1, 2].map(|i| cond.now[i].min(stats.max[i]));
+        cond.stats = stats;
+        let now = filetime_now();
+        cond.now[0] = recharge(cond.now[0], cond.stats.max[0], cond.stats.shield_tau_ms, (now - cond.shield_at) as f64 / FILETIME_SECOND as f64);
+        cond.shield_at = now;
+        cond.now[layer] = (cond.now[layer] + amount).min(cond.stats.max[layer]);
+        let max = cond.stats.max;
+        let changes = vec![
+            attribute_change(char_id, Value::Int(ship), ATTR_SHIELD_CHARGE, Value::Float(cond.now[0]), Value::Float(old[0])),
+            attribute_change(char_id, Value::Int(ship), ATTR_ARMOR_DAMAGE, Value::Float(max[1] - cond.now[1]), Value::Float(old_max[1] - old[1])),
+            attribute_change(char_id, Value::Int(ship), ATTR_HULL_DAMAGE, Value::Float(max[2] - cond.now[2]), Value::Float(old_max[2] - old[2])),
+        ];
+        let health = [0, 1, 2].map(|i| if max[i] > 0.0 { (cond.now[i] / max[i]).clamp(0.0, 1.0) } else { 0.0 });
+        drop(st);
+        s.notify_pilot(char_id, "OnModuleAttributeChanges", vec![Value::List(changes)]);
+        s.set_health(ship, health);
+    }).await;
     Ok(())
 }
 /// Set the damage fraction of selected layers of the active player ship.

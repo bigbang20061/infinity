@@ -29,6 +29,19 @@ fn fuel_discharge_and_empty_booster_policy() {
     assert!(charge_sensitive(armor));
     assert!(!charge_sensitive(EffectKind::Neutralizer));
 }
+
+#[test]
+fn ancillary_remote_uses_local_charge_and_capacitor_policy() {
+    let shield = charge_kind(i64::from(EFFECT_ANCILLARY_REMOTE_SHIELD_BOOSTER), EffectKind::RemoteRepair { layer: 0 });
+    let armor = charge_kind(i64::from(EFFECT_ANCILLARY_REMOTE_ARMOR_REPAIRER), EffectKind::RemoteRepair { layer: 1 });
+    assert!(charge_sensitive(shield));
+    assert!(charge_sensitive(armor));
+    assert_eq!(cycle_discharge(shield, true, 20.0), 0.0);
+    assert_eq!(cycle_discharge(shield, false, 20.0), 20.0);
+    assert_eq!(cycle_discharge(armor, true, 20.0), 20.0);
+    assert!(matches!(armor, EffectKind::FueledLocalRepair { charge_bonus_attr: Some(ATTR_CHARGED_ARMOR_DAMAGE_MULTIPLIER), .. }));
+    assert!(!charge_sensitive(charge_kind(0, EffectKind::RemoteRepair { layer: 1 })));
+}
 #[test]
 fn discarded_cycle_owners_release_only_their_generation() {
     let master = -9011;
