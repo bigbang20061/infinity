@@ -1,5 +1,6 @@
 //! Combat mechanics; state and routing live in the parent module.
 use super::*;
+use crate::consts::CATEGORY_MODULE;
 
 // ---------------------------------------------------------------- weapon groups
 
@@ -377,8 +378,6 @@ pub(super) async fn reward_kill(db: &Db, world: &World, system: i64, npc: &Ball,
     Ok(())
 }
 
-/// `sde.inv_categories`: category 7 contains modules.
-const CATEGORY_MODULE: i32 = 7;
 fn loot_category(published: Option<bool>, category: Option<i32>) -> Option<i32> {
     category.filter(|&id| published == Some(true) && (id == CATEGORY_MODULE || id == CATEGORY_CHARGE))
 }
