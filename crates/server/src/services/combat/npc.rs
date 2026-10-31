@@ -1,5 +1,52 @@
 //! Combat mechanics; state and routing live in the parent module.
 use super::*;
+use crate::consts::ATTR_AGILITY;
+use crate::sde::types::TypeData;
+use crate::space::{MODE_STOP, V3};
+
+/// Create the SDE-derived NPC ball and attach its existing combat brain.
+pub(crate) async fn spawn(db: &Db, world: &Arc<World>, system: i64, data: &TypeData, corp: i64, pos: V3, tick: i64, owner: Option<i64>) -> Result<i64, CallError> {
+    let ball = Ball {
+        id: crate::services::missions::NEXT_NPC_ID.fetch_add(1, Ordering::Relaxed),
+        type_id: data.type_id,
+        owner_id: corp,
+        corp_id: corp,
+        alliance_id: -1,
+        char_id: None,
+        mode: MODE_STOP,
+        radius: data.radius.unwrap_or(50.0) as f32,
+        signature_radius: None,
+        mass: data.mass.unwrap_or(1_000_000.0),
+        max_vel: data.attribute(ATTR_MAX_VELOCITY).unwrap_or(300.0) as f32,
+        agility: data.attribute(ATTR_AGILITY).unwrap_or(3.0) as f32,
+        speed_fraction: 0.0,
+        pos,
+        vel: [0.0; 3],
+        old_pos: pos,
+        old_vel: [0.0; 3], segment_acceleration: None,
+        goto: [0.0; 3],
+        follow_id: 0,
+        follow_range: 0.0,
+        free: true,
+        global: false,
+        massive: true,
+        interactive: false,
+        warp: crate::space::WarpState::default(),
+        warp_factor: 0,
+        last_ms: tick,
+        interpolation_anchor_ms: tick,
+        effect_stamp: 0,
+        cloak: 0,
+        cloak_until: 0,
+        health: [1.0; 3],
+        launcher: 0,
+        slim: vec![("corpID", Value::Int(corp))],
+    };
+    let id = ball.id;
+    world.add_ship(system, ball).await.map_err(CallError::Internal)?;
+    spawn_npc(db.clone(), world.clone(), system, id, data.type_id, owner).await?;
+    Ok(id)
+}
 
 // ---------------------------------------------------------------- NPCs
 

@@ -4,15 +4,12 @@
 //! and persistent site state are unsupported.
 use super::*;
 use crate::services::sql_pattern::matches_pattern;
-use crate::consts::{ATTR_AGILITY, ATTR_MAX_VELOCITY, CATEGORY_ENTITY};
+use crate::consts::CATEGORY_ENTITY;
+use crate::sde::types::TypeData;
 
 struct Npc<'a> {
-    type_id: i32,
+    data: &'a TypeData,
     name: &'a str,
-    radius: f64,
-    mass: f64,
-    velocity: Option<f64>,
-    agility: Option<f64>,
     generic: bool,
 }
 
@@ -28,10 +25,10 @@ fn candidate_group(name: &str, faction: &str) -> Option<bool> {
         .then_some(generic)
 }
 
-fn preferred<'a, 'b>(rows: &'a [Npc<'b>], class: &str) -> Vec<&'a Npc<'b>> {
-    let fits: Vec<_> = rows.iter().filter(|r| group_has_class(r.name, class)).collect();
-    if fits.iter().any(|r| !r.generic) {
-        fits.into_iter().filter(|r| !r.generic).collect()
+fn preferred<'a, T>(rows: &'a [T], class: &str, candidate: impl Fn(&T) -> (&str, bool)) -> Vec<&'a T> {
+    let fits: Vec<_> = rows.iter().filter(|r| group_has_class(candidate(r).0, class)).collect();
+    if fits.iter().any(|r| !candidate(r).1) {
+        fits.into_iter().filter(|r| !candidate(r).1).collect()
     } else {
         fits
     }
@@ -86,11 +83,7 @@ pub(super) async fn ensure_site(c: &mut Client, m: &Mission) -> Result<(), CallE
         if group.category_id != Some(CATEGORY_ENTITY) { return None; }
         let name = group.name.as_deref()?;
         let generic = candidate_group(group.lower_name.as_deref()?, faction_name)?;
-        Some(Npc {
-            type_id: t.type_id, name, radius: t.radius.unwrap_or(50.0),
-            mass: t.mass.unwrap_or(1_000_000.0),
-            velocity: t.attribute(ATTR_MAX_VELOCITY), agility: t.attribute(ATTR_AGILITY), generic,
-        })
+        Some(Npc { data: t, name, generic })
     }).collect();
     // NPCs belong to the faction's NPC corporation: the client looks owners and corpIDs up
     // as corporations (tickers, standings), and a faction ID there breaks target locking.
@@ -100,7 +93,7 @@ pub(super) async fn ensure_site(c: &mut Client, m: &Mission) -> Result<(), CallE
     let mut spawned = Vec::new();
     let [min_range, max_range] = crate::config::game().missions.spawn_range_m;
     for class in spawn_classes(level) {
-        let pool = preferred(&rows, class);
+        let pool = preferred(&rows, class, |r| (r.name, r.generic));
         if pool.is_empty() {
             continue;
         }
@@ -108,46 +101,8 @@ pub(super) async fn ensure_site(c: &mut Client, m: &Mission) -> Result<(), CallE
         let d = rand_dir();
         let dist = min_range as f64 + rand01() * (max_range as f64 - min_range as f64);
         let pos = [m.pos[0] + d[0] * dist, m.pos[1] + d[1] * dist * 0.3, m.pos[2] + d[2] * dist];
-        let ball = Ball {
-            id: NEXT_NPC_ID.fetch_add(1, Ordering::Relaxed),
-            type_id: r.type_id,
-            owner_id: corp,
-            corp_id: corp,
-            alliance_id: -1,
-            char_id: None,
-            mode: MODE_STOP,
-            radius: r.radius as f32,
-            signature_radius: None,
-            mass: r.mass,
-            max_vel: r.velocity.unwrap_or(300.0) as f32,
-            agility: r.agility.unwrap_or(3.0) as f32,
-            speed_fraction: 0.0,
-            pos,
-            vel: [0.0; 3],
-            old_pos: pos,
-            old_vel: [0.0; 3], segment_acceleration: None,
-            goto: [0.0; 3],
-            follow_id: 0,
-            follow_range: 0.0,
-            free: true,
-            global: false,
-            massive: true,
-            interactive: false,
-            warp: crate::space::WarpState::default(),
-            warp_factor: 0,
-            last_ms: tick,
-            interpolation_anchor_ms: tick,
-            effect_stamp: 0,
-            cloak: 0,
-            cloak_until: 0,
-            health: [1.0; 3],
-            launcher: 0,
-            slim: vec![("corpID", Value::Int(corp))],
-        };
-        spawned.push(ball.id);
-        let (id, type_id) = (ball.id, ball.type_id);
-        c.world.add_ship(m.system_id, ball).await.map_err(CallError::Internal)?;
-        super::combat::spawn_npc(c.db.clone(), c.world.clone(), m.system_id, id, type_id, Some(me)).await?;
+        let id = combat::npc::spawn(&c.db, &c.world, m.system_id, r.data, corp, pos, tick, Some(me)).await?;
+        spawned.push(id);
     }
     let group_members = spawned.clone();
     let group = c.world.with(m.system_id, move |s| s.spawn_group(group_members, |_| {})).await

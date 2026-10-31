@@ -53,7 +53,7 @@ use crate::db::executor::Executor;
 use crate::db::outbox::{dispatch_client, Effect, Outbox};
 use crate::messages;
 use crate::sde::Sde;
-use crate::space::{dist, kg_to_tonnes, minutes_to_seconds, now_ms, seconds_to_ms, Ball, World, MODE_RIGID, MODE_STOP, V3};
+use crate::space::{dist, kg_to_tonnes, minutes_to_seconds, now_ms, seconds_to_ms, Ball, World, MODE_RIGID, V3};
 use marshal::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};

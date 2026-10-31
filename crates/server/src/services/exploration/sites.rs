@@ -2,7 +2,7 @@
 //! Shared exploration state and data sources are documented in the parent module.
 
 use super::*;
-use crate::consts::{ATTR_AGILITY, ATTR_MAX_VELOCITY, CATEGORY_ENTITY};
+use crate::consts::CATEGORY_ENTITY;
 
 
 // ---------------------------------------------------------------- site content
@@ -105,45 +105,7 @@ pub(super) async fn spawn_rats(db: &Db, world: &Arc<World>, system: i64, center:
         let d = spread.0 + rand01() * (spread.1 - spread.0);
         let v = rand_dir();
         let pos = [center[0] + v[0] * d, center[1] + v[1] * d * 0.3, center[2] + v[2] * d];
-        let ball = Ball {
-            id: crate::services::missions::NEXT_NPC_ID.fetch_add(1, Ordering::Relaxed),
-            type_id: r.type_id,
-            owner_id: corp,
-            corp_id: corp,
-            alliance_id: -1,
-            char_id: None,
-            signature_radius: None,
-            mode: MODE_STOP,
-            radius: r.radius.unwrap_or(50.0) as f32,
-            mass: r.mass.unwrap_or(1_000_000.0),
-            max_vel: r.attribute(ATTR_MAX_VELOCITY).unwrap_or(300.0) as f32,
-            agility: r.attribute(ATTR_AGILITY).unwrap_or(3.0) as f32,
-            speed_fraction: 0.0,
-            pos,
-            vel: [0.0; 3],
-            old_pos: pos,
-            old_vel: [0.0; 3], segment_acceleration: None,
-            goto: [0.0; 3],
-            follow_id: 0,
-            follow_range: 0.0,
-            free: true,
-            global: false,
-            massive: true,
-            interactive: false,
-            warp: crate::space::WarpState::default(),
-            warp_factor: 0,
-            last_ms: ms,
-            interpolation_anchor_ms: ms,
-            effect_stamp: 0,
-            cloak: 0,
-            cloak_until: 0,
-            health: [1.0; 3],
-            launcher: 0,
-            slim: vec![("corpID", Value::Int(corp))],
-        };
-        let (id, type_id) = (ball.id, ball.type_id);
-        world.add_ship(system, ball).await.map_err(CallError::Internal)?;
-        crate::services::combat::spawn_npc(db.clone(), world.clone(), system, id, type_id, Some(crate::space::HOSTILE_TO_ALL)).await?;
+        let id = crate::services::combat::npc::spawn(db, world, system, r, corp, pos, ms, Some(crate::space::HOSTILE_TO_ALL)).await?;
         spawned.push(id);
     }
     Ok(spawned)

@@ -5,6 +5,7 @@
 //! implement localisation, data-derived names, or protocol identifiers.
 
 pub(crate) mod gm;
+pub(crate) mod standings;
 
 /// Proxy usurp reason from `carbon/common/script/net/machoNet.py`.
 pub(crate) const SESSION_USURPED: &str = "The user's connection has been usurped on the proxy";

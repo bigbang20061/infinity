@@ -39,10 +39,10 @@ use super::{db_err, keyval, rand01, rand_dir, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
 use crate::consts::{FLAG_CARGO, FLAG_HANGAR, IX_STACK_SIZE, TYPE_SOLAR_SYSTEM};
 use crate::messages;
-use crate::space::{dist, now_ms, Ball, MODE_STOP, V3};
+use crate::space::{dist, now_ms, V3};
 use marshal::Value;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::AtomicI64;
 use std::sync::{Mutex, OnceLock};
 use tracing::info;
 

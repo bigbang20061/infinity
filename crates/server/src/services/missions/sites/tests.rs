@@ -14,17 +14,14 @@ fn candidate_groups_follow_sql_patterns() {
 
 #[test]
 fn faction_candidates_are_preferred_per_class() {
-    let npc = |type_id, name, generic| Npc {
-        type_id, name, generic, radius: 50.0, mass: 1_000_000.0,
-        velocity: None, agility: None,
-    };
     let rows = [
-        npc(1, "Mission Generic Cruiser", true),
-        npc(2, "Mission Caldari Cruiser", false),
-        npc(3, "Mission Generic Frigate", true),
-        npc(4, "Mission Caldari Battle Cruiser", false),
+        ("Mission Generic Cruiser", true),
+        ("Mission Caldari Cruiser", false),
+        ("Mission Generic Frigate", true),
+        ("Mission Caldari Battle Cruiser", false),
     ];
-    assert_eq!(preferred(&rows, "Cruiser").iter().map(|r| r.type_id).collect::<Vec<_>>(), vec![2]);
-    assert_eq!(preferred(&rows, "Frigate").iter().map(|r| r.type_id).collect::<Vec<_>>(), vec![3]);
-    assert!(preferred(&rows, "Destroyer").is_empty());
+    fn candidate<'a>(r: &'a (&'static str, bool)) -> (&'a str, bool) { (r.0, r.1) }
+    assert_eq!(preferred(&rows, "Cruiser", candidate).iter().map(|r| r.0).collect::<Vec<_>>(), vec!["Mission Caldari Cruiser"]);
+    assert_eq!(preferred(&rows, "Frigate", candidate).iter().map(|r| r.0).collect::<Vec<_>>(), vec!["Mission Generic Frigate"]);
+    assert!(preferred(&rows, "Destroyer", candidate).is_empty());
 }
