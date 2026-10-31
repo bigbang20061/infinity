@@ -129,12 +129,12 @@ pub async fn add_lp<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<
     if amount == 0 || corp == 0 {
         return Ok(());
     }
-    let before = lp_balance(db, char_id, corp).await?;
-    if before + amount < 0 {
+    let Some(after) = crate::dao::wallets::loyalty::add(db, char_id, corp, amount).await.map_err(db_err)? else {
+        let before = lp_balance(db, char_id, corp).await?;
         return Err(notify_error(&messages::loyalty_balance_message(before)));
-    }
-    crate::dao::wallets::loyalty::add(db, char_id, corp, amount).await.map_err(db_err)?;
-    outbox.notify_pilot(char_id, "OnLPChange", vec![Value::str("lp"), Value::Int(corp), Value::Int(before), Value::Int(before + amount)]);
+    };
+    let before = after - amount;
+    outbox.notify_pilot(char_id, "OnLPChange", vec![Value::str("lp"), Value::Int(corp), Value::Int(before), Value::Int(after)]);
     Ok(())
 }
 
