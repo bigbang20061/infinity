@@ -47,8 +47,12 @@ pub const TYPE_CAPSULE: i32 = 670;
 pub const GROUP_PLANET: i32 = 7;
 /// SDE invGroups: Asteroid Belt.
 pub const GROUP_ASTEROID_BELT: i32 = 9;
+/// SDE invCategories: Owner.
+pub const CATEGORY_OWNER: i32 = 1;
 /// SDE invCategories: Ship.
 pub const CATEGORY_SHIP: i32 = 6;
+/// SDE invCategories: Module.
+pub const CATEGORY_MODULE: i32 = 7;
 /// SDE invCategories: Charge.
 pub const CATEGORY_CHARGE: i32 = 8;
 /// SDE invCategories: Entity.

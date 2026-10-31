@@ -661,6 +661,29 @@ pub(crate) const MINMATAR_CATEGORY_NAME: &str = "米玛塔尔";
 /// Other faction category.
 pub(crate) const OTHER_FACTION_CATEGORY_NAME: &str = "其他";
 
+// GM per-item dogma overrides.
+pub(crate) const GM_HELP_DOGMA: &str = "/dogma <ship|物品ID|flag:N> <属性ID|名称> [数值|reset]；/dogma <目标> list";
+pub(crate) const GM_DOGMA_USAGE: &str = "用法：/dogma <ship|物品ID|flag:N> <属性ID|名称> [数值|reset]，或 /dogma <目标> list。";
+pub(crate) const GM_DOGMA_NO_SHIP: &str = "没有当前飞船。";
+pub(crate) const GM_DOGMA_SINGLETON: &str = "只能修改单件物品，请使用已组装的单件物品。";
+pub(crate) const GM_DOGMA_FORBIDDEN_TARGET: &str = "不能修改弹药、角色、建筑或 NPC 的属性。";
+pub(crate) const GM_DOGMA_RUNTIME: &str = "此属性由运行状态管理；护盾、装甲和结构请使用 /heal，在线状态请使用模块在线开关。";
+pub(crate) const GM_DOGMA_CHARACTER: &str = "角色属性不能通过 /dogma 修改。";
+pub(crate) const GM_DOGMA_ACTIVE_CYCLE: &str = "运行中的模块不能修改周期属性；请先关闭模块。";
+pub(crate) const GM_DOGMA_VISIBILITY: &str = "模块或船体原本没有的属性不会显示在装配窗口和 HUD 最大值中。";
+pub(crate) const GM_DOGMA_BASE_ONLY: &str = "目标不在当前装配中；仅显示基础值，实际有效值取决于其装配和驾驶员。";
+pub(crate) const GM_DOGMA_EMPTY: &str = "没有属性覆盖。";
+pub(crate) fn gm_dogma_invalid_target(s: &str) -> String { format!("无效的目标：{s}") }
+pub(crate) fn gm_dogma_attribute(s: &str) -> String { format!("未知属性：{s}") }
+pub(crate) fn gm_dogma_ambiguous(s: &str, ids: &str) -> String { format!("属性名称 {s} 不唯一，请使用 ID：{ids}") }
+pub(crate) fn gm_dogma_result(item: i64, attr: &str, id: i32, old_base: f64, new_base: f64, effective: Option<(f64, f64)>, overridden: bool) -> String {
+    let effective = effective.map(|(old, new)| format!("；有效值 {old} → {new}")).unwrap_or_default();
+    format!("物品 {item} 属性 {attr} ({id})：基础值 {old_base} → {new_base}{effective}；覆盖：{}", if overridden { "是" } else { "否" })
+}
+pub(crate) fn gm_dogma_noop(item: i64, id: i32) -> String { format!("物品 {item} 的属性 {id} 没有覆盖，无需重置。") }
+pub(crate) fn gm_dogma_list_item(flag: i32, name: &str, item: i64) -> String { format!("位置 {flag}，{name}，物品 {item}") }
+pub(crate) fn gm_dogma_list_entry(id: i32, value: f64) -> String { format!("  属性 {id}: {value}") }
+
 // Client message-catalogue names
 /// Client message `BkmMustBeInFlight`.
 pub(crate) const MSG_BKM_MUST_BE_IN_FLIGHT: &str = "BkmMustBeInFlight";

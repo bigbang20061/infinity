@@ -51,6 +51,7 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
 - Stopping the server with Ctrl-C or SIGTERM (`docker compose stop`) saves the position of every ship in space before it exits. The server waits at most 10 seconds for these writes.
 - Space movement matches carbonengine destiny only for flight toward a distant point (go-to and align) by ships of ordinary mass. The slow-down on arrival at a near point, approach, orbit, follow, stop, warp alignment and warp flight are approximations, and there are no collisions, so ships do not bump off stations, gates or each other. After an undock bump, an orbit or a warp, other pilots can see a ship somewhere other than where its pilot does, until the next full state update.
 - Balances are stored with up to 36 digits (ISK: 34 integer digits and 2 decimal places; PLEX: 36 integer digits), and the server works with the full value. The client is sent at most the largest balance it displays without scientific notation: 1,000,000,000,000,000,000 ISK for a character wallet, 9,223,372,036,854,774,784 ISK for a corporation wallet, and 99,999,999,999,999 PLEX. ISK reaches the client as a double, so above about 45 trillion ISK it can no longer show every cent.
+- A `/dogma` override changes every value the server computes. The client's fitting window and HUD show it only for an attribute the ship's hull type has; for a module, or a ship attribute the hull type lacks, they keep showing the type's value, while Show Info in space shows the new one. The command's reply says so.
 
 ## Repository layout
 
@@ -196,6 +197,8 @@ UPDATE game.accounts SET role = role | 27021597764489216 WHERE lower(user_name) 
 | `/setplex <count>` | Set your account's PLEX vault balance |
 | `/addplex <count>` | Add PLEX to your account's vault |
 | `/heal` | Repair the ship in space |
+| `/dogma <ship\|itemID\|flag:N> <attribute> [value\|reset]` | Show, set or clear a per-item base value of a dogma attribute (by ID or exact name). Skills and modules still apply on top. Targets are single items only: the active ship, a module fitted at flag `N`, or any singleton item by ID. Runtime state (shield, armor and hull damage, online, charge, quantity, skills) is refused; use `/heal` or the module controls. |
+| `/dogma <target> list` | List the overrides of an item; for `ship`, of the ship and every fitted module |
 | `/help` | List the commands |
 
 ## Releases

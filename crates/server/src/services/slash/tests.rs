@@ -47,3 +47,30 @@ fn exact_balance_clamp_and_echo() {
     assert_eq!(messages::gm_plex_balance("12", None), "vault 12 PLEX");
     assert_eq!(messages::gm_plex_balance("1000", Some(999)), "vault 1000 PLEX (client shows 999)");
 }
+
+#[test]
+fn dogma_grammar() {
+    use dogma::{parse, Action, Target};
+    assert_eq!(parse(&["ship", "list"]), Some((Target::Ship, Action::List)));
+    assert_eq!(parse(&["flag:27", "damageMultiplier", "3"]), Some((Target::Flag(27), Action::Set("damageMultiplier", 3.0))));
+    assert_eq!(parse(&["123", "37"]), Some((Target::Item(123), Action::Query("37"))));
+    assert_eq!(parse(&["ship", "37", "reset"]), Some((Target::Ship, Action::Reset("37"))));
+    for args in [&[][..], &["ship"][..], &["flag:x", "37"][..], &["flag:-1", "37"][..],
+        &["0", "37"][..], &["ship", "", "1"][..], &["ship", "37", "NaN"][..],
+        &["ship", "37", "inf"][..], &["ship", "37", "-inf"][..],
+        &["ship", "37", "x"][..], &["ship", "list", "1"][..], &["ship", "37", "1", "2"][..]] {
+        assert_eq!(parse(args), None, "{args:?}");
+    }
+}
+
+#[test]
+fn dogma_runtime_and_character_attributes_are_denied_for_all_actions() {
+    use dogma::{denied, parse, Action};
+    for args in [&["ship", "skillPoints"][..], &["ship", "skillPoints", "1"][..], &["ship", "skillPoints", "reset"][..]] {
+        let (_, action) = parse(args).unwrap();
+        assert_eq!(match action { Action::Query(a) | Action::Set(a, _) | Action::Reset(a) => a, Action::List => panic!("expected attribute action") }, "skillPoints");
+        assert_eq!(denied(9999, |name, id| name == "skillPoints" && id == 9999), Some(messages::GM_DOGMA_RUNTIME));
+        assert_eq!(denied(164, |_, _| false), Some(messages::GM_DOGMA_CHARACTER));
+        assert_eq!(denied(9999, |_, _| false), None);
+    }
+}

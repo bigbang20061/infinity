@@ -56,3 +56,22 @@ fn operation_and_target_shapes() {
     }
 }
 
+#[test]
+fn hull_override_filter_reset_and_skill_preassignment() {
+    let mut effects = BTreeMap::new();
+    insert_hull_overrides(&mut effects, &[(37, 12.0), (99, 8.0)], |id| id == 37);
+    let t = target("M", OP_PRE_ASSIGN, None);
+    assert_eq!(effects.len(), 1);
+    let encoded = wire(&t, Effect { value: effects[&t].value, skills: Vec::new() }, 42);
+    let Value::Reduce { data, .. } = encoded else { panic!("expected reduce") };
+    let Value::Tuple(parts) = *data else { panic!("expected tuple") };
+    assert!(parts[2].get("skills") == Some(&Value::list([])));
+    assert!(parts[2].get("operation") == Some(&Value::Int(OP_PRE_ASSIGN as i64)));
+    assert_eq!(parts[2].get("value").unwrap().as_float(), Some(12.0));
+    combine(&mut effects, t.clone(), 7.0, 11);
+    assert_eq!(effects[&t].value, 7.0);
+    effects.clear();
+    insert_hull_overrides(&mut effects, &[], |_| true);
+    assert!(effects.is_empty());
+}
+

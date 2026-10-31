@@ -19,3 +19,17 @@ fn unknown_type_uses_attribute_default() {
     assert_eq!(super::base_attribute(None, Some(&null_default), 1), 0.0);
 }
 
+#[test]
+fn node_override_precedence_and_modifier() {
+    use super::{Node, ATTR_SKILL_LEVEL};
+    let mut node = Node { type_id: 1, data_position: None, in_ship: false, online: true, active: false, level: None, overrides: vec![(1, 10.0), (ATTR_SKILL_LEVEL, 99.0)] };
+    let meta = super::Attribute { attribute_id: 1, default_value: Some(7.5), stackable: None };
+    assert_eq!(node.base(None, Some(&meta), 1), 10.0);
+    assert_eq!(node.base(None, None, 2), 0.0);
+    assert_eq!(apply(node.base(None, Some(&meta), 1), &[(6, 25.0, false)]), 12.5);
+    node.level = Some(4);
+    assert_eq!(node.base(None, None, ATTR_SKILL_LEVEL), 4.0);
+    node.overrides.clear();
+    assert_eq!(node.base(None, Some(&meta), 1), 7.5);
+}
+

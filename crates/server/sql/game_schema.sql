@@ -65,6 +65,13 @@ CREATE TABLE IF NOT EXISTS game.items (
 );
 CREATE INDEX IF NOT EXISTS items_location_idx ON game.items (location_id, flag_id);
 CREATE INDEX IF NOT EXISTS items_owner_idx ON game.items (owner_id);
+-- dao/items/dogma: per-item dogma base overrides.
+CREATE TABLE IF NOT EXISTS game.item_attributes (
+    item_id bigint NOT NULL REFERENCES game.items(item_id) ON DELETE CASCADE,
+    attribute_id integer NOT NULL,
+    value double precision NOT NULL,
+    PRIMARY KEY (item_id, attribute_id)
+);
 -- idCheckers.IsPlayerItem: >= 100,000,000; start far above character IDs.
 SELECT setval('game.items_item_id_seq', GREATEST((SELECT max(item_id) FROM game.items), 1000000000000), true);
 
