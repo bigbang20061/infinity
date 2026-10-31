@@ -4,7 +4,6 @@
 //! This DAO has no direct client mirror or wire contract; owning services supply those.
 //! Startup orchestration, transactions, refusals, notifications and World are caller concerns.
 use crate::db::{self, executor::Executor};
-use crate::consts::NPC_BID_RATIO;
 use tokio_postgres::Row;
 const MARKET_SEED: &str = include_str!("../../../sql/market_seed.sql");
 struct Seeded { seeded: bool }
@@ -26,12 +25,12 @@ pub(crate) async fn seed_bids(ex: &(impl Executor + ?Sized)) -> Result<u64, db::
                                                      price, vol_entered, vol_remaining, bid, range, duration)
                      SELECT type_id, station_id, solar_system_id, constellation_id, region_id,
                             GREATEST(round((price * $1::float8)::numeric, 2), 0.01)::float8, 1000000, 1000000, true, 32767, 365
-                     FROM game.market_orders WHERE char_id IS NULL AND NOT bid", &[&NPC_BID_RATIO]).await
+                     FROM game.market_orders WHERE char_id IS NULL AND NOT bid", &[&crate::config::game().market.npc_buy_ratio]).await
 }
 pub(crate) async fn reprice(ex: &(impl Executor + ?Sized)) -> Result<u64, db::Error> {
     ex.execute("UPDATE game.market_orders o
                  SET price = GREATEST(round((r.average * CASE WHEN o.bid THEN $1::float8 ELSE 1 END)::numeric, 2), 0.01)::float8
                  FROM game.retail_prices r
                  WHERE o.char_id IS NULL AND o.type_id = r.type_id AND r.average > 0
-                   AND o.price <> GREATEST(round((r.average * CASE WHEN o.bid THEN $1::float8 ELSE 1 END)::numeric, 2), 0.01)::float8", &[&NPC_BID_RATIO]).await
+                   AND o.price <> GREATEST(round((r.average * CASE WHEN o.bid THEN $1::float8 ELSE 1 END)::numeric, 2), 0.01)::float8", &[&crate::config::game().market.npc_buy_ratio]).await
 }

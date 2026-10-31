@@ -1,28 +1,26 @@
 //! PostgreSQL access for server services using game and SDE tables.
 //! The bounded NoTls pool uses Verified recycling to reject terminated backends
 //! before a statement; Fast can race the connection task and return a termination error.
-//! Failed statements are not retried.
+//! Failed statements are not retried. Startup schema application can be disabled.
 //! Account and market persistence is delegated to the DAO; login and startup policy remain here.
+//! Unknown accounts are registered only when enabled by the development policy.
 
 pub mod executor;
 pub mod outbox;
 pub mod transaction;
 
-use crate::consts::ROLE_PLAYER_LOGIN;
+use crate::config::deployment::{DatabaseConfig, DevelopmentConfig};
+use crate::consts::{GM_ROLES, ROLE_PLAYER_LOGIN};
 use crate::dao::{accounts::authentication, market::startup};
 use anyhow::{Context, Result};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use tokio_postgres::{types::ToSql, NoTls, Row, ToStatement};
-use tracing::info;
+use tracing::{info, warn};
 
 const GAME_SCHEMA: &str = include_str!("../../sql/game_schema.sql");
 
-/// Existing server policy for the first database reconnect delay.
-const RECONNECT_INITIAL_DELAY_SECONDS: u64 = 1;
-/// Existing server policy for the largest database reconnect retry delay.
-const RECONNECT_MAX_RETRY_DELAY_SECONDS: u64 = 16;
 /// Existing server policy for exponential database reconnect backoff.
 const RECONNECT_BACKOFF_FACTOR: u64 = 2;
 
@@ -88,25 +86,32 @@ impl Db {
     }
 
 
-    pub async fn connect(url: &str, pool_size: usize) -> Result<Db> {
-        anyhow::ensure!(pool_size > 0, "DATABASE_POOL_SIZE must be greater than zero");
-        let config = url.parse::<tokio_postgres::Config>().context("parsing PostgreSQL URL")?;
+    pub async fn connect(cfg: &DatabaseConfig) -> Result<Db> {
+        let config = cfg.to_pg_config()?;
+        info!(hosts = ?config.get_hosts(), ports = ?config.get_ports(), user = ?config.get_user(), dbname = ?config.get_dbname(), pool_size = cfg.pool_size, "connecting to PostgreSQL");
         let manager = Manager::from_config(config, NoTls, ManagerConfig { recycling_method: RecyclingMethod::Verified });
-        let pool = Pool::builder(manager).max_size(pool_size).build().context("building PostgreSQL pool")?;
-        let mut delay = RECONNECT_INITIAL_DELAY_SECONDS;
+        let wait_timeout = (cfg.checkout_timeout_secs != 0).then(|| std::time::Duration::from_secs(cfg.checkout_timeout_secs));
+        let pool = Pool::builder(manager).max_size(cfg.pool_size).wait_timeout(wait_timeout).runtime(deadpool_postgres::Runtime::Tokio1).build().context("building PostgreSQL pool")?;
+        let mut delay = Some(cfg.startup_retry_secs[0]);
         let client = loop {
             match pool.get().await {
                 Ok(c) => break c,
-                Err(e) if delay <= RECONNECT_MAX_RETRY_DELAY_SECONDS => {
-                    info!("database not ready ({e}); retrying in {delay}s");
-                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-                    delay *= RECONNECT_BACKOFF_FACTOR;
-                }
-                Err(e) => return Err(e).context("connecting to PostgreSQL"),
+                Err(e) => match delay {
+                    Some(seconds) if seconds <= cfg.startup_retry_secs[1] => {
+                        info!("database not ready ({e}); retrying in {seconds}s");
+                        tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+                        delay = seconds.checked_mul(RECONNECT_BACKOFF_FACTOR);
+                    }
+                    _ => return Err(e).context("connecting to PostgreSQL"),
+                },
             }
         };
         // The initial checkout is retained for schema setup, then returned to the pool.
-        client.batch_execute(GAME_SCHEMA).await.context("applying game schema")?;
+        if cfg.schema_on_start {
+            client.batch_execute(GAME_SCHEMA).await.context("applying game schema")?;
+        } else {
+            warn!("game schema application skipped by configuration");
+        }
         drop(client);
         let db = Db { pool, online: Arc::new(AtomicI64::new(0)) };
         load_retail_prices(&db).await.context("loading retail prices")?;
@@ -137,8 +142,8 @@ impl Db {
         self.online.fetch_add(delta, Ordering::Relaxed);
     }
 
-    /// Verify credentials. Unknown user names are registered on first login.
-    pub async fn login(&self, user_name: &str, password_hash: &[u8]) -> Result<Option<Account>> {
+    /// Verify credentials, optionally registering unknown user names on first login.
+    pub async fn login(&self, user_name: &str, password_hash: &[u8], policy: &DevelopmentConfig) -> Result<Option<Account>> {
         let row = authentication::find(self, user_name).await?;
         let (user_id, role, user_type) = match row {
             Some(r) => {
@@ -148,9 +153,13 @@ impl Db {
                 (r.user_id, r.role, r.user_type)
             }
             None => {
-                let r = authentication::register(self, user_name, password_hash, ROLE_PLAYER_LOGIN).await?;
+                if !policy.auto_register_accounts {
+                    return Ok(None);
+                }
+                let role = ROLE_PLAYER_LOGIN | if policy.auto_register_role == "gm" { GM_ROLES } else { 0 };
+                let r = authentication::register(self, user_name, password_hash, role, crate::config::game().accounts.starting_plex).await?;
                 info!("registered new account {user_name:?}");
-                (r.user_id, ROLE_PLAYER_LOGIN, r.user_type)
+                (r.user_id, role, r.user_type)
             }
         };
         authentication::last_login(self, user_id).await?;

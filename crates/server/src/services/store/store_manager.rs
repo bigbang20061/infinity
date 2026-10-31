@@ -8,9 +8,8 @@ use super::*;
 const PLX: &str = "PLX";
 const TYPE_PLEX: i32 = 44992;
 const PERIOD_DAY: i64 = 1;
-/// The daily free gift: 10,000 skill points.
+/// Protocol offer ID for the daily free gift.
 const DAILY_GIFT_OFFER: i64 = 1;
-const DAILY_GIFT_TYPE: i32 = 52520;
 // ---------------------------------------------------------------- catalogue
 
 struct Category {
@@ -44,7 +43,7 @@ fn service_price(average: Option<f64>, plex_isk: f64, list_price: i64) -> i64 {
 
 async fn build_catalogue(c: &Client) -> Result<Catalogue, CallError> {
     let prices = crate::dao::store::catalogue::prices(&c.db).await.map_err(db_err)?;
-    let plex_isk = prices.get(&TYPE_PLEX).copied().unwrap_or(23_500_000.0);
+    let plex_isk = prices.get(&TYPE_PLEX).copied().unwrap_or(crate::config::game().store.plex_price_isk_fallback);
     let to_plex = |isk: f64| ((isk / plex_isk).round() as i64).max(1);
     let sde = &c.sde;
     let presentation = |type_id: i32| -> Result<(String, String), CallError> {
@@ -71,11 +70,14 @@ async fn build_catalogue(c: &Client) -> Result<Catalogue, CallError> {
     }
 
     // Daily free gift.
-    let (name, image) = presentation(DAILY_GIFT_TYPE)?;
+    let gift = &crate::config::game().store.daily_gift;
+    let type_id = i32::try_from(gift.type_id).map_err(|e| db_err(anyhow::anyhow!("daily gift type out of range: {e}")))?;
+    i32::try_from(gift.quantity).map_err(|e| db_err(anyhow::anyhow!("daily gift quantity out of range: {e}")))?;
+    let (name, image) = presentation(type_id)?;
     cat.offers.push(Offer {
         id: DAILY_GIFT_OFFER,
-        type_id: DAILY_GIFT_TYPE,
-        quantity: 1,
+        type_id,
+        quantity: gift.quantity,
         name,
         image,
         category: 6201,

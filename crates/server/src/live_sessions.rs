@@ -1,7 +1,8 @@
 //! Process-local ownership of live account sessions.
 //!
 //! A replacement cancels the previous registration and waits for its completion
-//! before becoming active. This corresponds to the client's usurp handling in
+//! before becoming active; takeover can instead be disabled to refuse duplicates.
+//! This corresponds to the client's usurp handling in
 //! `carbon/common/script/net/machoNet.py`. The registry contains only in-memory
 //! account state and cannot coordinate sessions across server processes.
 //!
@@ -48,11 +49,14 @@ pub struct Registration {
     cancelled: watch::Receiver<bool>,
 }
 
-/// Atomically install a registration and cancel the previous one, if any.
-pub fn register(account_id: i64) -> Registration {
+/// Atomically install a registration, or refuse an existing account without takeover.
+pub fn register(account_id: i64, takeover: bool) -> Option<Registration> {
+    let mut state = state().lock().expect("live session registry poisoned");
+    if !takeover && state.accounts.contains_key(&account_id) {
+        return None;
+    }
     let (cancelled_tx, cancelled_rx) = watch::channel(false);
     let (completion_tx, completion_rx) = watch::channel(());
-    let mut state = state().lock().expect("live session registry poisoned");
     let id = state.next_id;
     state.next_id = id.checked_add(1).expect("live session registration IDs exhausted");
     let entry = state.accounts.entry(account_id).or_insert_with(|| Entry {
@@ -69,7 +73,7 @@ pub fn register(account_id: i64) -> Registration {
         completion: completion_rx,
         dropped: false,
     });
-    Registration { account_id, id, predecessor, cancelled: cancelled_rx }
+    Some(Registration { account_id, id, predecessor, cancelled: cancelled_rx })
 }
 
 impl Registration {

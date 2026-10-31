@@ -5,7 +5,7 @@
 //! the system: ores by the system's security band, sized in the thousands of m3 each.
 //! Exploration's ore, ice and gas sites get fields of their own (services/exploration).
 //! Rocks are stored in game.asteroids and shrink as they are mined; an emptied belt
-//! grows back after BELT_REGROW_SECS, scheduled on its system actor. Depletion
+//! grows back after the configured regrowth interval, scheduled on its system actor. Depletion
 //! timestamps persist; timers are restored when the system's fields are loaded.
 //!
 //! A mining module runs through combat's activation loop (the `miningLaser` /
@@ -16,8 +16,8 @@
 //! Extraction range uses ship and rock positions sampled at the same system-actor time.
 //!
 //! Reprocessing (the station's bound reprocessingSvc) turns items into their
-//! canonical SDE type materials per portion: a station yield of 50%, raised by Reprocessing,
-//! Reprocessing Efficiency and the item's own processing skill, less a 5% tax in ISK.
+//! canonical SDE type materials per portion: the configured station yield, raised by Reprocessing,
+//! Reprocessing Efficiency and the item's own processing skill, less the configured ISK tax.
 //! Output that exceeds a single stack's capacity is refused without consuming inputs.
 
 mod mining_scan_mgr;
@@ -47,13 +47,6 @@ const SKILL_REPROCESSING_EFFICIENCY: i32 = 3389;
 /// SDE invCategories: asteroid resources.
 const CATEGORY_ASTEROID: i32 = 25;
 const SKILL_SCRAPMETAL: i32 = 12196;
-/// Server policy: an emptied belt grows back after two hours.
-const BELT_REGROW_SECS: i64 = 7200;
-/// NPC station reprocessing: base yield and tax (of the materials' value, in ISK).
-const STATION_EFFICIENCY: f64 = 0.5;
-const STATION_TAX: f64 = 0.05;
-/// The ship mining scanner reaches this far (m).
-const SCAN_RANGE: f64 = 500_000.0;
 
 
 // ---------------------------------------------------------------- fields
@@ -171,24 +164,31 @@ fn rock_radius(field: Field, volume_m3: f64) -> f32 {
     r.clamp(800.0, 25_000.0) as f32
 }
 
+/// Sample the existing half-open generation range; equal endpoints remain fixed.
+fn sample_range(range: [f64; 2], random: f64) -> f64 {
+    range[0] + random * (range[1] - range[0])
+}
+
 /// Grow a field of rocks around `center` and put it in space. Returns the rock IDs.
 pub async fn grow_field(db: &Db, world: &World, system: i64, field_id: i64, center: V3, field: Field, security: f64, jspace: bool) -> Result<Vec<i64>, CallError> {
     let types = field_types(world.sde(), field, security, jspace);
     if types.is_empty() {
         return Ok(vec![]);
     }
-    let count = match field {
-        Field::Ore => 15 + (rand01() * 10.0) as usize,
-        Field::Ice => 6 + (rand01() * 5.0) as usize,
-        Field::Gas => 5 + (rand01() * 4.0) as usize,
+    let policy = &crate::config::game().mining;
+    let count_range = match field {
+        Field::Ore => policy.ore_rocks,
+        Field::Ice => policy.ice_rocks,
+        Field::Gas => policy.gas_clouds,
     };
+    let count = count_range[0] + (rand01() * (count_range[1] - count_range[0]) as f64) as i64;
     let mut ids = vec![];
     for _ in 0..count {
         let (type_id, unit_volume) = types[(rand01() * types.len() as f64) as usize % types.len()];
         let volume = match field {
-            Field::Ore => 4_000.0 + rand01() * 21_000.0,
-            Field::Ice => (300.0 + rand01() * 1_200.0) * unit_volume,
-            Field::Gas => 3_000.0 + rand01() * 12_000.0,
+            Field::Ore => sample_range(policy.ore_rock_m3, rand01()),
+            Field::Ice => sample_range([policy.ice_rock_units[0] as f64, policy.ice_rock_units[1] as f64], rand01()) * unit_volume,
+            Field::Gas => sample_range(policy.gas_cloud_m3, rand01()),
         };
         let quantity = (volume / unit_volume).round().max(1.0) as i64;
         let radius = rock_radius(field, volume);
@@ -237,7 +237,7 @@ pub async fn ensure_fields(db: &Db, world: &Arc<World>, system: i64) -> Result<(
             continue;
         }
         let depleted = crate::dao::asteroids::depleted(db, belt).await.map_err(db_err)?;
-        let regrow_at = depleted.flatten().map(|t| t + BELT_REGROW_SECS * FILETIME_SECOND);
+        let regrow_at = depleted.flatten().map(|t| t.saturating_add(crate::config::game().mining.belt_regrowth_secs.saturating_mul(FILETIME_SECOND)));
         if regrow_at.is_some_and(|t| t > now) {
             world.system(system).await.map_err(CallError::Internal)?;
             schedule_regrow(db.clone(), world.clone(), system, belt, [b.x.expect("belt x"), b.y.expect("belt y"), b.z.expect("belt z")], regrow_at.unwrap_or(now));
@@ -290,7 +290,7 @@ async fn exhaust(db: &Db, world: &Arc<World>, id: i64) -> Result<(), CallError> 
     if let Some(b) = belt {
         let now = filetime_now();
         crate::dao::asteroids::mark_depleted(db, rock.field, now).await.map_err(db_err)?;
-        schedule_regrow(db.clone(), world.clone(), rock.system, rock.field, [b.x.expect("belt x"), b.y.expect("belt y"), b.z.expect("belt z")], now + BELT_REGROW_SECS * FILETIME_SECOND);
+        schedule_regrow(db.clone(), world.clone(), rock.system, rock.field, [b.x.expect("belt x"), b.y.expect("belt y"), b.z.expect("belt z")], now.saturating_add(crate::config::game().mining.belt_regrowth_secs.saturating_mul(FILETIME_SECOND)));
         info!("mining: belt {} in {} mined out", rock.field, rock.system);
     }
     Ok(())

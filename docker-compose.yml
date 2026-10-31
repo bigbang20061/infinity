@@ -30,6 +30,7 @@ services:
     build: .
     image: infinity-rust:latest
     environment:
+      CONFIG: /config.toml
       DATABASE_URL: postgres://infinity:infinity@db/infinity
       RUST_LOG: ${RUST_LOG:-info,infinity_server=debug}
       # Pilots in space per solar system before stargate jumps queue; 0 = no limit.
@@ -42,6 +43,7 @@ services:
       - "26002:26002" # public gateway (gRPC)
       - "80:80"       # content CDN (flatbuffer checkpoints)
     volumes:
+      - ./config.example.toml:/config.toml:ro
       - images:/data/images
     depends_on:
       db:

@@ -21,6 +21,24 @@ fn usurp_exception_roundtrips_with_close_arguments() {
     });
 }
 
+#[test]
+fn refusal_exception_roundtrips_with_reason_code() {
+    let decoded = marshal::loads(&marshal::dumps(&not_accepting_close())).unwrap();
+    assert_eq!(decoded, Value::Reduce {
+        data: Box::new(Value::tuple([
+            Value::global("exceptions.GPSTransportClosed"),
+            Value::tuple([Value::None]),
+            Value::dict([
+                ("reason", Value::None),
+                ("reasonCode", Value::str(crate::messages::ACL_NOTACCEPTING)),
+                ("reasonArgs", Value::Dict(vec![])),
+            ]),
+        ])),
+        list: vec![],
+        dict: vec![],
+    });
+}
+
 #[tokio::test]
 async fn close_stops_reader_and_delivers_eof() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -1,5 +1,6 @@
 //! Contract lifecycle mechanics for contractProxy, mirroring eve/client/script/ui/shared/neocom/contracts.
 //! Uses game contracts and items through database access and immutable SDE types and stations; corporation contracts are unsupported.
+//! Expiry, courier duration, item counts and text lengths use the configured contracts policy.
 
 use super::*;
 use crate::dao::contracts::lifecycle as contract_dao;
@@ -31,9 +32,18 @@ pub(super) async fn create(c: &Client, info: &Value) -> CallResult {
     if assignee == me {
         return Err(notify_error(messages::CONTRACT_SELF_ASSIGNMENT_FORBIDDEN));
     }
-    let minutes = int("minutesExpire").clamp(60, 90 * 1440);
-    let num_days = if kind == TYPE_COURIER { int("numDays").clamp(1, 365) as i32 } else { 0 };
-    let (title, description) = (text("title", 100), text("description", 4000));
+    let policy = &crate::config::game().contracts;
+    let minutes = i128::from(int("minutesExpire")).clamp(
+        i128::from(policy.expiry_min_minutes),
+        i128::from(policy.expiry_max_days) * i128::from(FILETIME_DAY / FILETIME_MINUTE),
+    );
+    let num_days = if kind == TYPE_COURIER {
+        i32::try_from(int("numDays").clamp(policy.courier_min_days, policy.courier_max_days)).unwrap_or(i32::MAX)
+    } else { 0 };
+    let (title, description) = (
+        text("title", usize::try_from(policy.title_max_len).unwrap_or(usize::MAX)),
+        text("description", usize::try_from(policy.description_max_len).unwrap_or(usize::MAX)),
+    );
     let items: Vec<(i64, i64)> = field(info, "itemList")
         .and_then(|v| v.items())
         .unwrap_or(&[])
@@ -63,7 +73,7 @@ pub(super) async fn create(c: &Client, info: &Value) -> CallResult {
         TYPE_ITEM_EXCHANGE if items.is_empty() && requested.is_empty() => return Err(notify_error(messages::ITEM_EXCHANGE_REQUIRES_OFFER_OR_REQUEST)),
         _ => {}
     }
-    if items.len() > MAX_ITEMS || requested.len() > MAX_ITEMS {
+    if items.len() as u128 > policy.max_items as u128 || requested.len() as u128 > policy.max_items as u128 {
         return Err(notify_error(messages::CONTRACT_ITEM_LIMIT_EXCEEDED));
     }
     let multi = truthy(field(info, "multiContract")) && items.len() > 1;
@@ -107,7 +117,7 @@ pub(super) async fn create(c: &Client, info: &Value) -> CallResult {
         let id = contract_dao::insert(db, &contract_dao::NewContract {
             kind, issuer: me, issuer_corp: corp, assignee, start: start_id, end: end_id,
             price, reward, collateral, title, description, num_days,
-            status: STATUS_OUTSTANDING, issued: now, expires: now + minutes * FILETIME_MINUTE,
+            status: STATUS_OUTSTANDING, issued: now, expires: expiry_time(now, minutes),
         }).await.map_err(db_err)?;
         for (item_id, qty) in group {
             if let Some(item) = loaded.remove(item_id) {
@@ -132,6 +142,10 @@ pub(super) async fn create(c: &Client, info: &Value) -> CallResult {
         info!("contracts: {me} created contract {id:?} (type {kind}) at {start_id}");
     }
     Ok(Value::List(created))
+}
+
+fn expiry_time(now: i64, minutes: i128) -> i64 {
+    (i128::from(now) + minutes * i128::from(FILETIME_MINUTE)).min(i128::from(i64::MAX)) as i64
 }
 
 async fn volume(db: &(impl crate::db::executor::Executor + ?Sized), sde: &crate::sde::Sde, id: i64) -> Result<f64, CallError> {

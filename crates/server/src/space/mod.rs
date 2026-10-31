@@ -9,7 +9,8 @@
 //! Only player-piloted ships set the explicit interactive ball field.
 //!
 //! The actor runs wall-aligned 100 ms housekeeping, timers and NPC decisions;
-//! ball kinetics advance in fixed one-second steps. The actor-owned `current_time`
+//! ball kinetics advance in fixed one-second steps. Player and NPC lock timing
+//! is controlled by the combat configuration. The actor-owned `current_time`
 //! is the integer destiny stamp: an action enqueued at C is stamped C and applied
 //! at the next boundary before evolution to C+1. Wire snapshots use whole integer
 //! stamps. Between boundaries `Ball::position_at`, `System::sample_position` and
@@ -75,12 +76,6 @@ const KILOGRAMS_PER_TONNE: f64 = 1000.0;
 const VECTOR_LENGTH_EPSILON: f64 = 1e-9;
 /// Carbonengine Ballpark::GotoDirection projection distance.
 const GOTO_DIRECTION_REACH: f64 = 1e17;
-/// Existing player targeting formula, preserved by D17.
-const LOCK_TIME_FACTOR_SECONDS: f64 = 40_000.0;
-/// Existing player targeting minimum.
-const MIN_LOCK_TIME_SECONDS: f64 = 0.5;
-/// Existing player targeting maximum.
-const MAX_LOCK_TIME_SECONDS: f64 = 60.0;
 /// Existing missing-warp-state serialization default.
 const DEFAULT_WARP_FACTOR: i64 = 3000;
 /// Existing server damage-state placeholder policy.
@@ -153,9 +148,10 @@ pub fn kg_to_tonnes(kg: f64) -> f64 { kg / KILOGRAMS_PER_TONNE }
 pub fn metres_to_km(metres: f64) -> f64 { metres / METRES_PER_KILOMETRE }
 /// Shared player and NPC targeting duration from effective dogma attributes.
 pub fn lock_time_ms(scan_resolution: f64, signature_radius: f64) -> u64 {
+    let combat = &crate::config::game().combat;
     let signature = signature_radius.max(1.0).asinh();
-    seconds_to_ms((LOCK_TIME_FACTOR_SECONDS / (scan_resolution.max(1.0) * signature * signature))
-        .clamp(MIN_LOCK_TIME_SECONDS, MAX_LOCK_TIME_SECONDS))
+    seconds_to_ms((combat.lock_time_factor / (scan_resolution.max(1.0) * signature * signature))
+        .clamp(combat.lock_time_min_secs, combat.lock_time_max_secs))
 }
 
 /// Simulation clock in Unix milliseconds (not a Destiny event stamp).

@@ -11,6 +11,7 @@ mod retail;
 mod chat;
 mod client;
 mod conn;
+mod config;
 mod consts;
 mod dao;
 mod db;
@@ -38,94 +39,16 @@ const FIRST_CLIENT_ID: i64 = 1_000_000_000_000;
 const ONLINE_JOIN_DELTA: i64 = 1;
 /// Server online population counter delta when a session leaves.
 const ONLINE_LEAVE_DELTA: i64 = -1;
-/// Server policy: leave capacity for administrators and tools under PostgreSQL's default 100 connections.
-const DATABASE_POOL_SIZE_DEFAULT: usize = 16;
-/// Server design decision: bound the shutdown position flush to ten seconds.
-const POSITION_FLUSH_TIMEOUT_SECS: u64 = 10;
-
-/// Values the client checks during the handshake; defaults match the
-/// Infinity build 3653293 start.ini and eveMachoNetVersion.machoVersion.
-pub struct Config {
-    pub bind: String,
-    pub database_url: String,
-    pub database_pool_size: usize,
-    pub macho_version: i64,
-    pub boot_version: f64,
-    pub boot_build: i64,
-    pub boot_codename: String,
-    pub boot_region: String,
-    /// Node ID the client sees as its proxy.
-    pub node_id: i64,
-    /// Address clients use to reach this host (chat, image server URLs).
-    pub public_host: String,
-    pub chat_bind: String,
-    /// XMPP domain: users are <charID>@domain, rooms <name>@conference.domain.
-    pub chat_domain: String,
-    pub image_bind: String,
-    pub image_port: u16,
-    pub image_dir: String,
-    /// Where missing NPC portraits, NPC corporation logos and type images are fetched
-    /// from once (empty: never); see images.rs.
-    pub image_upstream: String,
-    pub gateway_bind: String,
-    /// Content CDN (plain HTTP); the client always fetches it on port 80.
-    pub cdn_bind: String,
-    /// Pilots allowed in space per solar system before stargate jumps queue (0 = no limit).
-    pub system_capacity: usize,
-}
-
-fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
-}
-
-impl Config {
-    fn from_env() -> Result<Config> {
-        Ok(Config {
-            bind: env_or("BIND", "0.0.0.0:26000".to_string()),
-            database_url: std::env::var("DATABASE_URL").context("DATABASE_URL is not set")?,
-            database_pool_size: env_or("DATABASE_POOL_SIZE", DATABASE_POOL_SIZE_DEFAULT),
-            macho_version: env_or("MACHO_VERSION", 496),
-            boot_version: env_or("BOOT_VERSION", 24.01),
-            boot_build: env_or("BOOT_BUILD", 3653293),
-            boot_codename: env_or("BOOT_CODENAME", "EVE-RELEASE".to_string()),
-            boot_region: env_or("BOOT_REGION", "optic".to_string()),
-            node_id: env_or("NODE_ID", 888444),
-            public_host: env_or("PUBLIC_HOST", "127.0.0.1".to_string()),
-            chat_bind: env_or("CHAT_BIND", "0.0.0.0:5222".to_string()),
-            chat_domain: env_or("CHAT_DOMAIN", "infinity".to_string()),
-            image_bind: env_or("IMAGE_BIND", "0.0.0.0:26001".to_string()),
-            image_port: env_or("IMAGE_PORT", 26001),
-            image_dir: env_or("IMAGE_DIR", "/data/images".to_string()),
-            image_upstream: env_or("IMAGE_UPSTREAM", "https://images.evetech.net".to_string()),
-            gateway_bind: env_or("GATEWAY_BIND", "0.0.0.0:26002".to_string()),
-            cdn_bind: env_or("CDN_BIND", "0.0.0.0:80".to_string()),
-            system_capacity: env_or("SYSTEM_CAPACITY", 0),
-        })
-    }
-
-    pub fn cdn_url(&self) -> String {
-        format!("http://{}", self.public_host)
-    }
-
-    /// machoNet global config handed to the client (handshake config_vals, GetGlobalConfig).
-    /// banned_words_enabled: the chat window drops every line when the word filter is off
-    /// (bannedwords_client.replace_chat_banned_words returns None); with it on, chat is
-    /// checked against the retail regexes (retail::cached_call bannedwords.fetch_regexes).
-    pub fn global_config(&self) -> marshal::Value {
-        marshal::Value::dict([
-            ("imageserverurl", marshal::Value::str(format!("http://{}:{}/", self.public_host, self.image_port))),
-            ("banned_words_enabled", marshal::Value::str("1")),
-        ])
-    }
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cfg = Arc::new(config::Config::load()?);
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,infinity_server=debug".into()))
+        .with_env_filter(tracing_subscriber::EnvFilter::try_new(&cfg.logging.filter)?)
         .init();
-    let cfg = Arc::new(Config::from_env()?);
-    let db = db::Db::connect(&cfg.database_url, cfg.database_pool_size).await?;
+    info!(source = cfg.source(), "configuration loaded");
+    config::init_game(cfg.game_config())?;
+    let db = db::Db::connect(&cfg.database).await?;
     let sde = Arc::new(sde::Sde::load(&db).await?);
     let types = sde.types.len();
     info!(target: "infinity_server::db", "database ready ({types} types in SDE)");
@@ -136,18 +59,19 @@ async fn main() -> Result<()> {
     if let Err(services::CallError::Internal(e)) = services::unbury_sites(&db, &sde).await {
         tracing::warn!("moving sites out of planets failed: {e:#}");
     }
-    let hub = chat::Hub::new(&cfg.chat_domain);
-    let world = space::World::new(db.clone(), sde.clone(), cfg.system_capacity);
+    let hub = chat::Hub::new(&cfg.chat.domain);
+    let world = space::World::new(db.clone(), sde.clone(), cfg.server.system_capacity);
     tokio::spawn(services::expire_market_orders(db.clone(), sde.clone(), world.clone()));
     tokio::spawn(services::settle_auctions(db.clone(), sde.clone(), world.clone()));
     tokio::spawn(services::run_billing(db.clone(), world.clone()));
-    let gateway_task = tokio::spawn(log_exit("public gateway", gateway::serve(cfg.gateway_bind.clone(), gateway::Gateway::new(db.clone(), cfg.cdn_url()))));
-    let chat_task = tokio::spawn(log_exit("chat", chat::serve(cfg.chat_bind.clone(), hub.clone())));
-    let upstream = images::Upstream::new(&cfg.image_upstream);
-    let image_task = tokio::spawn(log_exit("image server", images::serve("images", cfg.image_bind.clone(), cfg.image_dir.clone().into(), upstream.clone())));
-    let cdn_task = tokio::spawn(log_exit("content cdn", images::serve("cdn", cfg.cdn_bind.clone(), cfg.image_dir.clone().into(), upstream)));
-    let listener = TcpListener::bind(&cfg.bind).await.with_context(|| format!("binding {}", cfg.bind))?;
-    info!("listening on {} (macho {}, build {}, {}@{})", cfg.bind, cfg.macho_version, cfg.boot_build, cfg.boot_codename, cfg.boot_region);
+    let gateway_task = tokio::spawn(log_exit("public gateway", gateway::serve(cfg.gateway.bind.clone(), gateway::Gateway::new(db.clone(), cfg.cdn_url()))));
+    let chat_task = tokio::spawn(log_exit("chat", chat::serve(cfg.chat.bind.clone(), hub.clone())));
+    let upstream = images::Upstream::new(&cfg.images.upstream, cfg.images.upstream_timeout_secs);
+    let upload_limit = cfg.images.upload_limit_bytes();
+    let image_task = tokio::spawn(log_exit("image server", images::serve("images", cfg.images.bind.clone(), cfg.images.dir.clone().into(), upstream.clone(), upload_limit)));
+    let cdn_task = tokio::spawn(log_exit("content cdn", images::serve("cdn", cfg.cdn.bind.clone(), cfg.images.dir.clone().into(), upstream, upload_limit)));
+    let listener = TcpListener::bind(&cfg.server.bind).await.with_context(|| format!("binding {}", cfg.server.bind))?;
+    info!("listening on {} (macho {}, build {}, {}@{})", cfg.server.bind, cfg.server.macho_version, cfg.server.boot_build, cfg.server.boot_codename, cfg.server.boot_region);
 
     #[cfg(unix)]
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -217,7 +141,7 @@ async fn main() -> Result<()> {
     cdn_task.abort();
     let _ = tokio::join!(gateway_task, chat_task, image_task, cdn_task);
     match tokio::time::timeout(
-        std::time::Duration::from_secs(POSITION_FLUSH_TIMEOUT_SECS),
+        std::time::Duration::from_secs(cfg.server.shutdown_flush_timeout_secs),
         world.flush_positions(),
     ).await {
         Ok(Ok(positions_written)) => info!(positions_written, "position snapshot shutdown flush"),
@@ -239,3 +163,6 @@ async fn log_exit(what: &'static str, f: impl std::future::Future<Output = Resul
         error!("{what} stopped: {e:#}");
     }
 }
+
+#[cfg(test)]
+mod tests;

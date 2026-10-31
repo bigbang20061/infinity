@@ -1,6 +1,7 @@
 //! Mission site and NPC mechanics, mirroring agent encounters in
 //! `eve/client/script/ui/shared/agencyNew/` and using startup SDE types and factions.
-//! Sites are transient; authored dungeon layouts and persistent site state are unsupported.
+//! Sites are transient; NPC spawn distances are operator policy. Authored dungeon layouts
+//! and persistent site state are unsupported.
 use super::*;
 use crate::services::sql_pattern::matches_pattern;
 use crate::consts::{ATTR_AGILITY, ATTR_MAX_VELOCITY, CATEGORY_ENTITY};
@@ -97,6 +98,7 @@ pub(super) async fn ensure_site(c: &mut Client, m: &Mission) -> Result<(), CallE
     let level = agent(m.agent_id).map(|a| a.level).unwrap_or(1);
     let tick = now_ms();
     let mut spawned = Vec::new();
+    let [min_range, max_range] = crate::config::game().missions.spawn_range_m;
     for class in spawn_classes(level) {
         let pool = preferred(&rows, class);
         if pool.is_empty() {
@@ -104,7 +106,7 @@ pub(super) async fn ensure_site(c: &mut Client, m: &Mission) -> Result<(), CallE
         }
         let r = pool[(rand01() * pool.len() as f64) as usize % pool.len()];
         let d = rand_dir();
-        let dist = 12_000.0 + rand01() * 20_000.0;
+        let dist = min_range as f64 + rand01() * (max_range as f64 - min_range as f64);
         let pos = [m.pos[0] + d[0] * dist, m.pos[1] + d[1] * dist * 0.3, m.pos[2] + d[2] * dist];
         let ball = Ball {
             id: NEXT_NPC_ID.fetch_add(1, Ordering::Relaxed),

@@ -232,5 +232,3 @@ pub(crate) const CLIENT_MAX_PLEX: i64 = 99_999_999_999_999;
 pub const ACCOUNT_CASH: i32 = 1000;
 /// Client appConst.rentalPeriodOffice, in days.
 pub const RENTAL_DAYS: i64 = 30;
-/// Server market policy: NPC buy orders pay this fraction of the NPC sell price.
-pub const NPC_BID_RATIO: f64 = 0.8;

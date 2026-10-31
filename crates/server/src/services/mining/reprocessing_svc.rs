@@ -51,13 +51,13 @@ async fn quote(c: &Client, char_id: i64, item: &crate::dao::items::loading::Item
     }
     let ids: Vec<_> = materials.iter().map(|m| m.material_type_id).collect();
     let prices: HashMap<_, _> = crate::dao::items::mining::prices(&c.db, &ids).await.map_err(db_err)?.into_iter().map(|p| (p.type_id, p.average)).collect();
-    let efficiency = (STATION_EFFICIENCY * skill_multiplier(c, char_id, item.type_id).await?).min(1.0);
+    let efficiency = (crate::config::game().mining.station_reprocessing_efficiency * skill_multiplier(c, char_id, item.type_id).await?).min(1.0);
     let mut result = Vec::new();
     for r in materials {
         let total = r.quantity.unwrap_or(0).checked_mul(batches as i64).ok_or_else(output_overflow)?;
         let received = (total as f64 * efficiency).floor() as i64;
         if total > 0 {
-            result.push((r.material_type_id, received, total - received, received as f64 * prices.get(&r.material_type_id).copied().unwrap_or(0.0) * STATION_TAX));
+            result.push((r.material_type_id, received, total - received, received as f64 * prices.get(&r.material_type_id).copied().unwrap_or(0.0) * crate::config::game().mining.station_reprocessing_tax));
         }
     }
     let materials = result;
@@ -100,9 +100,9 @@ pub(super) async fn reprocessing(c: &mut Client, call: &Call<'_>) -> CallResult 
                     quotes.push((Value::Int(item.item_id), quote_value(item.item_id, &q)));
                 }
             }
-            Ok(Value::tuple([Value::Float(STATION_TAX), Value::Dict(vec![(Value::None, Value::Float(STATION_EFFICIENCY))]), Value::Dict(quotes)]))
+            Ok(Value::tuple([Value::Float(crate::config::game().mining.station_reprocessing_tax), Value::Dict(vec![(Value::None, Value::Float(crate::config::game().mining.station_reprocessing_efficiency))]), Value::Dict(quotes)]))
         }
-        "GetStationEfficiencyForTypeID" => Ok(Value::Float(STATION_EFFICIENCY)),
+        "GetStationEfficiencyForTypeID" => Ok(Value::Float(crate::config::game().mining.station_reprocessing_efficiency)),
         "GetCharRefiningYieldPercentageForType" => {
             let type_id = call.args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as i32;
             Ok(Value::Float(skill_multiplier(c, char_id, type_id).await?))

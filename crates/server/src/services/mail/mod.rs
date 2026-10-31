@@ -4,8 +4,8 @@
 //! (game.mail_status) with read/replied/forwarded/trashed bits and a label bitmask: Inbox,
 //! Sent, Corporation and Alliance, then the character's own labels (game.mail_labels) at the
 //! higher bits. The client keeps headers and bodies cached and syncs by message ID; bodies
-//! travel zlib-compressed. Mail to a corporation reaches its player members; mailing lists
-//! aren't supported.
+//! travel zlib-compressed. The operator configures the maximum mail title length.
+//! Mail to a corporation reaches its player members; mailing lists aren't supported.
 //!
 //! Notifications (game.notifications) are what other systems post for a character
 //! (`notify`): a type, a sender and YAML data the client's formatter for that type reads.

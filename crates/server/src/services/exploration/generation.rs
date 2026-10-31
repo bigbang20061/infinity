@@ -3,6 +3,7 @@
 //! generated sites are persisted as game state. `eve/client/script/parklife/scanSvc.py:253-260` consumes
 //! scan results, not a position generator. No usable general live-server dungeon-layout
 //! source was validated in the decoded client tree; full layouts are not reproduced.
+//! Mining-site chances and missing wormhole attributes use operator policy.
 
 use super::*;
 
@@ -146,9 +147,10 @@ pub(super) fn wormhole_pair(
         warn!("exploration: no wormhole destination of class {targets:?} from {system}");
         return Ok(None);
     };
-    let life = sde.types.attribute(type_id, ATTR_WH_LIFE_MINUTES).unwrap_or(960.0);
-    let mass = sde.types.attribute(type_id, ATTR_WH_MASS).unwrap_or(1_000_000_000.0);
-    let jump = sde.types.attribute(type_id, ATTR_WH_JUMP_MASS).unwrap_or(300_000_000.0);
+    let policy = &crate::config::game().exploration;
+    let life = sde.types.attribute(type_id, ATTR_WH_LIFE_MINUTES).unwrap_or(policy.wormhole_lifetime_min as f64);
+    let mass = sde.types.attribute(type_id, ATTR_WH_MASS).unwrap_or(policy.wormhole_total_mass_kg as f64);
+    let jump = sde.types.attribute(type_id, ATTR_WH_JUMP_MASS).unwrap_or(policy.wormhole_jump_mass_kg as f64);
     let nebula = |id| sde.map.system(id).and_then(|s| s.region_id)
         .and_then(|id| sde.map.region(id)).and_then(|r| r.nebula_id).unwrap_or(0);
     let born = filetime_now();
@@ -326,10 +328,10 @@ pub(super) fn mining_sites(sde: &Sde, system: i64, info: &SystemInfo, taken: &mu
     for _ in 0..if info.class == 9 { 2 } else { 1 } {
         out.extend(mining_site(sde, system, info, Field::Ore, taken)?);
     }
-    if !jspace && rand01() < 0.3 {
+    if !jspace && rand01() < crate::config::game().exploration.ice_site_chance {
         out.extend(mining_site(sde, system, info, Field::Ice, taken)?);
     }
-    if jspace || info.class != 7 || rand01() < 0.5 {
+    if jspace || info.class != 7 || rand01() < crate::config::game().exploration.gas_site_chance {
         out.extend(mining_site(sde, system, info, Field::Gas, taken)?);
     }
     Ok(out)

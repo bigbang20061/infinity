@@ -1,6 +1,7 @@
 //! charUnboundMgr: character selection and creation before a character is
 //! chosen (loginCharacterselection/charselData.py, eve/client/script/ui/login).
 //! Uses character, account, item and skill DAOs and SDE starting data; appearance is stored without interpretation.
+//! Slot counts, name limits, starting ISK and deletion delay are operator policies.
 
 use crate::dao::{accounts, characters, items, skills};
 use super::{db_err, keyval, trimmed_arg_text, Call, CallError, CallResult};
@@ -11,8 +12,6 @@ use anyhow::Context;
 use marshal::Value;
 use tracing::{info, warn};
 
-/// Server character-selection policy: slots per account.
-const CHARACTER_SLOTS: i64 = 3;
 /// Client chooseNameSection.py valid-name result.
 const NAME_VALID: i64 = 1;
 /// Client chooseNameSection.py short-name result.
@@ -27,12 +26,6 @@ const NAME_TOO_MANY_SPACES: i64 = -6;
 const NAME_CONSECUTIVE_SPACES: i64 = -7;
 /// Client chooseNameSection.py unavailable-name result.
 const NAME_UNAVAILABLE: i64 = -101;
-/// Server name validation policy: minimum character count.
-const MIN_NAME_LENGTH: usize = 3;
-/// Server name validation policy: maximum character count.
-const MAX_NAME_LENGTH: usize = 37;
-/// Server name validation policy: maximum spaces.
-const MAX_NAME_SPACES: usize = 2;
 /// SDE invTypes: Velator, the fallback rookie ship.
 const FALLBACK_ROOKIE_SHIP: i32 = 606;
 /// SDE chrRaces: Caldari, used when the creation argument is missing.
@@ -45,21 +38,18 @@ const RANDOM_NAME_ATTEMPTS: usize = 50;
 const RANDOM_NAME_SUFFIX_START: usize = 100;
 /// Server random-name policy: number of possible suffixes.
 const RANDOM_NAME_SUFFIX_COUNT: usize = 900;
-/// Server starting balance policy, in ISK.
-const STARTING_BALANCE: i64 = 5_000_000;
-/// Server deletion policy: guard against a stray click.
-const BIOMASS_DELAY_SECS: i64 = 30;
 
 fn arg_int(call: &Call<'_>, i: usize) -> Option<i64> {
     call.args.get(i).and_then(|v| v.as_int())
 }
 
 fn name_shape_code(name: &str) -> i64 {
-    let n = name.chars().count();
-    if n < MIN_NAME_LENGTH {
+    let policy = &crate::config::game().characters;
+    let n = name.chars().count() as u128;
+    if n < policy.name_min_len as u128 {
         return NAME_TOO_SHORT;
     }
-    if n > MAX_NAME_LENGTH {
+    if n > policy.name_max_len as u128 {
         return NAME_TOO_LONG;
     }
     if !name.chars().all(|c| c.is_alphanumeric() || c == ' ' || c == '-' || c == '\'') {
@@ -68,7 +58,7 @@ fn name_shape_code(name: &str) -> i64 {
     if name.contains("  ") {
         return NAME_CONSECUTIVE_SPACES;
     }
-    if name.matches(' ').count() > MAX_NAME_SPACES {
+    if name.matches(' ').count() as u128 > policy.name_max_spaces as u128 {
         return NAME_TOO_MANY_SPACES;
     }
     NAME_VALID
@@ -244,8 +234,8 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
         "GetCharacterSelectionData" => {
             let created = accounts::selection::creation_date(&c.db, c.login.user_id, FILETIME_SECOND, FILETIME_UNIX_EPOCH).await.map_err(db_err)?;
             let user = keyval([
-                ("characterSlots", Value::Int(CHARACTER_SLOTS)),
-                ("maxCharacterSlots", Value::Int(CHARACTER_SLOTS)),
+                ("characterSlots", Value::Int(crate::config::game().accounts.character_slots)),
+                ("maxCharacterSlots", Value::Int(crate::config::game().accounts.character_slots)),
                 ("userName", Value::unicode(c.login.user_name.clone())),
                 ("creationDate", Value::Int(created)),
                 ("subscriptionEndTime", Value::Int(FAR_FUTURE)),
@@ -265,7 +255,10 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
         // PrepareCharacterForDelete(charID) -> when it can be deleted (FILETIME).
         "PrepareCharacterForDelete" => {
             let char_id = own_character(c, call).await?;
-            let when = crate::client::filetime_now() + BIOMASS_DELAY_SECS * FILETIME_SECOND;
+            let delay = crate::config::game().characters.delete_delay_secs.checked_mul(FILETIME_SECOND)
+                .ok_or_else(|| CallError::Internal(anyhow::anyhow!("character deletion delay exceeds FILETIME range")))?;
+            let when = crate::client::filetime_now().checked_add(delay)
+                .ok_or_else(|| CallError::Internal(anyhow::anyhow!("character deletion time exceeds FILETIME range")))?;
             characters::selection::prepare_delete(&c.db, char_id, when).await.map_err(db_err)?;
             info!(user = c.login.user_id, "character {char_id} submitted to the biomass queue");
             Ok(Value::Int(when))
@@ -328,7 +321,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
                 user_id: c.login.user_id, name: &name, race_id: race_id as i32, bloodline_id: bloodline_id as i32,
                 gender_id: gender_id as i32, ancestry_id: ancestry_id.map(|v| v as i32), school_id: school_id.map(|v| v as i32),
                 corporation_id: corp, station_id: station, solar_system_id: system, constellation_id: constellation, region_id: region,
-                appearance: &appearance, portrait: &portrait, balance: STARTING_BALANCE,
+                appearance: &appearance, portrait: &portrait, balance: crate::config::game().characters.starting_isk,
             }).await.map_err(db_err)?;
             super::skills::starting::grant_starting_skills(c, char_id, race_id as i32).await?;
             info!(user = c.login.user_id, "created character {name:?} ({char_id}) in station {station}");
@@ -346,3 +339,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

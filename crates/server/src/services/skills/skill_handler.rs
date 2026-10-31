@@ -2,6 +2,7 @@
 //! Uses game.skills, game.skill_queue, game.characters and startup SDE data
 //! through the training and attribute helpers.
 //! History, boosters, implants, penalties and several other calls use fixed answers.
+//! The reported free respec count is an operator policy.
 use super::*;
 use super::attributes::character_attributes;
 use super::training::{skills_dict, queue_list, save_queue};
@@ -50,7 +51,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         (SKILL_HANDLER, "GetSkillHistory") => Ok(Value::list([])),
         (SKILL_HANDLER, "GetPenaltySkillPoints") | (SKILL_HANDLER, "GetDiminishedSpFromInjectors") => Ok(Value::Int(0)),
         (SKILL_HANDLER, "GetRespecInfo") => Ok(keyval([
-            ("freeRespecs", Value::Int(1)),
+            ("freeRespecs", Value::Int(crate::config::game().characters.free_respecs)),
             ("lastRespecDate", Value::None),
             ("nextTimedRespec", Value::Int(filetime_now())),
         ])),

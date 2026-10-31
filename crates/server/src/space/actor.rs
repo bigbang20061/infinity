@@ -5,6 +5,7 @@
 //! Its `interval_at` starts at the next whole Unix 100 ms boundary and uses
 //! `MissedTickBehavior::Skip`. Housekeeping runs every interval; destiny motion
 //! advances only on whole-second boundaries. Mailbox messages never evolve balls.
+//! The operator-configured mailbox budget controls depth warnings.
 //! This module does not decode the client protocol or perform database work
 //! inside the actor; timers and non-position dynamic state are not persistent.
 use super::*;
@@ -19,8 +20,6 @@ const TICK_INTERVAL_MS: u64 = 100;
 const TICK_BUDGET_MS: u64 = 100;
 /// Existing server tick-lateness budget.
 const TICK_LATENESS_BUDGET_MS: u64 = 100;
-/// D6 server mailbox budget.
-const MAILBOX_DEPTH_BUDGET: usize = 10_000;
 
 pub(super) type Job = Box<dyn FnOnce(&mut System) + Send>;
 #[derive(Clone)]
@@ -84,7 +83,7 @@ pub(super) fn start(mut system: System, id: i64, systems: Weak<Mutex<HashMap<i64
                     if lateness > Duration::from_millis(TICK_LATENESS_BUDGET_MS) || duration > Duration::from_millis(TICK_BUDGET_MS) {
                         warn!(system = id, ?duration, ?lateness, "space tick exceeds budget");
                     }
-                    if depth > MAILBOX_DEPTH_BUDGET { warn!(system = id, mailbox_depth = depth, "space mailbox exceeds budget"); }
+                    if depth as u128 > crate::config::game().space.mailbox_budget as u128 { warn!(system = id, mailbox_depth = depth, "space mailbox exceeds budget"); }
                 }
             }
         }

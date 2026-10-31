@@ -283,7 +283,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
     }
     match (call.service, call.method) {
         // Monikers: every bindable service lives on this node.
-        (_, "MachoResolveObject") => Ok(Value::Int(c.cfg.node_id)),
+        (_, "MachoResolveObject") => Ok(Value::Int(c.cfg.server.node_id)),
         (_, "MachoBindObject") => bind_object(c, call).await,
 
 

@@ -1,5 +1,6 @@
 //! Exploration scanning mechanics.
 //! Shared exploration state and data sources are documented in the parent module.
+//! Unresolved scan results use the configured uncertainty floor.
 
 use super::*;
 
@@ -144,7 +145,7 @@ pub(super) fn result_value(s: &Site, certainty: f64, spread: f64) -> Value {
         f.push(("pos", pos_value(s.pos)));
     } else {
         // A sphere of uncertainty around a guess near the site.
-        let radius = (spread * (1.0 - certainty)).max(10_000_000.0);
+        let radius = (spread * (1.0 - certainty)).max(crate::config::game().exploration.scan_uncertainty_floor_m);
         f.push(("data", Value::Float(radius)));
         f.push(("pos", pos_value(offset(s.pos, rand01() * radius * 0.5))));
     }

@@ -64,7 +64,8 @@ pub(super) async fn spawn_site_npcs(c: &mut Client, site: &Site) -> Result<(), C
     } else {
         site_classes(site.difficulty).iter().map(|class| format!("{} {class}", rat_prefix(faction))).collect()
     };
-    let spawned = spawn_rats(c, site.system, site.pos, faction, &groups, (15_000.0, 40_000.0)).await?;
+    let [min, max] = crate::config::game().npc.site_spawn_range_m;
+    let spawned = spawn_rats(c, site.system, site.pos, faction, &groups, (min as f64, max as f64)).await?;
     info!(user = c.login.user_id, "site {} ({}) in {}: spawned {} NPCs", site.target, site.id, site.system, spawned.len());
     if let Some(s) = state().sites.get_mut(&site.id) {
         s.npcs = Some(spawned.clone());
@@ -78,7 +79,7 @@ pub(super) fn track_site_clearance(db: Db, world: Arc<World>, site_id: i64, syst
     let completion_world = world.clone();
     world.post(system, move |s| {
         s.spawn_group(members, move |s| {
-            s.schedule(CLEARED_SITE_LINGER_MS, move |s| {
+            s.schedule(seconds_to_ms(crate::config::game().npc.cleared_site_linger_secs as f64), move |s| {
                 s.defer(async move {
                     if let Err(e) = replace_site(&db, &completion_world, site_id).await {
                         warn!("replacing site {site_id}: {}", err_text(e));

@@ -9,6 +9,7 @@
 //! chat channel. A member's roles are one mask (game.characters.corp_roles) used for all
 //! locations. Static NPC corporations and schools come from the startup SDE. Alliances are
 //! services/alliances; titles, wallet divisions and offices are supported. Shares aren't supported.
+//! The required management skill level and corporation header shares are operator policies.
 
 use super::{db_err, keyval, notify_error, row, rowset, trimmed_arg_text, value_id_list, Call, CallError, CallResult};
 use super::alliances;
@@ -29,8 +30,6 @@ use tracing::info;
 const STARTUP_COST: f64 = 1_599_800.0;
 /// SDE invTypes: Corporation Management skill.
 const SKILL_CORPORATION_MANAGEMENT: i32 = 3363;
-/// Server policy: minimum Corporation Management skill level for founding or leading a corporation.
-const MIN_CORPORATION_MANAGEMENT_LEVEL: i32 = 1;
 /// Client appConst.corpRolePersonnelManager.
 const ROLE_PERSONNEL_MANAGER: i64 = 128;
 /// Server policy: the CEO holds every role.
@@ -63,8 +62,6 @@ const CTV_SET: i64 = 3;
 const TITLE_COUNT: usize = 16;
 /// Server policy: maximum returned historical corporation applications.
 const OLD_APPLICATION_LIMIT: i64 = 100;
-/// Server corporation header policy: initial number of shares.
-const INITIAL_SHARES: i64 = 1000;
 /// Player corporation IDs (idCheckers.IsPlayerCorporation).
 const FIRST_PLAYER_CORP: i64 = 98_000_000;
 
@@ -197,7 +194,7 @@ pub async fn corporation_line(db: &Db, corp: i64) -> Result<Option<Vec<Value>>, 
         Value::None,
         opt(r.alliance_id),
         Value::None,
-        Value::Int(INITIAL_SHARES),
+        Value::Int(crate::config::game().corporations.initial_shares),
         Value::Int(r.member_count),
         Value::Int(CORPORATION_UNLIMITED_MEMBER_LIMIT),
         Value::None,

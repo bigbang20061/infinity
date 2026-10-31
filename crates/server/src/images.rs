@@ -7,8 +7,9 @@
 //! A size that isn't stored is served from the nearest stored size of the same image.
 //! Images of things that exist on CCP's servers under the same IDs (NPC characters such
 //! as agents, NPC corporations, factions, types) are fetched once from the upstream image
-//! server (IMAGE_UPSTREAM) and kept. Player characters, corporations and alliances are
-//! never fetched: their IDs are this server's own.
+//! server (configured upstream) and kept. Player characters, corporations and alliances are
+//! never fetched: their IDs are this server's own. Upload limits and upstream timeouts
+//! are configured at startup.
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
@@ -17,16 +18,12 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
 
-/// Server image-upload size limit, in bytes.
-const MAX_UPLOAD: usize = 8 * 1024 * 1024;
 /// Server-supported image categories from the client image URL convention.
 const KINDS: [&str; 5] = ["Character", "Corporation", "Alliance", "Type", "Render"];
 /// Image sizes offered by the upstream image server, in pixels.
 const SIZES: [u32; 6] = [32, 64, 128, 256, 512, 1024];
 /// Server image policy: character and corporation IDs from here on are local.
 const FIRST_PLAYER_ID: u64 = 90_000_000;
-/// Server upstream image request timeout, in seconds.
-const UPSTREAM_TIMEOUT_SECONDS: u64 = 10;
 /// Upstream type icon maximum size, in pixels.
 const MAX_TYPE_ICON_SIZE: u32 = 64;
 
@@ -35,12 +32,12 @@ const MAX_TYPE_ICON_SIZE: u32 = 64;
 pub struct Upstream(Option<Arc<(String, reqwest::Client)>>);
 
 impl Upstream {
-    pub fn new(base: &str) -> Upstream {
+    pub fn new(base: &str, timeout_secs: u64) -> Upstream {
         let base = base.trim_end_matches('/');
         if base.is_empty() {
             return Upstream(None);
         }
-        let client = reqwest::Client::builder().user_agent("infinity-emulator image cache").timeout(std::time::Duration::from_secs(UPSTREAM_TIMEOUT_SECONDS)).build();
+        let client = reqwest::Client::builder().user_agent("infinity-emulator image cache").timeout(std::time::Duration::from_secs(timeout_secs)).build();
         Upstream(client.ok().map(|c| Arc::new((base.to_string(), c))))
     }
 
@@ -73,7 +70,7 @@ impl Upstream {
 }
 
 /// Serve on `bind`; `name` labels this listener's request log lines ("images", "cdn").
-pub async fn serve(name: &'static str, bind: String, root: PathBuf, upstream: Upstream) -> Result<()> {
+pub async fn serve(name: &'static str, bind: String, root: PathBuf, upstream: Upstream, upload_limit_bytes: usize) -> Result<()> {
     for k in KINDS {
         tokio::fs::create_dir_all(root.join(k)).await?;
     }
@@ -83,7 +80,7 @@ pub async fn serve(name: &'static str, bind: String, root: PathBuf, upstream: Up
         let (stream, peer) = listener.accept().await?;
         let (root, upstream) = (root.clone(), upstream.clone());
         tokio::spawn(async move {
-            if let Err(e) = handle(stream, &root, name, peer, &upstream).await {
+            if let Err(e) = handle(stream, &root, name, peer, &upstream, upload_limit_bytes).await {
                 warn!("{name}: request from {peer} failed: {e:#}");
             }
         });
@@ -154,7 +151,7 @@ async fn find(file: &Path, upstream: &Upstream) -> Option<Vec<u8>> {
     Some(data)
 }
 
-async fn handle(mut stream: TcpStream, root: &Path, name: &'static str, peer: std::net::SocketAddr, upstream: &Upstream) -> Result<()> {
+async fn handle(mut stream: TcpStream, root: &Path, name: &'static str, peer: std::net::SocketAddr, upstream: &Upstream, upload_limit_bytes: usize) -> Result<()> {
     let mut reader = BufReader::new(&mut stream);
     // Read raw bytes: a request line or header may not be UTF-8.
     let mut raw = Vec::new();
@@ -177,14 +174,14 @@ async fn handle(mut stream: TcpStream, root: &Path, name: &'static str, peer: st
     }
     let upload = matches!(method.as_str(), "PUT" | "POST");
     let mut body = Vec::new();
-    if upload && content_length > 0 && content_length <= MAX_UPLOAD {
+    if upload && content_length > 0 && content_length <= upload_limit_bytes {
         body = vec![0u8; content_length];
         reader.read_exact(&mut body).await?;
     }
     drop(reader);
     let req = Req { name, peer, method: &method, path: &path };
-    if upload && (content_length == 0 || content_length > MAX_UPLOAD) {
-        warn!("{name}: {peer} {method} {path}: body of {content_length} bytes rejected (limit {MAX_UPLOAD})");
+    if upload && (content_length == 0 || content_length > upload_limit_bytes) {
+        warn!("{name}: {peer} {method} {path}: body of {content_length} bytes rejected (limit {upload_limit_bytes})");
     }
     if let Some(name) = path.strip_prefix("/content/") {
         return match crate::cdn::content(name.split('?').next().unwrap_or("")) {

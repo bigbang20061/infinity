@@ -251,7 +251,7 @@ async fn found(c: &Client, call: &Call<'_>) -> CallResult {
         return Err(notify_error(messages::CORP_SHORT_NAME_INVALID));
     }
     let skill = crate::dao::skills::levels::level(db, me, SKILL_CORPORATION_MANAGEMENT).await.map_err(db_err)?.unwrap_or(0);
-    if skill < MIN_CORPORATION_MANAGEMENT_LEVEL {
+    if i64::from(skill) < crate::config::game().corporations.min_management_skill_level {
         return Err(notify_error(messages::CORPORATION_MANAGEMENT_SKILL_REQUIRED));
     }
     let (current, _) = membership(db, me).await?;

@@ -124,22 +124,44 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
 
 ## Configuration
 
-The server reads its configuration from environment variables. `docker-compose.yml` sets `DATABASE_URL`, `RUST_LOG` and `SYSTEM_CAPACITY`.
+The server reads `config.toml` from its working directory, or the file named by the `CONFIG` environment variable. Every key is optional: a missing file means the built-in defaults, and `config.example.toml` lists every key with its default and where the default comes from. The file is read once at start; changes need a restart. `docker-compose.yml` mounts `config.example.toml` as `/config.toml` and sets `DATABASE_URL`, `RUST_LOG` and `SYSTEM_CAPACITY`.
 
-| Variable | Default | Meaning |
+A deployment key can also be set by its environment variable, which wins over the file; the file wins over the default. Game keys have no environment variables.
+
+The game sections, `[accounts]` through `[space]`, set the server's own rules: starting balances, fees and taxes, timers, limits, rewards, and spawn ranges and sizes. Their defaults are the values the server used before the file existed. Values the client checks itself, values from the static data, and the destiny physics constants cannot be changed. `characters.starting_isk` accepts 0 to 9,999,999,999,999.99 (an amount with more than 15 significant digits would not be stored exactly); `accounts.starting_plex` accepts 0 to 9,223,372,036,854,775,807.
+
+Start-up stops with an error that names the file and the dotted key when a key is unknown or a value is invalid, including an invalid environment variable. Errors show numbers and `true`/`false` values only; strings such as passwords and connection URLs are never printed. The `configuration loaded` log line names the file (or `defaults`) and the database host, port, user, database name and pool size in use.
+
+| Key | Variable | Default | Meaning |
+|---|---|---|---|
+| `database.url` | `DATABASE_URL` | empty | PostgreSQL connection string or URL. When set, it wins over the five fields below. Keep passwords in the environment, not in the file. |
+| `database.host`, `.port`, `.user`, `.password`, `.name` | `DATABASE_HOST`, `DATABASE_PORT`, `DATABASE_USER`, `DATABASE_PASSWORD`, `DATABASE_NAME` | `127.0.0.1`, `5432`, `infinity`, empty, `infinity` | Connection used when `database.url` is empty |
+| `database.pool_size` | `DATABASE_POOL_SIZE` | `16` | Maximum number of PostgreSQL connections the server opens. Keep it below the server's `max_connections` (PostgreSQL's default is 100), leaving room for tools. |
+| `database.application_name` | | `infinity-server` | Connection name shown in `pg_stat_activity` |
+| `database.connect_timeout_secs` / `.checkout_timeout_secs` | | `5` / `30` | Time limit for one connection attempt, and for waiting for a free pooled connection (`0` = wait forever) |
+| `database.startup_retry_secs` | | `[1, 16]` | First and longest wait between connection attempts at start; the wait doubles |
+| `database.schema_on_start` | | `true` | Apply `game_schema.sql` at every start. With `false` the server skips it and logs a warning; the schema must then already exist. |
+| `server.public_host` | `PUBLIC_HOST` | `127.0.0.1` | Address clients use to reach this host (image server and CDN URLs). Set it when clients are not local. |
+| `server.system_capacity` | `SYSTEM_CAPACITY` | `0` | Pilots in space per solar system before stargate jumps queue (`0` = no limit) |
+| `server.bind` | `BIND` | `0.0.0.0:26000` | machoNet listener |
+| `chat.bind` / `chat.domain` | `CHAT_BIND` / `CHAT_DOMAIN` | `0.0.0.0:5222` / `infinity` | XMPP listener and domain |
+| `images.bind` / `.port` / `.dir` | `IMAGE_BIND` / `IMAGE_PORT` / `IMAGE_DIR` | `0.0.0.0:26001` / `26001` / `/data/images` | Image server listener, the port advertised to clients, and its storage |
+| `images.upstream` | `IMAGE_UPSTREAM` | `https://images.evetech.net` | Where missing NPC, NPC corporation and type images are fetched from once (empty = never) |
+| `gateway.bind` | `GATEWAY_BIND` | `0.0.0.0:26002` | Public gateway listener |
+| `cdn.bind` | `CDN_BIND` | `0.0.0.0:80` | Content CDN listener |
+| `server.macho_version`, `.boot_version`, `.boot_build`, `.boot_codename`, `.boot_region`, `.node_id` | `MACHO_VERSION`, `BOOT_VERSION`, `BOOT_BUILD`, `BOOT_CODENAME`, `BOOT_REGION`, `NODE_ID` | match build 3653293 | Values the client checks during the handshake |
+| `logging.filter` | `RUST_LOG` | `info,infinity_server=debug` | Log filter |
+
+Some keys switch behaviour on or off rather than set a number:
+
+| Key | Default | Effect |
 |---|---|---|
-| `DATABASE_URL` | (required) | PostgreSQL connection string |
-| `DATABASE_POOL_SIZE` | `16` | Maximum number of PostgreSQL connections the server opens. Keep it below the server's `max_connections` (PostgreSQL's default is 100), leaving room for tools. |
-| `PUBLIC_HOST` | `127.0.0.1` | Address clients use to reach this host (image server and CDN URLs). Set it when clients are not local. |
-| `SYSTEM_CAPACITY` | `0` | Pilots in space per solar system before stargate jumps queue (`0` = no limit) |
-| `BIND` | `0.0.0.0:26000` | machoNet listener |
-| `CHAT_BIND` / `CHAT_DOMAIN` | `0.0.0.0:5222` / `infinity` | XMPP listener and domain |
-| `IMAGE_BIND` / `IMAGE_PORT` / `IMAGE_DIR` | `0.0.0.0:26001` / `26001` / `/data/images` | Image server listener, the port advertised to clients, and its storage |
-| `IMAGE_UPSTREAM` | `https://images.evetech.net` | Where missing NPC, NPC corporation and type images are fetched from once (empty = never) |
-| `GATEWAY_BIND` | `0.0.0.0:26002` | Public gateway listener |
-| `CDN_BIND` | `0.0.0.0:80` | Content CDN listener |
-| `MACHO_VERSION`, `BOOT_VERSION`, `BOOT_BUILD`, `BOOT_CODENAME`, `BOOT_REGION`, `NODE_ID` | match build 3653293 | Values the client checks during the handshake |
-| `RUST_LOG` | `info,infinity_server=debug` | Log filter |
+| `development.auto_register_accounts` | `true` | Create an account the first time an unknown name logs in. With `false`, an unknown name is refused like a wrong password. |
+| `development.auto_register_role` | `player` | Roles of accounts created that way: `player`, or `gm` for the GM roles as well |
+| `server.login_takeover` | `true` | A login to an account that is already online replaces the old session. With `false` the new login is refused and the old session stays; the client shows its generic "not accepting connections" message, because it has no "already logged in" message. |
+| `combat.bounty_multiplier` | `1.0` | Scales the ISK paid for NPC kills (`0` = none). Loot and security status gains are unaffected. |
+| `industry.job_time_multiplier` | `1.0` | Scales industry job durations (below 1 is faster). Materials and costs are unchanged; the duration the client shows before a job starts does not include it. |
+| `crimewatch.concord_enabled` | `true` | With `false`, CONCORD does not respond. Criminal flags, timers and security status penalties still apply. |
 
 ## Database
 

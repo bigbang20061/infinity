@@ -162,7 +162,7 @@ pub(super) async fn delete_title(db: &Db, world: &World, me: i64, corp: i64, tit
 
 /// Members other than the CEO with Corporation Management, who could take over.
 pub(super) async fn potential_ceos(db: &Db, corp: i64, ceo: i64) -> Result<Vec<i64>, CallError> {
-    role_dao::potential_ceos(db, corp, ceo, SKILL_CORPORATION_MANAGEMENT, MIN_CORPORATION_MANAGEMENT_LEVEL).await.map_err(db_err)
+    role_dao::potential_ceos(db, corp, ceo, SKILL_CORPORATION_MANAGEMENT, crate::config::game().corporations.min_management_skill_level as i32).await.map_err(db_err)
 }
 
 /// `ResignFromCEO(newCeoID=None)`. Without a successor it returns the members who could be

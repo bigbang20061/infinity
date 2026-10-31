@@ -12,3 +12,19 @@ fn station_preserves_location_and_defaults_null_owner() {
     row.owner_id = Some(50);
     assert_eq!(market_station(&row).owner, 50);
 }
+
+#[test]
+fn broker_fee_applies_minimum_and_rounds() {
+    crate::tests::init_config();
+    assert_eq!(broker_fee(0.03, 10.0), 100.0);
+    assert_eq!(broker_fee(0.03, 4_001.0), 120.03);
+}
+
+#[test]
+fn duration_obeys_policy_and_timestamp_bounds() {
+    crate::tests::init_config();
+    assert!(valid_duration(90, 0));
+    assert!(!valid_duration(91, 0));
+    assert!(!valid_duration(-1, 0));
+    assert!(!valid_duration(1, i64::MAX));
+}

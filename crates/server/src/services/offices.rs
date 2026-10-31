@@ -5,6 +5,7 @@
 //! inventory lists and moves them). Renting again before the period ends extends it;
 //! renewing is billed (services/bills). Station and system data come from the startup SDE;
 //! office records and counts come from game.offices. Impounding is not supported.
+//! Office capacity and security-based rent are operator policies.
 
 use super::corps::is_player_corp;
 use super::{db_err, has_role_or_is_ceo, keyval, notify_error, Call, CallError, CallResult};
@@ -25,16 +26,10 @@ use tracing::info;
 const TYPE_OFFICE: i32 = 27;
 /// Server office item policy: no inventory flag on the station's office item.
 const OFFICE_ITEM_FLAG: i32 = 0;
-/// Offices a station has room for (the live server's capacity never shipped with the client or SDE).
-const STATION_OFFICE_SLOTS: i64 = 24;
 /// appConst.corpRoleCanRentOffice
 const ROLE_CAN_RENT_OFFICE: i64 = 562_949_953_421_312;
 /// Server office rent policy: security used when the station's system is unavailable.
 const DEFAULT_SECURITY: f64 = 0.5;
-/// Server office rent policy: minimum rent in ISK.
-const BASE_RENT: f64 = 100_000.0;
-/// Server office rent policy: additional ISK at security 1.
-const SECURITY_RENT: f64 = 900_000.0;
 /// Server office rent policy: half-ISK tolerance for rounded quotes.
 const QUOTE_TOLERANCE: f64 = 0.5;
 
@@ -45,7 +40,8 @@ pub(super) fn rent_price(sde: &Sde, station: i64) -> f64 {
         .and_then(|id| sde.map.system(id))
         .map(|system| system.security.unwrap_or(0.0))
         .unwrap_or(DEFAULT_SECURITY);
-    (BASE_RENT + SECURITY_RENT * security.clamp(0.0, 1.0)).round()
+    let policy = &crate::config::game().corporations;
+    (policy.office_rent_base_isk + policy.office_rent_per_security_isk * security.clamp(0.0, 1.0)).round()
 }
 
 /// The corporation's office at `station`, if it rents one.
@@ -139,7 +135,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             Err(e) => Err(db_err(e)),
         },
         "GetEmptyOfficeCount" => match offices::count(db, station).await {
-            Ok(count) => Ok(Value::Int((STATION_OFFICE_SLOTS - count).max(0))),
+            Ok(count) => Ok(Value::Int((crate::config::game().corporations.office_slots_per_station - count).max(0))),
             Err(e) => Err(db_err(e)),
         },
         // GetPriceQuote(corpID) -> ISK for one rental period

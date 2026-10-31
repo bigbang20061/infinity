@@ -31,8 +31,6 @@ const LABEL_CORPORATION: i32 = 4;
 const FIRST_CUSTOM_LABEL: i32 = 16;
 /// Client appConst.mailMaxRecipients.
 const MAX_RECIPIENTS: usize = 50;
-/// Server mail policy: maximum title characters.
-const MAX_MAIL_TITLE_LENGTH: usize = 150;
 /// Server mail policy: first custom-label bit position.
 const FIRST_CUSTOM_LABEL_BIT: u32 = 4;
 /// Server mail policy: exclusive upper custom-label bit position.
@@ -84,7 +82,7 @@ async fn send(c: &Client, call: &Call<'_>) -> CallResult {
     let to_chars = value_id_list(call.args.first());
     let to_list = call.args.get(1).and_then(|v| v.as_int());
     let to_corp = call.args.get(2).and_then(|v| v.as_int());
-    let title = value_text(call.args.get(3), MAX_MAIL_TITLE_LENGTH);
+    let title = value_text(call.args.get(3), usize::try_from(crate::config::game().mail.title_max_len).unwrap_or(usize::MAX));
     let body = call.args.get(4).and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
     let (reply_to, forwarded_from) = (call.args.get(5).and_then(|v| v.as_int()).unwrap_or(0), call.args.get(6).and_then(|v| v.as_int()).unwrap_or(0));
     if to_list.is_some() {
