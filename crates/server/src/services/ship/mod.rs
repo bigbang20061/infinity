@@ -5,10 +5,14 @@
 //! data come from the SDE; locations are persisted in game tables.
 //! Ship shield, armor and hull condition are persisted in item dogma overrides.
 //!
-//! Movement commands apply at destiny boundaries; jump waits and arrival cloak
-//! expiry use the actor tick. Gate range and live warp targets use positions
-//! sampled at the system actor's time. GOTO stores an absolute point; direction
-//! commands project a point from the current position and send the raw direction.
+//! Movement commands apply at destiny boundaries; jump and docking waits and arrival cloak
+//! expiry use the actor tick. During the four-second jump wait, the source ballpark
+//! receives jump-out effects before the session changes. In-range docking stops and
+//! uncloaks the ship, sends acceptance, then waits 5.5 seconds while forwarding destiny
+//! before persisting condition and changing session. Docking and gate ranges, as well as
+//! live warp targets, use positions sampled at the system actor's time. GOTO stores an
+//! absolute point; direction commands project a point from the current position and send
+//! the raw direction.
 //! Carbonengine `Ballpark::WarpTo` (`Ballpark.cpp:4102-4113`) falls back to
 //! GotoPoint with no WarpFX when the raw destination is strictly below 100 km;
 //! exactly 100 km takes the full-warp path. Exit callbacks are transient and
@@ -32,6 +36,12 @@ use tracing::{info, warn};
 
 /// Server gameplay policy: minimum clearance from an object when warping to it (m).
 const MIN_OBJECT_WARP_CLEARANCE: f64 = 2500.0;
+
+/// Docking interaction range in metres (`menusvc.DEFAULT_INTERACTION_RANGE`).
+const DOCKING_RANGE: f64 = 2500.0;
+
+/// Docking acceptance delay in milliseconds (`appConst.invulnerabilityDocking`).
+const DOCK_DELAY_MS: u64 = 5500;
 
 fn required<T>(value: Option<T>, field: &str) -> Result<T, CallError> {
     value.ok_or_else(|| CallError::Internal(anyhow::anyhow!("missing SDE {field}")))
@@ -163,6 +173,23 @@ async fn dock(c: &mut Client, station: i64) -> CallResult {
         return Err(CallError::User { msg: messages::MSG_DOCKING_REQUEST_DENIED.into(), dict: vec![] });
     };
     check_weapons_timer(c, messages::WEAPONS_TIMER_DOCK)?;
+    let gap = c.world.with(system, move |s| {
+        let (b, station) = (s.ball(ship)?, s.ball(station)?);
+        Some(space::dist(b.position_at(s.now_ms()), station.position_at(s.now_ms()))
+            - b.radius as f64 - station.radius as f64)
+    }).await.flatten();
+    if gap.is_none_or(|g| g > DOCKING_RANGE) {
+        return Err(CallError::User { msg: messages::MSG_DOCKING_REQUEST_DENIED.into(), dict: vec![] });
+    }
+    c.world.command(system, ship, |b, t, _| {
+        b.stop();
+        vec![event(t, "Stop", vec![Value::Int(b.id)])]
+    });
+    c.world.uncloak(system, ship).await;
+    c.notify("OnDockingAccepted", vec![Value::Int(station)]);
+    if !c.wait_pumping(system, DOCK_DELAY_MS).await.map_err(CallError::Internal)? {
+        return Err(CallError::Internal(anyhow::anyhow!("system actor stopped during docking wait")));
+    }
     super::combat::reset(c);
     remove_and_save(c, system, ship).await?;
     c.world.unobserve(c.login.client_id);

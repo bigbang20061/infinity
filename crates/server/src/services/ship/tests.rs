@@ -104,3 +104,53 @@ fn stale_warp_snapshot_has_no_side_effects_and_can_retry() {
     s.tick(14_000);
     assert_eq!(s.ball(123).unwrap().mode, MODE_WARP);
 }
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
+async fn docking_checks_surface_range_before_accepting() {
+    use std::sync::Arc;
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
+    let world = space::World::new(db.clone(), sde.clone(), 1);
+    let system = -1;
+    world.system(system).await.unwrap();
+    let cfg = Arc::new(crate::config::Config::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+    let (stream, address) = listener.accept().await.unwrap();
+    let login = crate::handshake::Login { user_id: 1, user_name: "test".into(), role: 0, client_id: 1, session_id: 1, language_id: "EN".into() };
+    let chat = crate::chat::Hub::new(&cfg.chat.domain);
+    let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg, db, sde, chat, world.clone(), login);
+    client.session.apply(vec![("solarsystemid", Value::Int(system)), ("shipid", Value::Int(123))]);
+    let mut vessel = ship();
+    vessel.mode = MODE_STOP;
+    vessel.pos = [0.0; 3];
+    vessel.old_pos = vessel.pos;
+    vessel.vel = [0.0; 3];
+    vessel.old_vel = vessel.vel;
+    vessel.segment_acceleration = None;
+    let mut station = vessel.clone();
+    station.id = 456;
+    station.radius = 1000.0;
+    station.pos = [3551.0, 0.0, 0.0];
+    station.old_pos = station.pos;
+    world.with(system, move |s| { s.insert(vessel); s.insert(station); }).await.unwrap();
+    for target in [999, 456] {
+        assert!(matches!(dock(&mut client, target).await, Err(CallError::User { msg, .. }) if msg == messages::MSG_DOCKING_REQUEST_DENIED));
+    }
+    world.with(system, |s| {
+        let mut station = s.ball(456).unwrap().clone();
+        station.pos = [3550.0, 0.0, 0.0];
+        station.old_pos = station.pos;
+        s.insert(station);
+    }).await.unwrap();
+    let docking = dock(&mut client, 456);
+    tokio::pin!(docking);
+    let frame = tokio::select! {
+        _ = &mut docking => panic!("docking finalized before acceptance delay"),
+        frame = tokio::time::timeout(std::time::Duration::from_secs(2), crate::framing::read_frame(&mut peer)) => frame.unwrap().unwrap().unwrap(),
+    };
+    let packet = crate::macho::Packet::from_value(&marshal::loads(&frame.payload).unwrap()).unwrap();
+    assert!(matches!(packet.destination, crate::macho::Address::Broadcast { broadcast_id, .. } if broadcast_id.as_text().as_deref() == Some("OnDockingAccepted")));
+}
