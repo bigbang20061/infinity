@@ -3,6 +3,9 @@
 //! Subject authorization is shared by activation, deactivation, analyzers and online changes.
 //! Projected effects require a locked, present target and use transient system state;
 //! later-wave behavior families are refused and resource fitting policy is not implemented.
+//! Accepted running activations cancel arrival jump cloak; online changes are not cycles.
+//! A non-targeted module's first-cycle FX may be unseen by observers until the next
+//! destiny boundary applies the queued uncloak (under one second); gameplay is unaffected.
 use super::{EffectKind, registry, unsupported, repair, mining, capacitor, projected, range};
 use super::registry::{Effect, EffectAttribute, EffectFlag};
 use super::notify::{attribute_change, fire_fx, ship_effect};
@@ -640,6 +643,8 @@ pub(crate) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
         st.active.insert(item_id, ActiveModule { char_id: cx.char_id, stop: stop.clone(), forced_inactive: false });
         st.activation_generation.insert(item_id, stop.clone());
     }
+    let ship = cx.ship_id;
+    cx.world.post(cx.system_id, move |s| { s.drop_jump_cloak(ship); });
     let owner = ActivationOwner { master: item_id, generation: stop.clone(), armed: true };
     ship_effect(&cx, item_id, effect.id, target, other.clone(), true, filetime_now(), duration_ms, repeat);
     info!(user = c.login.user_id, "module {item_id} activated {effect_name} on {target:?} (x{}, {duration_ms:.0} ms, repeat {repeat})", modules.len());

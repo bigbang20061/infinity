@@ -4,6 +4,7 @@
 //! reservations and actor deadlines that do not precede the advertised FILETIME.
 //! Automatic reload searches only ship cargo.
 //! Reload timer markers are memory-only; newer starts return older reservations, and startup recovery returns pending charges rather than resuming timers.
+//! Accepted targeting attempts cancel arrival jump cloak before the lock timer.
 use super::*;
 
 // ---------------------------------------------------------------- targeting
@@ -38,6 +39,7 @@ pub(super) async fn add_target(c: &mut Client, target: i64) -> CallResult {
     let delay = lock_time_ms(fit.value(Key::Ship, ATTR_SCAN_RESOLUTION), attr(cx.world.sde(), t.type_id, ATTR_SIGNATURE_RADIUS, t.radius as f64));
     let attempt = NEXT_LOCK.fetch_add(1, Ordering::Relaxed);
     state().locking.insert((cx.char_id, target), attempt);
+    cx.world.post(cx.system_id, move |s| { s.drop_jump_cloak(ship_id); });
     debug!(user = c.login.user_id, "locking {target} in {delay}ms");
     let current = targets_of(cx.char_id);
     let world = cx.world.clone();
