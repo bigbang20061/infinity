@@ -16,7 +16,7 @@ pub(crate) fn gm_rows_truncated(count: usize) -> String { format!("另有 {count
 /// Teleport command help.
 pub(crate) const GM_HELP_TELEPORT: &str = "/tr me <itemID|characterID|solarSystemID|stationID|celestialID> — teleport";
 /// Wormhole command help.
-pub(crate) const GM_HELP_WORMHOLE: &str = "/wh — teleport next to a wormhole (scanned down for you)";
+pub(crate) const GM_HELP_WORMHOLE: &str = "/wh [status|ensure|random|clear] — 虫洞操作；无参数时前往虫洞";
 /// Scan-all command help.
 pub(crate) const GM_HELP_SCAN_ALL: &str = "/scanall — scan every signature in this system to 100%";
 /// Site listing command help.
@@ -203,3 +203,12 @@ pub(crate) const GM_DAMAGE_SET: &str = "舰船损伤已设置。";
 pub(crate) fn gm_npc_spawned(count: usize) -> String { format!("已生成 {count} 个NPC。") }
 pub(crate) fn gm_npc_cleared(count: usize) -> String { format!("已移除 {count} 个GM生成的NPC。") }
 pub(crate) fn gm_debris_spawned(id: i64) -> String { format!("已生成太空物体 {id}。") }
+// Wormhole administration.
+pub(crate) const GM_WH_USAGE: &str = "用法：/wh status|ensure|clear [here] 或 /wh random [数量] [here]";
+pub(crate) const GM_WH_NONE: &str = "当前星系没有可用虫洞。";
+pub(crate) const GM_WH_ENSURED: &str = "当前星系已有可用虫洞。";
+pub(crate) fn gm_wh_status_row(target: &str, type_id: i32, dest_system: i64, dest_class: i64, mass_used: f64, mass_max: f64) -> String {
+    format!("{target} 类型 {type_id} → 星系 {dest_system}（等级 {dest_class}），质量 {mass_used:.0}/{mass_max:.0} 千克")
+}
+pub(crate) fn gm_wh_created(count: usize) -> String { format!("已创建 {count} 个虫洞连接。") }
+pub(crate) fn gm_wh_cleared(count: usize) -> String { format!("已清除 {count} 个虫洞连接。") }

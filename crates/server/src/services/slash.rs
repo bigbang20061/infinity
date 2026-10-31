@@ -35,6 +35,7 @@ mod skills;
 mod items;
 mod npc;
 mod combat;
+mod wormholes;
 
 /// Server design: clearance in metres when teleporting to an item.
 const TELEPORT_CLEARANCE: f64 = 5000.0;
@@ -52,6 +53,7 @@ const LIST_ROW_LIMIT: usize = 50;
 const COMMANDS: &[(&str, &str)] = &[
     ("tr", messages::gm::GM_HELP_TELEPORT),
     ("wh", messages::gm::GM_HELP_WORMHOLE),
+    ("wormhole", messages::gm::GM_HELP_WORMHOLE),
     ("scanall", messages::gm::GM_HELP_SCAN_ALL),
     ("sites", messages::gm::GM_HELP_SITES),
     ("create", messages::gm::GM_HELP_CREATE),
@@ -307,7 +309,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     info!(user = c.login.user_id, "slash: /{line}");
     let result = match command.as_str() {
         "tr" => tr(c, args).await,
-        "wh" | "wormhole" => super::exploration::gm_wormhole(c).await,
+        "wh" | "wormhole" => wormholes::command(c, &command, args).await,
         "scanall" => super::exploration::gm_scan_all(c).await,
         "sites" => super::exploration::gm_sites(c).await,
         "create" | "createitem" => create(c, args).await,

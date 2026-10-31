@@ -34,3 +34,31 @@ fn hacking_prefers_archetype_before_random_and_only_then_falls_back() {
     assert!(!hack_name("Local Site: Annex", "Local"));
     assert!(!hack_name("Locally Site", "Local"));
 }
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL and loaded SDE"]
+async fn far_targets_reserve_persisted_and_batch_allocations() {
+    let mut config = crate::config::tests::test_database();
+    config.schema_on_start = false;
+    let db = Db::connect(&config).await.expect("database pool");
+    let sde = Sde::load(&db).await.expect("loaded SDE");
+    let _guard = load_lock().lock().await;
+    let system = *sde.dungeons.systems_of_class(7).first().expect("known-space system");
+    let mut here_targets = HashSet::new();
+    let mut destinations = HashMap::new();
+    let mut allocated: HashMap<i64, HashSet<String>> = HashMap::new();
+    for _ in 0..64 {
+        let (_, far) = match wormhole_pair(&db, &sde, system, 7, &[1, 2, 3, 4, 5, 6], &mut here_targets, &mut destinations).await {
+            Ok(Some(pair)) => pair,
+            _ => panic!("wormhole destination required"),
+        };
+        let persisted = crate::dao::exploration::sites(&db, far.system).await.unwrap();
+        let reserved = destinations.get(&far.system).expect("destination reservation");
+        assert!(reserved.contains(&far.target));
+        for site in persisted {
+            assert_ne!(site.target, far.target);
+            assert!(reserved.contains(&site.target));
+        }
+        assert!(allocated.entry(far.system).or_default().insert(far.target));
+    }
+}

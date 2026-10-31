@@ -35,10 +35,10 @@
 //! - beyonce.CmdWarpToStuff('scan', targetID); wormholeMgr.WormholeJump(wormholeID).
 
 mod scan_mgr;
-mod wormhole_mgr;
+pub(crate) mod wormhole_mgr;
 mod generation;
 mod scanning;
-mod sites;
+pub(crate) mod sites;
 mod landing;
 
 use generation::*;
