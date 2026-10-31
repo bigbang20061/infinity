@@ -6,6 +6,8 @@
 //!
 //! Celestials come from the SDE; dynamic balls and timers are transient. Changed
 //! pilot positions are periodically saved to `game.items` and flushed at shutdown.
+//! Pilot presence is process-local and uses live notification channels; it does not
+//! coordinate presence across server processes.
 //! Only player-piloted ships set the explicit interactive ball field.
 //!
 //! The actor runs wall-aligned 100 ms housekeeping, timers and NPC decisions;
@@ -456,6 +458,10 @@ impl Pilots {
         self.notify.lock().unwrap().get(&char_id).is_some_and(|tx| !tx.is_closed())
     }
 
+    pub fn online_pilots(&self) -> Vec<i64> {
+        self.notify.lock().unwrap().iter().filter_map(|(&id, tx)| (!tx.is_closed()).then_some(id)).collect()
+    }
+
     pub fn notify_pilot(&self, char_id: i64, event: &str, args: Vec<Value>) {
         if let Some(tx) = self.notify.lock().unwrap().get(&char_id) {
             let _ = tx.send((event.to_string(), args));
@@ -544,6 +550,7 @@ impl World {
     pub fn register_pilot(&self, char_id: i64, tx: NotifyTx) { self.pilots.register_pilot(char_id, tx); }
     pub fn unregister_pilot(&self, char_id: i64) { self.pilots.unregister_pilot(char_id); }
     pub fn is_online(&self, char_id: i64) -> bool { self.pilots.is_online(char_id) }
+    pub fn online_pilots(&self) -> Vec<i64> { self.pilots.online_pilots() }
     pub fn notify_pilot(&self, char_id: i64, name: &str, args: Vec<Value>) { self.pilots.notify_pilot(char_id, name, args); }
     /// Start the destination before removing a jumping ship from its source.
     /// Construction is serialized with the live-handle check.

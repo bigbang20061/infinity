@@ -1,6 +1,32 @@
 use super::*;
 
 #[test]
+fn presence_tracks_live_replaced_and_removed_channels() {
+    let pilots = Pilots::default();
+    let (first, first_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (closed, closed_rx) = tokio::sync::mpsc::unbounded_channel();
+    pilots.register_pilot(1, first);
+    pilots.register_pilot(2, closed);
+    drop(closed_rx);
+    assert!(pilots.is_online(1));
+    assert!(!pilots.is_online(2));
+    assert_eq!(pilots.online_pilots(), vec![1]);
+    let (replacement, replacement_rx) = tokio::sync::mpsc::unbounded_channel();
+    pilots.register_pilot(1, replacement);
+    drop(first_rx);
+    assert!(pilots.is_online(1));
+    assert_eq!(pilots.online_pilots(), vec![1]);
+    drop(replacement_rx);
+    assert!(!pilots.is_online(1));
+    assert!(pilots.online_pilots().is_empty());
+    let (new_tx, _new_rx) = tokio::sync::mpsc::unbounded_channel();
+    pilots.register_pilot(1, new_tx);
+    pilots.unregister_pilot(1);
+    assert!(!pilots.is_online(1));
+    assert!(pilots.online_pilots().is_empty());
+}
+
+#[test]
 fn integrate_zero_time_preserves_state_before_division() {
     let position = [1.0, -2.0, 3.0];
     let velocity = [4.0, 5.0, -6.0];

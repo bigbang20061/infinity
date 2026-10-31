@@ -227,6 +227,7 @@ impl Client {
         if let Some(char_id) = self.session.int("charid") {
             services::fleet_logged_off(&self.world, char_id);
             self.world.unregister_pilot(char_id);
+            services::online_status::presence_changed(&self.db, &self.world, char_id, false).await;
         }
         let trade_result = services::trade::on_leave(self).await.map_err(|error| match error {
             services::CallError::Internal(error) => error,

@@ -7,6 +7,7 @@ use crate::consts::{ATTR_STRUCTURE_HP, FILETIME_SECOND, FILETIME_UNIX_EPOCH, TYP
 use marshal::Value;
 
 mod char_mgr;
+mod contacts;
 mod paper_doll_server;
 mod corporation_svc;
 mod repair_svc;

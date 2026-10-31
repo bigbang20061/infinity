@@ -1,7 +1,6 @@
-//! Character public information, asset lists and private notes for `charMgr`.
-//! Uses `game.characters`, `game.items`, `game.market_orders` and `game.char_notes`
-//! through DAOs, and startup SDE station data. Contacts and other unmodelled
-//! answers use the fixed-answer table.
+//! Character public information, assets, private notes and personal contacts for `charMgr`.
+//! Mirrors `addressbookService.py`; uses character, item, contact and block DAOs and SDE.
+//! Contact labels and other unmodelled answers are not managed here.
 use super::*;
 
 async fn public_info(c: &Client, id: i64) -> Result<Value, CallError> {
@@ -57,6 +56,13 @@ async fn home_station_row(c: &Client, me: i64) -> CallResult {
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     let me = char_id(c);
     Some(match (call.service, call.method) {
+        ("charMgr", "GetContactList") => contacts::list(c, call.args).await,
+        ("charMgr", "AddContact") => contacts::add_edit(c, call.args, false).await,
+        ("charMgr", "EditContact") => contacts::add_edit(c, call.args, true).await,
+        ("charMgr", "EditContactsRelationshipID") => contacts::batch(c, call.args, contacts::Batch::Relationship).await,
+        ("charMgr", "DeleteContacts") => contacts::batch(c, call.args, contacts::Batch::Delete).await,
+        ("charMgr", "BlockOwners") => contacts::batch(c, call.args, contacts::Batch::Block(true)).await,
+        ("charMgr", "UnblockOwners") => contacts::batch(c, call.args, contacts::Batch::Block(false)).await,
         ("charMgr", "GetPublicInfo") => {
             let id = call.args.first().and_then(|v| v.as_int()).unwrap_or(me);
             public_info(c, id).await
