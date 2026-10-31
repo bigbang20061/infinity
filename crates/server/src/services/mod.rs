@@ -43,6 +43,7 @@ pub(crate) mod mail;
 pub(crate) mod market;
 mod npe;
 mod offices;
+pub(crate) mod online_status;
 mod orgs;
 mod mining;
 mod missions;
@@ -382,6 +383,9 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
                 return r;
             }
             if let Some(r) = fixed::social(call) {
+                return r;
+            }
+            if let Some(r) = online_status::dispatch(c, call).await {
                 return r;
             }
             if let Some(r) = character::dispatch(c, call).await {

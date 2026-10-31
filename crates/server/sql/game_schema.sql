@@ -90,6 +90,21 @@ CREATE TABLE IF NOT EXISTS game.char_notes (
     note    text NOT NULL,
     PRIMARY KEY (char_id, item_id)
 );
+-- dao/characters/contacts: independent personal contacts and blocked owners.
+CREATE TABLE IF NOT EXISTS game.char_contacts (
+    char_id bigint NOT NULL,
+    contact_id bigint NOT NULL,
+    relationship real NOT NULL,
+    in_watchlist boolean NOT NULL,
+    label_mask bigint NOT NULL DEFAULT 0,
+    PRIMARY KEY (char_id, contact_id)
+);
+CREATE INDEX IF NOT EXISTS char_contacts_contact_idx ON game.char_contacts (contact_id, char_id);
+CREATE TABLE IF NOT EXISTS game.char_blocked (
+    char_id bigint NOT NULL,
+    owner_id bigint NOT NULL,
+    PRIMARY KEY (char_id, owner_id)
+);
 -- The activities window's auto-popup setting (activityMgr pop state; 0 opens it at login).
 ALTER TABLE game.characters ADD COLUMN IF NOT EXISTS activities_pop_state integer NOT NULL DEFAULT 1;
 

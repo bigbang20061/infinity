@@ -2,6 +2,7 @@
 //! chosen (loginCharacterselection/charselData.py, eve/client/script/ui/login).
 //! Uses character, account, item and skill DAOs and SDE starting data; appearance is stored without interpretation.
 //! Slot counts, name limits, starting ISK and deletion delay are operator policies.
+//! Selecting a character registers process-local presence; appearance editing is not interpreted here.
 
 use crate::dao::{accounts, characters, items, skills};
 use super::{db_err, keyval, trimmed_arg_text, Call, CallError, CallResult};
@@ -222,6 +223,7 @@ async fn select_character(c: &mut Client, char_id: i64) -> Result<(), CallError>
         c.world.add_ship(system, ball).await.map_err(CallError::Internal)?;
     }
     c.world.register_pilot(char_id, c.notify_tx.clone());
+    super::online_status::presence_changed(&c.db, &c.world, char_id, true).await;
     let role = c.session.int("role").unwrap_or(0);
     c.chat.set_profile(char_id, &r.name, r.gender_id as i64, corp, alliance, None, role);
     info!(user = c.login.user_id, "character {char_id} entering game at station {station:?} / system {system}");

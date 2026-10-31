@@ -1,8 +1,9 @@
 //! Constant replies for unmodelled remote services.
 //! Mirrors client remote-service calls; no database or state is accessed.
-//! Stateful and argument-dependent services are handled by their feature modules.
+//! Stateful and argument-dependent services are handled by their feature modules;
+//! personal contact label management is unsupported.
 
-use super::{keyval, notify_error, rowset, Call, CallResult};
+use super::{notify_error, rowset, Call, CallResult};
 use super::universe::{WARZONES, DYNAMIC_RESOURCE_MAX_OUTPUT};
 use marshal::Value;
 use super::fleets::MAX_MEMBERS;
@@ -183,6 +184,8 @@ pub(super) fn station(call: &Call<'_>) -> Option<CallResult> {
         ("charMgr", "GetSettingsInfo") => Value::tuple([Value::str(settings_info_code()), int(0)]),
         ("charMgr", "LogSettings") => Value::None,
         ("charMgr", "GetCharacterSettings") => empty_dict(),
+        // addressbookService.GetContactLabels caches this mapping and reads its values.
+        ("charMgr", "GetLabels") => empty_dict(),
         ("ProjectDiscovery", "initialize_tutorial_status") => Value::Bool(true),
         // Analysis Kredits (the LP store's Project Discovery currency).
         ("ProjectDiscovery", "get_player_analysis_kredits") => int(0),
@@ -275,11 +278,9 @@ pub(super) fn social(call: &Call<'_>) -> Option<CallResult> {
         ("charMgr", "GetPaperdollState") => Value::Int(PAPERDOLL_NO_RECUSTOMIZATION),
         ("charMgr", "SetActivityStatus") => Value::None,
         ("charMgr", "GetCharacterDescription") => Value::unicode(""),
-        ("charMgr", "GetContactList") => keyval([("addresses", rowset(&["contactID", "inWatchlist", "relationshipID", "labelMask"], vec![])), ("blocked", rowset(&["senderID"], vec![]))]),
         ("repairSvc", "RepairItemsInStation" | "RepairItemsInStructure") => Value::None,
         ("structureAssetSafety", "GetItemsInSafetyForCharacter" | "GetItemsInSafetyForCorp") => Value::list([]),
         ("bannedwords", "check_words_allowed") => Value::None,
-        ("onlineStatus", "GetInitialState") => rowset(&["contactID", "online"], vec![]),
         ("corpRegistry", "GetAggressionSettings") | ("accessGroupBookmarkMgr", "AddFolder") | ("corpStationMgr", "DoStandingCheckForStationService") | ("shipAdaptionMgr", "fetch_user_data") => Value::None,
         ("RWManager", "solarsystem_contains_rw_instances") => Value::Bool(false),
         ("dynamicBountyMgr", "GetOutputForClientSolarSystem") => Value::tuple([Value::None, Value::Bool(false)]),

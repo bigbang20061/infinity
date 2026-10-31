@@ -5,6 +5,7 @@
 //! implement localisation, data-derived names, or protocol identifiers.
 
 pub(crate) mod bounty;
+pub(crate) mod contacts;
 pub(crate) mod effects;
 pub(crate) mod gm;
 pub(crate) mod scheduler;
