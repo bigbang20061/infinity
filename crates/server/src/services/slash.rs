@@ -60,7 +60,9 @@ fn slash_error(text: String) -> CallError {
 }
 
 fn help() -> String {
-    COMMANDS.iter().map(|(_, usage)| *usage).collect::<Vec<_>>().join("\n")
+    let mut entries: Vec<String> = COMMANDS.iter().map(|(_, usage)| (*usage).to_owned()).collect();
+    if crate::lua::enabled() { entries.extend(crate::lua::command_help().into_iter().map(|(_, help)| help)); }
+    entries.join("\n")
 }
 
 
@@ -237,16 +239,23 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     if call.service != "slash" || call.method != "SlashCmd" {
         return None;
     }
-    if c.login.role & GM_ROLES == 0 {
-        return Some(Err(slash_error(messages::gm::GM_ROLE_REQUIRED.into())));
-    }
+
     let line = call.args.first().and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
     let line = line.trim().trim_start_matches('/');
     let mut words = line.split_whitespace();
     let command = words.next().unwrap_or("").to_lowercase();
     let args: Vec<&str> = words.collect();
+    if crate::lua::enabled() {
+        if let Some(result) = crate::lua::command(c, &command, &args).await {
+            return Some(result.map(Value::unicode));
+        }
+    }
+    if c.login.role & GM_ROLES == 0 {
+        return Some(Err(slash_error(messages::gm::GM_ROLE_REQUIRED.into())));
+    }
     if command.is_empty() {
-        let names: Vec<String> = COMMANDS.iter().map(|(n, _)| messages::gm::gm_command_name(n)).collect();
+        let mut names: Vec<String> = COMMANDS.iter().map(|(n, _)| messages::gm::gm_command_name(n)).collect();
+        if crate::lua::enabled() { names.extend(crate::lua::command_help().into_iter().map(|(name, _)| messages::gm::gm_command_name(&name))); }
         return Some(Err(slash_error(messages::gm::gm_command_list(&names.join(", ")))));
     }
     info!(user = c.login.user_id, "slash: /{line}");

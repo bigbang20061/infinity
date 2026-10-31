@@ -4,7 +4,7 @@ use super::*;
 use crate::{client::filetime_now, dao::jobs};
 
 async fn test_db() -> Db {
-    let db = Db::connect(&crate::config::tests::scheduler_database()).await.unwrap();
+    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
     assert!(jobs::next_due(&db, &[]).await.unwrap().is_none(), "scheduler tests require a dedicated database without scheduled or running jobs");
     db
 }

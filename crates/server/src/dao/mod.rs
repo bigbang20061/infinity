@@ -21,6 +21,7 @@ pub(crate) mod insurance;
 pub(crate) mod items;
 pub(crate) mod jobs;
 pub(crate) mod killmails;
+pub(crate) mod lua_store;
 pub(crate) mod mail;
 pub(crate) mod market;
 pub(crate) mod missions;

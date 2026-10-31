@@ -263,10 +263,10 @@ fn postgres_conversion_uses_url_or_individual_fields_and_applies_common_options(
     assert!(!error.contains("secret"), "{error}");
 }
 
-pub(crate) fn scheduler_database() -> deployment::DatabaseConfig {
+pub(crate) fn test_database() -> deployment::DatabaseConfig {
     crate::tests::init_config();
     deployment::DatabaseConfig {
-        url: std::env::var("INFINITY_TEST_DATABASE_URL").expect("INFINITY_TEST_DATABASE_URL required for ignored scheduler tests"),
+        url: std::env::var("INFINITY_TEST_DATABASE_URL").expect("INFINITY_TEST_DATABASE_URL must name a dedicated test database"),
         ..Default::default()
     }
 }

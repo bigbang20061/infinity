@@ -120,3 +120,9 @@ pub(crate) fn gm_dogma_result(item: i64, attr: &str, id: i32, old_base: f64, new
 pub(crate) fn gm_dogma_noop(item: i64, id: i32) -> String { format!("物品 {item} 的属性 {id} 没有覆盖，无需重置。") }
 pub(crate) fn gm_dogma_list_item(flag: i32, name: &str, item: i64) -> String { format!("位置 {flag}，{name}，物品 {item}") }
 pub(crate) fn gm_dogma_list_entry(id: i32, value: f64) -> String { format!("  属性 {id}: {value}") }
+
+// Lua administration.
+pub(crate) const LUA_HELP: &str = "用法：/lua reload 或 /lua list";
+pub(crate) const LUA_RELOADED: &str = "脚本已重新加载。";
+pub(crate) fn lua_reload_failed(error: &str) -> String { format!("脚本重新加载失败：{error}") }
+pub(crate) fn lua_list(list: &str) -> String { format!("Lua 脚本：\n{list}") }

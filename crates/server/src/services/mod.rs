@@ -19,7 +19,7 @@ mod bookmarks;
 mod calendar;
 mod character;
 mod clones;
-mod combat;
+pub(crate) mod combat;
 mod charsel;
 mod config;
 mod contracts;
@@ -36,10 +36,10 @@ mod fitting;
 mod hacking;
 mod industry;
 mod insurance;
-mod inventory;
-mod items;
-mod mail;
-mod market;
+pub(crate) mod inventory;
+pub(crate) mod items;
+pub(crate) mod mail;
+pub(crate) mod market;
 mod npe;
 mod offices;
 mod orgs;
@@ -47,13 +47,13 @@ mod mining;
 mod missions;
 mod ship;
 mod skills;
-mod standings;
+pub(crate) mod standings;
 mod slash;
 mod sql_pattern;
 mod station;
 mod store;
 mod universe;
-mod wallets;
+pub(crate) mod wallets;
 
 pub use fleets::logged_off as fleet_logged_off;
 pub(crate) use combat::recover_pending_reloads;
@@ -281,9 +281,12 @@ async fn bind_object(c: &mut Client, call: &Call<'_>) -> CallResult {
     // Binding the remote ballpark is the client's signal that it is ready for destiny state.
     if call.service == "beyonce" {
         ship::send_state(c).await?;
+        if crate::lua::enabled() { crate::lua::ballpark_bound(c).await?; }
     }
     Ok(Value::tuple([object, ret]))
 }
+
+pub(crate) fn lua_fixed_claimed(call: &Call<'_>) -> bool { fixed::root(call).is_some() }
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
     // What the retail server answered for this build, where the client cached it.
@@ -291,6 +294,9 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
         return Ok(v);
     }
     if call.method != "MachoResolveObject" && call.method != "MachoBindObject" {
+        if crate::lua::enabled() {
+            if let Some(reply) = crate::lua::dispatch(c, call).await { return reply; }
+        }
         if let Some(reply) = fixed::root(call) { return reply; }
         if let Some(reply) = station::root(c, call).await { return reply; }
     }

@@ -120,7 +120,7 @@ fn today() -> i64 {
 // ---------------------------------------------------------------- trading
 
 /// Trades run one at a time, so each sees the book as the last one left it.
-pub(super) async fn lock() -> tokio::sync::MutexGuard<'static, ()> {
+pub(crate) async fn lock() -> tokio::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(Default::default).lock().await
 }

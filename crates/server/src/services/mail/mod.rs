@@ -10,7 +10,7 @@
 //! Notifications (game.notifications) are what other systems post for a character
 //! (`notify`): a type, a sender and YAML data the client's formatter for that type reads.
 
-mod mail_mgr;
+pub(crate) mod mail_mgr;
 mod notification_mgr;
 
 use super::{db_err, Call, CallError, CallResult};

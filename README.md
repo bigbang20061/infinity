@@ -30,6 +30,7 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
   - Seven wallet divisions with ISK transfers between characters and corporations. Offices rented per station, with corporation hangars and rent bills that can be paid automatically.
   - Alliances: founding, applications, member removal, executor support, and bulletins and contacts.
 - **Store.** New Eden Store catalogue, PLEX vault, redeeming queue and seasonal login rewards.
+- **Lua scripts.** Scripts in `crates/server/lua/` can answer remote calls and add GM commands without changes to the server's routing. The bundled scripts keep a message of the day that a GM sets, sent when a pilot's ballpark is bound, and answer five client calls that only need fixed answers. See [Lua scripts](docs/lua.md).
 - **GM slash commands** (see [GM commands](#gm-commands)).
 
 ## Known limitations
@@ -43,6 +44,7 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
   - shared bookmark folders
   - implants
   - modules whose effect is not implemented yet, among them electronic warfare, capacitor warfare and transfer, remote repair, smartbombs, micro jump drives, salvagers, tractor beams and bombs. Activating one is refused with a message, and `/effects unsupported` lists the effects tried since the server started.
+  - game events for Lua scripts other than the ballpark being bound, and vetoes from scripts
 - Some runtime state lives only in memory and is lost when the server restarts:
   - fleets, combat and Crimewatch timers, ship damage, and in-progress hacking;
   - everything spawned into space (NPCs, wrecks, scheduled effects);
@@ -59,6 +61,7 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
 | Path | Contents |
 |---|---|
 | `crates/server` | The server (`infinity-server` binary) |
+| `crates/server/lua` | Lua scripts the server loads at start (see [docs/lua.md](docs/lua.md)) |
 | `crates/server/src/services` | Remote services the client calls (`sm.RemoteSvc(name).Method(...)`), one module per feature area |
 | `crates/server/sql` | `game_schema.sql` (applied at every start) and `market_seed.sql` |
 | `crates/server/retail` | Data captured from the retail server for this build (CDN content, cached machoNet calls) |
@@ -154,6 +157,11 @@ Start-up stops with an error that names the file and the dotted key when a key i
 | `cdn.bind` | `CDN_BIND` | `0.0.0.0:80` | Content CDN listener |
 | `server.macho_version`, `.boot_version`, `.boot_build`, `.boot_codename`, `.boot_region`, `.node_id` | `MACHO_VERSION`, `BOOT_VERSION`, `BOOT_BUILD`, `BOOT_CODENAME`, `BOOT_REGION`, `NODE_ID` | match build 3653293 | Values the client checks during the handshake |
 | `logging.filter` | `RUST_LOG` | `info,infinity_server=debug` | Log filter |
+| `lua.enabled` | | `true` | Load the Lua scripts. With `false` no Lua VM is created and no call is claimed by a script. |
+| `lua.scripts_dir` | | `crates/server/lua` | Directory the scripts are loaded from, relative to the working directory |
+| `lua.memory_limit_mb`, `.call_budget_ms`, `.call_budget_instructions`, `.instruction_hook_interval` | | `64`, `50`, `5000000`, `1000` | Lua VM memory, and the time and instructions one call may use (counted every `instruction_hook_interval` instructions). A call over budget fails; a game change it already started still completes. |
+| `lua.store_value_limit_bytes` | | `65536` | Largest value a script may keep in its persistent store |
+| `lua.scripts.<name>` | | none | Settings only the script `<name>` can read |
 
 Some keys switch behaviour on or off rather than set a number:
 
@@ -228,6 +236,9 @@ UPDATE game.accounts SET role = role | 27021597764489216 WHERE lower(user_name) 
 | `/jobs` | Count scheduled jobs by kind and state, and list the next ten |
 | `/jobs retry <id>` | Run a job now; a stopped job gets a fresh set of attempts |
 | `/jobs cancel <id>` | Delete a job. A job already running finishes but is not rescheduled. The periodic jobs come back at the next start. |
+| `/lua list` | List the loaded scripts, the calls, commands and events they claim, and their limits |
+| `/lua reload` | Load the scripts again. If any script fails to load, the old set stays in use; calls already running finish on the old set. |
+| `/motd [set <text>]` | Show or set the message of the day (bundled `motd.lua` script) |
 | `/help` | List the commands |
 
 ## Releases

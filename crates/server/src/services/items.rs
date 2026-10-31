@@ -23,7 +23,7 @@ pub(crate) async fn load_items(ex: &(impl Executor + ?Sized), sde: &Sde, query: 
     }).collect())
 }
 
-pub(super) async fn take_items<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, item: Item, quantity: i32) -> Result<(), CallError> {
+pub(crate) async fn take_items<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, item: Item, quantity: i32) -> Result<(), CallError> {
     let owner = item.owner_id;
     if quantity >= item.quantity {
         inventory::delete(db, item.item_id).await.map_err(db_err)?;
@@ -53,7 +53,7 @@ pub(super) async fn deliver<X: Send>(db: &(impl Executor + ?Sized), sde: &Sde, o
     }
     Ok(())
 }
-pub(super) async fn deposit<X: Send>(db: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<X>, owner: i64, location: i64, flag: i32, type_id: i32, quantity: i32, from: i64) -> Result<(), CallError> {
+pub(crate) async fn deposit<X: Send>(db: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<X>, owner: i64, location: i64, flag: i32, type_id: i32, quantity: i32, from: i64) -> Result<(), CallError> {
     match transfers::stack(db, location, flag, type_id, owner).await.map_err(db_err)? {
         Some(r) => { transfers::add(db, r.item_id, quantity).await.map_err(db_err)?; notify_item_change(db, sde, outbox, r.item_id, vec![(IX_STACK_SIZE, Value::Int(r.quantity as i64))]).await }
         None => { let id = transfers::insert(db, type_id, owner, location, flag, quantity).await.map_err(db_err)?; notify_item_change(db, sde, outbox, id, vec![(IX_LOCATION_ID, Value::Int(from)), (IX_FLAG, Value::Int(flag as i64))]).await }

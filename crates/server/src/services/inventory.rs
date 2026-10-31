@@ -29,7 +29,7 @@ pub const INVENTORY: &str = "invInventory";
 
 /// Which container a bound inventory lists.
 #[derive(Clone)]
-enum Container {
+pub(crate) enum Container {
     /// The character's hangar in a station.
     Hangar { station_id: i64, owner_id: i64 },
     /// Any item acting as a container (ship, character, can...).
@@ -166,12 +166,24 @@ pub(super) async fn split_stack(db: &(impl Executor + ?Sized), item: &Item, quan
 }
 
 /// Tell the client an item is gone (moved to the junkyard), then delete it.
-async fn destroy_item(c: &mut Client, item: Item) -> Result<(), CallError> {
+pub(crate) async fn destroy_item(c: &mut Client, item: Item) -> Result<(), CallError> {
     inventory_dao::delete(&c.db, item.item_id).await.map_err(db_err)?;
     let old_location = item.location_id;
     let gone = Item { location_id: LOCATION_JUNKYARD, ..item };
     let change = Value::Dict(vec![(Value::Int(IX_LOCATION_ID), Value::Int(old_location))]);
     c.notify("OnItemChange", vec![gone.row(), change, Value::None]);
+    Ok(())
+}
+
+/// Apply the same ownership and active-ship policy as TrashItems.
+pub(crate) async fn trash_items(c: &mut Client, ids: &[i64]) -> Result<(), CallError> {
+    let char_id = c.session.int("charid").unwrap_or(0);
+    let items = load_items(&c.db, &c.sde, ItemQuery::IdsOwner(ids, char_id)).await.map_err(db_err)?;
+    for item in items {
+        if Some(item.item_id) != c.session.int("shipid") {
+            destroy_item(c, item).await?;
+        }
+    }
     Ok(())
 }
 
@@ -191,7 +203,7 @@ async fn free_slot(c: &Client, ship: i64, module_type: i32) -> Result<Option<i32
 
 /// Move `item_id` (all of it, or `qty` split off a stack) into `container` under `flag`.
 /// Returns the ID of the item now at the destination.
-async fn move_item(c: &mut Client, container: &Container, item_id: i64, flag: Option<i32>, qty: Option<i64>) -> Result<Option<i64>, CallError> {
+pub(crate) async fn move_item(c: &mut Client, container: &Container, item_id: i64, flag: Option<i32>, qty: Option<i64>) -> Result<Option<i64>, CallError> {
     let char_id = c.session.int("charid").unwrap_or(0);
     let Some(item) = load_items(&c.db, &c.sde, ItemQuery::Id(item_id)).await.map_err(db_err)?.into_iter().next() else { return Ok(None) };
     if Some(item_id) == c.session.int("shipid") && matches!(container, Container::Item(_)) {
@@ -409,16 +421,7 @@ pub async fn broker(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         // TrashItems(itemIDs, locationID) -> [error messages]
         "TrashItems" => {
             let ids = value_id_list(call.args.first());
-            let r = async {
-                let items = load_items(&c.db, &c.sde, ItemQuery::IdsOwner(&ids, char_id)).await.map_err(db_err)?;
-                for item in items {
-                    if Some(item.item_id) != c.session.int("shipid") {
-                        destroy_item(c, item).await?;
-                    }
-                }
-                Ok::<_, CallError>(Value::list([]))
-            }
-            .await;
+            let r = trash_items(c, &ids).await.map(|()| Value::list([]));
             return Some(r);
         }
         // SetLabel(itemID, name): ship and container names.

@@ -10,7 +10,7 @@ use crate::db::{executor::Executor, outbox::Outbox};
 use crate::messages;
 use marshal::Value;
 
-pub(super) async fn balance(db: &(impl Executor + ?Sized), char_id: i64) -> Result<f64, CallError> {
+pub(crate) async fn balance(db: &(impl Executor + ?Sized), char_id: i64) -> Result<f64, CallError> {
     characters::balance(db, char_id).await.map_err(db_err)
 }
 
@@ -18,14 +18,14 @@ pub(super) fn not_enough_money(have: f64, amount: f64) -> CallError {
     user_error(messages::MSG_NOT_ENOUGH_MONEY, vec![("balance".into(), Value::Float(have)), ("amount".into(), Value::Float(amount))])
 }
 
-pub(super) async fn credit<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, char_id: i64, amount: f64) -> Result<(), CallError> {
+pub(crate) async fn credit<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, char_id: i64, amount: f64) -> Result<(), CallError> {
     if amount <= 0.0 { return Ok(()); }
     let balance = characters::credit(db, char_id, amount).await.map_err(db_err)?;
     outbox.notify_pilot(char_id, "OnAccountChange", vec![Value::str("cash"), Value::Int(char_id), Value::Float(balance)]);
     Ok(())
 }
 
-pub(super) async fn debit<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, char_id: i64, amount: f64) -> Result<(), CallError> {
+pub(crate) async fn debit<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, char_id: i64, amount: f64) -> Result<(), CallError> {
     if amount <= 0.0 { return Ok(()); }
     match characters::debit(db, char_id, amount).await.map_err(db_err)? {
         Some(balance) => {
