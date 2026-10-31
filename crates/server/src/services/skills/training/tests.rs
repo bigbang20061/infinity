@@ -4,12 +4,6 @@ use super::*;
 mod atomicity;
 
 #[test]
-fn completed_levels_are_sorted_and_only_include_new_levels() {
-    let done = [(2, 2, 20), (1, 2, 20), (1, 1, 10), (2, 2, 20), (2, 1, 10), (1, 3, 30)];
-    let levels = HashMap::from([(1, 1), (2, 0)]);
-    assert_eq!(completed_levels(&done, levels), vec![(1, 2), (1, 3), (2, 1), (2, 2)]);
-}
-#[test]
 fn malformed_queue_maps_are_refused_without_becoming_aborts() {
     let bad = [
         Value::None,
@@ -109,6 +103,7 @@ async fn queue_save_completion_notifies_once_and_rollback_dispatches_nothing() {
 
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let _market = crate::services::market::lock().await;
     for notify in [true, false] {
         let f = fixture::create(&db).await.unwrap();
         fixture::seed_skill(&db, f.character).await.unwrap();
@@ -117,10 +112,10 @@ async fn queue_save_completion_notifies_once_and_rollback_dispatches_nothing() {
         let sde = c.sde.clone();
         let dispatched = Arc::new(AtomicBool::new(false));
         let flag = dispatched.clone();
-        let result: Result<(), CallError> = db.transaction(|tx, outbox: &mut Outbox| {
+        let result: Result<(), CallError> = db.transaction(|tx, outbox: &mut Outbox<crate::services::effects::online::OnlineChanged>| {
             let sde = sde.clone();
             Box::pin(async move {
-                save_queue_tx(tx, outbox, &sde, f.character, vec![], false, notify, filetime_now(), vec![], &[]).await?;
+                save_queue_tx(tx, outbox, &sde, f.character, vec![], false, notify, filetime_now(), Default::default(), &[]).await?;
                 Err(CallError::Internal(anyhow::anyhow!("force rollback")))
             })
         }, |(), _outbox| async move {
@@ -132,13 +127,13 @@ async fn queue_save_completion_notifies_once_and_rollback_dispatches_nothing() {
         assert_eq!(fixture::skill_fingerprint(&db, f.character).await.unwrap(), before);
         assert!(crate::dao::skills::history::list(&db, f.character, 50).await.unwrap().is_empty());
 
-        let effects = db.transaction(|tx, outbox: &mut Outbox| {
+        let effects = db.transaction(|tx, outbox: &mut Outbox<crate::services::effects::online::OnlineChanged>| {
             let sde = sde.clone();
             Box::pin(async move {
-                save_queue_tx(tx, outbox, &sde, f.character, vec![], false, notify, filetime_now(), vec![], &[]).await?;
+                save_queue_tx(tx, outbox, &sde, f.character, vec![], false, notify, filetime_now(), Default::default(), &[]).await?;
                 Ok(())
             })
-        }, |(), outbox| async move { Ok::<_, CallError>(outbox.into_entries()) }).await.unwrap_or_else(|_| panic!("failed to save skill queue and collect effects"));
+        }, |(), outbox| async move { Ok::<_, CallError>({ let entries = outbox.into_entries(); assert!(!entries.iter().any(|effect| matches!(effect, crate::db::outbox::Effect::Operation(_)))); entries }) }).await.unwrap_or_else(|_| panic!("failed to save skill queue and collect effects"));
         let mut changed = 0;
         let mut trained = 0;
         let mut brains = 0;
@@ -148,13 +143,13 @@ async fn queue_save_completion_notifies_once_and_rollback_dispatches_nothing() {
                 Effect::Notification(Notification::Pilot { char_id, event, .. }) if char_id == f.character => {
                     if event == "OnServerSkillsChanged" { changed += 1; }
                     if event == crate::client::BRAIN_REFRESH { brains += 1; }
+                    if event == "OnNewSkillQueueSaved" { queues += 1; }
                 }
-                Effect::Notification(Notification::DirectClient { event, .. }) if event == "OnNewSkillQueueSaved" => queues += 1,
                 Effect::Event(GameEvent::SkillTrained { char_id, type_id: 1, level: 1 }) if char_id == f.character => trained += 1,
                 _ => {}
             }
         }
-        assert_eq!((changed, trained, brains, queues), (1, 1, 1, usize::from(notify)));
+        assert_eq!((changed, trained, brains, queues), (1, 1, 1, 1));
         fixture::cleanup(&db, f).await.unwrap();
     }
 }

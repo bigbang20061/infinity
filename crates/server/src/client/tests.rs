@@ -71,3 +71,27 @@ async fn wait_flushes_queued_notifications_and_forwards_later_destiny() {
     assert!(matches!(packet.destination, Address::Broadcast { broadcast_id, .. } if broadcast_id.as_text().as_deref() == Some("DoDestinyUpdate")));
     assert!(wait.await.unwrap());
 }
+
+#[test]
+fn dogma_days_convert_to_whole_second_filetime() {
+    assert_eq!(filetime_from_dogma_days(0.0), Some(FILETIME_UNIX_EPOCH));
+    assert_eq!(filetime_from_dogma_days(0.5), Some(FILETIME_UNIX_EPOCH + FILETIME_DAY / 2));
+    let seconds_per_day = FILETIME_DAY as f64 / FILETIME_SECOND as f64;
+    assert_eq!(filetime_from_dogma_days(0.49 / seconds_per_day), Some(FILETIME_UNIX_EPOCH));
+    assert_eq!(filetime_from_dogma_days(0.51 / seconds_per_day), Some(FILETIME_UNIX_EPOCH + FILETIME_SECOND));
+    for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MAX, -f64::MAX] {
+        assert_eq!(filetime_from_dogma_days(value), None);
+    }
+    assert_eq!(filetime_from_dogma_days(i64::MAX as f64 / FILETIME_DAY as f64), None);
+}
+
+#[test]
+fn hours_convert_to_checked_filetime_ticks() {
+    assert_eq!(filetime_ticks_from_hours(0.0), Some(0));
+    assert_eq!(filetime_ticks_from_hours(1.5), Some(FILETIME_HOUR + FILETIME_HOUR / 2));
+    assert_eq!(filetime_ticks_from_hours(-1.0), Some(-FILETIME_HOUR));
+    for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MAX, -f64::MAX] {
+        assert_eq!(filetime_ticks_from_hours(value), None);
+    }
+    assert_eq!(filetime_ticks_from_hours(i64::MAX as f64 / FILETIME_HOUR as f64), None);
+}

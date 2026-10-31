@@ -1,8 +1,8 @@
 //! Attribute remapping for eve/client/script/ui/shared/neocom/attributes.py.
 //! Uses game.character_respec, skills, skill_queue, skill_history and jobs;
 //! timed and bonus entitlements serialize with skill queue mutations.
-use super::{attributes::CHAR_ATTRIBUTES, db_err, keyval, training, CallError};
-use crate::{client::{filetime_now, Client, BRAIN_REFRESH}, consts::FILETIME_DAY, dao::{characters::attributes, skills::{queue, training as skill_dao}}, db::{executor::Executor, outbox::{dispatch_client, Outbox}}, services::notify_error};
+use super::{attributes::CHAR_ATTRIBUTES, completion, db_err, keyval, training, CallError};
+use crate::{client::{filetime_now, Client}, consts::FILETIME_DAY, dao::{characters::attributes, skills::{queue, training as skill_dao}}, db::{executor::Executor, outbox::{dispatch_client, Outbox}}, services::{effects::online::{self, OnlineChanged}, notify_error}};
 use marshal::Value;
 
 /// Client eve/common/lib/appConst.py:1582-1585 remap interval and bounds.
@@ -65,14 +65,14 @@ pub(super) async fn get(c: &mut Client, char_id: i64) -> Result<Value, CallError
     }), |value, outbox| async move { dispatch_client(value, outbox, c) }).await
 }
 
-async fn apply_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox, sde: &std::sync::Arc<crate::sde::Sde>, char_id: i64, bases: &[i32; 5], now: i64) -> Result<Value, CallError> {
+async fn apply_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<OnlineChanged>, sde: &std::sync::Arc<crate::sde::Sde>, char_id: i64, bases: &[i32; 5], now: i64) -> Result<Value, CallError> {
     crate::dao::characters::selection::lock_character(tx, char_id).await.map_err(db_err)?;
     let state = attributes::initialize_respec(tx, char_id, crate::config::game().characters.free_respecs).await.map_err(db_err)?;
     let timed = state.next_timed_respec.is_none_or(|date| date <= now);
     if !timed && state.free_respecs <= 0 { return Err(too_soon(state.next_timed_respec.unwrap_or(now))); }
     let next = if timed { now + INTERVAL } else { state.next_timed_respec.unwrap_or(now) };
     let free = if timed { state.free_respecs } else { state.free_respecs - 1 };
-    let finished = training::complete_tx(tx, outbox, char_id, now).await?;
+    let mut progress = completion::advance_tx(tx, outbox, sde, char_id, now).await?;
     let banked = training::in_training_sp(tx, char_id, now).await?;
     skill_dao::write_skills(tx, char_id, &training::plan_skills(&[], banked)).await.map_err(db_err)?;
     let rows = queue::list(tx, char_id).await.map_err(db_err)?;
@@ -81,8 +81,8 @@ async fn apply_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox, sde: &std:
     if !attributes::save_respec(tx, char_id, bases, &state, free, now, next).await.map_err(db_err)? {
         return Err(notify_error(crate::messages::skills::REMAP_UNAVAILABLE));
     }
-    let finished = training::save_queue_tx(tx, outbox, sde, char_id, entries, active, true, now, finished, &[]).await?;
-    if finished.is_empty() { outbox.notify_pilot(char_id, BRAIN_REFRESH, vec![]); }
+    progress.brain_changed = true;
+    training::save_queue_tx(tx, outbox, sde, char_id, entries, active, true, now, progress, &[]).await?;
     outbox.notify_client("OnRespecInfoChanged", vec![]);
     Ok(Value::None)
 }
@@ -92,12 +92,13 @@ pub(super) async fn apply(c: &mut Client, char_id: i64, input: &Value) -> Result
     let now = filetime_now();
     let db = c.db.clone();
     let sde = c.sde.clone();
-    db.transaction(|tx, outbox: &mut Outbox| {
+    let _market = crate::services::market::lock().await;
+    db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| {
         let sde = sde.clone();
         Box::pin(async move { apply_tx(tx, outbox, &sde, char_id, &bases, now).await })
     }, |value, outbox| async move {
         crate::scheduler::wake();
-        dispatch_client(value, outbox, c)
+        online::dispatch_changed(value, outbox, c)
     }).await
 }
 

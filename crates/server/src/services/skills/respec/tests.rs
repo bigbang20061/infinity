@@ -1,6 +1,7 @@
 //! Remap validation and persistence regressions.
 use super::*;
 use super::super::completion;
+use crate::client::BRAIN_REFRESH;
 fn values(values: [i64; 5]) -> Value {
     Value::Dict(CHAR_ATTRIBUTES.into_iter().zip(values).map(|(id, value)| (Value::Int(id), Value::Int(value))).collect())
 }
@@ -104,7 +105,7 @@ async fn active_queue_banks_progress_and_reschedules() {
 
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
-async fn remap_rolls_back_on_queue_failure_and_batches_overdue_completion() {
+async fn remap_rolls_back_after_staged_writes_and_batches_overdue_completion() {
     use crate::{db::{Db, outbox::{Effect, Notification}}, lua::events::GameEvent, services::tests::{client, fixture}};
     use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
     crate::tests::init_config();
@@ -120,26 +121,34 @@ async fn remap_rolls_back_on_queue_failure_and_batches_overdue_completion() {
     completion::reschedule(&db, f.character).await.unwrap_or_else(|_| panic!("seed completion job"));
     let snapshot_sql = "SELECT (SELECT row_to_json(r)::text FROM game.character_respec r WHERE character_id=$1) || '|' || (SELECT COALESCE(string_agg(row_to_json(s)::text, '' ORDER BY type_id), '') FROM game.skills s WHERE character_id=$1) || '|' || (SELECT COALESCE(string_agg(row_to_json(q)::text, '' ORDER BY position), '') FROM game.skill_queue q WHERE character_id=$1) || '|' || (SELECT COALESCE(string_agg(row_to_json(h)::text, '' ORDER BY history_id), '') FROM game.skill_history h WHERE character_id=$1) || '|' || (SELECT COALESCE(row_to_json(j)::text, '') FROM game.jobs j WHERE job_id=$2) AS snapshot";
     let before: String = db.query_one(snapshot_sql, &[&f.character, &id]).await.unwrap().get("snapshot");
-    let function = format!("atomicity_remap_{}", f.character);
-    db.execute(&format!("CREATE FUNCTION game.{function}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.character_id = {} THEN RAISE EXCEPTION 'remap fixture'; END IF; RETURN NEW; END $$", f.character), &[]).await.unwrap();
-    db.execute(&format!("CREATE TRIGGER {function} BEFORE INSERT ON game.skill_queue FOR EACH ROW EXECUTE FUNCTION game.{function}()"), &[]).await.unwrap();
     let sde = c.sde.clone();
     let dispatched = Arc::new(AtomicBool::new(false));
     let flag = dispatched.clone();
-    let result: Result<Value, CallError> = db.transaction(|tx, outbox: &mut Outbox| {
+    let _market = crate::services::market::lock().await;
+    let result: Result<Value, CallError> = db.transaction(|tx, outbox: &mut Outbox<crate::services::effects::online::OnlineChanged>| {
         let sde = sde.clone();
-        Box::pin(async move { apply_tx(tx, outbox, &sde, f.character, &[17, 17, 17, 21, 27], now).await })
+        Box::pin(async move {
+            let value = apply_tx(tx, outbox, &sde, f.character, &[17, 17, 17, 21, 27], now).await?;
+            let staged = attributes::respec(tx, f.character).await.map_err(db_err)?.expect("staged remap");
+            assert_eq!(staged.bases.as_deref(), Some(&[17, 17, 17, 21, 27][..]));
+            tx.query_one("SELECT 1 / 0", &[]).await.map_err(|error| db_err(crate::db::Error::from(error)))?;
+            Ok(value)
+        })
     }, |value, _outbox| async move { flag.store(true, Ordering::SeqCst); Ok(value) }).await;
-    assert!(matches!(result, Err(CallError::Internal(_))));
+    match result {
+        Err(CallError::Internal(error)) => match error.downcast_ref::<crate::db::Error>() {
+            Some(crate::db::Error::Postgres(error)) => assert_eq!(error.code(), Some(&tokio_postgres::error::SqlState::DIVISION_BY_ZERO)),
+            _ => panic!("expected a PostgreSQL division-by-zero error"),
+        },
+        _ => panic!("expected a PostgreSQL division-by-zero error"),
+    }
     assert!(!dispatched.load(Ordering::SeqCst));
     let after: String = db.query_one(snapshot_sql, &[&f.character, &id]).await.unwrap().get("snapshot");
     assert_eq!(before, after);
-    db.execute(&format!("DROP TRIGGER {function} ON game.skill_queue"), &[]).await.unwrap();
-    db.execute(&format!("DROP FUNCTION game.{function}()"), &[]).await.unwrap();
-    let effects = db.transaction(|tx, outbox: &mut Outbox| {
+    let effects = db.transaction(|tx, outbox: &mut Outbox<crate::services::effects::online::OnlineChanged>| {
         let sde = sde.clone();
         Box::pin(async move { apply_tx(tx, outbox, &sde, f.character, &[17, 17, 17, 21, 27], now).await })
-    }, |_, outbox| async move { Ok::<_, CallError>(outbox.into_entries()) }).await.unwrap_or_else(|_| panic!("remap transaction"));
+    }, |_, outbox| async move { Ok::<_, CallError>({ let entries = outbox.into_entries(); assert!(!entries.iter().any(|effect| matches!(effect, crate::db::outbox::Effect::Operation(_)))); entries }) }).await.unwrap_or_else(|_| panic!("remap transaction"));
     let (mut changed, mut brains, mut trained) = (0, 0, 0);
     for effect in effects {
         match effect {
@@ -171,4 +180,63 @@ async fn stale_entitlement_write_is_refused() {
     assert_eq!(current.free_respecs, 2);
     assert!(current.bases.is_none());
     fixture::cleanup(&db, f).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
+async fn remap_banks_overdue_booster_expiry_at_its_real_time() {
+    use crate::{consts::{ATTR_BOOSTERNESS, ATTR_SKILL_TIME_CONSTANT, FILETIME_MINUTE, FLAG_BOOSTER}, services::tests::{client, fixture}};
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let f = fixture::create(&db).await.unwrap();
+    let (c, _peer) = client(db.clone(), f.character).await;
+    let existing = skill_dao::current(&db, f.character).await.unwrap();
+    let now = filetime_now();
+    let start = now - 20 * FILETIME_MINUTE;
+    let expiry = now - 10 * FILETIME_MINUTE;
+    let mut exercised = false;
+    'types: for data in c.sde.types.iter() {
+        if data.attribute(ATTR_BOOSTERNESS).is_none() { continue; }
+        for entry in data.effects() {
+            let Some(effect) = c.sde.dogma.effect(entry.effect_id) else { continue };
+            if effect.effect_category.unwrap_or(0) != 0 { continue; }
+            for modifier in effect.modifiers() {
+                if !CHAR_ATTRIBUTES.contains(&(modifier.modified as i64)) || modifier.modified == modifier.modifying { continue; }
+                let item: i64 = db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,singleton,brain_activated_at,brain_expires_at,brain_effect_ids) VALUES ($1,$2,$2,$3,true,$4,$5,ARRAY[$6::integer]) RETURNING item_id", &[&data.type_id, &f.character, &FLAG_BOOSTER, &start, &expiry, &effect.effect_id]).await.unwrap().get("item_id");
+                db.execute("INSERT INTO game.item_attributes (item_id,attribute_id,value) VALUES ($1,$2,10)", &[&item, &modifier.modifying]).await.unwrap();
+                let old = super::super::attributes::character_attributes_at(&db, &c.sde, f.character, expiry - 1).await.unwrap_or_else(|_| panic!("active attributes"));
+                let new = super::super::attributes::character_attributes_at(&db, &c.sde, f.character, expiry).await.unwrap_or_else(|_| panic!("expired attributes"));
+                for skill in c.sde.types.iter().filter(|s| s.attribute(ATTR_SKILL_TIME_CONSTANT).is_some() && !existing.iter().any(|r| r.type_id == s.type_id) && super::super::requirements::requirements(&c.sde, s.type_id).next().is_none()) {
+                    let dest = super::super::formulas::sp_for_level(training::skill_type(&c.sde, skill.type_id).rank, 1);
+                    let mut row = queue::QueueEntry { position: 0, type_id: skill.type_id, to_level: 1, start_sp: 0, dest_sp: dest, start_time: None, end_time: None };
+                    let mut slower = row.clone();
+                    let Ok(old_end) = training::schedule(&c.sde, &mut row, &old, start) else { continue };
+                    let Ok(new_end) = training::schedule(&c.sde, &mut slower, &new, start) else { continue };
+                    if old_end <= now || new_end <= old_end { continue; }
+                    skill_dao::starting_skill(&db, f.character, skill.type_id, 0, 0).await.unwrap();
+                    queue::insert(&db, f.character, &row).await.unwrap();
+                    let projected = super::super::timeline::plan_tx(&db, &c.sde, f.character, now).await.unwrap_or_else(|_| panic!("project timeline"));
+                    let expected = projected.trained_points().unwrap_or_else(|_| panic!("project points")) - existing.iter().map(|s| s.skill_points).sum::<i64>();
+                    let _market = crate::services::market::lock().await;
+                    let effects = db.transaction(|tx, outbox: &mut Outbox<crate::services::effects::online::OnlineChanged>| {
+                        let sde = c.sde.clone();
+                        Box::pin(async move { apply_tx(tx, outbox, &sde, f.character, &[17, 17, 17, 21, 27], now).await })
+                    }, |_, outbox| async move { Ok::<_, CallError>({ let entries = outbox.into_entries(); assert!(!entries.iter().any(|effect| matches!(effect, crate::db::outbox::Effect::Operation(_)))); entries }) }).await.unwrap_or_else(|_| panic!("remap"));
+                    let saved = skill_dao::current(&db, f.character).await.unwrap();
+                    assert_eq!(saved.iter().find(|s| s.type_id == skill.type_id).unwrap().skill_points, expected);
+                    let active = queue::active(&db, f.character).await.unwrap().unwrap();
+                    assert_eq!((active.start_sp, active.start_time), (expected, Some(now)));
+                    assert!(crate::dao::items::brain::get(&db, f.character, item).await.unwrap().is_none());
+                    assert_eq!(effects.iter().filter(|e| matches!(e, crate::db::outbox::Effect::Notification(crate::db::outbox::Notification::Pilot { event, .. }) if event == BRAIN_REFRESH)).count(), 1);
+                    exercised = true;
+                    break;
+                }
+                if exercised { break 'types; }
+                db.execute("DELETE FROM game.items WHERE item_id=$1", &[&item]).await.unwrap();
+            }
+        }
+    }
+    crate::scheduler::cancel(&db, &format!("{}:{}", completion::KIND, f.character)).await.unwrap();
+    fixture::cleanup(&db, f).await.unwrap();
+    assert!(exercised, "no compatible training booster and skill in test SDE");
 }

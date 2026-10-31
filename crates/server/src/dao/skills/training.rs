@@ -5,6 +5,7 @@ use crate::db::{executor::Executor, Error};
 use std::collections::BTreeMap;
 use tokio_postgres::Row;
 
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct Skill { pub type_id: i32, pub level: i32, pub skill_points: i64 }
 impl Skill { fn from_row(r: &Row) -> Self { Self { type_id: r.get("type_id"), level: r.get("level"), skill_points: r.get("skill_points") } } }
 struct Total { points: i64 }

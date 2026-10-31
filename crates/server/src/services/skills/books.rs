@@ -1,13 +1,13 @@
 //! Atomic book injection and start-training for skillsvc.py and dogmaIM.
 //! Uses startup SDE prerequisites and game items, skills, history and queue.
 use super::{db_err, requirements::requirements, trading::{consume, refusal, source}, training, CallError};
-use crate::{client::{filetime_now, Client}, consts::CATEGORY_SKILL, dao::skills::{history, trading, training as skill_dao}, db::{executor::Executor, outbox::{dispatch_client, Outbox}}, messages, sde::Sde, services::user_error};
+use crate::{client::{filetime_now, Client}, consts::CATEGORY_SKILL, dao::skills::{history, trading, training as skill_dao}, db::{executor::Executor, outbox::Outbox}, messages, sde::Sde, services::{effects::online::{self, OnlineChanged}, user_error}};
 use marshal::Value;
 use std::{collections::{BTreeSet, HashMap}, sync::Arc};
 
-async fn inject_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox, sde: &Arc<Sde>, char_id: i64, ship: Option<i64>, ids: &[i64], now: i64, start: Option<i64>) -> Result<Value, CallError> {
+async fn inject_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<OnlineChanged>, sde: &Arc<Sde>, char_id: i64, ship: Option<i64>, ids: &[i64], now: i64, start: Option<i64>) -> Result<Value, CallError> {
     crate::dao::characters::selection::lock_character(tx, char_id).await.map_err(db_err)?;
-    let finished = training::complete_tx(tx, outbox, char_id, now).await?;
+    let progress = super::completion::advance_tx(tx, outbox, sde, char_id, now).await?;
     let accrued = training::in_training_sp(tx, char_id, now).await?;
     skill_dao::write_skills(tx, char_id, &training::plan_skills(&[], accrued)).await.map_err(db_err)?;
     let known: HashMap<_, _> = skill_dao::current(tx, char_id).await.map_err(db_err)?.into_iter().map(|s| (s.type_id, s.level)).collect();
@@ -33,13 +33,9 @@ async fn inject_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox, sde: &Arc
     let changed: Vec<_> = types.into_iter().collect();
     if start.is_some() {
         let type_id = *changed.first().ok_or_else(refusal)?;
-        training::save_queue_tx(tx, outbox, sde, char_id, vec![(0, i64::from(type_id), 1)], true, true, now, finished, &changed).await?;
+        training::save_queue_tx(tx, outbox, sde, char_id, vec![(0, i64::from(type_id), 1)], true, true, now, progress, &changed).await?;
     } else {
-        super::completion::reschedule(tx, char_id).await?;
-        super::completion::notify_changes(tx, outbox, sde, char_id, now, &finished, &changed).await?;
-        if !finished.is_empty() {
-            outbox.notify_pilot(char_id, "OnNewSkillQueueSaved", vec![training::queue_list_db(tx, char_id).await?]);
-        }
+        super::completion::finish_tx(tx, outbox, sde, char_id, now, &progress, &changed).await?;
     }
     Ok(Value::None)
 }
@@ -56,7 +52,7 @@ pub(crate) async fn inject(c: &mut Client, args: &[Value]) -> Result<Value, Call
     let _lock = crate::services::market::lock().await;
     let db = c.db.clone();
     let sde = c.sde.clone();
-    db.transaction(|tx, outbox: &mut Outbox| { let sde = sde.clone(); let ids = ids.clone(); Box::pin(async move { inject_tx(tx, outbox, &sde, char_id, ship, &ids, now, None).await }) }, |value, outbox| async move { crate::scheduler::wake(); dispatch_client(value, outbox, c) }).await
+    db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| { let sde = sde.clone(); let ids = ids.clone(); Box::pin(async move { inject_tx(tx, outbox, &sde, char_id, ship, &ids, now, None).await }) }, |value, outbox| async move { crate::scheduler::wake(); online::dispatch_changed(value, outbox, c) }).await
 }
 
 /// skillsvc.py Train: inject the accessible book and replace the active queue.
@@ -68,10 +64,10 @@ pub(super) async fn start_training(c: &mut Client, char_id: i64, args: &[Value])
     let _lock = crate::services::market::lock().await;
     let db = c.db.clone();
     let sde = c.sde.clone();
-    db.transaction(|tx, outbox: &mut Outbox| {
+    db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| {
         let sde = sde.clone();
         Box::pin(async move { inject_tx(tx, outbox, &sde, char_id, ship, &[id], now, Some(location)).await })
-    }, |value, outbox| async move { crate::scheduler::wake(); dispatch_client(value, outbox, c) }).await
+    }, |value, outbox| async move { crate::scheduler::wake(); online::dispatch_changed(value, outbox, c) }).await
 }
 
 #[cfg(test)] mod tests;

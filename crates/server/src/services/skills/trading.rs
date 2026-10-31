@@ -1,13 +1,11 @@
 //! Shared item authority for the skill item economy.
 //! Item sources are the current personal hangar or the active owned ship's cargo.
 //! The caller owns serialization, transaction and post-commit dispatch.
-//! Extraction reconciles all owned online hulls in the settlement transaction.
-//! Until booster expiry is implemented, equipped brain items are the shared active
-//! authority, as in Fit; expiry is not applied by that common loader.
+//! Timeline mutations reconcile owned online hulls in the settlement transaction.
 //! Planetary colonies, clone implant custody and clone-grade restrictions are not
 //! modelled; all characters follow the existing Omega policy.
 use super::{db_err, CallError};
-use crate::{consts::{FLAG_CARGO, FLAG_HANGAR, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD}, dao::items::{loading::{Item, ItemQuery}, quantities::{self, QuantityChange}, transfers}, db::{executor::Executor, outbox::Outbox}, messages, sde::Sde, services::{items::load_items, notify_error}};
+use crate::{consts::{ATTR_NON_DIMINISHING_SKILL_INJECTOR_USES, FLAG_CARGO, FLAG_HANGAR, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD}, dao::items::{loading::{Item, ItemQuery}, quantities::{self, QuantityChange}, transfers}, db::{executor::Executor, outbox::Outbox}, messages, sde::Sde, services::{items::load_items, notify_error}};
 use marshal::Value;
 use std::sync::Arc;
 use crate::services::effects::online::{self, OnlineChanged};
@@ -32,8 +30,6 @@ const EXTRACTION_MINIMUM: i64 = 5_500_000;
 const FULL_INJECTOR: i32 = 40520;
 const MINI_INJECTOR: i32 = 43630;
 const SMALL_INJECTOR: i32 = 45635;
-/// Client dogma/const.py attributeNonDiminishingSkillInjectorUses.
-const CREDIT_ATTRIBUTE: i32 = 2806;
 /// Client dogma/const.py attributeContainedSkillPoints.
 const CONTAINED_POINTS: i32 = 2461;
 /// Client dogma/const.py attributeMaxCharacterSkillPointLimit.
@@ -41,24 +37,24 @@ const MAX_CHARACTER_POINTS: i32 = 2459;
 
 struct Credit { item: i64, observed: Option<f64>, uses: i64 }
 
-/// Equipped boosters are the shared active relation until expiry is implemented.
-async fn credits(tx: &(impl Executor + ?Sized), sde: &Sde, char_id: i64) -> Result<Vec<Credit>, CallError> {
-    let boosters: Vec<_> = crate::dao::items::fit::brain_items(tx, char_id).await.map_err(db_err)?.into_iter().filter(|b| b.flag_id == crate::consts::FLAG_BOOSTER).collect();
+/// Credits are drawn only from boosters active at the captured time.
+async fn credits(tx: &(impl Executor + ?Sized), sde: &Sde, char_id: i64, at: i64) -> Result<Vec<Credit>, CallError> {
+    let boosters: Vec<_> = crate::dao::items::fit::brain_items(tx, char_id, at).await.map_err(db_err)?.into_iter().filter(|b| b.flag_id == crate::consts::FLAG_BOOSTER).collect();
     let ids: Vec<_> = boosters.iter().map(|b| b.item_id).collect();
     let overrides = crate::dao::items::dogma::overrides_for(tx, &ids).await.map_err(db_err)?;
     let mut result = Vec::new();
     for item in boosters {
-        let observed = overrides.iter().find(|row| row.item_id == item.item_id && row.attribute_id == CREDIT_ATTRIBUTE).map(|row| row.value);
-        let value = observed.or_else(|| sde.types.attribute(item.type_id, CREDIT_ATTRIBUTE)).unwrap_or(0.0);
+        let observed = overrides.iter().find(|row| row.item_id == item.item_id && row.attribute_id == ATTR_NON_DIMINISHING_SKILL_INJECTOR_USES).map(|row| row.value);
+        let value = observed.or_else(|| sde.types.attribute(item.type_id, ATTR_NON_DIMINISHING_SKILL_INJECTOR_USES)).unwrap_or(0.0);
         if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > i64::MAX as f64 { return Err(refusal()); }
         if value > 0.0 { result.push(Credit { item: item.item_id, observed, uses: value as i64 }); }
     }
     Ok(result)
 }
 
-/// Available charges use the shared brain loader, which does not apply expiry.
-pub(crate) async fn available_credits(tx: &(impl Executor + ?Sized), sde: &Sde, char_id: i64) -> Result<i64, CallError> {
-    credits(tx, sde, char_id).await?.iter().try_fold(0_i64, |sum, credit| sum.checked_add(credit.uses).ok_or_else(refusal))
+/// Available charges use the shared as-of-time brain loader.
+pub(crate) async fn available_credits(tx: &(impl Executor + ?Sized), sde: &Sde, char_id: i64, at: i64) -> Result<i64, CallError> {
+    credits(tx, sde, char_id, at).await?.iter().try_fold(0_i64, |sum, credit| sum.checked_add(credit.uses).ok_or_else(refusal))
 }
 
 /// Server policy: each unit uses the rate at its starting total, rounding down;
@@ -127,24 +123,6 @@ pub(super) async fn consume<E>(tx: &(impl Executor + ?Sized), outbox: &mut Outbo
     Ok(())
 }
 
-async fn total_points(tx: &(impl Executor + ?Sized), char_id: i64, now: i64) -> Result<i64, CallError> {
-    let rows = crate::dao::skills::training::current(tx, char_id).await.map_err(db_err)?;
-    let mut points: BTreeMap<_, _> = rows.into_iter().map(|row| (row.type_id, row.skill_points)).collect();
-    for row in crate::dao::skills::queue::list(tx, char_id).await.map_err(db_err)? {
-        if let (Some(start), Some(end)) = (row.start_time, row.end_time) {
-            if end <= now {
-                points.entry(row.type_id).and_modify(|sp| *sp = (*sp).max(row.dest_sp)).or_insert(row.dest_sp);
-            } else {
-                let frac = ((now - start) as f64 / (end - start).max(1) as f64).clamp(0.0, 1.0);
-                let accrued = row.start_sp + ((row.dest_sp - row.start_sp) as f64 * frac) as i64;
-                if let Some(sp) = points.get_mut(&row.type_id) { *sp = (*sp).max(accrued); }
-                break;
-            }
-        }
-    }
-    let free = crate::dao::characters::attributes::free_points(tx, char_id).await.map_err(db_err)?;
-    points.values().try_fold(free, |sum, sp| sum.checked_add(*sp).ok_or_else(refusal))
-}
 
 pub(super) async fn quote(c: &crate::client::Client, char_id: i64, args: &[Value]) -> Result<Value, CallError> {
     let type_id = args.first().and_then(Value::as_int).and_then(|v| i32::try_from(v).ok()).ok_or_else(refusal)?;
@@ -156,8 +134,10 @@ pub(super) async fn quote(c: &crate::client::Client, char_id: i64, args: &[Value
         let sde = sde.clone();
         Box::pin(async move {
             crate::dao::characters::selection::lock_character(tx, char_id).await.map_err(db_err)?;
-            let total = total_points(tx, char_id, now).await?;
-            let count = available_credits(tx, &sde, char_id).await?;
+            let plan = super::timeline::plan_tx(tx, &sde, char_id, now).await?;
+            let free = crate::dao::characters::attributes::free_points(tx, char_id).await.map_err(db_err)?;
+            let total = plan.trained_points()?.checked_add(free).ok_or_else(refusal)?;
+            let count = available_credits(tx, &sde, char_id, now).await?;
             Ok(Value::Int(injector_yield(&sde, type_id, quantity, total, count)?.0))
         })
     }, |value, _: Outbox| async move { Ok(value) }).await
@@ -172,12 +152,12 @@ pub(super) async fn inject(c: &mut crate::client::Client, char_id: i64, args: &[
     let _lock = crate::services::market::lock().await;
     let db = c.db.clone();
     let sde = c.sde.clone();
-    db.transaction(|tx, outbox: &mut Outbox| {
+    db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| {
         let sde = sde.clone();
         Box::pin(async move {
             inject_tx(tx, outbox, &sde, char_id, ship, id, quantity, qty, now, check).await
         })
-    }, |value, outbox| async move { crate::scheduler::wake(); crate::db::outbox::dispatch_client(value, outbox, c) }).await
+    }, |value, outbox| async move { crate::scheduler::wake(); online::dispatch_changed(value, outbox, c) }).await
 }
 
 pub(super) async fn convert(c: &mut crate::client::Client, char_id: i64, args: &[Value], split: bool) -> Result<Value, CallError> {
@@ -189,12 +169,12 @@ pub(super) async fn convert(c: &mut crate::client::Client, char_id: i64, args: &
     let _lock = crate::services::market::lock().await;
     let db = c.db.clone();
     let sde = c.sde.clone();
-    db.transaction(|tx, outbox: &mut Outbox| {
+    db.transaction(|tx, outbox: &mut Outbox<OnlineChanged>| {
         let sde = sde.clone();
         Box::pin(async move {
             convert_tx(tx, outbox, &sde, char_id, ship, id, quantity, qty, now, split).await
         })
-    }, |value, outbox| async move { crate::scheduler::wake(); crate::db::outbox::dispatch_client(value, outbox, c) }).await
+    }, |value, outbox| async move { crate::scheduler::wake(); online::dispatch_changed(value, outbox, c) }).await
 }
 
 /// The opaque client token has no local verifier; the session and item authority
@@ -234,7 +214,7 @@ async fn extract_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<OnlineCha
             if transfers::docked(tx, char_id).await.map_err(db_err)?.is_none() {
                 return Err(CallError::User { msg: messages::MSG_SKILL_EXTRACTOR_NOT_DOCKED_IN_STATION.into(), dict: vec![("extractor".into(), Value::Int(i64::from(EXTRACTOR)))] });
             }
-            let finished = super::training::complete_tx(tx, outbox, char_id, now).await?;
+            let progress = super::completion::advance_tx(tx, outbox, sde, char_id, now).await?;
             let accrued = super::training::in_training_sp(tx, char_id, now).await?;
             skill_dao::write_skills(tx, char_id, &super::training::plan_skills(&[], accrued)).await.map_err(db_err)?;
             let item = source(tx, &sde, char_id, ship, id, true).await?;
@@ -267,7 +247,7 @@ async fn extract_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<OnlineCha
             }
             let mut dependents: Vec<i32> = skills.iter().filter(|s| s.skill_points - selected.get(&s.type_id).copied().unwrap_or(0) > 0).map(|s| s.type_id).collect();
             dependents.extend(queued.iter().map(|q| q.type_id));
-            dependents.extend(crate::dao::items::fit::brain_items(tx, char_id).await.map_err(db_err)?.into_iter().map(|item| item.type_id));
+            dependents.extend(crate::dao::items::fit::brain_items(tx, char_id, now).await.map_err(db_err)?.into_iter().map(|item| item.type_id));
             if let Some(ship) = ship {
                 let ships = load_items(tx, &sde, ItemQuery::Id(ship)).await.map_err(db_err)?;
                 if let Some(item) = ships.into_iter().find(|item| item.owner_id == char_id) {
@@ -297,28 +277,24 @@ async fn extract_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<OnlineCha
             let output = transfers::insert(tx, FULL_INJECTOR, char_id, location, flag, 1).await.map_err(db_err)?;
             crate::services::inventory::notify_item_change(tx, &sde, outbox, output, vec![(IX_LOCATION_ID, Value::Int(0))]).await?;
             let changed: Vec<_> = selected.keys().copied().collect();
-            super::completion::notify_changes(tx, outbox, sde, char_id, now, &finished, &changed).await?;
-            if !finished.is_empty() {
-                outbox.notify_pilot(char_id, "OnNewSkillQueueSaved", vec![super::training::queue_list_db(tx, char_id).await?]);
-            }
-            super::completion::reschedule(tx, char_id).await?;
-            online::reconcile_owner(tx, sde, outbox, char_id).await?;
+            super::completion::finish_tx(tx, outbox, sde, char_id, now, &progress, &changed).await?;
             Ok(Value::None)
 }
 
-async fn inject_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox, sde: &Sde, char_id: i64, ship: Option<i64>, id: i64, quantity: i64, qty: i32, now: i64, check: bool) -> Result<Value, CallError> {
+async fn inject_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<OnlineChanged>, sde: &Arc<Sde>, char_id: i64, ship: Option<i64>, id: i64, quantity: i64, qty: i32, now: i64, check: bool) -> Result<Value, CallError> {
             crate::dao::characters::selection::lock_character(tx, char_id).await.map_err(db_err)?;
             let item = source(tx, &sde, char_id, ship, id, false).await?;
             if qty <= 0 || qty > item.quantity { return Err(refusal()); }
-            let total = total_points(tx, char_id, now).await?;
-            let mut credits = credits(tx, &sde, char_id).await?;
+            let plan = super::timeline::plan_tx(tx, sde, char_id, now).await?;
+            let balance = crate::dao::characters::attributes::free_points(tx, char_id).await.map_err(db_err)?;
+            let total = plan.trained_points()?.checked_add(balance).ok_or_else(refusal)?;
+            let mut credits = credits(tx, sde, char_id, now).await?;
             let count = credits.iter().try_fold(0_i64, |sum, c| sum.checked_add(c.uses).ok_or_else(refusal))?;
             let (amount, mut used) = injector_yield(&sde, item.type_id, quantity, total, count)?;
             if check { return Ok(Value::None); }
-            let finished = super::training::complete_tx(tx, outbox, char_id, now).await?;
+            let progress = super::completion::apply_plan_tx(tx, outbox, sde, &plan).await?;
             let accrued = super::training::in_training_sp(tx, char_id, now).await?;
             crate::dao::skills::training::write_skills(tx, char_id, &super::training::plan_skills(&[], accrued)).await.map_err(db_err)?;
-            let balance = crate::dao::characters::attributes::free_points(tx, char_id).await.map_err(db_err)?;
             let new_balance = balance.checked_add(amount).ok_or_else(refusal)?;
             consume(tx, outbox, item, qty).await?;
             if !crate::dao::characters::attributes::replace_free_points(tx, char_id, balance, new_balance).await.map_err(db_err)? { return Err(refusal()); }
@@ -326,23 +302,19 @@ async fn inject_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox, sde: &Sde
             for credit in &mut credits {
                 let take = used.min(credit.uses);
                 if take > 0 {
-                    if !crate::dao::items::skills::spend_credit(tx, credit.item, CREDIT_ATTRIBUTE, credit.observed, (credit.uses - take) as f64).await.map_err(db_err)? { return Err(refusal()); }
+                    if !crate::dao::items::skills::spend_credit(tx, credit.item, ATTR_NON_DIMINISHING_SKILL_INJECTOR_USES, credit.observed, (credit.uses - take) as f64).await.map_err(db_err)? { return Err(refusal()); }
                     used -= take;
                 }
             }
-            if total_used > 0 { outbox.notify_client("OnNonDiminishingInjectionsUsed", vec![Value::Int(total_used)]); }
+            if total_used > 0 { outbox.notify_pilot(char_id, "OnNonDiminishingInjectionsUsed", vec![Value::Int(total_used)]); }
             outbox.notify_client("OnFreeSkillPointsChanged", vec![Value::Int(new_balance)]);
-            super::completion::reschedule(tx, char_id).await?;
-            super::completion::notify_changes(tx, outbox, &sde, char_id, now, &finished, &[]).await?;
-            if !finished.is_empty() {
-                outbox.notify_pilot(char_id, "OnNewSkillQueueSaved", vec![super::training::queue_list_db(tx, char_id).await?]);
-            }
+            super::completion::finish_tx(tx, outbox, sde, char_id, now, &progress, &[]).await?;
             Ok(Value::None)
 }
 
-async fn convert_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox, sde: &Sde, char_id: i64, ship: Option<i64>, id: i64, quantity: i64, qty: i32, now: i64, split: bool) -> Result<Value, CallError> {
+async fn convert_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<OnlineChanged>, sde: &Arc<Sde>, char_id: i64, ship: Option<i64>, id: i64, quantity: i64, qty: i32, now: i64, split: bool) -> Result<Value, CallError> {
             crate::dao::characters::selection::lock_character(tx, char_id).await.map_err(db_err)?;
-            let finished = super::training::complete_tx(tx, outbox, char_id, now).await?;
+            let progress = super::completion::advance_tx(tx, outbox, sde, char_id, now).await?;
             let accrued = super::training::in_training_sp(tx, char_id, now).await?;
             crate::dao::skills::training::write_skills(tx, char_id, &super::training::plan_skills(&[], accrued)).await.map_err(db_err)?;
             let item = source(tx, &sde, char_id, ship, id, false).await?;
@@ -363,11 +335,7 @@ async fn convert_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox, sde: &Sd
             consume(tx, outbox, item, consumed).await?;
             let output = transfers::insert(tx, target, char_id, location, flag, count).await.map_err(db_err)?;
             crate::services::inventory::notify_item_change(tx, &sde, outbox, output, vec![(IX_LOCATION_ID, Value::Int(0))]).await?;
-            super::completion::reschedule(tx, char_id).await?;
-            super::completion::notify_changes(tx, outbox, &sde, char_id, now, &finished, &[]).await?;
-            if !finished.is_empty() {
-                outbox.notify_pilot(char_id, "OnNewSkillQueueSaved", vec![super::training::queue_list_db(tx, char_id).await?]);
-            }
+            super::completion::finish_tx(tx, outbox, sde, char_id, now, &progress, &[]).await?;
             Ok(Value::None)
 }
 

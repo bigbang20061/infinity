@@ -2,11 +2,10 @@ use crate::services::skills::completion::{self, KIND};
 use crate::services::tests::{client, fixture};
 use crate::services::{skills, Call};
 use marshal::Value;
-use crate::scheduler::Job;
 
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
-async fn scheduled_completion_rolls_back_finished_queue_when_skill_write_fails() {
+async fn shared_completion_transaction_rolls_back_after_database_failure() {
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let f = fixture::create(&db).await.unwrap();
@@ -14,7 +13,6 @@ async fn scheduled_completion_rolls_back_finished_queue_when_skill_write_fails()
     let result = tokio::spawn(async move {
         fixture::seed_skill(&test_db, f.character).await.unwrap();
         let before = fixture::skill_fingerprint(&test_db, f.character).await.unwrap();
-        fixture::install_skill_failure(&test_db, f.character).await.unwrap();
         let (mut c, _peer) = client(test_db.clone(), f.character).await;
         for method in ["GetSkills", "GetSkillQueue"] {
             let kwargs = Value::None;
@@ -22,18 +20,36 @@ async fn scheduled_completion_rolls_back_finished_queue_when_skill_write_fails()
             assert!(skills::dispatch(&mut c, &call).await.unwrap().is_ok());
             assert_eq!(fixture::skill_fingerprint(&test_db, f.character).await.unwrap(), before);
         }
-        let job = Job { id: format!("{KIND}:{}", f.character), kind: KIND.into(), due_at: 1, payload: f.character.to_string() };
-        assert!(completion::handle(test_db.clone(), c.world.clone(), job).await.is_err());
+        let job = format!("{KIND}:{}", f.character);
+        let before_all = snapshot(&test_db, f.character, &job).await;
+        let sde = c.sde.clone();
+        let dispatched = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = dispatched.clone();
+        let _market = crate::services::market::lock().await;
+        let failed: Result<(), crate::services::CallError> = test_db.transaction(|tx, outbox: &mut crate::db::outbox::Outbox<crate::services::effects::online::OnlineChanged>| {
+            let sde = sde.clone();
+            Box::pin(async move {
+                crate::dao::characters::selection::lock_character(tx, f.character).await.map_err(crate::services::db_err)?;
+                let now = crate::client::filetime_now();
+                let progress = completion::advance_tx(tx, outbox, &sde, f.character, now).await?;
+                completion::finish_tx(tx, outbox, &sde, f.character, now, &progress, &[]).await?;
+                assert_eq!(progress.completed, vec![(1, 1)]);
+                tx.query_one("SELECT 1 / 0", &[]).await.map_err(|error| crate::services::db_err(crate::db::Error::from(error)))?;
+                Ok(())
+            })
+        }, |(), _| async move { flag.store(true, std::sync::atomic::Ordering::SeqCst); Ok(()) }).await;
+        fixture::assert_division_by_zero(failed);
+        assert!(!dispatched.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(snapshot(&test_db, f.character, &job).await, before_all);
         assert_eq!(fixture::skill_fingerprint(&test_db, f.character).await.unwrap(), before);
         assert!(c.outbox.is_empty());
     }).await;
-    fixture::remove_skill_failure(&db, f.character).await.unwrap();
     fixture::cleanup(&db, f).await.unwrap();
     assert_eq!(fixture::remaining(&db, f).await.unwrap(), 0);
     assert!(result.is_ok(), "skill rollback task failed: {result:?}");
 }
 
-const SNAPSHOT: &str = "SELECT (SELECT COALESCE(string_agg(row_to_json(s)::text, '' ORDER BY type_id), '') FROM game.skills s WHERE character_id=$1) || '|' || (SELECT COALESCE(string_agg(row_to_json(q)::text, '' ORDER BY position), '') FROM game.skill_queue q WHERE character_id=$1) || '|' || (SELECT COALESCE(string_agg(row_to_json(h)::text, '' ORDER BY history_id), '') FROM game.skill_history h WHERE character_id=$1) || '|' || (SELECT COALESCE(row_to_json(j)::text, '') FROM game.jobs j WHERE job_id=$2) AS snapshot";
+const SNAPSHOT: &str = "SELECT (SELECT COALESCE(string_agg(row_to_json(s)::text, '' ORDER BY type_id), '') FROM game.skills s WHERE character_id=$1) || '|' || (SELECT COALESCE(string_agg(row_to_json(q)::text, '' ORDER BY position), '') FROM game.skill_queue q WHERE character_id=$1) || '|' || (SELECT COALESCE(string_agg(row_to_json(h)::text, '' ORDER BY history_id), '') FROM game.skill_history h WHERE character_id=$1) || '|' || COALESCE((SELECT row_to_json(j)::text FROM game.jobs j WHERE job_id=$2), '') AS snapshot";
 
 async fn snapshot(db: &crate::db::Db, character: i64, job: &str) -> String {
     db.query_one(SNAPSHOT, &[&character, &job]).await.unwrap().get("snapshot")
@@ -122,11 +138,12 @@ async fn refused_saves_roll_back_completion_history_jobs_and_effects() {
             let dispatched = Arc::new(AtomicBool::new(false));
             let flag = dispatched.clone();
             let sde = c.sde.clone();
-            let result: Result<(), CallError> = test_db.transaction(|tx, outbox: &mut Outbox| {
+            let _market = crate::services::market::lock().await;
+            let result: Result<(), CallError> = test_db.transaction(|tx, outbox: &mut Outbox<crate::services::effects::online::OnlineChanged>| {
                 let sde = sde.clone();
                 let entries = entries.clone();
                 Box::pin(async move {
-                    save_queue_tx(tx, outbox, &sde, f.character, entries, true, true, crate::client::filetime_now(), vec![], &[]).await?;
+                    save_queue_tx(tx, outbox, &sde, f.character, entries, true, true, crate::client::filetime_now(), Default::default(), &[]).await?;
                     Ok(())
                 })
             }, |(), _outbox| async move { flag.store(true, Ordering::SeqCst); Ok(()) }).await;

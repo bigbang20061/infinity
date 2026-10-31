@@ -8,8 +8,8 @@
 //! behavior, not a validated client fallback. Effective fitting is the subset in
 //! `services/fit.rs`, not a complete implementation of client dogma.
 //! Module online changes and resource reconciliation use the shared effects policy.
-//! Character brains compile passive skills and active implant and booster modifiers; structure effects
-//! and implant/booster injection or expiry are unsupported.
+//! Character brains compile passive skills and active implant and booster modifiers;
+//! structure effects remain unsupported.
 //! Brain versions are in-memory and reset when the server restarts.
 //! Ship priming reports the in-space capacitor's lazily recharged runtime level;
 //! ships not present in a running system use their fitted capacity.
@@ -337,6 +337,9 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
         }
         "CheckSendLocationInfo" | "LogAttribute" => Ok(Value::None),
         "InjectSkillIntoBrain" => skills::books::inject(c, call.args).await,
+        "InjectImplant" => skills::brain_items::inject_implant(c, call.args).await,
+        "DestroyImplant" => skills::brain_items::destroy_implant(c, call.args).await,
+        "UseBooster" => skills::brain_items::use_booster(c, call.args).await,
         "LaunchProbes" => exploration::launch_probes(c, call).await,
         // Both RPCs use the lifecycle's fitted-subject authorization and notifications.
         "SetModuleOnline" | "TakeModuleOffline" => {

@@ -1,7 +1,7 @@
 //! Bound skillHandler calls used by `eve/client/script/ui/services/skillsvc.py`.
-//! Uses game.skills, game.skill_queue, game.characters and startup SDE data
-//! through the training and attribute helpers. History and remaps are persisted;
-//! boosters, implants and penalties remain fixed answers.
+//! Uses game.skills, game.skill_queue, game.characters, game.items and startup
+//! SDE data through the training, augmentation and attribute helpers.
+//! History, remaps and augmentations are persisted; penalties remain fixed answers.
 //! `CharStartTrainingSkill` accepts an accessible unlearned book item and its
 //! location (`skillsvc.py:763-767`); learned skills have no item identity here.
 //! Injector diminishing and rounding are server policy, not a native algorithm.
@@ -51,7 +51,8 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         (SKILL_HANDLER, "GetAttributes") => character_attributes(c, me)
             .await
             .map(|a| Value::Dict(a.into_iter().map(|(k, v)| (Value::Int(k), Value::Float(v))).collect())),
-        (SKILL_HANDLER, "GetBoosters") | (SKILL_HANDLER, "GetImplants") => Ok(Value::Dict(vec![])),
+        (SKILL_HANDLER, "GetBoosters") => super::brain_reads::get_boosters(c, me).await,
+        (SKILL_HANDLER, "GetImplants") => super::brain_reads::get_implants(c, me).await,
         (SKILL_HANDLER, "GetSkillHistory") => super::history::get(c, me, call.kwargs.get("maxresults").or_else(|| call.args.first())).await,
         (SKILL_HANDLER, "GetPenaltySkillPoints") => Ok(Value::Int(0)),
         (SKILL_HANDLER, "GetDiminishedSpFromInjectors") => super::trading::quote(c, me, call.args).await,

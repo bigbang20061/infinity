@@ -1,16 +1,21 @@
 //! Skill service routing and shared mechanics, mirroring characterskills/util.py.
-//! Uses game.skills, game.skill_queue, game.characters and startup SDE bloodline,
-//! race and type attribute data through its submodules.
-//! Effective character attributes use Fit modifiers; several skill handler features are not modelled.
+//! Submodules use game.skills, game.skill_queue, game.characters, game.items,
+//! game.item_attributes and game.jobs with startup SDE data. Training and timed
+//! augmentations are durable; legacy boosters without timing have no known expiry.
+//! Clone custody is not modelled.
 use super::{db_err, keyval, Call, CallError, CallResult};
 use crate::client::Client;
 pub(crate) mod attributes;
+pub(crate) mod brain_items;
+mod brain_reads;
 pub(crate) mod formulas;
 pub(crate) mod requirements;
 pub(crate) mod starting;
+mod non_diminishing_injection_mgr;
 mod skill_mgr2;
 mod skill_handler;
 mod training;
+mod timeline;
 pub(crate) mod completion;
 pub(crate) mod gm;
 mod history;
@@ -25,5 +30,7 @@ mod tests;
 pub const SKILL_HANDLER: &str = "skillHandler";
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
-    if call.service == "skillMgr2" { skill_mgr2::dispatch(c, call).await } else { skill_handler::dispatch(c, call).await }
+    if call.service == "skillMgr2" { skill_mgr2::dispatch(c, call).await }
+    else if let Some(result) = non_diminishing_injection_mgr::dispatch(c, call).await { Some(result) }
+    else { skill_handler::dispatch(c, call).await }
 }

@@ -65,6 +65,13 @@ CREATE TABLE IF NOT EXISTS game.items (
 );
 CREATE INDEX IF NOT EXISTS items_location_idx ON game.items (location_id, flag_id);
 CREATE INDEX IF NOT EXISTS items_owner_idx ON game.items (owner_id);
+-- dao/items/brain: durable augmentation metadata on installed item rows.
+ALTER TABLE game.items ADD COLUMN IF NOT EXISTS brain_slot integer;
+ALTER TABLE game.items ADD COLUMN IF NOT EXISTS brain_activated_at bigint;
+ALTER TABLE game.items ADD COLUMN IF NOT EXISTS brain_expires_at bigint;
+ALTER TABLE game.items ADD COLUMN IF NOT EXISTS brain_effect_ids integer[];
+CREATE UNIQUE INDEX IF NOT EXISTS items_brain_slot_idx ON game.items (owner_id, flag_id, brain_slot)
+    WHERE location_id = owner_id AND brain_slot IS NOT NULL;
 -- dao/items/dogma: per-item dogma base overrides.
 CREATE TABLE IF NOT EXISTS game.item_attributes (
     item_id bigint NOT NULL REFERENCES game.items(item_id) ON DELETE CASCADE,

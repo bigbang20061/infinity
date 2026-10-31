@@ -5,6 +5,23 @@
 //! Runtime configuration, formulas and module-owned wire protocol constants do
 //! not belong here. Shared gateway protocol units are included. This module
 //! provides no data lookup or runtime state.
+/// Client dogma/const.py attributeImplantness.
+pub const ATTR_IMPLANTNESS: i32 = 331;
+/// Client dogma/const.py attributeBoosterness.
+pub const ATTR_BOOSTERNESS: i32 = 1087;
+/// Client dogma/const.py attributeBoosterDuration, in milliseconds.
+pub const ATTR_BOOSTER_DURATION: i32 = 330;
+/// Client dogma/const.py attributeBoosterMaxCharAgeHours.
+pub const ATTR_BOOSTER_MAX_CHAR_AGE_HOURS: i32 = 1647;
+/// Client dogma/const.py attributeBoosterLastInjectionDatetime, SDE days since Unix epoch.
+pub const ATTR_BOOSTER_LAST_INJECTION_DATETIME: i32 = 2422;
+/// Client dogma/const.py attributeNonDiminishingSkillInjectorUses.
+pub const ATTR_NON_DIMINISHING_SKILL_INJECTOR_USES: i32 = 2806;
+/// Client inventorycommon.const.categoryImplant.
+pub const CATEGORY_IMPLANT: i32 = 20;
+/// Client inventorycommon.const.groupBooster.
+pub const GROUP_BOOSTER: i32 = 303;
+
 
 /// `dogma/const.py` dgmGroupableGroupIDs: weapon groups permitted in banks.
 pub const GROUPABLE_GROUP_IDS: [i64; 19] = [53, 55, 56, 74, 506, 507, 508, 509, 510, 511, 512, 524, 771, 1245, 1327, 1328, 1562, 1673, 1674];

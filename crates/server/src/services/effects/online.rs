@@ -1,6 +1,7 @@
 //! Online state changes for fitted modules, mirroring clientDogmaLocation and godma.
 //! Reads effect metadata from the SDE and persists online state in game.items.
-//! Resource overloads are reconciled using baseDogmaLocation.py:1114-1183.
+//! Resource overloads are reconciled using baseDogmaLocation.py:1114-1183;
+//! committed changes dispatch to clients or the world in outbox order.
 use super::lifecycle::subject_core;
 use super::notify::attribute_change;
 use crate::client::{filetime_now, Client};
@@ -111,15 +112,23 @@ pub(in crate::services) fn dispatch_notification(notification: crate::db::outbox
     }
 }
 
-pub(in crate::services) fn dispatch_changed<T>(value: T, outbox: Outbox<OnlineChanged>, c: &Client) -> Result<T, CallError> {
+fn dispatch_entries<T>(value: T, outbox: Outbox<OnlineChanged>, mut notify: impl FnMut(crate::db::outbox::Notification) -> Result<(), CallError>) -> Result<T, CallError> {
     for entry in outbox.into_entries() {
         match entry {
             OutboxEffect::Operation(change) => apply_online_changed(change),
-            OutboxEffect::Notification(notification) => dispatch_notification(notification, c)?,
+            OutboxEffect::Notification(notification) => notify(notification)?,
             OutboxEffect::Event(event) => crate::lua::on_event(event),
         }
     }
     Ok(value)
+}
+
+pub(in crate::services) fn dispatch_changed<T>(value: T, outbox: Outbox<OnlineChanged>, c: &Client) -> Result<T, CallError> {
+    dispatch_entries(value, outbox, |notification| dispatch_notification(notification, c))
+}
+
+pub(in crate::services) fn dispatch_changed_world<T>(value: T, outbox: Outbox<OnlineChanged>, world: &crate::space::World) -> Result<T, CallError> {
+    dispatch_entries(value, outbox, |notification| notification.dispatch(world, None))
 }
 
 /// Reconcile all owned online hulls while the caller holds the market lock.

@@ -6,6 +6,7 @@
 //! This DAO has no direct client mirror or wire contract; owning services supply those.
 //! Policy, transactions, refusals, notifications and World are caller concerns.
 
+pub(crate) mod brain;
 pub(crate) mod charges;
 pub(crate) mod clones;
 pub(crate) mod combat;

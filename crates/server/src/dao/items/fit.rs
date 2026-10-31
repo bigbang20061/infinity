@@ -1,8 +1,10 @@
 //! Active fit data from game items and module charges; skill levels come from `skills::levels`.
 //! This DAO has no direct client service; dogma evaluation and SDE category filtering remain in the caller.
+//! Brain reads use an explicit FILETIME and exclude expired boosters, including before cleanup.
 //! Shared item type lookup lives in `items::inventory`; activation and consumption are not handled here.
 use crate::db::{executor::Executor, Error};
 use crate::consts::{FLAG_BOOSTER, FLAG_DRONE_BAY, FLAG_FITTING_FIRST, FLAG_FITTING_LAST, FLAG_IMPLANT, FLAG_RIG_FIRST, FLAG_RIG_LAST, FLAG_SUBSYSTEM_FIRST, FLAG_SUBSYSTEM_LAST};
+use super::brain::BrainItem;
 use tokio_postgres::Row;
 
 pub(crate) struct Module { pub item_id: i64, pub type_id: i32, pub online: bool, pub flag_id: i32 }
@@ -10,14 +12,12 @@ impl Module { fn from_row(r: &Row) -> Self { Self { item_id: r.get("item_id"), t
 pub(crate) struct Charge { pub flag_id: i32, pub type_id: i32 }
 impl Charge { fn from_row(r: &Row) -> Self { Self { flag_id: r.get("flag_id"), type_id: r.get("type_id") } } }
 
-pub(crate) struct BrainItem { pub item_id: i64, pub type_id: i32, pub flag_id: i32 }
-impl BrainItem { fn from_row(r: &Row) -> Self { Self { item_id: r.get("item_id"), type_id: r.get("type_id"), flag_id: r.get("flag_id") } } }
 pub(crate) struct Drone { pub item_id: i64, pub type_id: i32 }
 impl Drone { fn from_row(r: &Row) -> Self { Self { item_id: r.get("item_id"), type_id: r.get("type_id") } } }
 
-pub(crate) async fn brain_items(ex: &(impl Executor + ?Sized), char_id: i64) -> Result<Vec<BrainItem>, Error> {
-    Ok(ex.query("SELECT item_id, type_id, flag_id FROM game.items WHERE owner_id = $1 AND location_id = $1 AND flag_id IN ($2, $3) ORDER BY item_id",
-        &[&char_id, &FLAG_BOOSTER, &FLAG_IMPLANT]).await?.iter().map(BrainItem::from_row).collect())
+pub(crate) async fn brain_items(ex: &(impl Executor + ?Sized), char_id: i64, at: i64) -> Result<Vec<BrainItem>, Error> {
+    Ok(ex.query("SELECT item_id, type_id, flag_id, brain_slot, brain_activated_at, brain_expires_at, brain_effect_ids FROM game.items WHERE owner_id = $1 AND location_id = $1 AND flag_id IN ($2, $3) AND (flag_id <> $2 OR ((brain_activated_at IS NULL OR brain_activated_at <= $4) AND (brain_expires_at IS NULL OR brain_expires_at > $4))) ORDER BY item_id",
+        &[&char_id, &FLAG_BOOSTER, &FLAG_IMPLANT, &at]).await?.iter().map(BrainItem::from_row).collect())
 }
 pub(crate) async fn drones(ex: &(impl Executor + ?Sized), char_id: i64, ship: i64) -> Result<Vec<Drone>, Error> {
     Ok(ex.query("SELECT item_id, type_id FROM game.items WHERE owner_id = $1 AND location_id = $2 AND flag_id = $3 ORDER BY item_id",

@@ -173,7 +173,6 @@ pub(super) fn station(call: &Call<'_>) -> Option<CallResult> {
         // (solarSystemID, campaignSnapshot): no insurgency here. The system must match the
         // session's or the client asks again.
         ("userSvc", "GetMultiCharactersTrainingSlots") => empty_dict(),
-        ("nonDiminishingInjectionMgr", "GetAvailableNonDiminishingInjections") => int(0),
         ("securityMgr", "get_modified_systems") => empty_dict(),
         ("monolithTaskTrackerMgr", "GetCompletedAchievementsAndClientEventCount") => {
             Value::dict([("completedDict", empty_dict()), ("eventDict", empty_dict())])

@@ -1,4 +1,4 @@
-//! Isolated database rows and scoped failure injection for prerequisite atomicity tests.
+//! Isolated database rows for atomicity tests.
 use crate::db::{Db, Error};
 
 #[derive(Clone, Copy)]
@@ -22,19 +22,16 @@ pub(in crate::services) async fn skill_fingerprint(db: &Db, character: i64) -> R
     Ok(db.query_one("SELECT (SELECT COALESCE(string_agg(row_to_json(s)::text, '' ORDER BY type_id), '') FROM game.skills s WHERE character_id = $1) || '|' || (SELECT COALESCE(string_agg(row_to_json(q)::text, '' ORDER BY position), '') FROM game.skill_queue q WHERE character_id = $1) AS fingerprint", &[&character]).await?.get("fingerprint"))
 }
 
-pub(in crate::services) async fn install_skill_failure(db: &Db, character: i64) -> Result<(), Error> {
-    let function = format!("atomicity_skill_{character}");
-    db.execute(&format!("CREATE FUNCTION game.{function}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.character_id = {character} THEN RAISE EXCEPTION 'atomicity fixture'; END IF; RETURN NEW; END $$"), &[]).await?;
-    db.execute(&format!("CREATE TRIGGER {function} BEFORE INSERT OR UPDATE ON game.skills FOR EACH ROW EXECUTE FUNCTION game.{function}()"), &[]).await?;
-    Ok(())
+pub(in crate::services) fn assert_division_by_zero(result: Result<(), crate::services::CallError>) {
+    match result {
+        Err(crate::services::CallError::Internal(error)) => match error.downcast_ref::<Error>() {
+            Some(Error::Postgres(error)) => assert_eq!(error.code(), Some(&tokio_postgres::error::SqlState::DIVISION_BY_ZERO)),
+            _ => panic!("expected a PostgreSQL division-by-zero error"),
+        },
+        _ => panic!("expected a PostgreSQL division-by-zero error"),
+    }
 }
 
-pub(in crate::services) async fn remove_skill_failure(db: &Db, character: i64) -> Result<(), Error> {
-    let function = format!("atomicity_skill_{character}");
-    db.execute(&format!("DROP TRIGGER IF EXISTS {function} ON game.skills"), &[]).await?;
-    db.execute(&format!("DROP FUNCTION IF EXISTS game.{function}()"), &[]).await?;
-    Ok(())
-}
 
 pub(in crate::services) async fn seed_mission(db: &Db, character: i64, agent: i64, station: i64, system: i64, mission: i32, arc: i64) -> Result<(), Error> {
     db.execute("INSERT INTO game.agent_missions (character_id, agent_id, mission_id, dungeon_id, faction_id, state, system_id, x, y, z, reward_isk, reward_lp, offered_at, kind, arc_id, cargo_type, cargo_qty) VALUES ($1, $2, $3, 0, 0, 1, $4, 0, 0, 0, 0, 0, 0, 'courier', $5, 1, 1)", &[&character, &agent, &mission, &system, &arc]).await?;

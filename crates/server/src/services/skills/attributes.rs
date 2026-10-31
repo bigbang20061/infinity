@@ -25,6 +25,11 @@ pub(super) async fn character_attributes_db(db: &(impl Executor + ?Sized), sde: 
     Ok(CHAR_ATTRIBUTES.iter().map(|&attr| (attr, fit.value(Key::Char, attr as i32))).collect())
 }
 
+pub(super) async fn character_attributes_at(db: &(impl Executor + ?Sized), sde: &Arc<crate::sde::Sde>, char_id: i64, at: i64) -> Result<HashMap<i64, f64>, CallError> {
+    let fit = Fit::load_character_at(db, Arc::clone(sde), char_id, at).await?;
+    Ok(CHAR_ATTRIBUTES.iter().map(|&attr| (attr, fit.value(Key::Char, attr as i32))).collect())
+}
+
 /// Persisted remap or bloodline-derived starting values before modifiers.
 pub(crate) async fn base_character_attributes(db: &(impl Executor + ?Sized), sde: &crate::sde::Sde, char_id: i64) -> Result<HashMap<i64, f64>, CallError> {
     if let Some(bases) = crate::dao::characters::attributes::respec(db, char_id).await.map_err(db_err)?.and_then(|r| r.bases) {

@@ -6,7 +6,7 @@
 //! Actor-timed transitions flush queued notifications and forward destiny batches while waiting.
 
 use crate::conn::{Conn, Writer};
-use crate::consts::{FILETIME_SECOND, FILETIME_UNIX_EPOCH};
+use crate::consts::{FILETIME_DAY, FILETIME_HOUR, FILETIME_SECOND, FILETIME_UNIX_EPOCH};
 use crate::db::Db;
 use crate::db::outbox::{dispatch_client, Outbox};
 use crate::lua::events::GameEvent;
@@ -431,6 +431,20 @@ pub fn unix_seconds_from_filetime(ticks: i64) -> i64 {
 /// Convert a signed whole-second duration to FILETIME ticks.
 pub fn filetime_ticks_from_seconds(seconds: i64) -> i64 {
     seconds * FILETIME_SECOND
+}
+/// Convert the SDE datetime unit (days since Unix epoch) as
+/// `dogma/attributes/datetime.py::float_as_time`, rounded to whole seconds.
+pub fn filetime_from_dogma_days(days: f64) -> Option<i64> {
+    let seconds = ((days * FILETIME_DAY as f64 + FILETIME_UNIX_EPOCH as f64) / FILETIME_SECOND as f64).round();
+    if !seconds.is_finite() || seconds < i64::MIN as f64 || seconds >= i64::MAX as f64 { return None; }
+    i64::try_from((seconds as i128) * i128::from(FILETIME_SECOND)).ok()
+}
+
+/// Convert a finite hour duration to FILETIME ticks, rejecting overflow.
+pub fn filetime_ticks_from_hours(hours: f64) -> Option<i64> {
+    let ticks = hours * FILETIME_HOUR as f64;
+    if !ticks.is_finite() || ticks < i64::MIN as f64 || ticks >= i64::MAX as f64 { return None; }
+    Some(ticks as i64)
 }
 
 /// Convert a FILETIME timestamp to Unix milliseconds, rounding toward positive infinity.

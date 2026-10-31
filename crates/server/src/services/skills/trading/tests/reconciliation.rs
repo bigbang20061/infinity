@@ -92,7 +92,11 @@ async fn extraction_reconciles_owned_hulls_and_rolls_back() {
     }, |_, outbox| async move {
         let mut notifications = Vec::new();
         for entry in outbox.into_entries() {
-            if let crate::db::outbox::Effect::Notification(crate::db::outbox::Notification::Pilot { event, args, .. }) = entry { notifications.push((event, args)); }
+            match entry {
+                crate::db::outbox::Effect::Notification(crate::db::outbox::Notification::Pilot { event, args, .. }) => notifications.push((event, args)),
+                crate::db::outbox::Effect::Operation(change) => online::apply_online_changed(change),
+                _ => {}
+            }
         }
         Ok(notifications)
     }).await.unwrap_or_else(|_| panic!("extraction failed"));
