@@ -36,7 +36,8 @@ fn stop_preserves_throttle_velocity_and_only_clears_follow_state() {
 fn stop_damps_y_before_tick_and_interpolation() {
     let mut b = ball();
     b.stop();
-    b.evolve(1000, 1000, &HashMap::new(), 0);
+    b.evolve_behavior_for_ball(1000, 1000, &HashMap::new(), 0);
+    b.evolve_position(1000);
     let damped = (20.0 - STOP_VERTICAL_DAMPING * 20.0) * STOP_VERTICAL_RETAIN;
     assert_eq!(b.old_vel, [10.0, damped, 30.0]);
     let factor = (-1.0_f64).exp();
@@ -69,7 +70,8 @@ fn low_effective_mass_is_unfloored_for_tick_and_interpolation() {
     b.agility = 0.5;
     b.vel = [10.0, 0.0, 0.0];
     b.stop();
-    b.evolve(1000, 1000, &HashMap::new(), 0);
+    b.evolve_behavior_for_ball(1000, 1000, &HashMap::new(), 0);
+    b.evolve_position(1000);
     let expected = 10.0 * 0.05 * (1.0 - (-20.0_f64).exp());
     let half = 10.0 * 0.05 * (1.0 - (-10.0_f64).exp());
     assert!((b.pos[0] - expected).abs() < 1e-12);
@@ -82,7 +84,8 @@ fn nonpositive_effective_mass_does_not_produce_nan() {
     let mut b = ball();
     b.mass = 0.0;
     b.stop();
-    b.evolve(1000, 1000, &HashMap::new(), 0);
+    b.evolve_behavior_for_ball(1000, 1000, &HashMap::new(), 0);
+    b.evolve_position(1000);
     assert_eq!(b.pos, [0.0; 3]);
     assert_eq!(b.vel, [0.0; 3]);
     assert_eq!(b.position_at(1500), [0.0; 3]);

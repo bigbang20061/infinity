@@ -23,9 +23,9 @@
 //! (`Ballpark.cpp:4102-4113`) falls back to GotoPoint for a raw destination
 //! strictly below 100 km, without WarpFX.
 //!
-//! Full warp and missile flight remain approximate; collisions and bumps
-//! are not modelled. Orientations, formations, miniballs,
-//! AddBalls2 and unsupported ball modes are not implemented.
+//! Missile flight uses native steering; the gameplay impact timer is separate.
+//! Full warp, collisions and bumps are not modelled. Orientations, formations,
+//! miniballs, AddBalls2 and unsupported ball modes are not implemented.
 //! Shared vector distances are defined here for simulation and service callers.
 
 use crate::consts::{AU, DAMAGE_LAYER_COUNT, FILETIME_SECOND, SECONDS_PER_MINUTE};
@@ -47,6 +47,7 @@ mod stop;
 mod goto;
 mod follow;
 mod orbit;
+mod missile;
 pub use npc::{HOSTILE_TO_ALL, NpcAction, NpcBrain, NpcConfig, NpcEffects, NpcFuture};
 pub use system::System;
 use actor::SystemHandle;
@@ -103,6 +104,7 @@ pub type V3 = [f64; 3];
 #[derive(Clone, Copy)]
 struct TargetState {
     pos: V3,
+    vel: V3,
     radius: f32,
 }
 
@@ -359,15 +361,14 @@ impl Ball {
         Value::instance("eve.common.script.util.slimItem.SlimItem", fields)
     }
 
-    fn evolve(&mut self, ms: i64, anchor: i64, others: &HashMap<i64, TargetState>, current_time: i64) {
-        if self.mode == MODE_MISSILE { return; }
-        if !self.free || ms <= self.last_ms {
-            self.last_ms = self.last_ms.max(ms);
-            return;
-        }
+    fn evolve_behavior_for_ball(&mut self, ms: i64, anchor: i64, others: &HashMap<i64, TargetState>, current_time: i64) {
+        if !self.free || ms <= self.last_ms { return; }
         self.interpolation_anchor_ms = anchor;
-        if matches!(self.mode, MODE_FOLLOW | MODE_ORBIT) && !others.contains_key(&self.follow_id) {
-            if self.mode == MODE_ORBIT && self.interactive { self.goto_direction(self.vel); } else { self.stop(); }
+        if matches!(self.mode, MODE_FOLLOW | MODE_ORBIT | MODE_MISSILE) && !others.contains_key(&self.follow_id) {
+            if self.mode == MODE_MISSILE {
+                self.massive = false;
+                self.goto_direction(self.vel);
+            } else if self.mode == MODE_ORBIT && self.interactive { self.goto_direction(self.vel); } else { self.stop(); }
         }
         if self.mode == MODE_STOP { self.evolve_stop(); }
         self.old_pos = self.pos;
@@ -381,10 +382,18 @@ impl Ball {
                     MODE_GOTO => self.evolve_goto(),
                     MODE_FOLLOW => self.evolve_follow(&others[&self.follow_id]),
                     MODE_ORBIT => self.evolve_old_style_orbit(&others[&self.follow_id], current_time),
+                    MODE_MISSILE => self.evolve_missile(&others[&self.follow_id], current_time),
                     _ => V3::default(),
                 }
             };
             self.segment_acceleration = Some(acceleration);
+        }
+    }
+
+    fn evolve_position(&mut self, ms: i64) {
+        if !self.free || ms <= self.last_ms {
+            self.last_ms = self.last_ms.max(ms);
+            return;
         }
         if let Some(w) = &self.warp {
             let elapsed = (ms - w.start) as f64;

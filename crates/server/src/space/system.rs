@@ -42,6 +42,7 @@ pub struct System {
     observers: HashMap<i64, (i64, DestinyTx)>,
     registry: Arc<Pilots>,
     target_states: HashMap<i64, TargetState>,
+    free_ids: Vec<i64>,
     /// Celestial warp-in points (warpin.rs), by celestial ID.
     warp_ins: HashMap<i64, V3>,
     pending: Option<HashMap<i64, Vec<Value>>>,
@@ -160,8 +161,11 @@ impl System {
 
     /// Ballpark::StopAllFollowers, for followers of a removed target.
     fn stop_all_followers(&mut self, id: i64) {
-        for ball in self.balls.values_mut().filter(|b| b.follow_id == id && matches!(b.mode, MODE_FOLLOW | MODE_ORBIT)) {
-            if ball.mode == MODE_ORBIT && ball.interactive { ball.goto_direction(ball.vel); } else { ball.stop(); }
+        for ball in self.balls.values_mut().filter(|b| b.follow_id == id && matches!(b.mode, MODE_FOLLOW | MODE_ORBIT | MODE_MISSILE)) {
+            if ball.mode == MODE_MISSILE {
+                ball.massive = false;
+                ball.goto_direction(ball.vel);
+            } else if ball.mode == MODE_ORBIT && ball.interactive { ball.goto_direction(ball.vel); } else { ball.stop(); }
         }
     }
 
@@ -178,7 +182,7 @@ impl System {
         self.actions.is_empty()
             && !self.timers.first_key_value().is_some_and(|(&(due, _), _)| due <= self.ms)
             && self.brains.is_empty() && self.observers.is_empty() && !self.balls.values().any(|b|
-            (b.free && b.mode != MODE_MISSILE && (b.mode != MODE_STOP || b.vel != [0.0; 3]))
+            (b.free && (b.mode != MODE_STOP || b.vel != [0.0; 3]))
             || (b.cloak != 0 && b.cloak_until > 0))
     }
     pub fn tick(&mut self, ms: i64) {
@@ -203,17 +207,24 @@ impl System {
                 let (stamp, action) = self.actions.pop_front().unwrap();
                 action(self, stamp);
             }
-            if self.balls.values().any(|b| b.free && b.mode != MODE_MISSILE
-                && (b.mode != MODE_STOP || b.vel != [0.0; 3])) {
+            if self.balls.values().any(|b| b.free && (b.mode != MODE_STOP || b.vel != [0.0; 3])) {
                 self.target_states.clear();
                 self.target_states.extend(self.balls.iter().map(|(&id, b)| (id, TargetState {
-                    pos: b.pos, radius: b.radius,
+                    pos: b.pos, vel: b.vel, radius: b.radius,
                 })));
+                self.free_ids.clear();
+                self.free_ids.extend(self.balls.iter().filter_map(|(&id, b)| b.free.then_some(id)));
+                self.free_ids.sort_unstable();
                 let logical_ms = (self.current_time + 1) * MILLISECONDS_PER_SECOND;
                 let anchor_ms = if due > MAX_CATCHUP_STEPS { ms }
                     else { next_tick_ms + step * MILLISECONDS_PER_SECOND };
-                for b in self.balls.values_mut().filter(|b| b.free) {
-                    b.evolve(logical_ms, anchor_ms, &self.target_states, self.current_time);
+                for id in &self.free_ids {
+                    let b = self.balls.get_mut(id).unwrap();
+                    b.evolve_behavior_for_ball(logical_ms, anchor_ms, &self.target_states, self.current_time);
+                    self.target_states.get_mut(id).unwrap().vel = b.vel;
+                }
+                for id in &self.free_ids {
+                    self.balls.get_mut(id).unwrap().evolve_position(logical_ms);
                 }
             }
             self.current_time += 1;
@@ -273,15 +284,21 @@ impl System {
         let id = ball.id;
         self.add_ship(ball);
         self.actions.push_back((self.current_time, Box::new(move |s, stamp| {
-            let Some(ball) = s.balls.get_mut(&id) else { return };
+            let Some(mut ball) = s.balls.remove(&id) else { return };
             ball.last_ms = s.current_time * MILLISECONDS_PER_SECOND;
             ball.interpolation_anchor_ms = s.ms;
-            ball.mode = MODE_MISSILE;
-            ball.speed_fraction = 1.0;
-            ball.follow_id = target;
-            ball.launcher = launcher;
-            ball.effect_stamp = stamp;
+            let owner = launcher.checked_abs().and_then(|owner_id| {
+                if owner_id == id { Some(&ball) } else { s.balls.get(&owner_id) }
+            }).map(|b| (b.pos, b.vel, b.max_vel));
+            if let Some(owner) = owner.filter(|_| target >= 0) {
+                let target_ball = if target == launcher { None } else if target == id {
+                    Some(&ball)
+                } else { s.balls.get(&target) };
+                let target_ball = target_ball.map(|b| (b.id, b.pos, b.radius, b.cloak));
+                ball.launch_native_missile(owner, target_ball, launcher, stamp);
+            }
             let visibility = (id, ball.cloak);
+            s.balls.insert(id, ball);
             let update = event(stamp, "LaunchMissile", vec![
                 Value::Int(id), Value::Int(target), Value::Int(launcher),
                 Value::Bool(MISSILE_AIMED_LAUNCH), Value::Bool(MISSILE_MASSIVE),

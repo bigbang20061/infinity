@@ -44,6 +44,7 @@ fn propulsion_and_missile_commands_wait_for_boundary_and_use_enqueue_stamp() {
         cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new(),
     };
     system.insert(ball.clone());
+    system.insert(Ball { id: 3, pos: [1000.0, 0.0, 0.0], ..ball.clone() });
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     system.observe(1, 1, tx);
     queue_kinematics(&mut system, 1, Kinematics { speed: 20.0, mass: 30.0, agility: 0.25, signature: 40.0 });

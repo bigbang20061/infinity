@@ -62,21 +62,22 @@ fn warp_segment_survives_landing_and_static_modes_stay_fixed() {
     b.mode = MODE_WARP;
     b.warp = Some(Warp { from: [0.0; 3], to: [120.0, 0.0, 0.0], start: 0, duration: 1500.0, factor: 1 });
     let positions = HashMap::new();
-    b.evolve(1000, 30_000, &positions, 0);
+    b.evolve_behavior_for_ball(1000, 30_000, &positions, 0);
+    b.evolve_position(1000);
     assert_eq!(b.position_at(30_000), [0.0; 3]);
     assert_eq!(b.position_at(30_500), [40.0, 0.0, 0.0]);
-    b.evolve(2000, 2000, &positions, 1);
+    b.evolve_behavior_for_ball(2000, 2000, &positions, 1);
+    b.evolve_position(2000);
     assert!(b.warp.is_none());
     assert_eq!(b.position_at(2000), [80.0, 0.0, 0.0]);
     assert_eq!(b.position_at(2500), [120.0, 0.0, 0.0]);
     assert_eq!(b.position_at(3000), b.pos);
-    for mode in [MODE_RIGID, MODE_MISSILE] {
-        let mut fixed = ball(2, None, 7.0);
-        fixed.mode = mode;
-        fixed.free = mode != MODE_RIGID;
-        fixed.evolve(1000, 1000, &positions, 0);
-        assert_eq!(fixed.position_at(1500), [7.0, 0.0, 0.0]);
-    }
+    let mut fixed = ball(2, None, 7.0);
+    fixed.mode = MODE_RIGID;
+    fixed.free = false;
+    fixed.evolve_behavior_for_ball(1000, 1000, &positions, 0);
+    fixed.evolve_position(1000);
+    assert_eq!(fixed.position_at(1500), [7.0, 0.0, 0.0]);
 }
 
 #[test]
@@ -211,6 +212,8 @@ fn command_stamps_seconds_and_borrows_other_balls() {
 fn missile_impact_delay_starts_at_launch_boundary() {
     let mut s = System::new(0, Arc::default(), 12_100);
     let mut rx = watch(&mut s, 1, 1);
+    s.insert(ball(5, None, 0.0));
+    s.insert(ball(4, None, 1000.0));
     let fired = Arc::new(Mutex::new(Vec::new()));
     let observed = fired.clone();
     let mut missile = ball(3, None, 0.0);
@@ -354,9 +357,11 @@ fn constant_target_integration_is_step_size_independent() {
     one.vel = [-3.0, 4.0, 2.0];
     let mut ten = one.clone();
     let positions = HashMap::new();
-    one.evolve(1000, 1000, &positions, 0);
+    one.evolve_behavior_for_ball(1000, 1000, &positions, 0);
+    one.evolve_position(1000);
     for ms in (100..=1000).step_by(100) {
-        ten.evolve(ms, ms, &positions, 0);
+        ten.evolve_behavior_for_ball(ms, ms, &positions, 0);
+        ten.evolve_position(ms);
     }
     for (a, b) in one.pos.into_iter().zip(ten.pos).chain(one.vel.into_iter().zip(ten.vel)) {
         assert!((a - b).abs() <= 1e-6 * a.abs().max(1.0));

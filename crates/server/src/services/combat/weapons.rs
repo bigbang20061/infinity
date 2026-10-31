@@ -264,8 +264,8 @@ pub(super) struct Missile {
 }
 
 
-/// Launch from the actor-sampled source and target captured together: it flies client-side;
-/// on impact it explodes and deals damage scaled by explosion radius vs. the target's signature.
+/// Launch a native-steered missile actor; the separate gameplay impact timer
+/// applies damage scaled by explosion radius versus the target's signature.
 pub(super) async fn launch_missile(db: Db, world: Arc<World>, system: i64, from: Ball, target: Ball, owner: i64, module: Option<i64>, m: Missile) -> Result<(), CallError> {
     let size = world.sde().types.get(m.charge)
         .ok_or_else(|| CallError::Internal(anyhow::anyhow!("unknown type {}", m.charge)))?;
