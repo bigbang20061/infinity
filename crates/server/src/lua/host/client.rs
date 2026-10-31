@@ -139,7 +139,7 @@ impl UserData for Context {
 async fn apply_mutation(c: &mut Client, operation: Mutation) -> Result<Option<i64>, CallError> {
     use crate::{db::outbox::{dispatch_client, dispatch_world, Outbox}, services::{inventory, items, market, standings, wallets}};
     match operation {
-        Mutation::Move { container, item, flag, quantity } => inventory::move_item(c, &container, item, flag, quantity).await,
+        Mutation::Move { container, item, flag, quantity } => inventory::move_item(c, &container, item, None, flag, quantity).await,
         Mutation::Delete { item } => { inventory::trash_items(c, &[item]).await?; Ok(None) }
         Mutation::Mail(input) => {
             let id = crate::services::mail::mail_mgr::send_mail(&c.db, &c.world, c.session.int("charid").unwrap_or(0), c.session.int("corpid"), input).await?;

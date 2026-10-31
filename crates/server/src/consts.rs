@@ -517,6 +517,8 @@ pub const FLAG_PILOT: i32 = 57;
 pub const FLAG_CORP_SAG1: i32 = 115;
 /// Client inventorycommon.const.locationJunkyard: deleted items.
 pub const LOCATION_JUNKYARD: i64 = 10;
+/// Client carbon const.ixOwnerID: inventory row owner column.
+pub const IX_OWNER_ID: i64 = 2;
 /// Client carbon const.ixLocationID: inventory row location column.
 pub const IX_LOCATION_ID: i64 = 3;
 /// Client carbon const.ixFlag: inventory row flag column.

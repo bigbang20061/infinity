@@ -228,12 +228,16 @@ impl Client {
             services::fleet_logged_off(&self.world, char_id);
             self.world.unregister_pilot(char_id);
         }
+        let trade_result = services::trade::on_leave(self).await.map_err(|error| match error {
+            services::CallError::Internal(error) => error,
+            services::CallError::User { msg, .. } => anyhow::anyhow!(msg),
+        });
         if let (Some(system), Some(ship)) = (self.session.int("solarsystemid"), self.session.int("shipid")) {
             if let Some(b) = self.world.remove_ball(system, ship).await {
                 crate::dao::items::positions::save(&self.db, ship, &b.pos).await?;
             }
         }
-        Ok(())
+        trade_result
     }
 
     async fn handle(&mut self, p: Packet) -> Result<()> {

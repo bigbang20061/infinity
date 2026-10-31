@@ -52,6 +52,7 @@ mod slash;
 mod sql_pattern;
 mod station;
 mod store;
+pub(crate) mod trade;
 mod universe;
 pub(crate) mod wallets;
 
@@ -66,6 +67,7 @@ pub(crate) fn scheduler_registrations() -> Vec<crate::scheduler::Registration> {
         periodic(MARKET, market::expire_orders, game.market.maintenance_secs as u64),
         periodic(CONTRACTS, contracts::settle_auctions, game.contracts.maintenance_secs as u64),
         periodic(BILLS, bills::run_billing, game.corporations.bills_maintenance_secs as u64),
+        trade::timeout_registration(),
     ]
 }
 
@@ -306,6 +308,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
         (_, "MachoBindObject") => bind_object(c, call).await,
 
 
+        ("trademgr", _) => trade::route(c, call).await,
         (inventory::INVENTORY, _) => inventory::inventory(c, call).await,
 
         ("config", _) => config::dispatch(c, call).await,

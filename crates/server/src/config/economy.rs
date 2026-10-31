@@ -10,6 +10,26 @@ const MAX_STARTING_PLEX: i64 = i64::MAX;
 
 /// 15 significant digits (f64 DBL_DIG): the largest two-decimal amount that survives decimal → f64 → PostgreSQL float8::numeric unchanged.
 const MAX_STARTING_ISK: f64 = 9_999_999_999_999.99;
+
+/// Direct trade policy.
+#[derive(Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TradeConfig {
+    /// Server policy: idle trade timeout, default 1800 seconds.
+    pub idle_timeout_secs: i64,
+}
+
+impl Default for TradeConfig {
+    fn default() -> Self { Self { idle_timeout_secs: 1800 } }
+}
+
+impl TradeConfig {
+    pub(super) fn validate(&self) -> Result<()> {
+        anyhow::ensure!(self.idle_timeout_secs > 0, "trade.idle_timeout_secs must be positive");
+        super::duration("trade.idle_timeout_secs", self.idle_timeout_secs, crate::consts::FILETIME_SECOND, true)?;
+        Ok(())
+    }
+}
 /// Daily free offer from services/store/store_manager.rs.
 #[derive(Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]

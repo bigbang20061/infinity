@@ -211,6 +211,42 @@ impl DbRowDescriptor {
         Some(DbRowDescriptor { columns, virtual_columns })
     }
 
+    /// Read a stored column from a decoded row. Fixed-width values are owned
+    /// because decoded DBRows keep packed bytes rather than individual Values.
+    pub fn get(&self, row: &Value, name: &str) -> Option<Value> {
+        let Value::DbRow { data, objects, .. } = row else { return None };
+        let index = self.columns.iter().position(|(column, _)| column == name)?;
+        let layout = self.layout();
+        let bit = layout.null_bits.checked_add(index)?;
+        if data.get(bit / 8)? & (1 << (bit % 8)) != 0 {
+            return Some(Value::None);
+        }
+        let ty = self.columns[index].1;
+        match layout.slots[index] {
+            Slot::Virtual => None,
+            Slot::Object(index) => objects.get(index).cloned(),
+            Slot::Bit(bit) => Some(Value::Bool(data.get(bit / 8)? & (1 << (bit % 8)) != 0)),
+            Slot::Fixed { offset, width } => {
+                let bytes = data.get(offset..offset.checked_add(width)?)?;
+                let mut raw = [0u8; 8];
+                raw[..width].copy_from_slice(bytes);
+                let value = match ty {
+                    DbType::I1 => Value::Int(i8::from_le_bytes([raw[0]]) as i64),
+                    DbType::I2 => Value::Int(i16::from_le_bytes(raw[..2].try_into().ok()?) as i64),
+                    DbType::I4 => Value::Int(i32::from_le_bytes(raw[..4].try_into().ok()?) as i64),
+                    DbType::UI1 | DbType::UI2 | DbType::UI4 => Value::Int(u64::from_le_bytes(raw) as i64),
+                    DbType::UI8 => Value::Int(i64::try_from(u64::from_le_bytes(raw)).ok()?),
+                    DbType::I8 | DbType::FileTime | DbType::DbTimestamp => Value::Int(i64::from_le_bytes(raw)),
+                    DbType::R4 => Value::Float(f32::from_le_bytes(raw[..4].try_into().ok()?) as f64),
+                    DbType::R8 => Value::Float(f64::from_le_bytes(raw)),
+                    DbType::Cy => Value::Float(i64::from_le_bytes(raw) as f64 / CURRENCY_SCALE),
+                    _ => return None,
+                };
+                Some(value)
+            }
+        }
+    }
+
     /// Build a row; `values` correspond to columns in order (`Value::None` = NULL).
     pub fn row(&self, values: &[Value]) -> Value {
         let layout = self.layout();

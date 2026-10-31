@@ -35,6 +35,8 @@ pub struct GameConfig {
     pub characters: economy::CharactersConfig,
     /// Market policy.
     pub market: economy::MarketConfig,
+    /// Direct trade policy.
+    pub trade: economy::TradeConfig,
     /// Store policy.
     pub store: economy::StoreConfig,
     /// Industry policy.
@@ -72,6 +74,7 @@ impl GameConfig {
         self.accounts.validate()?;
         self.characters.validate()?;
         self.market.validate()?;
+        self.trade.validate()?;
         self.store.validate()?;
         self.industry.validate()?;
         self.missions.validate()?;

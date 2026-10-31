@@ -29,6 +29,7 @@ fn jump_cooldown(base_hours: i64, reduction_per_level: i64, level: i64) -> i128 
 }
 
 enum JumpEffect {
+    Trade(Outbox<crate::services::trade::TradeEffect>),
     Session { station: i64, system: i64, constellation: i64, region: i64, capsule: i64 },
 }
 
@@ -88,6 +89,7 @@ async fn jump(c: &mut Client, me: i64, dest: i64, clone_id: i64) -> CallResult {
     };
     let now = filetime_now();
     let ship = c.session.int("shipid");
+    let _lock = crate::services::market::lock().await;
     let db = c.db.clone();
     let sde = c.sde.clone();
     db.transaction(
@@ -109,6 +111,9 @@ async fn jump(c: &mut Client, me: i64, dest: i64, clone_id: i64) -> CallResult {
             if to == station {
                 return Err(notify_error(messages::ALREADY_AT_JUMP_CLONE_DESTINATION));
             }
+            let mut trade_outbox = Outbox::default();
+            crate::services::trade::abort_for_char(tx, &sde, &mut trade_outbox, me).await?;
+            outbox.operation(JumpEffect::Trade(trade_outbox));
             clone_dao::delete(tx, clone_id).await.map_err(db_err)?;
             clone_dao::install(tx, me, station).await.map_err(db_err)?;
             if let Some(ship) = ship {
@@ -126,6 +131,7 @@ async fn jump(c: &mut Client, me: i64, dest: i64, clone_id: i64) -> CallResult {
             for effect in outbox.into_entries() {
                 match effect {
                     Effect::Notification(notification) => notification.dispatch(&world, Some(&mut *c))?,
+                    Effect::Operation(JumpEffect::Trade(trade_outbox)) => crate::services::trade::dispatch((), trade_outbox, &world)?,
                     Effect::Operation(JumpEffect::Session { station, system, constellation, region, capsule }) => c.change_session(vec![
                         ("stationid", Value::Int(station)), ("solarsystemid2", Value::Int(system)),
                         ("constellationid", Value::Int(constellation)), ("regionid", Value::Int(region)),

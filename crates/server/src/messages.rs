@@ -9,6 +9,7 @@ pub(crate) mod gm;
 pub(crate) mod scheduler;
 pub(crate) mod lua;
 pub(crate) mod standings;
+pub(crate) mod trade;
 
 /// Proxy usurp reason from `carbon/common/script/net/machoNet.py`.
 pub(crate) const SESSION_USURPED: &str = "The user's connection has been usurped on the proxy";
