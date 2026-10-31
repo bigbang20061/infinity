@@ -314,6 +314,15 @@ pub(super) fn absorb(now: &mut [f64; 3], resonance: &[[f64; 4]; 3], raw: [f64; 4
     dealt
 }
 
+fn damage_npc_cached(target: i64, initial: impl FnOnce() -> Hp, raw: [f64; 4]) -> (f64, bool, [f64; 3]) {
+    let mut st = state();
+    let hp = st.hp.entry(target).or_insert_with(initial);
+    let dealt = absorb(&mut hp.now, &hp.resonance, raw);
+    let destroyed = hp.now[2] <= 0.0 && (hp.max[2] > 0.0 || hp.now.iter().all(|v| *v <= 0.0));
+    let health = [0, 1, 2].map(|i| if hp.max[i] > 0.0 { (hp.now[i] / hp.max[i]).clamp(0.0, 1.0) } else { 0.0 });
+    (dealt, destroyed, health)
+}
+
 /// Damage an NPC (or any non-player ball); destroys it at zero structure.
 pub(super) async fn damage_npc(db: &Db, world: &World, system: i64, target: i64, raw: [f64; 4], attacker: Option<i64>) -> Result<f64, CallError> {
     let Some(ball) = world.ball(system, target).await else { return Ok(0.0) };
@@ -322,16 +331,11 @@ pub(super) async fn damage_npc(db: &Db, world: &World, system: i64, target: i64,
             s.add_aggressor(target, pilot);
         });
     }
-    let known = state().hp.get(&target).cloned();
-    let mut hp = match known {
-        Some(hp) => hp,
-        None => {
-            let max = ATTR_HP.map(|id| attr(world.sde(), ball.type_id, id, 0.0));
-            Hp { now: max, max, resonance: ATTR_RESONANCE.map(|layer| layer.map(|id| attr(world.sde(), ball.type_id, id, 1.0))) }
-        }
-    };
-    let dealt = absorb(&mut hp.now, &hp.resonance, raw);
-    if hp.now[2] <= 0.0 && (hp.max[2] > 0.0 || hp.now.iter().all(|v| *v <= 0.0)) {
+    let (dealt, destroyed, health) = damage_npc_cached(target, || {
+        let max = ATTR_HP.map(|id| attr(world.sde(), ball.type_id, id, 0.0));
+        Hp { now: max, max, resonance: ATTR_RESONANCE.map(|layer| layer.map(|id| attr(world.sde(), ball.type_id, id, 1.0))) }
+    }, raw);
+    if destroyed {
         let destroyed = world.destroy_ball(system, target).await;
         forget_ship(target);
         forget_target(world, target);
@@ -350,8 +354,6 @@ pub(super) async fn damage_npc(db: &Db, world: &World, system: i64, target: i64,
             }
         }
     } else {
-        let health = [0, 1, 2].map(|i| if hp.max[i] > 0.0 { (hp.now[i] / hp.max[i]).clamp(0.0, 1.0) } else { 0.0 });
-        state().hp.insert(target, hp);
         world.set_health(system, target, health);
     }
     Ok(dealt)

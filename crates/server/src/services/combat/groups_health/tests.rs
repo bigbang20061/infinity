@@ -42,3 +42,21 @@ fn refused_cycle_drain_leaves_stored_state_untouched() {
     assert_eq!(result.amount, 0.0);
     assert_eq!(entries.get(&1), Some(&(20.0, 0)));
 }
+
+#[test]
+fn concurrent_npc_damage_does_not_overwrite_cached_updates() {
+    let target = i64::MIN + 205;
+    state().hp.remove(&target);
+    std::thread::scope(|scope| {
+        for _ in 0..2 {
+            scope.spawn(|| {
+                for _ in 0..100 {
+                    damage_npc_cached(target, || Hp {
+                        now: [1000.0; 3], max: [1000.0; 3], resonance: [[1.0; 4]; 3],
+                    }, [1.0, 0.0, 0.0, 0.0]);
+                }
+            });
+        }
+    });
+    assert_eq!(state().hp.remove(&target).unwrap().now[0], 800.0);
+}
