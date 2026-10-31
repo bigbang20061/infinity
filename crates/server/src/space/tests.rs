@@ -133,4 +133,5 @@ fn goto_tick_steers_toward_absolute_point_and_zero_has_no_thrust() {
 }
 
 mod destiny_reference;
+mod pr2_reference;
 
