@@ -71,6 +71,7 @@ Any other tag starts nothing.
 | Login handshake | `handshake.rs` (GPS, Placebo crypto), `live_sessions.rs` (one live session per account) |
 | Packet loop, session changes, notifications | `client.rs`, `session.rs`, `macho.rs`, `conn.rs`, `framing.rs` |
 | Remote service dispatch | `services/mod.rs` (`dispatch`), one module per feature under `services/`, and `services/fixed.rs` (constant answers for services that are not modelled) |
+| Lua scripts | `lua/` (VM, typed values, host functions and reload), `dao/lua_store.rs` (`game.lua_store`); the shipped scripts are in `crates/server/lua/`, and `docs/lua.md` documents the script API |
 | Server-side dogma | `services/fit.rs` (effective attributes), `services/dogma.rs` (dogmaIM), `services/effects/` (effect registry, activation lifecycle and the effect families; see `docs/effects.md`) |
 | Space simulation and destiny | `space/mod.rs` (`World` facade, `Ball`, destiny encoding, integration and interpolation, pilot registry and jump queues), `space/system.rs` (`System`: one system's state, destiny clock, action queue, tick, timers), `space/actor.rs` (per-system mailbox and the wall-aligned 100 ms loop), `space/npc.rs` (NPC brains, spawn groups, effects worker), `space/snapshot.rs` (periodic pilot position saves and the shutdown flush) |
 | Scheduled jobs | `scheduler/` (job registration, the claim runner, retries and the shutdown drain), `dao/jobs.rs` (`game.jobs`); handlers register in `services/mod.rs` |
@@ -129,6 +130,13 @@ Any other tag starts nothing.
 4. `retail::cached_call` answers first. Do not shadow a captured retail answer unless you replace it on purpose.
 5. If a feature isn't modelled but the client needs an answer, add an empty but well-formed constant answer to `services/fixed.rs`, in the function for its position in the dispatch chain, with a comment saying what the client reads from it.
 6. Unhandled calls log `UNHANDLED <service>::<method>` and return `None`. Make that line go away by handling the call. Never suppress the warning.
+
+### Lua scripts
+
+- Scripts in `crates/server/lua/` can claim remote calls, GM commands and events. A claimed call is answered after `retail::cached_call` and before every Rust module, and the claims are logged when the scripts load. `docs/lua.md` documents the script API.
+- Host functions under `lua/host/` call the same service functions as the Rust handlers, with their transactions, outbox notifications and `World` operations. A new host function calls an existing service function; never write a second version of a game rule for scripts.
+- Scripts get no SQL. A script's own persistent data goes through the `store` host functions, which keep typed values per script in `game.lua_store` (`dao/lua_store.rs`).
+- Lua is compiled from source by `mlua` (`vendored`). Do not add a dependency on a system Lua or on any other system library.
 
 ### Values on the wire
 
