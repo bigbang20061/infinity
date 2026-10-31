@@ -1,6 +1,7 @@
 use super::*;
 
 fn ball(id: i64, pilot: Option<i64>, x: f64) -> Ball {
+    crate::tests::init_config();
     Ball {
         id, type_id: 1, owner_id: 1, corp_id: 1, alliance_id: -1,
         char_id: pilot, signature_radius: pilot.map(|_| 1.0), mode: MODE_STOP, radius: 1.0, mass: 1e6,

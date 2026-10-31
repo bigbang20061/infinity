@@ -26,6 +26,7 @@ fn seconds_to_milliseconds_preserves_fractions() {
 
 #[test]
 fn lock_time_clamps_floors_and_calculates_interior() {
+    crate::tests::init_config();
     assert_eq!(lock_time_ms(1.0, 1.0), 60_000);
     assert_eq!(lock_time_ms(1e9, 1e9), 500);
     assert_eq!(lock_time_ms(-10.0, 0.0), lock_time_ms(1.0, 1.0));

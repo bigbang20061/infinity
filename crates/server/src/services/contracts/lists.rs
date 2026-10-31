@@ -1,5 +1,6 @@
 //! Contract listing mechanics for contractProxy, mirroring eve/client/script/ui/shared/neocom/contracts.
 //! Uses game contracts and items plus immutable SDE stations and types; corporation contracts are unsupported.
+//! Search and owner listing limits use the configured contracts pagination policy.
 
 use super::*;
 
@@ -61,14 +62,15 @@ pub(super) async fn search(c: &Client, kw: &Value) -> CallResult {
             .map(|item| item.contract_id).collect();
         found.retain(|k| matching.contains(&k.id));
     }
-    found.truncate(MAX_SEARCH_RESULTS);
-    let start = (int("startNum").unwrap_or(0).max(0) as usize).min(found.len());
-    let page = &found[start..(start + CONTRACTS_PER_PAGE).min(found.len())];
+    let policy = &crate::config::game().contracts;
+    found.truncate(usize::try_from(policy.page_size_max).unwrap_or(usize::MAX));
+    let start = usize::try_from(int("startNum").unwrap_or(0).max(0)).unwrap_or(usize::MAX).min(found.len());
+    let page = &found[start..start.saturating_add(usize::try_from(policy.page_size).unwrap_or(usize::MAX)).min(found.len())];
     Ok(keyval([
         ("contracts", Value::List(bundles(db, &c.sde, page).await?)),
         ("numFound", Value::Int(found.len() as i64)),
         ("searchTime", Value::Int(started.elapsed().as_millis() as i64)),
-        ("maxResults", Value::Int(MAX_SEARCH_RESULTS as i64)),
+        ("maxResults", Value::Int(policy.page_size_max)),
     ]))
 }
 
@@ -83,7 +85,7 @@ pub(super) async fn list_for_owner(c: &Client, call: &Call<'_>) -> CallResult {
         me, issued_by: match call.args.get(3) { Some(Value::Bool(v)) => Some(*v), _ => None },
         status: arg_int(1).unwrap_or(STATUS_OUTSTANDING as i64) as i32, kind: arg_int(2),
         before: call.kwargs.get("startContractID").and_then(|v| v.as_int()),
-        num: call.kwargs.get("num").and_then(|v| v.as_int()).unwrap_or(100).clamp(1, 1000),
+        num: call.kwargs.get("num").and_then(|v| v.as_int()).unwrap_or(crate::config::game().contracts.page_size).clamp(1, crate::config::game().contracts.page_size_max),
         outstanding: STATUS_OUTSTANDING, in_progress: STATUS_IN_PROGRESS, finished: STATUS_FINISHED,
         all: CONTYPE_ALL, combined: CONTYPE_AUCTION_AND_ITEM_EXCHANGE, exchange: TYPE_ITEM_EXCHANGE, auction: TYPE_AUCTION,
     };

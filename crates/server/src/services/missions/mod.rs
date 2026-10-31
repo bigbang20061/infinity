@@ -21,6 +21,8 @@
 //! The objective completes once the actor's spawned NPC group is cleared. Site
 //! records and group state are held in memory. Startup moves legacy buried mission sites
 //! clear of planets.
+//! Operators configure basic mission rewards, site placement and NPC spawn distances.
+//! Epic arc rewards continue to come from mission data.
 mod agent_mgr;
 mod mechanics;
 mod mission_tracker_mgr;
@@ -69,9 +71,7 @@ const AGENT_TYPE_BASIC: i64 = 2;
 const TYPE_CREDITS: i64 = 29;
 /// Owner of mission NPCs from dungeons without a faction (Guristas Pirates).
 const GENERIC_NPC_CORP: i64 = 1000127;
-/// Mission sites sit this far off a planet (m).
-const SITE_OFFSET: f64 = 15_000_000.0;
-/// A ship this close to a site's centre (m) is in it; NPCs spawn up to 32 km out.
+/// A ship this close to a site's centre (m) is in it.
 const SITE_RADIUS: f64 = 100_000.0;
 /// Server design: fallback station radius in metres when its ball is unavailable.
 const FALLBACK_STATION_RADIUS: f64 = 5000.0;

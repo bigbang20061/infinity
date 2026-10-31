@@ -128,6 +128,8 @@ The server reads `config.toml` from its working directory, or the file named by 
 
 A deployment key can also be set by its environment variable, which wins over the file; the file wins over the default. Game keys have no environment variables.
 
+The game sections, `[accounts]` through `[space]`, set the server's own rules: starting balances, fees and taxes, timers, limits, rewards, and spawn ranges and sizes. Their defaults are the values the server used before the file existed. Values the client checks itself, values from the static data, and the destiny physics constants cannot be changed. `characters.starting_isk` accepts 0 to 9,999,999,999,999.99 (an amount with more than 15 significant digits would not be stored exactly); `accounts.starting_plex` accepts 0 to 9,223,372,036,854,775,807.
+
 Start-up stops with an error that names the file and the dotted key when a key is unknown or a value is invalid, including an invalid environment variable. Errors show numbers and `true`/`false` values only; strings such as passwords and connection URLs are never printed. The `configuration loaded` log line names the file (or `defaults`) and the database host, port, user, database name and pool size in use.
 
 | Key | Variable | Default | Meaning |

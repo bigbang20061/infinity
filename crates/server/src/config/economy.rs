@@ -20,12 +20,12 @@ pub struct DailyGift {
     pub quantity: i64,
 }
 impl Default for DailyGift {
-    fn default() -> Self { Self { type_id: 52520, quantity: 10000 } }
+    fn default() -> Self { Self { type_id: 52520, quantity: 1 } }
 }
 impl DailyGift {
     pub fn validate(&self) -> Result<()> {
-        anyhow::ensure!(self.type_id > 0, "store.daily_gift.type_id={} must be positive", self.type_id);
-        anyhow::ensure!(self.quantity > 0, "store.daily_gift.quantity={} must be positive", self.quantity);
+        anyhow::ensure!((1..=i64::from(i32::MAX)).contains(&self.type_id), "store.daily_gift.type_id={} must fit a positive i32", self.type_id);
+        anyhow::ensure!((1..=i64::from(i32::MAX)).contains(&self.quantity), "store.daily_gift.quantity={} must fit a positive i32", self.quantity);
         Ok(())
     }
 }
@@ -34,9 +34,9 @@ impl DailyGift {
 #[derive(Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AccountsConfig {
-    /// Default source: game_schema.sql account PLEX vault and services/charsel.rs character-selection policy.
+    /// Existing SQL default for the account PLEX vault.
     pub starting_plex: i64,
-    /// Default source: game_schema.sql account PLEX vault and services/charsel.rs character-selection policy.
+    /// Server character-selection slots per account.
     pub character_slots: i64,
 }
 
@@ -61,17 +61,17 @@ impl AccountsConfig {
 #[derive(Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CharactersConfig {
-    /// Default source: services/charsel.rs and services/skills/skill_handler.rs character policy.
+    /// Server starting balance policy in services/charsel.rs.
     pub starting_isk: f64,
-    /// Default source: services/charsel.rs and services/skills/skill_handler.rs character policy.
+    /// Minimum length in server character-name validation.
     pub name_min_len: i64,
-    /// Default source: services/charsel.rs and services/skills/skill_handler.rs character policy.
+    /// Maximum length in server character-name validation.
     pub name_max_len: i64,
-    /// Default source: services/charsel.rs and services/skills/skill_handler.rs character policy.
+    /// Maximum spaces in server character-name validation.
     pub name_max_spaces: i64,
-    /// Default source: services/charsel.rs and services/skills/skill_handler.rs character policy.
+    /// Server deletion delay guards against a stray click.
     pub delete_delay_secs: i64,
-    /// Default source: services/charsel.rs and services/skills/skill_handler.rs character policy.
+    /// Server design default for free respecs in services/skills/skill_handler.rs.
     pub free_respecs: i64,
 }
 
@@ -95,6 +95,7 @@ impl CharactersConfig {
         anyhow::ensure!(self.name_max_len > 0, "characters.name_max_len={} is outside its valid domain", self.name_max_len);
         anyhow::ensure!(self.name_max_spaces > 0, "characters.name_max_spaces={} is outside its valid domain", self.name_max_spaces);
         anyhow::ensure!(self.delete_delay_secs > 0, "characters.delete_delay_secs={} is outside its valid domain", self.delete_delay_secs);
+        super::duration("characters.delete_delay_secs", self.delete_delay_secs, crate::consts::FILETIME_SECOND, true)?;
         anyhow::ensure!(self.free_respecs > 0, "characters.free_respecs={} is outside its valid domain", self.free_respecs);
         anyhow::ensure!(self.name_min_len <= self.name_max_len, "characters.name_min_len={} exceeds characters.name_max_len={}", self.name_min_len, self.name_max_len);
         Ok(())
@@ -105,23 +106,23 @@ impl CharactersConfig {
 #[derive(Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MarketConfig {
-    /// Default source: services/market/mod.rs marketutil.const, appConst.mktMinimumFee and server market policy.
+    /// Default broker fee from marketutil.const.
     pub broker_fee: f64,
-    /// Default source: services/market/mod.rs marketutil.const, appConst.mktMinimumFee and server market policy.
+    /// Minimum broker fee from appConst.mktMinimumFee.
     pub broker_fee_min_isk: f64,
-    /// Default source: services/market/mod.rs marketutil.const, appConst.mktMinimumFee and server market policy.
+    /// Transaction tax from MKT_TRANSACTION_TAX_DEFAULT.
     pub sales_tax: f64,
-    /// Default source: services/market/mod.rs marketutil.const, appConst.mktMinimumFee and server market policy.
+    /// Server design default for order duration in services/market/mod.rs.
     pub max_order_days: i64,
-    /// Default source: services/market/mod.rs marketutil.const, appConst.mktMinimumFee and server market policy.
+    /// Server market policy: NPC buy price as a fraction of sell price.
     pub npc_buy_ratio: f64,
-    /// Default source: services/market/mod.rs marketutil.const, appConst.mktMinimumFee and server market policy.
+    /// Server market order maintenance cadence.
     pub maintenance_secs: i64,
-    /// Default source: services/market/mod.rs marketutil.const, appConst.mktMinimumFee and server market policy.
+    /// Server closed-order history retention.
     pub order_history_days: i64,
-    /// Default source: services/market/mod.rs marketutil.const, appConst.mktMinimumFee and server market policy.
+    /// Server default transaction-history period.
     pub transaction_history_days: i64,
-    /// Default source: services/market/mod.rs marketutil.const, appConst.mktMinimumFee and server market policy.
+    /// Server market price-history retention.
     pub price_history_days: i64,
 }
 
@@ -146,12 +147,15 @@ impl MarketConfig {
         anyhow::ensure!(self.broker_fee.is_finite() && (0.0..=1.0).contains(&self.broker_fee), "market.broker_fee={} is outside its valid domain", self.broker_fee);
         anyhow::ensure!(self.broker_fee_min_isk.is_finite() && self.broker_fee_min_isk >= 0.0, "market.broker_fee_min_isk={} is outside its valid domain", self.broker_fee_min_isk);
         anyhow::ensure!(self.sales_tax.is_finite() && (0.0..=1.0).contains(&self.sales_tax), "market.sales_tax={} is outside its valid domain", self.sales_tax);
-        anyhow::ensure!(self.max_order_days > 0, "market.max_order_days={} is outside its valid domain", self.max_order_days);
+        anyhow::ensure!((1..=i64::from(i16::MAX)).contains(&self.max_order_days), "market.max_order_days={} must fit a positive i16", self.max_order_days);
         anyhow::ensure!(self.npc_buy_ratio.is_finite() && (0.0..=1.0).contains(&self.npc_buy_ratio), "market.npc_buy_ratio={} is outside its valid domain", self.npc_buy_ratio);
         anyhow::ensure!(self.maintenance_secs > 0, "market.maintenance_secs={} is outside its valid domain", self.maintenance_secs);
         anyhow::ensure!(self.order_history_days > 0, "market.order_history_days={} is outside its valid domain", self.order_history_days);
         anyhow::ensure!(self.transaction_history_days > 0, "market.transaction_history_days={} is outside its valid domain", self.transaction_history_days);
         anyhow::ensure!(self.price_history_days > 0, "market.price_history_days={} is outside its valid domain", self.price_history_days);
+        for (key, value) in [("market.order_history_days", self.order_history_days), ("market.transaction_history_days", self.transaction_history_days), ("market.price_history_days", self.price_history_days)] {
+            super::duration(key, value, crate::consts::FILETIME_DAY, false)?;
+        }
         Ok(())
     }
 }
@@ -160,13 +164,14 @@ impl MarketConfig {
 #[derive(Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StoreConfig {
-    /// Default source: services/store/store_manager.rs and services/store/mod.rs store policy.
+    /// Server design default fallback price in services/store/mod.rs.
     pub plex_price_isk_fallback: f64,
-    /// Default source: services/store/store_manager.rs and services/store/mod.rs store policy.
+    /// The daily free gift: 10,000 skill points, granted by one type 52520 token.
     pub daily_gift: DailyGift,
-    /// Default source: services/store/store_manager.rs and services/store/mod.rs store policy.
+    /// Daily turnover of login rewards and daily offers (UTC; 11:00 Beijing time).
+    /// Existing server policy: daily reward turnover offset from midnight UTC, in seconds.
     pub daily_turnover_utc: String,
-    /// Default source: services/store/store_manager.rs and services/store/mod.rs store policy.
+    /// Server design default for checkout in services/store/store_manager.rs.
     pub fast_checkout: bool,
 }
 
@@ -174,7 +179,7 @@ impl Default for StoreConfig {
     fn default() -> Self {
         Self {
             plex_price_isk_fallback: 23500000.0,
-            daily_gift: DailyGift { type_id: 52520, quantity: 10000 },
+            daily_gift: DailyGift::default(),
             daily_turnover_utc: "03:00:00".to_owned(),
             fast_checkout: false,
         }
@@ -201,25 +206,25 @@ impl StoreConfig {
 #[derive(Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct IndustryConfig {
-    /// Default source: services/industry/mod.rs industry.const and server policy; job multiplier is a new server policy.
+    /// Industry job cost rate from industry.const in services/industry/mod.rs.
     pub job_cost_rate: f64,
-    /// Default source: services/industry/mod.rs industry.const and server policy; job multiplier is a new server policy.
+    /// SCC surcharge from industry.const in services/industry/mod.rs.
     pub scc_surcharge_rate: f64,
-    /// Default source: services/industry/mod.rs industry.const and server policy; job multiplier is a new server policy.
+    /// security.common.const.INDUSTRY_SECURITY_TAX_RATE, high-sec only.
     pub highsec_security_tax: f64,
-    /// Default source: services/industry/mod.rs industry.const and server policy; job multiplier is a new server policy.
+    /// What an NPC station's industry service charges on the estimated item value.
     pub npc_facility_tax: f64,
-    /// Default source: services/industry/mod.rs industry.const and server policy; job multiplier is a new server policy.
+    /// The system cost index of every activity everywhere (there is no activity tracking).
     pub system_cost_index: f64,
-    /// Default source: services/industry/mod.rs industry.const and server policy; job multiplier is a new server policy.
+    /// Invention skill probability from industry.const in services/industry/mod.rs.
     pub invention_skill_probability: f64,
-    /// Default source: services/industry/mod.rs industry.const and server policy; job multiplier is a new server policy.
+    /// Server design default duration multiplier in services/industry/mod.rs.
     pub job_time_multiplier: f64,
-    /// Default source: services/industry/mod.rs industry.const and server policy; job multiplier is a new server policy.
+    /// Server design default maximum run duration in services/industry/mod.rs.
     pub max_run_secs: f64,
-    /// Default source: services/industry/mod.rs industry.const and server policy; job multiplier is a new server policy.
+    /// Server design default run limit in services/industry/mod.rs.
     pub max_runs: i64,
-    /// Default source: services/industry/mod.rs industry.const and server policy; job multiplier is a new server policy.
+    /// Existing server policy for completed industry job history, in days.
     pub history_days: i64,
 }
 
@@ -231,7 +236,7 @@ impl Default for IndustryConfig {
             highsec_security_tax: 0.05,
             npc_facility_tax: 0.0025,
             system_cost_index: 0.02,
-            invention_skill_probability: 0.0333333,
+            invention_skill_probability: 1.0 / 30.0,
             job_time_multiplier: 1.0,
             max_run_secs: 2592000.0,
             max_runs: 1000000,

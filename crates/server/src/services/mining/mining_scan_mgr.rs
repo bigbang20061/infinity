@@ -10,7 +10,7 @@ pub(super) async fn perform_scan(c: &Client) -> Value {
         Some(Value::List(
             rocks
                 .into_iter()
-                .filter(|(id, _, _)| s.sample_position(*id).is_some_and(|pos| dist(pos, me) <= SCAN_RANGE))
+                .filter(|(id, _, _)| s.sample_position(*id).is_some_and(|pos| dist(pos, me) <= crate::config::game().mining.scanner_range_m))
                 .map(|(id, type_id, quantity)| Value::tuple([Value::Int(id), Value::Int(type_id as i64), Value::Int(quantity)]))
                 .collect(),
         ))

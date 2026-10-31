@@ -8,6 +8,7 @@
 //! they shrink as it approaches the limit. Agents above level 1 need an effective standing
 //! (the best of the three, unless any is -2 or worse) of 1, 3, 5 or 7. Mission
 //! changes use the caller's executor and outbox so completion dispatches after commit.
+//! Mission gain and decline rates are operator-configured.
 //!
 //! Loyalty points (game.lp_balances) are paid per corporation by missions and spent in that
 //! corporation's LP store. The live stores' offer tables never shipped with the client or
@@ -27,18 +28,10 @@ mod standing_mgr;
 mod lp_svc;
 mod lp_store_mgr;
 
-/// Server mission policy: corporation gain per agent level.
-const MISSION_CORP_GAIN: f64 = 0.01;
-/// Server mission policy: decline or quit standing loss.
-const DECLINE_LOSS: f64 = -0.01;
 /// Client standings convention: absolute standing limit.
 const STANDING_LIMIT: f64 = 10.0;
 /// Client standingsvc.GetEffectiveStandingWithAgent rejection threshold.
 const AGENT_STANDING_REJECTION: f64 = -2.0;
-/// Server mission policy: agent gain multiplier.
-const MISSION_AGENT_GAIN_MULTIPLIER: f64 = 2.0;
-/// Server mission policy: faction gain divisor.
-const MISSION_FACTION_GAIN_DIVISOR: f64 = 5.0;
 /// Client standingsvc agent access: required standing for levels 2 through 5.
 const AGENT_LEVEL_STANDINGS: [f64; 4] = [1.0, 3.0, 5.0, 7.0];
 /// Client standingsvc agent access: level two.
@@ -84,14 +77,16 @@ pub fn required_for_level(level: i64) -> f64 {
 
 /// A mission was completed for an agent of `level`.
 pub async fn mission_completed<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, char_id: i64, agent: i64, corp: i64, faction: i64, level: i64) -> Result<(), CallError> {
-    let gain = MISSION_CORP_GAIN * level.max(1) as f64;
-    let changes = [(agent, gain * MISSION_AGENT_GAIN_MULTIPLIER), (corp, gain), (faction, gain / MISSION_FACTION_GAIN_DIVISOR)];
+    let policy = &crate::config::game().standings;
+    let gain = policy.mission_corp_gain * level.max(1) as f64;
+    let changes = [(agent, gain * policy.mission_agent_gain_multiplier), (corp, gain), (faction, gain / policy.mission_faction_gain_divisor)];
     apply_mission_standings(db, outbox, char_id, &changes).await
 }
 
 /// A mission was declined or quit.
 pub async fn mission_declined<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, char_id: i64, agent: i64, corp: i64) -> Result<(), CallError> {
-    apply_mission_standings(db, outbox, char_id, &[(agent, DECLINE_LOSS), (corp, DECLINE_LOSS)]).await
+    let loss = crate::config::game().standings.decline_loss;
+    apply_mission_standings(db, outbox, char_id, &[(agent, loss), (corp, loss)]).await
 }
 
 async fn apply_mission_standings<X: Send, const N: usize>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, char_id: i64, changes: &[(i64, f64); N]) -> Result<(), CallError> {

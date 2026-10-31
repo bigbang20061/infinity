@@ -1,11 +1,11 @@
 //! Bills (billMgr; bound allianceRegistry's GetBills/PayBill): what corporations, alliances
 //! and characters owe, in game.bills, using startup SDE station data for office landlords.
 //!
-//! Office rent is the one bill issued: a week before an office's rental period ends its
-//! corporation is billed the station's rent, due when the period ends; paying extends the
-//! office by another period. A corporation can have its accountants' chosen bill types paid
-//! automatically from a wallet division (billMgr automatic payment settings). Billing runs
-//! every ten minutes. An office whose rent goes unpaid isn't taken away.
+//! Office rent is the one bill issued: before an office's rental period ends its corporation
+//! is billed the station's rent, due when the period ends; paying extends the office by
+//! another period. A corporation can have its accountants' chosen bill types paid automatically
+//! from a wallet division (billMgr automatic payment settings). Advance billing and maintenance
+//! cadence are operator policies. An office whose rent goes unpaid isn't taken away.
 
 use super::{db_err, has_role_or_is_ceo, keyval, notify_error, Call, CallError, CallResult};
 use crate::dao::characters::members;
@@ -20,15 +20,10 @@ use marshal::Value;
 use std::sync::Arc;
 use tracing::{info, warn};
 
-/// Existing server policy for billing maintenance cadence.
-const BILLING_INTERVAL_SECONDS: u64 = 600;
-
 // appConst.billType* and bill status
 const BILL_RENTAL: i32 = 2;
 const UNPAID: i32 = 0;
 const PAID: i32 = 1;
-/// Retained server advance-billing policy for rent before the period ends.
-const BILL_AHEAD: i64 = 7 * FILETIME_DAY;
 
 fn bill_row(r: &bills_dao::Bill) -> Value {
     let opt = |v: Option<i64>| v.map(Value::Int).unwrap_or(Value::None);
@@ -101,7 +96,8 @@ pub(super) async fn pay(db: &Db, world: &World, bill: i64, corp: Option<i64>, ke
 /// Issue rent bills that have come due and pay those set to be paid automatically.
 async fn run(db: &Db, world: &World) -> Result<(), CallError> {
     let now = filetime_now();
-    let due = bills_dao::due(db, now, BILL_AHEAD, BILL_RENTAL, UNPAID).await.map_err(db_err)?;
+    let ahead = crate::config::game().corporations.advance_billing_days.saturating_mul(FILETIME_DAY);
+    let due = bills_dao::due(db, now, ahead, BILL_RENTAL, UNPAID).await.map_err(db_err)?;
     for r in due {
         let (office, corp, station, until) = (r.office_id, r.corporation_id, r.station_id, r.rented_until);
         let landlord = world.sde().map.station(station).and_then(|st| st.owner_id).unwrap_or(1_000_001);
@@ -122,13 +118,13 @@ async fn run(db: &Db, world: &World) -> Result<(), CallError> {
     Ok(())
 }
 
-/// Billing, every ten minutes.
+/// Run billing at the configured maintenance cadence.
 pub async fn run_billing(db: Db, world: Arc<World>) {
     loop {
         if let Err(CallError::Internal(e)) = run(&db, &world).await {
             warn!("billing failed: {e:#}");
         }
-        tokio::time::sleep(std::time::Duration::from_secs(BILLING_INTERVAL_SECONDS)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(crate::config::game().corporations.bills_maintenance_secs as u64)).await;
     }
 }
 

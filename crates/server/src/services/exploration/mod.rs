@@ -10,6 +10,7 @@
 //! sites hold hackable containers (services/hacking) with loot. A wormhole leads to a
 //! random system of its target class, where a K162 leads back; both ends share one mass
 //! budget and lifetime.
+//! Belt spawning, rat ranges and cleared or hacked site linger times are operator policies.
 //!
 //! Static placement and generation use the shared startup SDE. Sites are stored in
 //! `game.exploration_sites`;
@@ -51,7 +52,7 @@ use crate::db::executor::Executor;
 use crate::db::outbox::{dispatch_client, Effect, Outbox};
 use crate::messages;
 use crate::sde::Sde;
-use crate::space::{dist, kg_to_tonnes, minutes_to_seconds, now_ms, Ball, World, MODE_RIGID, MODE_STOP, V3};
+use crate::space::{dist, kg_to_tonnes, minutes_to_seconds, now_ms, seconds_to_ms, Ball, World, MODE_RIGID, MODE_STOP, V3};
 use marshal::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -103,12 +104,6 @@ const CONE_HALF_ANGLE_DIVISOR: f64 = 2.0;
 const WORMHOLE_JUMP_RANGE: f64 = 5000.0;
 /// After a jump, a pilot can't use the same connection again for this long (s).
 const POLARIZATION_SECS: i64 = 300;
-/// Existing server policy: cleared combat sites linger before replacement.
-const CLEARED_SITE_LINGER_MS: u64 = 30_000;
-/// Existing server policy: a cleared belt stays empty before rats respawn.
-const BELT_RAT_RESPAWN_MS: u64 = 900_000;
-/// Existing server policy: fully hacked sites linger for looting.
-const HACKED_SITE_LINGER_MS: u64 = 600_000;
 /// Existing server policy: recovered probes take this long to disappear.
 const PROBE_RECOVERY_DELAY_MS: u64 = 2000;
 /// Loot value per hackable container by tier (ISK).
@@ -438,11 +433,11 @@ pub async fn launch_probes(c: &mut Client, call: &Call<'_>) -> CallResult {
 
 
 
-/// A pilot is warping to `belt`: unless its rats are still about (or it was cleared less
-/// than BELT_RAT_RESPAWN_MS ago), the region's pirates spawn there. Other celestials
-/// and wormhole space get none.
+/// A pilot is warping to `belt`: unless disabled, its rats are still about, or it
+/// was cleared within the configured respawn delay, the region's pirates spawn.
+/// Other celestials and wormhole space get none.
 pub async fn belt_rats(c: &mut Client, system: i64, belt: i64, center: V3) -> Result<(), CallError> {
-    if state().belts.contains(&belt) {
+    if !crate::config::game().npc.belt_rats || state().belts.contains(&belt) {
         return Ok(());
     }
     let is_belt = c.world.sde().map.celestial(belt).is_some_and(|body| body.group_id == Some(i64::from(GROUP_ASTEROID_BELT)));
@@ -452,7 +447,8 @@ pub async fn belt_rats(c: &mut Client, system: i64, belt: i64, center: V3) -> Re
     }
     let faction = pirate_faction(info.faction, info.region);
     let groups: Vec<String> = belt_classes(info.security).iter().map(|class| format!("{} {class}", rat_prefix(faction))).collect();
-    let spawned = match spawn_rats(c, system, center, faction, &groups, (5_000.0, 20_000.0)).await {
+    let [min, max] = crate::config::game().npc.belt_spawn_range_m;
+    let spawned = match spawn_rats(c, system, center, faction, &groups, (min as f64, max as f64)).await {
         Ok(s) => s,
         Err(e) => {
             state().belts.remove(&belt);
@@ -462,7 +458,7 @@ pub async fn belt_rats(c: &mut Client, system: i64, belt: i64, center: V3) -> Re
     info!(user = c.login.user_id, "belt {belt} in {system}: spawned {} rats", spawned.len());
     c.world.post(system, move |s| {
         s.spawn_group(spawned, move |s| {
-            s.schedule(BELT_RAT_RESPAWN_MS, move |_| {
+            s.schedule(seconds_to_ms(crate::config::game().npc.belt_rat_respawn_secs as f64), move |_| {
                 state().belts.remove(&belt);
             });
         });
@@ -580,7 +576,7 @@ pub(super) async fn container_hacked(db: &Db, world: &Arc<World>, container: i64
                         set_container_state(world, site.system, container, 2).await;
                         if site.containers.as_ref().is_some_and(|c| c.iter().all(|id| site.hacked.contains(id))) {
                             let (db, completion_world) = (db.clone(), world.clone());
-                            world.schedule(site.system, HACKED_SITE_LINGER_MS, move |s| {
+                            world.schedule(site.system, seconds_to_ms(crate::config::game().npc.hacked_site_linger_secs as f64), move |s| {
                                 s.defer(async move {
                                     if let Err(e) = replace_site(&db, &completion_world, site_id).await {
                                         warn!("replacing site {site_id}: {}", err_text(e));

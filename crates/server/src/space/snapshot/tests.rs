@@ -22,6 +22,7 @@ fn ball(id: i64, pilot: Option<i64>, x: f64) -> Ball {
 
 #[test]
 fn candidates_only_include_changed_pilot_ids_and_generations() {
+    crate::tests::init_config();
     let mut s = System::default();
     s.insert(ball(1, Some(10), 0.0));
     s.insert(ball(2, Some(20), 0.0));
@@ -36,6 +37,7 @@ fn candidates_only_include_changed_pilot_ids_and_generations() {
 
 #[test]
 fn changed_pilots_retry_conflicts_and_acknowledge_only_written_positions() {
+    crate::tests::init_config();
     let mut s = System::default();
     s.insert(ball(1, Some(10), 0.0));
     s.insert(ball(2, Some(20), 0.0));
@@ -57,6 +59,7 @@ fn changed_pilots_retry_conflicts_and_acknowledge_only_written_positions() {
 
 #[test]
 fn old_acknowledgement_cannot_mark_reinserted_ship_written() {
+    crate::tests::init_config();
     let mut s = System::default();
     s.insert(ball(1, Some(10), 0.0));
     s.command(1, |b, _, _| { b.pos[0] = 5.0; Vec::new() });
@@ -72,16 +75,34 @@ fn old_acknowledgement_cannot_mark_reinserted_ship_written() {
 
 #[test]
 fn no_pilots_keep_cold_skip_and_no_deadline() {
+    crate::tests::init_config();
     let mut s = System::default();
     s.insert(ball(1, None, 0.0));
-    s.tick(POSITION_SNAPSHOT_INTERVAL_MS as i64);
+    s.tick(seconds_to_ms(crate::config::game().space.position_snapshot_secs as f64) as i64);
     assert!(s.is_cold());
     assert_eq!(s.snapshot_due, 0);
     assert!(changed(&s).is_empty());
 }
 
 #[test]
+fn snapshot_deadline_follows_config_and_resets_when_pilots_leave() {
+    crate::tests::init_config();
+    let mut s = System::default();
+    let interval = seconds_to_ms(crate::config::game().space.position_snapshot_secs as f64) as i64;
+    s.insert(ball(1, Some(10), 0.0));
+    assert_eq!(s.snapshot_due, interval);
+    s.tick(interval - 1);
+    assert_eq!(s.snapshot_due, interval);
+    s.tick(interval);
+    assert_eq!(s.snapshot_due, interval * 2);
+    s.take(1);
+    s.tick(interval + 1);
+    assert_eq!(s.snapshot_due, 0);
+}
+
+#[test]
 fn candidates_follow_boundary_motion_not_mailbox_time() {
+    crate::tests::init_config();
     let mut s = System::default();
     s.insert(ball(1, Some(10), 0.0));
     s.command(1, |b, _, _| {

@@ -1,11 +1,9 @@
 //! Periodic pilot position persistence for destiny's ballpark (michelle.py).
 //! Uses game.items with guarded writes on the system worker, including shutdown flushes;
-//! other ball state and persistent timers are not supported.
+//! the snapshot interval is operator-configured. Other ball state and persistent
+//! timers are not supported.
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
-
-/// Issue #4 server design: persist changed pilot positions every 30 seconds, bounding crash loss to 30 seconds of movement when snapshots succeed.
-pub(super) const POSITION_SNAPSHOT_INTERVAL_MS: u64 = 30_000;
 
 #[derive(Clone)]
 pub(super) struct Context {

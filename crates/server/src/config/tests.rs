@@ -68,8 +68,10 @@ fn invalid_numeric_values_report_field_and_value() {
         ("[accounts]\nstarting_plex = -1", "accounts.starting_plex", "-1"),
         ("[characters]\nname_max_spaces = 0", "characters.name_max_spaces", "0"),
         ("[characters]\nfree_respecs = 0", "characters.free_respecs", "0"),
-        ("[crimewatch]\nconcord_base_delay_secs = 0.0", "crimewatch.concord_base_delay_secs", "0"),
-        ("[crimewatch]\nconcord_delay_per_security_secs = 0.0", "crimewatch.concord_delay_per_security_secs", "0"),
+        ("[crimewatch]\nconcord_base_delay_secs = 0", "crimewatch.concord_base_delay_secs", "0"),
+        ("[crimewatch]\nconcord_delay_per_security_secs = 0", "crimewatch.concord_delay_per_security_secs", "0"),
+        ("[crimewatch]\nconcord_base_delay_secs = 6.5", "crimewatch.concord_base_delay_secs", "6.5"),
+        ("[crimewatch]\nconcord_delay_per_security_secs = 28.5", "crimewatch.concord_delay_per_security_secs", "28.5"),
     ] {
         let error = load_error(contents);
         assert!(error.contains(field) && error.contains(value), "expected {field} and {value} in {error}");
@@ -81,6 +83,44 @@ fn invalid_numeric_values_report_field_and_value() {
     config.market.sales_tax = f64::INFINITY;
     let error = config.validate().expect_err("infinity must be rejected").to_string();
     assert!(error.contains("market.sales_tax") && error.contains("inf"), "{error}");
+}
+
+#[test]
+fn representation_overflows_are_rejected_with_the_key_and_value() {
+    for (contents, key, value) in [
+        ("[store]\ndaily_gift = { type_id = 2147483648, quantity = 1 }", "store.daily_gift.type_id", "2147483648"),
+        ("[store]\ndaily_gift = { type_id = 1, quantity = 2147483648 }", "store.daily_gift.quantity", "2147483648"),
+        ("[market]\nmax_order_days = 32768", "market.max_order_days", "32768"),
+        ("[market]\norder_history_days = 9223372036854775807", "market.order_history_days", "9223372036854775807"),
+        ("[characters]\ndelete_delay_secs = 922337203685", "characters.delete_delay_secs", "922337203685"),
+        ("[contracts]\nexpiry_max_days = 9223372036854775807", "contracts.expiry_max_days", "9223372036854775807"),
+        ("[contracts]\ncourier_max_days = 2147483648", "contracts.courier_max_days", "2147483648"),
+        ("[npc]\nhacked_site_linger_secs = 9223372036854775807", "npc.hacked_site_linger_secs", "9223372036854775807"),
+        ("[crimewatch]\nweapons_timer_secs = 9223372036854775807", "crimewatch.weapons_timer_secs", "9223372036854775807"),
+        ("[crimewatch]\nconcord_base_delay_secs = 9223372036854775807", "crimewatch.concord_base_delay_secs", "9223372036854775807"),
+        ("[crimewatch]\nconcord_delay_per_security_secs = 9223372036854775807", "crimewatch.concord_delay_per_security_secs", "9223372036854775807"),
+        ("[space]\nposition_snapshot_secs = 9223372036854775807", "space.position_snapshot_secs", "9223372036854775807"),
+    ] {
+        let error = load_error(contents);
+        assert!(error.contains(key) && error.contains(value), "{error}");
+    }
+    let error = load_error("[crimewatch]\nconcord_base_delay_secs = 7000000000000000\nconcord_delay_per_security_secs = 6000000000000000");
+    assert!(error.contains("crimewatch.concord_base_delay_secs=7000000000000000") && error.contains("crimewatch.concord_delay_per_security_secs=6000000000000000"), "{error}");
+    let mut config = Config::default();
+    config.corporations.office_rent_base_isk = f64::MAX;
+    config.corporations.office_rent_per_security_isk = f64::MAX;
+    let error = config.validate().expect_err("overflowing rent is rejected").to_string();
+    assert!(error.contains("corporations.office_rent_base_isk") && error.contains("corporations.office_rent_per_security_isk"), "{error}");
+}
+
+#[test]
+fn millisecond_deadline_overflow_is_rejected_at_startup() {
+    let unit = crate::space::seconds_to_ms(1.0) as i64;
+    let seconds = i64::MAX / unit;
+    let interval = seconds.checked_mul(unit).expect("interval must fit in i64");
+    assert!(crate::space::now_ms().checked_add(interval).is_none());
+    let error = load_error(&format!("[space]\nposition_snapshot_secs = {seconds}"));
+    assert!(error.contains("space.position_snapshot_secs") && error.contains(&seconds.to_string()), "{error}");
 }
 
 #[test]

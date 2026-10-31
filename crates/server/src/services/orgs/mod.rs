@@ -4,6 +4,7 @@
 //! A corporation's communications officers (corpRoleChatManager) and directors edit its
 //! bulletins, and its diplomats and directors its contacts and labels; for an alliance,
 //! those of its executor corporation do.
+//! The bulletin limit is an operator policy for both corporations and alliances.
 
 use super::corps::membership;
 use super::{crowset, db_err, keyval, notify_error, value_ids, Call, CallError, CallResult};
@@ -23,8 +24,6 @@ const ROLE_CHAT_MANAGER: i64 = 36_028_797_018_963_968;
 const ROLE_DIPLOMAT: i64 = 17_179_869_184;
 /// Player alliance ID range, matching the server's game.alliances sequence.
 const FIRST_PLAYER_ALLIANCE: i64 = 99_000_000;
-/// base_corporation.MAX_NUM_BULLETINS
-const MAX_BULLETINS: i64 = 10;
 /// Server label-mask policy: exclusive upper bit position for positive i64 labels.
 const LABEL_BIT_END: u32 = 62;
 
@@ -101,7 +100,7 @@ async fn add_bulletin(db: &Db, me: i64, owner: i64, call: &Call<'_>) -> CallResu
         }
         None => {
             let count = orgs::bulletin_count(db, owner).await.map_err(db_err)?;
-            if count >= MAX_BULLETINS {
+            if count >= crate::config::game().corporations.max_bulletins {
                 return Err(CallError::User { msg: messages::MSG_CORP_TOO_MANY_BULLETINS.into(), dict: vec![] });
             }
             orgs::insert_bulletin(db, owner, &title, &body, me, now).await.map_err(db_err)?;

@@ -18,6 +18,7 @@
 //! Contract lifecycle mutations and stack splits commit their database changes atomically;
 //! their notifications are delivered only after commit.
 //! Contract and item state comes from game tables; station ancestry comes from the loaded SDE.
+//! Creation limits and listing page sizes are operator policies in the contracts configuration.
 
 mod lifecycle;
 mod lists;
@@ -76,9 +77,6 @@ const SKILL_ADVANCED_CONTRACTING: i32 = 73912;
 // contractscommon
 const NUM_CONTRACTS_BY_SKILL: [i64; 6] = [7, 16, 17, 18, 19, 20];
 const NUM_CONTRACTS_BY_ADVSKILL: [i64; 6] = [21, 22, 23, 24, 25, 26];
-const CONTRACTS_PER_PAGE: usize = 100;
-const MAX_SEARCH_RESULTS: usize = 1000;
-const MAX_ITEMS: usize = 500;
 
 /// Attribute of a client object: an old-style instance, a new-style one (contracts.ContractStruct
 /// pickles as a NewObj with its __dict__ as state), or a dict.
@@ -117,7 +115,7 @@ impl Contract {
     }
 
     fn overdue(&self, now: i64) -> bool {
-        self.status == STATUS_IN_PROGRESS && self.accepted + self.num_days as i64 * FILETIME_DAY <= now
+        self.status == STATUS_IN_PROGRESS && self.accepted.saturating_add(i64::from(self.num_days).saturating_mul(FILETIME_DAY)) <= now
     }
 
     /// May `char_id` (of `corp_id`) take this contract?
@@ -146,7 +144,7 @@ impl Contract {
             ("dateAccepted", int(self.accepted)),
             ("dateCompleted", int(self.completed)),
             ("numDays", int(self.num_days as i64)),
-            ("expires", int(self.accepted + self.num_days as i64 * FILETIME_DAY)),
+            ("expires", int(self.accepted.saturating_add(i64::from(self.num_days).saturating_mul(FILETIME_DAY)))),
             ("startStationID", int(self.start)),
             ("startSolarSystemID", int(start.and_then(|s| s.solar_system_id).unwrap_or(0))),
             ("startRegionID", int(start.and_then(|s| s.region_id).unwrap_or(0))),

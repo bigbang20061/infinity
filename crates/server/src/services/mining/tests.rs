@@ -2,6 +2,15 @@ use super::*;
 use super::reprocessing_svc::{add_output, output_stack_quantity};
 
 #[test]
+fn field_volume_sampling_uses_half_open_range() {
+    crate::tests::init_config();
+    let range = crate::config::game().mining.ore_rock_m3;
+    assert_eq!(sample_range(range, 0.0), range[0]);
+    assert_eq!(sample_range(range, 0.5), range[0] + (range[1] - range[0]) / 2.0);
+    assert_eq!(sample_range([17.0, 17.0], 0.5), 17.0);
+}
+
+#[test]
 fn regrowth_deadline_rounds_up_to_milliseconds() {
     let whole = crate::client::filetime_from_unix_ms(42);
     assert_eq!(unix_ms_from_filetime_ceil(whole), 42);

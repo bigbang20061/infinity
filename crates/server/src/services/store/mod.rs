@@ -17,6 +17,7 @@
 //! clamps its client-facing i64 projection. Balance notifications include `userid`.
 //! Purchases and redeeming use `game.store_purchases` and `game.redeem_tokens`.
 //! Clients cannot display oversized balances exactly.
+//! Daily gift, turnover and checkout policies come from the game configuration.
 
 use crate::dao::items::loading::ItemQuery;
 use super::items::load_items;
@@ -27,10 +28,6 @@ use crate::messages;
 use marshal::Value;
 use tracing::info;
 
-/// Daily turnover of login rewards and daily offers (UTC; 11:00 Beijing time).
-const TURNOVER: &str = "03:00:00";
-/// Existing server policy: daily reward turnover offset from midnight UTC, in seconds.
-const TURNOVER_OFFSET_SECONDS: i64 = 10_800;
 
 fn s(v: &str) -> Value {
     Value::unicode(v)
@@ -39,8 +36,14 @@ fn s(v: &str) -> Value {
 
 /// `YYYY-MM-DDTHH:MM:SSZ` of the current daily period's start.
 fn period_start() -> String {
-    let secs = unix_seconds_from_filetime(filetime_now()) - TURNOVER_OFFSET_SECONDS;
-    let day = secs.div_euclid(86_400);
+    period_start_at(unix_seconds_from_filetime(filetime_now()), &crate::config::game().store.daily_turnover_utc)
+}
+
+fn period_start_at(now: i64, turnover: &str) -> String {
+    let mut parts = turnover.split(':').map(|part| part.parse::<i64>().expect("validated UTC turnover"));
+    let offset = parts.next().unwrap() * crate::consts::SECONDS_PER_HOUR
+        + parts.next().unwrap() * crate::consts::SECONDS_PER_MINUTE + parts.next().unwrap();
+    let day = (now - offset).div_euclid(86_400);
     // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
     let z = day + 719_468;
     let era = z.div_euclid(146_097);
@@ -51,7 +54,7 @@ fn period_start() -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + i64::from(m <= 2);
-    format!("{y:04}-{m:02}-{d:02}T{TURNOVER}Z")
+    format!("{y:04}-{m:02}-{d:02}T{turnover}Z")
 }
 
 
@@ -66,7 +69,8 @@ pub(super) fn notify_plex_balance(c: &mut Client, balance: i64) {
 
 /// Queue `quantity` x `type_id` on `user_id`'s redeeming queue.
 async fn grant_token(c: &Client, user_id: i64, type_id: i32, quantity: i64, label: &str) -> Result<(), CallError> {
-    crate::dao::store::purchases::grant(&c.db, user_id, type_id, quantity as i32, label, filetime_now()).await.map_err(db_err)?;
+    let quantity = i32::try_from(quantity).map_err(|e| db_err(anyhow::anyhow!("redeem quantity out of range: {e}")))?;
+    crate::dao::store::purchases::grant(&c.db, user_id, type_id, quantity, label, filetime_now()).await.map_err(db_err)?;
     Ok(())
 }
 

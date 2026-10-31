@@ -11,6 +11,20 @@ pub mod world;
 #[path = "social.rs"]
 pub mod social;
 
+fn duration(key: &str, value: i64, unit: i64, future: bool) -> Result<()> {
+    let ticks = value.checked_mul(unit);
+    anyhow::ensure!(ticks.is_some_and(|ticks| !future || crate::client::filetime_now().checked_add(ticks).is_some()),
+        "{key}={value} exceeds the representable duration or deadline");
+    Ok(())
+}
+
+fn milliseconds(key: &str, seconds: i64) -> Result<()> {
+    let deadline = seconds.checked_mul(crate::space::seconds_to_ms(1.0) as i64)
+        .and_then(|interval| crate::space::now_ms().checked_add(interval));
+    anyhow::ensure!(deadline.is_some(), "{key}={seconds} exceeds the representable duration or deadline");
+    Ok(())
+}
+
 /// Immutable gameplay policy captured at startup.
 #[derive(Default, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]

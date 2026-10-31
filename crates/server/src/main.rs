@@ -163,3 +163,6 @@ async fn log_exit(what: &'static str, f: impl std::future::Future<Output = Resul
         error!("{what} stopped: {e:#}");
     }
 }
+
+#[cfg(test)]
+mod tests;

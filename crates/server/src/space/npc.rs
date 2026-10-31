@@ -4,17 +4,13 @@
 //! Neither runs inside the actor.
 //! Targeting uses positions sampled at the actor's clock; shot jobs capture those
 //! positions before the effects worker runs.
+//! Think intervals and target-loss range are controlled by the combat configuration.
 //! Brains and groups are transient; persistent NPC simulation is not supported.
 use super::*;
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-
-/// D9 once-per-second NPC thinking and initial staggering.
-const NPC_THINK_INTERVAL_MS: i64 = 1000;
-/// Existing server target-loss policy.
-const NPC_TARGET_LOSS_RANGE_FACTOR: f64 = 2.0;
 
 static NEXT_GROUP: AtomicU64 = AtomicU64::new(1);
 
@@ -100,10 +96,10 @@ pub(super) struct SpawnGroup {
 }
 
 impl System {
-    /// Attach only to a live ball. First think is staggered over the next second.
+    /// Attach only to a live ball. First think is staggered over the configured interval.
     pub fn add_npc(&mut self, id: i64, mut brain: NpcBrain) -> bool {
         if !self.contains(id) { return false; }
-        brain.next_think_ms = self.ms + id.rem_euclid(NPC_THINK_INTERVAL_MS);
+        brain.next_think_ms = self.ms.saturating_add(id.rem_euclid(crate::config::game().combat.npc_think_ms));
         self.brains.insert(id, brain);
         true
     }
@@ -151,7 +147,7 @@ impl System {
         due.extend(self.brains.iter().filter(|(_, b)| self.ms >= b.next_think_ms).map(|(&id, _)| id));
         for &id in &due {
             let Some(mut brain) = self.brains.remove(&id) else { continue };
-            brain.next_think_ms = self.ms + NPC_THINK_INTERVAL_MS;
+            brain.next_think_ms = self.ms.saturating_add(crate::config::game().combat.npc_think_ms);
             self.think_npc(id, &mut brain);
             if self.contains(id) { self.brains.insert(id, brain); }
         }
@@ -174,7 +170,7 @@ impl System {
         let pos = me.position_at(self.ms);
         let current = brain.target.and_then(|(ship, _, _)| self.ball(ship))
             .filter(|b| b.cloak == 0 && b.mode != MODE_WARP && b.signature_radius.is_some()
-                && len(sub(b.position_at(self.ms), pos)) < brain.config.aggro_range * NPC_TARGET_LOSS_RANGE_FACTOR);
+                && len(sub(b.position_at(self.ms), pos)) < brain.config.aggro_range * crate::config::game().combat.npc_target_loss_range_factor);
         let victim_id = current.map(|b| b.id);
         let (shield, armor, cycle) = brain.config.repairs;
         if (shield > 0.0 || armor > 0.0) && self.ms >= brain.next_repair_ms {
@@ -220,7 +216,7 @@ impl System {
         let valid = current && self.ball(id).zip(self.ball(ship)).is_some_and(|(me, victim)|
                 victim.char_id == Some(pilot) && victim.signature_radius.is_some()
                 && victim.cloak == 0 && victim.mode != MODE_WARP
-                && len(sub(victim.position_at(self.ms), me.position_at(self.ms))) < brain.config.aggro_range * NPC_TARGET_LOSS_RANGE_FACTOR);
+                && len(sub(victim.position_at(self.ms), me.position_at(self.ms))) < brain.config.aggro_range * crate::config::game().combat.npc_target_loss_range_factor);
         if valid {
             self.notify_pilot(pilot, "OnTarget", vec![Value::str("otheradd"), Value::Int(id)]);
             brain.announced = true;

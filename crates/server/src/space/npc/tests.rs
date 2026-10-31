@@ -15,6 +15,7 @@ fn ball(id: i64, pilot: Option<i64>, x: f64) -> Ball {
     }
 }
 fn setup(owner: Option<i64>) -> (System, mpsc::UnboundedReceiver<EffectJob>, mpsc::UnboundedReceiver<(String, Vec<Value>)>) {
+    crate::tests::init_config();
     let registry = Arc::new(Pilots::default());
     let (notify, notifications) = mpsc::unbounded_channel();
     registry.register_pilot(10, notify);
@@ -27,6 +28,17 @@ fn setup(owner: Option<i64>) -> (System, mpsc::UnboundedReceiver<EffectJob>, mps
         repairs: (0.0, 0.0, 5000.0),
     }, Arc::new(|_| panic!("effects must run outside the actor"))));
     (s, rx, notifications)
+}
+#[test]
+fn npc_acquires_only_on_configured_think_interval() {
+    let (mut s, _, _) = setup(Some(10));
+    let interval = crate::config::game().combat.npc_think_ms;
+    s.tick(0);
+    s.insert(ball(1, Some(10), 50.0));
+    s.tick(interval - 1);
+    assert!(s.brains[&1000].target.is_none());
+    s.tick(interval);
+    assert_eq!(s.brains[&1000].target.unwrap().0, 1);
 }
 #[test]
 fn nearest_hostile_excludes_cloak_warp_and_outside_aggro() {

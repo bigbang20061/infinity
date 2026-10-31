@@ -8,21 +8,21 @@ use serde::Deserialize;
 #[derive(Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CorporationsConfig {
-    /// Default source: services/corps, services/offices.rs, services/bills.rs and services/orgs server policy.
+    /// Minimum Corporation Management skill to found or lead a corporation.
     pub min_management_skill_level: i64,
-    /// Default source: services/corps, services/offices.rs, services/bills.rs and services/orgs server policy.
+    /// Initial corporation shares from the corporation header.
     pub initial_shares: i64,
-    /// Default source: services/corps, services/offices.rs, services/bills.rs and services/orgs server policy.
+    /// Corporation and alliance bulletin limit from base_corporation.MAX_NUM_BULLETINS.
     pub max_bulletins: i64,
-    /// Default source: services/corps, services/offices.rs, services/bills.rs and services/orgs server policy.
+    /// Server office room capacity; no capacity was shipped in client or SDE.
     pub office_slots_per_station: i64,
-    /// Default source: services/corps, services/offices.rs, services/bills.rs and services/orgs server policy.
+    /// Server minimum office rent.
     pub office_rent_base_isk: f64,
-    /// Default source: services/corps, services/offices.rs, services/bills.rs and services/orgs server policy.
+    /// Additional office rent in ISK at security 1.
     pub office_rent_per_security_isk: f64,
-    /// Default source: services/corps, services/offices.rs, services/bills.rs and services/orgs server policy.
+    /// Server billing maintenance cadence in services/bills.rs.
     pub bills_maintenance_secs: i64,
-    /// Default source: services/corps, services/offices.rs, services/bills.rs and services/orgs server policy.
+    /// Server advance rent billing policy in services/bills.rs.
     pub advance_billing_days: i64,
 }
 
@@ -49,8 +49,10 @@ impl CorporationsConfig {
         anyhow::ensure!(self.office_slots_per_station > 0, "corporations.office_slots_per_station={} is outside its valid domain", self.office_slots_per_station);
         anyhow::ensure!(self.office_rent_base_isk.is_finite() && self.office_rent_base_isk >= 0.0, "corporations.office_rent_base_isk={} is outside its valid domain", self.office_rent_base_isk);
         anyhow::ensure!(self.office_rent_per_security_isk.is_finite() && self.office_rent_per_security_isk >= 0.0, "corporations.office_rent_per_security_isk={} is outside its valid domain", self.office_rent_per_security_isk);
+        anyhow::ensure!((self.office_rent_base_isk + self.office_rent_per_security_isk).is_finite(), "corporations.office_rent_base_isk={} plus corporations.office_rent_per_security_isk={} must be finite", self.office_rent_base_isk, self.office_rent_per_security_isk);
         anyhow::ensure!(self.bills_maintenance_secs > 0, "corporations.bills_maintenance_secs={} is outside its valid domain", self.bills_maintenance_secs);
         anyhow::ensure!(self.advance_billing_days > 0, "corporations.advance_billing_days={} is outside its valid domain", self.advance_billing_days);
+        super::duration("corporations.advance_billing_days", self.advance_billing_days, crate::consts::FILETIME_DAY, true)?;
         Ok(())
     }
 }
@@ -59,23 +61,23 @@ impl CorporationsConfig {
 #[derive(Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ContractsConfig {
-    /// Default source: services/contracts lifecycle and pagination policy.
+    /// Server design default minimum expiry in services/contracts/lifecycle.rs.
     pub expiry_min_minutes: i64,
-    /// Default source: services/contracts lifecycle and pagination policy.
+    /// Server design default maximum expiry in services/contracts/lifecycle.rs.
     pub expiry_max_days: i64,
-    /// Default source: services/contracts lifecycle and pagination policy.
+    /// Server design default minimum courier duration in services/contracts/lifecycle.rs.
     pub courier_min_days: i64,
-    /// Default source: services/contracts lifecycle and pagination policy.
+    /// Server design default maximum courier duration in services/contracts/lifecycle.rs.
     pub courier_max_days: i64,
-    /// Default source: services/contracts lifecycle and pagination policy.
+    /// Server design default item limit in services/contracts/lifecycle.rs.
     pub max_items: i64,
-    /// Default source: services/contracts lifecycle and pagination policy.
+    /// Server design default title limit in services/contracts/lifecycle.rs.
     pub title_max_len: i64,
-    /// Default source: services/contracts lifecycle and pagination policy.
+    /// Server design default description limit in services/contracts/lifecycle.rs.
     pub description_max_len: i64,
-    /// Default source: services/contracts lifecycle and pagination policy.
+    /// Server design default search page size in services/contracts.
     pub page_size: i64,
-    /// Default source: services/contracts lifecycle and pagination policy.
+    /// Server design default maximum search page size in services/contracts.
     pub page_size_max: i64,
 }
 
@@ -101,6 +103,10 @@ impl ContractsConfig {
         anyhow::ensure!(self.expiry_max_days > 0, "contracts.expiry_max_days={} is outside its valid domain", self.expiry_max_days);
         anyhow::ensure!(self.courier_min_days > 0, "contracts.courier_min_days={} is outside its valid domain", self.courier_min_days);
         anyhow::ensure!(self.courier_max_days > 0, "contracts.courier_max_days={} is outside its valid domain", self.courier_max_days);
+        anyhow::ensure!(self.courier_max_days <= i64::from(i32::MAX), "contracts.courier_max_days={} must fit i32", self.courier_max_days);
+        super::duration("contracts.expiry_min_minutes", self.expiry_min_minutes, crate::consts::FILETIME_MINUTE, true)?;
+        super::duration("contracts.expiry_max_days", self.expiry_max_days, crate::consts::FILETIME_DAY, true)?;
+        super::duration("contracts.courier_max_days", self.courier_max_days, crate::consts::FILETIME_DAY, true)?;
         anyhow::ensure!(self.max_items > 0, "contracts.max_items={} is outside its valid domain", self.max_items);
         anyhow::ensure!(self.title_max_len > 0, "contracts.title_max_len={} is outside its valid domain", self.title_max_len);
         anyhow::ensure!(self.description_max_len > 0, "contracts.description_max_len={} is outside its valid domain", self.description_max_len);
@@ -117,9 +123,9 @@ impl ContractsConfig {
 #[derive(Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ClonesConfig {
-    /// Default source: services/clones.rs jump clone policy.
+    /// Server base jump-clone cooldown in services/clones.rs.
     pub jump_cooldown_hours: i64,
-    /// Default source: services/clones.rs jump clone policy.
+    /// One hour less cooldown per Infomorph Synchronizing level in services/clones.rs.
     pub synchronizing_hours_per_level: i64,
 }
 
@@ -136,6 +142,7 @@ impl ClonesConfig {
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(self.jump_cooldown_hours > 0, "clones.jump_cooldown_hours={} is outside its valid domain", self.jump_cooldown_hours);
         anyhow::ensure!(self.synchronizing_hours_per_level > 0, "clones.synchronizing_hours_per_level={} is outside its valid domain", self.synchronizing_hours_per_level);
+        super::duration("clones.jump_cooldown_hours", self.jump_cooldown_hours, crate::consts::FILETIME_HOUR, true)?;
         Ok(())
     }
 }
@@ -167,11 +174,11 @@ impl MailConfig {
 #[derive(Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CalendarConfig {
-    /// Default source: services/calendar/mod.rs calendar policy.
+    /// Server design default invitee limit in services/calendar/mod.rs.
     pub max_invitees: i64,
-    /// Default source: services/calendar/mod.rs calendar policy.
+    /// Server design default title limit in services/calendar/mod.rs.
     pub title_max_len: i64,
-    /// Default source: services/calendar/mod.rs calendar policy.
+    /// Server design default description limit in services/calendar/mod.rs.
     pub description_max_len: i64,
 }
 
@@ -198,9 +205,9 @@ impl CalendarConfig {
 #[derive(Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SpaceConfig {
-    /// Default source: space/snapshot.rs and space/actor.rs persistence and mailbox policy.
+    /// Issue 4: persist changed positions every 30 seconds, bounding default crash loss.
     pub position_snapshot_secs: i64,
-    /// Default source: space/snapshot.rs and space/actor.rs persistence and mailbox policy.
+    /// D6 server space actor mailbox budget.
     pub mailbox_budget: i64,
 }
 
@@ -216,6 +223,7 @@ impl Default for SpaceConfig {
 impl SpaceConfig {
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(self.position_snapshot_secs > 0, "space.position_snapshot_secs={} is outside its valid domain", self.position_snapshot_secs);
+        super::milliseconds("space.position_snapshot_secs", self.position_snapshot_secs)?;
         anyhow::ensure!(self.mailbox_budget > 0, "space.mailbox_budget={} is outside its valid domain", self.mailbox_budget);
         Ok(())
     }

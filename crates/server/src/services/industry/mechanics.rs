@@ -58,6 +58,7 @@ async fn plan(
     optional: Option<i32>,
     facility: &Facility,
 ) -> Result<Plan, CallError> {
+    let policy = &crate::config::game().industry;
     let level = |s: i32| skills.get(&s).copied().unwrap_or(0) as f64;
     // Materials: ME applies to manufacturing; copying multiplies by the licensed runs.
     let material_runs = if activity_id == COPYING { runs as f64 * licensed_runs as f64 } else { runs as f64 };
@@ -73,7 +74,7 @@ async fn plan(
     let mut probability = 1.0;
     if activity_id == INVENTION {
         let base = act.products.iter().map(|p| p.2).sum::<f64>() / act.products.len().max(1) as f64;
-        let skill_bonus = 1.0 + act.skills.iter().map(|(s, _)| level(*s) * INVENTION_SKILL_PROBABILITY).sum::<f64>();
+        let skill_bonus = 1.0 + act.skills.iter().map(|(s, _)| level(*s) * policy.invention_skill_probability).sum::<f64>();
         let decryptor_multiplier = match optional {
             Some(d) => decryptor(sde, d).0,
             None => 1.0,
@@ -122,7 +123,7 @@ async fn plan(
         INVENTION => seconds *= char_attr(ATTR_INVENTION_RESEARCH_SPEED),
         _ => {}
     }
-    if seconds - seconds / runs as f64 > MAX_RUN_LENGTH {
+    if seconds - seconds / runs as f64 > policy.max_run_secs {
         return Err(notify_error(messages::INDUSTRY_PROJECT_TOO_LONG));
     }
 
@@ -136,18 +137,18 @@ async fn plan(
     };
     let job_cost = match activity_id {
         MANUFACTURING => blueprint_price(db, sde, bp.type_id).await? * runs as f64,
-        COPYING => blueprint_price(db, sde, bp.type_id).await? * COST_PERCENTAGE * licensed_runs as f64 * runs as f64,
-        RESEARCH_TIME | RESEARCH_MATERIAL if act.time > 0.0 => blueprint_price(db, sde, bp.type_id).await? * COST_PERCENTAGE * base_seconds / act.time,
+        COPYING => blueprint_price(db, sde, bp.type_id).await? * policy.job_cost_rate * licensed_runs as f64 * runs as f64,
+        RESEARCH_TIME | RESEARCH_MATERIAL if act.time > 0.0 => blueprint_price(db, sde, bp.type_id).await? * policy.job_cost_rate * base_seconds / act.time,
         INVENTION => match product {
-            Some(p) => blueprint_price(db, sde, p).await? * COST_PERCENTAGE * runs as f64,
+            Some(p) => blueprint_price(db, sde, p).await? * policy.job_cost_rate * runs as f64,
             None => 0.0,
         },
         _ => 0.0,
     };
     let base_cost = job_cost.round();
-    let scc = if matches!(activity_id, RESEARCH_TIME | RESEARCH_MATERIAL) { SCC_SURCHARGE_RATE * 0.5 } else { SCC_SURCHARGE_RATE };
-    let security_tax = if facility.security >= 0.45 { (base_cost * INDUSTRY_SECURITY_TAX_RATE).round() } else { 0.0 };
-    let total_cost = (job_cost * SYSTEM_COST_INDEX).round() + (base_cost * FACILITY_TAX).round() + (base_cost * scc).round() + security_tax;
+    let scc = if matches!(activity_id, RESEARCH_TIME | RESEARCH_MATERIAL) { policy.scc_surcharge_rate * 0.5 } else { policy.scc_surcharge_rate };
+    let security_tax = if facility.security >= 0.45 { (base_cost * policy.highsec_security_tax).round() } else { 0.0 };
+    let total_cost = (job_cost * policy.system_cost_index).round() + (base_cost * policy.npc_facility_tax).round() + (base_cost * scc).round() + security_tax;
     Ok(Plan { materials, seconds: seconds.round() as i64, total_cost, probability, product })
 }
 
@@ -162,7 +163,8 @@ pub(super) async fn install(c: &Client, request: &Value) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
     let int = |k: &str| request.get(k).filter(|v| !v.is_none()).and_then(|v| v.as_int());
     let activity_id = int("activityID").unwrap_or(0) as i32;
-    let runs = int("runs").unwrap_or(1).clamp(1, MAX_RUNS_HARD_CAP as i64) as i32;
+    let max_runs = crate::config::game().industry.max_runs.min(i32::MAX as i64) as i32;
+    let runs = int("runs").unwrap_or(1).clamp(1, max_runs as i64) as i32;
     let licensed_runs = int("licensedRuns").unwrap_or(1).max(1) as i32;
     let account_owner = request.get("account").and_then(|v| v.items()).and_then(|a| a.first()).and_then(|v| v.as_int()).unwrap_or(me);
     if account_owner != me {
@@ -214,7 +216,7 @@ pub(super) async fn install(c: &Client, request: &Value) -> CallResult {
                     RESEARCH_TIME => (MAX_TIME_EFFICIENCY - bp.te) / 2,
                     RESEARCH_MATERIAL => MAX_MATERIAL_EFFICIENCY - bp.me,
                     MANUFACTURING | INVENTION if bp.copy => bp.runs,
-                    _ => MAX_RUNS_HARD_CAP,
+                    _ => max_runs,
                 };
                 if runs > max_runs || (activity_id == COPYING && licensed_runs > act.max_production_limit) {
                     return Err(notify_error(messages::BLUEPRINT_RUN_COUNT_EXCEEDED));

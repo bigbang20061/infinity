@@ -15,7 +15,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         ("industryManager", "GetJobsByOwner") => {
             let owner = int(0);
             let completed = call.args.get(1).is_some_and(|v| matches!(v, Value::Bool(true)) || v.as_int().is_some_and(|i| i != 0));
-            let cutoff = if completed { filetime_now() - COMPLETED_JOB_HISTORY_DAYS * FILETIME_DAY } else { 0 };
+            let cutoff = if completed { filetime_now().saturating_sub(crate::config::game().industry.history_days.saturating_mul(FILETIME_DAY)) } else { 0 };
             match industry_dao::jobs_by_owner(&c.db, owner, completed, INDUSTRY_JOB_STATUS_INSTALLED, cutoff).await {
                 Ok(rows) => Ok(Value::list(rows.iter().map(Job::keyval))),
                 Err(e) => Err(db_err(e)),

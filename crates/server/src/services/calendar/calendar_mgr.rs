@@ -9,10 +9,11 @@ async fn create(c: &Client, call: &Call<'_>, owner: i64) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
     let when = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
     let duration = call.args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as i32;
-    let (title, description) = (value_text(call.args.get(2), MAX_TITLE_LENGTH), value_text(call.args.get(3), MAX_DESCRIPTION_LENGTH));
+    let policy = &crate::config::game().calendar;
+    let (title, description) = (value_text(call.args.get(2), usize::try_from(policy.title_max_len).unwrap_or(usize::MAX)), value_text(call.args.get(3), usize::try_from(policy.description_max_len).unwrap_or(usize::MAX)));
     let important = call.args.get(4).and_then(|v| v.as_int()).unwrap_or(0) as i32;
     let now = filetime_now();
-    let guests: Vec<i64> = call.args.get(5).and_then(|v| v.items()).unwrap_or(&[]).iter().filter_map(|v| v.as_int()).filter(|g| *g != me).take(MAX_INVITEES).collect();
+    let guests: Vec<i64> = call.args.get(5).and_then(|v| v.items()).unwrap_or(&[]).iter().filter_map(|v| v.as_int()).filter(|g| *g != me).take(usize::try_from(policy.max_invitees).unwrap_or(usize::MAX)).collect();
     let world = c.world.clone();
     c.db.transaction(
         |tx, outbox: &mut Outbox| {
@@ -44,9 +45,10 @@ async fn edit(c: &Client, call: &Call<'_>) -> CallResult {
     let old = call.args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
     let when = call.args.get(2).and_then(|v| v.as_int()).unwrap_or(old);
     let duration = call.args.get(3).and_then(|v| v.as_int()).unwrap_or(0) as i32;
-    let title = value_text(call.args.get(4), MAX_TITLE_LENGTH);
+    let policy = &crate::config::game().calendar;
+    let title = value_text(call.args.get(4), usize::try_from(policy.title_max_len).unwrap_or(usize::MAX));
     let important = call.args.get(6).and_then(|v| v.as_int()).unwrap_or(0) as i32;
-    dao::edit(&c.db, &dao::EditEvent { event, when, duration, title: &title, description: &value_text(call.args.get(5), MAX_DESCRIPTION_LENGTH), importance: important, modified: filetime_now() }).await.map_err(db_err)?;
+    dao::edit(&c.db, &dao::EditEvent { event, when, duration, title: &title, description: &value_text(call.args.get(5), usize::try_from(policy.description_max_len).unwrap_or(usize::MAX)), importance: important, modified: filetime_now() }).await.map_err(db_err)?;
     for g in invitees(c, event).await? {
         c.world.notify_pilot(g, "OnEditCalendarEvent", vec![Value::Int(event), Value::Int(owner), Value::Int(old), Value::Int(when), Value::Int(duration as i64), Value::unicode(title.as_str()), Value::Int(important as i64)]);
     }

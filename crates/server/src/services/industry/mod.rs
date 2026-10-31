@@ -9,8 +9,9 @@
 //! materials from the blueprint's ME, time from its TE and the character's industry
 //! attributes (services::fit), and cost from the estimated item value (adjusted prices) times
 //! the system cost index plus the facility tax, the SCC surcharge and, in high-sec, the
-//! security tax. Blueprint and station-operation data comes from the immutable typed SDE. Corporation jobs
-//! aren't supported.
+//! security tax. These rates, invention skill probability, run limits and completed-job history
+//! are operator policies in the industry configuration. Blueprint and station-operation data
+//! comes from the immutable typed SDE. Corporation jobs aren't supported.
 
 use super::contracts::{field, show_items};
 use crate::dao::items::loading::{Item, ItemQuery};
@@ -33,21 +34,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::info;
 
-/// Existing server policy for completed industry job history, in days.
-const COMPLETED_JOB_HISTORY_DAYS: i64 = 90;
 
 // industry.const
 const STATUS_DELIVERED: i32 = 101;
 const STATUS_CANCELLED: i32 = 102;
 const MAX_MATERIAL_EFFICIENCY: i32 = 10;
 const MAX_TIME_EFFICIENCY: i32 = 20;
-const COST_PERCENTAGE: f64 = 0.02;
-const SCC_SURCHARGE_RATE: f64 = 0.04;
-const MAX_RUN_LENGTH: f64 = 2_592_000.0;
-const MAX_RUNS_HARD_CAP: i32 = 1_000_000;
 const INVENTION_MATERIAL_EFFICIENCY: i32 = 2;
 const INVENTION_TIME_EFFICIENCY: i32 = 4;
-const INVENTION_SKILL_PROBABILITY: f64 = 1.0 / 30.0;
 const RESEARCH_TIMES: [f64; 10] = [
     1.0,
     29.0 / 21.0,
@@ -64,13 +58,6 @@ const RESEARCH_TIMES: [f64; 10] = [
 const DISTANCE_PER_LEVEL: [i64; 6] = [0, 5, 10, 15, 20, 25];
 const SKILL_SUPPLY_CHAIN_MANAGEMENT: i32 = 24268;
 const SKILL_SCIENTIFIC_NETWORKING: i32 = 24270;
-/// security.common.const.INDUSTRY_SECURITY_TAX_RATE (high-sec only)
-const INDUSTRY_SECURITY_TAX_RATE: f64 = 0.05;
-
-/// What an NPC station's industry service charges on the estimated item value.
-const FACILITY_TAX: f64 = 0.0025;
-/// The system cost index of every activity everywhere (there is no activity tracking).
-const SYSTEM_COST_INDEX: f64 = 0.02;
 
 const STATION_SERVICE_FACTORY: i32 = 14;
 const STATION_SERVICE_LABORATORY: i32 = 15;
@@ -137,7 +124,7 @@ impl Facility {
             (s("facilityID"), Value::Int(self.id)),
             (s("typeID"), Value::Int(self.type_id)),
             (s("ownerID"), Value::Int(self.owner)),
-            (s("tax"), Value::Float(FACILITY_TAX)),
+            (s("tax"), Value::Float(crate::config::game().industry.npc_facility_tax)),
             (s("solarSystemID"), Value::Int(self.system)),
             (s("online"), Value::Bool(true)),
             (s("serviceAccess"), Value::Dict(vec![])),
@@ -147,7 +134,7 @@ impl Facility {
                 s("globalModifiers"),
                 Value::Dict(vec![
                     (s("faction"), Value::Float(1.0)),
-                    (s("system"), Value::Dict(activities.iter().map(|a| (Value::Int(*a as i64), Value::Float(SYSTEM_COST_INDEX))).collect())),
+                    (s("system"), Value::Dict(activities.iter().map(|a| (Value::Int(*a as i64), Value::Float(crate::config::game().industry.system_cost_index))).collect())),
                 ]),
             ),
             (

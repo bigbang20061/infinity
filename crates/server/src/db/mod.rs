@@ -152,7 +152,7 @@ impl Db {
                 (r.user_id, r.role, r.user_type)
             }
             None => {
-                let r = authentication::register(self, user_name, password_hash, ROLE_PLAYER_LOGIN).await?;
+                let r = authentication::register(self, user_name, password_hash, ROLE_PLAYER_LOGIN, crate::config::game().accounts.starting_plex).await?;
                 info!("registered new account {user_name:?}");
                 (r.user_id, ROLE_PLAYER_LOGIN, r.user_type)
             }

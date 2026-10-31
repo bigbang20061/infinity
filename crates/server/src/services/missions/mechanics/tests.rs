@@ -1,5 +1,5 @@
 //! Eligibility preserves JSON key presence separately from its nullable value.
-use super::eligible_kill;
+use super::{eligible_kill, rewards};
 use crate::sde::{dungeons::Dungeon, missions::{Mission, JournalMessage}};
 
 #[test]
@@ -12,4 +12,16 @@ fn kill_eligibility_uses_key_presence_and_difficulty() {
     assert!(!eligible_kill(&m, &d, 1));
     m.has_name = false;
     assert!(!eligible_kill(&m, &d, 2));
+}
+
+#[test]
+fn rewards_use_level_table_and_clamp_high_levels() {
+    crate::tests::init_config();
+    let table = &crate::config::game().missions.rewards;
+    for level in 1..=5 {
+        let reward = &table[(level - 1) as usize];
+        assert_eq!(rewards(level), (reward.isk, reward.lp));
+    }
+    assert_eq!(rewards(i64::MAX), rewards(5));
+    assert_eq!(rewards(0), rewards(5));
 }

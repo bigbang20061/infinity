@@ -1,7 +1,7 @@
 //! marketProxy: regional order books (eve/client/script/ui/services/marketsvc.py).
 //!
 //! The book holds the NPC orders seeded at the starter stations (sql/market_seed.sql, and
-//! region-wide buy orders at consts::NPC_BID_RATIO of those prices) and players' orders. NPC
+//! region-wide buy orders priced at the configured NPC buy ratio) and players' orders. NPC
 //! stock and demand are unlimited, so fills never consume NPC orders.
 //!
 //! A trade happens at the resting order's price and delivers to the buyer's hangar in the
@@ -10,7 +10,8 @@
 //! order holds its items and a buy order its ISK in escrow until it fills, is cancelled or
 //! expires; closed orders move to game.market_order_history, and every fill is a row of
 //! game.market_transactions (wallet transactions and price history). Ranges in jumps use
-//! the startup-loaded SDE map. The SQL startup seed is the static-data exception.
+//! the startup-loaded SDE map. Fees, tax, duration, history and maintenance cadence are
+//! configured market policies. The SQL startup seed is the static-data exception.
 
 use crate::dao::items::loading::ItemQuery;
 use super::items::load_items;
@@ -33,31 +34,17 @@ use tracing::{info, warn};
 mod lists;
 use lists::{best_asks, escrow, history_header, my_orders, order_history, orders, price_history, transactions};
 
-/// Existing server policy for market order maintenance cadence.
-const ORDER_MAINTENANCE_INTERVAL_SECONDS: u64 = 60;
-
-/// Existing server policy for closed market order history, in days.
-const ORDER_HISTORY_DAYS: i64 = 90;
-/// Existing server policy for the default transaction history, in days.
-const DEFAULT_TRANSACTION_HISTORY_DAYS: i64 = 30;
-/// Existing server policy for market price history, in days.
-const PRICE_HISTORY_DAYS: i64 = 365;
 
 const RANGE_STATION: i64 = -1;
 const RANGE_SOLAR_SYSTEM: i64 = 0;
 const RANGE_REGION: i64 = 32767;
 /// marketutil.const.MAX_ORDER_PRICE
 const MAX_ORDER_PRICE: f64 = 9_223_372_036_854.0;
-/// Longest order the sell and buy windows offer (days).
-const MAX_DURATION: i64 = 90;
 /// What the client shows for a system it can't route to.
 const UNREACHABLE: i64 = 1_000_000;
 
 // marketutil.const, appConst.mktMinimumFee and MKT_TRANSACTION_TAX_DEFAULT
-const BROKER_FEE: f64 = 0.03;
 const BROKER_RELATIONS_PER_LEVEL: f64 = 0.003;
-const MIN_BROKER_FEE: f64 = 100.0;
-const SALES_TAX: f64 = 0.08;
 const ACCOUNTING_PER_LEVEL: f64 = 0.11;
 
 // marketHistory orderState
@@ -111,6 +98,12 @@ fn valid_price(price: f64) -> Result<f64, CallError> {
     } else {
         Err(notify_error(messages::INVALID_PRICE))
     }
+}
+
+fn valid_duration(duration: i64, now: i64) -> bool {
+    (0..=crate::config::game().market.max_order_days).contains(&duration)
+        && duration <= i32::MAX as i64
+        && duration.checked_mul(FILETIME_DAY).and_then(|days| now.checked_add(days)).is_some()
 }
 
 
@@ -190,14 +183,14 @@ async fn skills(db: &(impl Executor + ?Sized), char_id: i64) -> Result<Skills, C
     let l = |skill: i32| levels.get(&skill).copied().unwrap_or(0) as f64;
     Ok(Skills {
         order_cap: (5.0 + 4.0 * l(SKILL_TRADE) + 8.0 * l(SKILL_RETAIL) + 16.0 * l(SKILL_WHOLESALE) + 32.0 * l(SKILL_TYCOON)) as i64,
-        sales_tax: SALES_TAX * (1.0 - ACCOUNTING_PER_LEVEL * l(SKILL_ACCOUNTING)),
-        broker_fee: BROKER_FEE - BROKER_RELATIONS_PER_LEVEL * l(SKILL_BROKER_RELATIONS),
+        sales_tax: crate::config::game().market.sales_tax * (1.0 - ACCOUNTING_PER_LEVEL * l(SKILL_ACCOUNTING)),
+        broker_fee: crate::config::game().market.broker_fee - BROKER_RELATIONS_PER_LEVEL * l(SKILL_BROKER_RELATIONS),
         modification_discount: 0.5 + 0.06 * l(SKILL_MARGIN_TRADING),
     })
 }
 
 fn broker_fee(rate: f64, amount: f64) -> f64 {
-    round2((rate * amount).max(MIN_BROKER_FEE))
+    round2((rate * amount).max(crate::config::game().market.broker_fee_min_isk))
 }
 
 async fn check_order_slots(db: &(impl Executor + ?Sized), char_id: i64, skills: &Skills) -> Result<(), CallError> {
@@ -376,7 +369,8 @@ async fn place_buy(c: &Client, station_id: i64, type_id: i64, price: f64, quanti
     let (db, world) = (&c.db, &*c.world);
     let me = c.session.int("charid").unwrap_or(0);
     let price = valid_price(price)?;
-    if quantity <= 0 || quantity > i32::MAX as i64 || !(0..=MAX_DURATION).contains(&duration) {
+    let now = filetime_now();
+    if quantity <= 0 || quantity > i32::MAX as i64 || !valid_duration(duration, now) {
         return Err(user_error(messages::MSG_MKT_ORDER_DID_NOT_MATCH, vec![]));
     }
     let (type_id, quantity) = (type_id as i32, quantity as i32);
@@ -384,7 +378,6 @@ async fn place_buy(c: &Client, station_id: i64, type_id: i64, price: f64, quanti
     let _trading = lock().await;
     let at = station(&c.sde, station_id)?;
     let sde = Arc::clone(&c.sde);
-    let now = filetime_now();
     db.transaction(|db, outbox: &mut Outbox<MarketEffect>| {
     let sde = Arc::clone(&sde);
     Box::pin(async move {
@@ -434,12 +427,12 @@ async fn place_sell(c: &Client, item_id: i64, station_id: i64, type_id: i64, pri
     let (db, world) = (&c.db, &*c.world);
     let me = c.session.int("charid").unwrap_or(0);
     let price = valid_price(price)?;
-    if quantity <= 0 || !(0..=MAX_DURATION).contains(&duration) {
+    let now = filetime_now();
+    if quantity <= 0 || !valid_duration(duration, now) {
         return Err(user_error(messages::MSG_MKT_ORDER_DID_NOT_MATCH, vec![]));
     }
     let _trading = lock().await;
     let sde = Arc::clone(&c.sde);
-    let now = filetime_now();
     db.transaction(|db, outbox: &mut Outbox<MarketEffect>| {
     let sde = Arc::clone(&sde);
     Box::pin(async move {
@@ -525,7 +518,7 @@ async fn modify(c: &Client, order_id: i64, new_price: f64) -> CallResult {
     let volume = o.vol_remaining as f64;
     let (old_amount, new_amount) = (o.price * volume, new_price * volume);
     let fee = round2(
-        (new_amount * skills.broker_fee * (1.0 - skills.modification_discount) + (new_amount - old_amount).max(0.0) * skills.broker_fee).max(MIN_BROKER_FEE),
+        (new_amount * skills.broker_fee * (1.0 - skills.modification_discount) + (new_amount - old_amount).max(0.0) * skills.broker_fee).max(crate::config::game().market.broker_fee_min_isk),
     );
     let escrow = if o.bid { round2(new_amount) } else { 0.0 };
     let top_up = escrow - o.escrow;
@@ -574,7 +567,7 @@ async fn cancel(c: &Client, order_id: i64) -> CallResult {
 /// Close players' orders past their duration, once a minute.
 pub async fn expire_orders(db: Db, sde: Arc<crate::sde::Sde>, world: Arc<World>) {
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(ORDER_MAINTENANCE_INTERVAL_SECONDS)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(crate::config::game().market.maintenance_secs as u64)).await;
         if let Err(CallError::Internal(e)) = expire(&db, &sde, &world).await {
             warn!("expiring market orders failed: {e:#}");
         }

@@ -1,9 +1,6 @@
 //! seasonalLoginCampaignManager for loginrewards/client/seasonalLoginCampaignService.py.
 //! Uses SDE campaign data and game reward claims; only the newest campaign is supported.
 use super::*;
-/// Daily turnover of login rewards and daily offers (UTC; 11:00 Beijing time).
-const TURNOVER: &str = "03:00:00";
-const REWARD_DAY_SQL: &str = "(now() AT TIME ZONE 'UTC' - interval '3 hours')::date";
 /// The newest seasonal campaign: (id, alpha rewards, omega rewards), each reward `(typeID, quantity)` by day.
 fn seasonal_campaign(c: &Client) -> Option<&crate::sde::store::Campaign> { c.sde.store.campaign() }
 /// (claims so far, claimed today) for `campaign`.
@@ -27,10 +24,9 @@ async fn seasonal(c: &mut Client, call: &Call<'_>) -> CallResult {
         // open until every reward is claimed: it ends the day after the last one would be.
         "get_active_campaign" => {
             let remaining = total - claimed;
-            let today_ordinal: i32 =
-                c.db.query_one(&format!("SELECT ({REWARD_DAY_SQL} - date '0001-01-01') + 1 AS ordinal"), &[]).await.map_err(db_err)?.get("ordinal");
+            let today_ordinal = crate::dao::store::rewards::today_ordinal(&c.db).await.map_err(db_err)?;
             let end = today_ordinal as i64 + remaining + 1;
-            Ok(Value::tuple([Value::Int(campaign as i64), Value::Int(end), Value::str(TURNOVER), Value::Int(remaining)]))
+            Ok(Value::tuple([Value::Int(campaign as i64), Value::Int(end), Value::str(&crate::config::game().store.daily_turnover_utc), Value::Int(remaining)]))
         }
         // {date ordinal: clone grade}
         "get_claim_history" => {

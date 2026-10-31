@@ -83,13 +83,13 @@ price_history_days = 365            # server market price-history retention
 
 [store]
 plex_price_isk_fallback = 23500000  # server fallback ISK per PLEX when no retail price is known
-daily_gift = { type_id = 52520, quantity = 10000 } # existing free daily offer: skill points
-daily_turnover_utc = "03:00:00"      # existing daily turnover in UTC
+daily_gift = { type_id = 52520, quantity = 1 } # daily free gift: one token grants 10,000 skill points
+daily_turnover_utc = "03:00:00"      # login rewards and daily offers turn over at 11:00 Beijing time; offset from midnight UTC
 fast_checkout = false               # existing policy: real-money purchase flow is off
 
 [missions]
 site_distance_m = 15000000          # existing mission site distance from its planet
-spawn_range_m = [15000, 40000]     # existing mission NPC spawn distance range
+spawn_range_m = [12000, 32000]     # existing mission NPC spawn distance range
 # Existing ISK and LP rewards by agent level 1..5; level 5 also covers higher levels.
 rewards = [
   { isk = 90000,   lp = 150  },
@@ -129,8 +129,8 @@ criminal_timer_secs = 900           # existing criminal timer duration
 engagement_secs = 300               # existing engagement duration
 outlaw_threshold = -5.0             # existing security status threshold for outlaws
 highsec_threshold = 0.45            # existing high-sec threshold for CONCORD response
-concord_base_delay_secs = 6         # existing CONCORD base response delay
-concord_delay_per_security_secs = 28 # existing CONCORD response delay slope per security point
+concord_base_delay_secs = 6         # integer seconds; computed response delay is truncated to whole seconds
+concord_delay_per_security_secs = 28 # integer seconds per security point
 security_gain_npc_kill = 0.0005     # existing NPC kill gain: fraction of distance to +10
 security_loss_aggression = 0.025    # existing illegal aggression loss: fraction of distance to -10
 security_loss_kill = 0.05           # existing illegal kill loss: fraction of distance to -10
@@ -162,7 +162,7 @@ scc_surcharge_rate = 0.04           # existing SCC surcharge rate
 highsec_security_tax = 0.05         # existing high-sec industry security tax
 npc_facility_tax = 0.0025           # existing NPC station industry service tax
 system_cost_index = 0.02            # existing fixed index: no activity tracking
-invention_skill_probability = 0.0333333 # existing approximate invention skill probability per level
+invention_skill_probability = 0.03333333333333333 # existing invention skill probability per level
 job_time_multiplier = 1.0           # existing behavior: job duration unchanged; below 1 is faster
 max_run_secs = 2592000              # existing maximum industry run duration
 max_runs = 1000000                  # existing hard maximum industry runs

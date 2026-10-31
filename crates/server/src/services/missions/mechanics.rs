@@ -4,18 +4,14 @@
 //! Mission and dungeon candidates, messages and placement use the shared SDE.
 //! Mission, character, item, loyalty and standing state is
 //! stored in the game database; site simulation is separate.
-//! Rewards and placement are server policy, not a client-provided generator; complete
-//! live-server mission layouts and mechanics are not reproduced.
+//! Basic mission rewards and placement are operator policy, not a client-provided generator;
+//! complete live-server mission layouts and mechanics are not reproduced.
 use super::*;
 /// (ISK, LP) rewards by agent level.
 fn rewards(level: i64) -> (i64, i64) {
-    match level {
-        1 => (90_000, 150),
-        2 => (350_000, 450),
-        3 => (1_000_000, 1_300),
-        4 => (2_800_000, 3_500),
-        _ => (7_000_000, 8_000),
-    }
+    let index = if (1..=4).contains(&level) { (level - 1) as usize } else { 4 };
+    let reward = &crate::config::game().missions.rewards[index];
+    (reward.isk, reward.lp)
 }
 
 fn mission_from(r: crate::dao::missions::MissionRow, data: &crate::sde::missions::Mission) -> Mission {
@@ -58,7 +54,7 @@ pub(super) async fn message(c: &Client, mission_id: i32, key: &str) -> Result<Op
 /// A mission site: a point well off the surface of a random planet of the system.
 fn mission_site_position(c: &Client, system: i64) -> V3 {
     let (base, radius) = super::site_position(&c.sde, system).unwrap_or(([0.0; 3], 0.0));
-    super::off_surface(base, radius, SITE_OFFSET)
+    super::off_surface(base, radius, crate::config::game().missions.site_distance_m)
 }
 
 fn eligible_kill(m: &crate::sde::missions::Mission, dungeon: &crate::sde::dungeons::Dungeon, level: i32) -> bool {

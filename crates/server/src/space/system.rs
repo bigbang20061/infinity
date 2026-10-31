@@ -139,7 +139,7 @@ impl System {
             self.snapshot_generation = self.snapshot_generation.checked_add(1).expect("snapshot generation exhausted");
             self.snapshot_positions.insert(ball.id, (self.snapshot_generation, ball.pos));
             if self.snapshot_due == 0 {
-                self.snapshot_due = self.ms.saturating_add(snapshot::POSITION_SNAPSHOT_INTERVAL_MS as i64);
+                self.snapshot_due = self.ms.saturating_add(crate::config::game().space.position_snapshot_secs.saturating_mul(MILLISECONDS_PER_SECOND));
             }
         }
         self.balls.insert(ball.id, ball);
@@ -209,7 +209,7 @@ impl System {
         if self.pilots.is_empty() {
             self.snapshot_due = 0;
         } else if self.snapshot_due != 0 && ms >= self.snapshot_due {
-            self.snapshot_due = ms.saturating_add(snapshot::POSITION_SNAPSHOT_INTERVAL_MS as i64);
+            self.snapshot_due = ms.saturating_add(crate::config::game().space.position_snapshot_secs.saturating_mul(MILLISECONDS_PER_SECOND));
             snapshot::schedule(self);
         }
         if self.is_cold() {

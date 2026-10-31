@@ -15,8 +15,8 @@ impl Registered {
 pub(crate) async fn find(ex: &(impl Executor + ?Sized), name: &str) -> Result<Option<Credentials>, db::Error> {
     Ok(ex.query_opt("SELECT user_id, password_hash, role, user_type FROM game.accounts WHERE lower(user_name) = lower($1)", &[&name]).await?.as_ref().map(Credentials::from_row))
 }
-pub(crate) async fn register(ex: &(impl Executor + ?Sized), name: &str, password: &[u8], role: i64) -> Result<Registered, db::Error> {
-    Ok(Registered::from_row(&ex.query_one("INSERT INTO game.accounts (user_name, password_hash, role) VALUES ($1, $2, $3) RETURNING user_id, user_type", &[&name, &password, &role]).await?))
+pub(crate) async fn register(ex: &(impl Executor + ?Sized), name: &str, password: &[u8], role: i64, starting_plex: i64) -> Result<Registered, db::Error> {
+    Ok(Registered::from_row(&ex.query_one("INSERT INTO game.accounts (user_name, password_hash, role, plex_balance) VALUES ($1, $2, $3, $4::bigint::numeric) RETURNING user_id, user_type", &[&name, &password, &role, &starting_plex]).await?))
 }
 pub(crate) async fn last_login(ex: &(impl Executor + ?Sized), user: i64) -> Result<u64, db::Error> {
     ex.execute("UPDATE game.accounts SET last_login = now() WHERE user_id = $1", &[&user]).await

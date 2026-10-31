@@ -1,17 +1,15 @@
 //! Crimewatch: combat timers, criminal flags, engagements, security status, CONCORD and
 //! killmails (eve/client/script/ui/services/crimewatchSvc.py, crimewatch.const).
 //!
-//! Activating a weapon on another pilot's ship is legal against criminals, outlaws (security
-//! status -5 or below), pilots you are engaged with, and anywhere outside empire space.
-//! Otherwise it is a criminal act: the aggressor loses security status and is flagged criminal
-//! for 15 minutes, open to anyone; in high-sec CONCORD destroys their ship after a response
-//! time that grows as security falls. Every aggression starts the aggressor's weapons timer
-//! (no docking or gate jumps for 60 s), puts both pilots on a 15-minute PvP timer and engages
-//! them for 5 minutes, so the victim may shoot back.
+//! Activating a weapon on another pilot's ship is legal against criminals, configured outlaws,
+//! pilots you are engaged with, and anywhere outside empire space. Otherwise it is a criminal
+//! act: the aggressor loses security status and is flagged criminal; in configured high-sec
+//! CONCORD destroys their ship after a response time that grows as security falls. Aggression
+//! starts weapons and PvP timers and a mutual engagement; their durations are operator policies.
 //!
-//! A lost player ship writes a killmail (game.killmails) naming everyone who damaged it in the
-//! last 5 minutes; an illegal kill costs those aggressors more security status. Killing NPCs
-//! that carry a bounty slowly raises it.
+//! A lost player ship writes a killmail (game.killmails) naming attackers within the configured
+//! window; an illegal kill costs those aggressors more security status. Killing NPCs that carry
+//! a bounty slowly raises it. Security adjustments and CONCORD response delays are configurable.
 //! CONCORD responses use the crime system's actor timer; character expiry timers
 //! follow pilots across systems and stations on Tokio tasks. These timers and
 //! criminal flags are in memory and do not survive a server restart.
@@ -24,7 +22,7 @@ mod war_statistic_mgr;
 
 use super::{db_err, keyval, Call, CallError, CallResult};
 use crate::client::{filetime_now, ms_from_filetime_ticks, Client};
-use crate::consts::{FILETIME_MINUTE, FILETIME_SECOND};
+use crate::consts::FILETIME_SECOND;
 use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::{dispatch_world, Outbox};
@@ -44,35 +42,12 @@ const CRIMINAL_IDLE: i64 = 300;
 const CRIMINAL_TIMER: i64 = 303;
 const NPC_IDLE: i64 = 400;
 const DISAPPROVAL_IDLE: i64 = 500;
-/// Retained server policy for the weapons timer duration.
-const WEAPONS_TIMEOUT: i64 = 60 * FILETIME_SECOND;
-/// Retained server policy for the PvP timer duration.
-const PVP_TIMEOUT: i64 = 15 * FILETIME_MINUTE;
-/// Retained server policy for the criminal timer duration.
-const CRIMINAL_TIMEOUT: i64 = 15 * FILETIME_MINUTE;
-/// Retained server policy for the engagement duration.
-const ENGAGEMENT_DURATION: i64 = 5 * FILETIME_MINUTE;
 const SAFETY_LEVEL_FULL: i64 = 2;
 
-/// Security status at or below which anyone may shoot a pilot.
-const OUTLAW: f64 = -5.0;
-/// Systems at or above this security (0.5 once rounded) are high-sec, where CONCORD answers.
-const HIGH_SEC: f64 = 0.45;
 /// Existing CONCORD response formula's minimum security input, distinct from the high-sec threshold.
 const CONCORD_MIN_SECURITY: f64 = 0.5;
-/// Existing server CONCORD response delay at maximum security.
-const CONCORD_BASE_DELAY_SECONDS: f64 = 6.0;
-/// Existing server CONCORD response delay slope per security point.
-const CONCORD_DELAY_SLOPE_SECONDS: f64 = 28.0;
 /// Existing server grace period after a character timer's expiry.
 const CHARACTER_TIMER_GRACE_MS: u64 = 500;
-/// Fraction of the way to -10 an illegal aggression, and an illegal kill, cost.
-const AGGRESSION_PENALTY: f64 = 0.025;
-const KILL_PENALTY: f64 = 0.05;
-/// Fraction of the way to +10 an NPC kill with a bounty earns.
-const NPC_KILL_GAIN: f64 = 0.0005;
-/// Retained server killmail window policy: older damage does not put an attacker on the killmail.
-const KILLMAIL_WINDOW: i64 = 5 * FILETIME_MINUTE;
 // notificationconst
 const NOTIFICATION_KILL_REPORT_VICTIM: i32 = 140;
 const NOTIFICATION_KILL_REPORT_FINAL_BLOW: i32 = 141;
@@ -181,13 +156,19 @@ pub async fn aggress(db: &Db, world: &Arc<World>, system: i64, attacker: i64, at
         return Ok(());
     }
     let now = filetime_now();
+    let policy = &crate::config::game().crimewatch;
     let system_sec = system_security(world, system);
     let victim_sec = security_status(db, victim).await?;
     let legal = system_sec <= 0.0
         || is_criminal(victim, now)
-        || victim_sec <= OUTLAW
+        || victim_sec <= policy.outlaw_threshold
         || state().engagements.get(&(attacker, victim)).is_some_and(|until| *until > now);
-    let (weapons, pvp) = (now + WEAPONS_TIMEOUT, now + PVP_TIMEOUT);
+    let (weapons, pvp) = (
+        now.saturating_add(policy.weapons_timer_secs.saturating_mul(FILETIME_SECOND)),
+        now.saturating_add(policy.pvp_timer_secs.saturating_mul(FILETIME_SECOND)),
+    );
+    let until = now.saturating_add(policy.criminal_timer_secs.saturating_mul(FILETIME_SECOND));
+    let engagement = now.saturating_add(policy.engagement_secs.saturating_mul(FILETIME_SECOND));
     let became_criminal = {
         let mut st = state();
         let a = st.pilots.entry(attacker).or_default();
@@ -195,11 +176,11 @@ pub async fn aggress(db: &Db, world: &Arc<World>, system: i64, attacker: i64, at
         a.pvp_until = pvp;
         let became = !legal && a.criminal_until <= now;
         if !legal {
-            a.criminal_until = now + CRIMINAL_TIMEOUT;
+            a.criminal_until = until;
         }
         st.pilots.entry(victim).or_default().pvp_until = pvp;
-        st.engagements.insert((victim, attacker), now + ENGAGEMENT_DURATION);
-        st.engagements.insert((attacker, victim), now + ENGAGEMENT_DURATION);
+        st.engagements.insert((victim, attacker), engagement);
+        st.engagements.insert((attacker, victim), engagement);
         let c = st.damage.entry(victim_ship).or_default().entry(attacker).or_default();
         c.ship_type = attacker_ship_type;
         c.weapon_type = weapon_type;
@@ -210,15 +191,14 @@ pub async fn aggress(db: &Db, world: &Arc<World>, system: i64, attacker: i64, at
     announce(world, attacker, "OnWeaponsTimerUpdate", WEAPONS_TIMER, WEAPONS_IDLE, weapons);
     announce(world, attacker, "OnPvpTimerUpdate", PVP_TIMER, PVP_IDLE, pvp);
     announce(world, victim, "OnPvpTimerUpdate", PVP_TIMER, PVP_IDLE, pvp);
-    world.notify_pilot(attacker, "OnCrimewatchEngagementCreated", vec![Value::Int(victim), Value::Int(now + ENGAGEMENT_DURATION)]);
-    world.notify_pilot(victim, "OnCrimewatchEngagementCreated", vec![Value::Int(attacker), Value::Int(now + ENGAGEMENT_DURATION)]);
+    world.notify_pilot(attacker, "OnCrimewatchEngagementCreated", vec![Value::Int(victim), Value::Int(engagement)]);
+    world.notify_pilot(victim, "OnCrimewatchEngagementCreated", vec![Value::Int(attacker), Value::Int(engagement)]);
     if legal {
         return Ok(());
     }
-    let until = now + CRIMINAL_TIMEOUT;
     announce(world, attacker, "OnCriminalTimerUpdate", CRIMINAL_TIMER, CRIMINAL_IDLE, until);
     let mut outbox = Outbox::default();
-    shift_security(db, &mut outbox, attacker, AGGRESSION_PENALTY, -10.0).await?;
+    shift_security(db, &mut outbox, attacker, policy.security_loss_aggression, -10.0).await?;
     dispatch_world((), outbox, world)?;
     info!("crimewatch: {attacker} committed a criminal act against {victim} in {system} (security {system_sec:.1})");
     if became_criminal {
@@ -227,7 +207,7 @@ pub async fn aggress(db: &Db, world: &Arc<World>, system: i64, attacker: i64, at
         }
         clear_flag_later(db.clone(), world.clone(), attacker, until);
     }
-    if system_sec >= HIGH_SEC && state().concord.insert(attacker) {
+    if system_sec >= policy.highsec_threshold && state().concord.insert(attacker) {
         dispatch_concord(world.clone(), system, attacker, system_sec);
     }
     Ok(())
@@ -261,12 +241,17 @@ fn clear_flag_later(db: Db, world: Arc<World>, char_id: i64, until: i64) {
     });
 }
 
-/// CONCORD arrives (6 s in 1.0 systems, up to 20 s in 0.5) and destroys the criminal's ship.
+/// CONCORD destroys the criminal's ship after the configured security-dependent delay.
 fn dispatch_concord(world: Arc<World>, system: i64, criminal: i64, security: f64) {
-    let delay_seconds = (CONCORD_BASE_DELAY_SECONDS + (1.0 - security.clamp(CONCORD_MIN_SECURITY, 1.0)) * CONCORD_DELAY_SLOPE_SECONDS) as u64;
+    let policy = &crate::config::game().crimewatch;
+    let delay_seconds = concord_delay_seconds(security, policy.concord_base_delay_secs, policy.concord_delay_per_security_secs);
     let pending = PendingConcord(criminal);
     let weak_world = Arc::downgrade(&world);
     world.schedule(system, seconds_to_ms(delay_seconds as f64), concord_response(pending, system, weak_world));
+}
+
+fn concord_delay_seconds(security: f64, base: i64, slope: i64) -> u64 {
+    (base as f64 + (1.0 - security.clamp(CONCORD_MIN_SECURITY, 1.0)) * slope as f64) as u64
 }
 
 fn concord_response(pending: PendingConcord, system: i64, weak_world: Weak<World>) -> impl FnOnce(&mut crate::space::System) + Send + 'static {
@@ -306,7 +291,7 @@ pub async fn ship_lost(db: &Db, world: &World, system: i64, victim: i64, victim_
     let now = filetime_now();
     let snapshot = state().damage.get(&ship).cloned().unwrap_or_default();
     let attackers: Vec<(i64, Contribution)> = snapshot.iter()
-        .filter(|(_, c)| c.last >= now - KILLMAIL_WINDOW)
+        .filter(|(_, c)| c.last >= now.saturating_sub(crate::config::game().crimewatch.killmail_attacker_window_secs.saturating_mul(FILETIME_SECOND)))
         .map(|(id, c)| (*id, c.clone()))
         .collect();
     let attacker_count = attackers.len();
@@ -387,7 +372,7 @@ async fn write_killmail<X: Send>(
     attackers.sort_unstable_by_key(|(char_id, _)| *char_id);
     for (char_id, c) in attackers {
         if c.illegal {
-            shift_security(db, outbox, *char_id, KILL_PENALTY, -10.0).await?;
+            shift_security(db, outbox, *char_id, crate::config::game().crimewatch.security_loss_kill, -10.0).await?;
         }
     }
     Ok((kill_id, isk_lost))
@@ -396,7 +381,7 @@ async fn write_killmail<X: Send>(
 /// A pilot killed an NPC with a bounty.
 pub async fn npc_killed(db: &Db, world: &World, char_id: i64) -> Result<(), CallError> {
     let mut outbox = Outbox::default();
-    shift_security(db, &mut outbox, char_id, NPC_KILL_GAIN, 10.0).await?;
+    shift_security(db, &mut outbox, char_id, crate::config::game().crimewatch.security_gain_npc_kill, 10.0).await?;
     dispatch_world((), outbox, world)
 }
 

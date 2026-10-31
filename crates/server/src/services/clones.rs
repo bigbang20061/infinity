@@ -3,9 +3,9 @@
 //! A character can keep one jump clone per station (game.jump_clones), as many as
 //! Infomorph Psychology and Advanced Infomorph Psychology levels allow. Clone jumping from a
 //! station to one of them leaves the current body behind as a clone there and wakes the
-//! pilot in a fresh capsule at the destination; it can be done once per 24 hours, an hour
-//! less per Infomorph Synchronizing level. Implants aren't modelled, so clones carry none
-//! and cost nothing. Ship-borne clone vat bays aren't supported.
+//! pilot in a fresh capsule at the destination. The jump cooldown and its reduction per
+//! Infomorph Synchronizing level are configured by the operator. Implants aren't modelled,
+//! so clones carry none and cost nothing. Ship-borne clone vat bays aren't supported.
 //! Clone destinations are resolved from the startup SDE after checking game ownership.
 
 use super::{crowset, db_err, notify_error, value_text, Call, CallError, CallResult};
@@ -20,10 +20,13 @@ use tracing::info;
 const SKILL_INFOMORPH_PSYCHOLOGY: i32 = 24242;
 const SKILL_ADVANCED_INFOMORPH_PSYCHOLOGY: i32 = 33407;
 const SKILL_INFOMORPH_SYNCHRONIZING: i32 = 33399;
-/// Existing server policy: base jump clone cooldown before skill reduction, in hours.
-const BASE_JUMP_COOLDOWN_HOURS: i64 = 24;
 /// Existing server policy: maximum jump clone name characters.
 const MAX_CLONE_NAME_LENGTH: usize = 100;
+
+fn jump_cooldown(base_hours: i64, reduction_per_level: i64, level: i64) -> i128 {
+    let hours = (i128::from(base_hours) - i128::from(level.max(0)) * i128::from(reduction_per_level)).max(0);
+    hours * i128::from(FILETIME_HOUR)
+}
 
 enum JumpEffect {
     Session { station: i64, system: i64, constellation: i64, region: i64, capsule: i64 },
@@ -93,9 +96,10 @@ async fn jump(c: &mut Client, me: i64, dest: i64, clone_id: i64) -> CallResult {
             Box::pin(async move {
             let last = clone_dao::last_jump(tx, me).await.map_err(db_err)?;
             let level = skill_dao::level(tx, me, SKILL_INFOMORPH_SYNCHRONIZING).await.map_err(db_err)?.unwrap_or(0) as i64;
-            let cooldown = (BASE_JUMP_COOLDOWN_HOURS - level) * FILETIME_HOUR;
-            if let Some(ready) = last.map(|l| l + cooldown).filter(|r| *r > now) {
-                let hours = (ready - now) as f64 / FILETIME_HOUR as f64;
+            let policy = &crate::config::game().clones;
+            let cooldown = jump_cooldown(policy.jump_cooldown_hours, policy.synchronizing_hours_per_level, level);
+            if let Some(ready) = last.map(|l| i128::from(l) + cooldown).filter(|r| *r > i128::from(now)) {
+                let hours = (ready - i128::from(now)) as f64 / FILETIME_HOUR as f64;
                 return Err(notify_error(&messages::jump_clone_cooldown(hours)));
             }
             let target = clone_dao::target(tx, clone_id, me, dest).await.map_err(db_err)?
@@ -169,3 +173,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         _ => return None,
     })
 }
+
+#[cfg(test)]
+mod tests;

@@ -116,7 +116,7 @@ pub(super) async fn my_orders(c: &Client) -> CallResult {
 /// `GetMarketOrderHistory`: the character's closed orders of the last 90 days.
 pub(super) async fn order_history(c: &Client) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
-    let rows = listings::history(&c.db, me, filetime_now() - ORDER_HISTORY_DAYS * FILETIME_DAY).await.map_err(db_err)?;
+    let rows = listings::history(&c.db, me, filetime_now().saturating_sub(crate::config::game().market.order_history_days.saturating_mul(FILETIME_DAY))).await.map_err(db_err)?;
     let header = DbRowDescriptor::new([
         ("orderID", DbType::I8),
         ("typeID", DbType::I4),
@@ -166,7 +166,7 @@ pub(super) async fn order_history(c: &Client) -> CallResult {
 /// `CharGetTransactions(fromDate)`: the character's fills, newest first (marketSvc.py).
 pub(super) async fn transactions(c: &Client, from: Option<i64>) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
-    let from = from.unwrap_or(filetime_now() - DEFAULT_TRANSACTION_HISTORY_DAYS * FILETIME_DAY);
+    let from = from.unwrap_or(filetime_now().saturating_sub(crate::config::game().market.transaction_history_days.saturating_mul(FILETIME_DAY)));
     let rows = listings::transactions(&c.db, me, from).await.map_err(db_err)?;
     let header = DbRowDescriptor::new([
         ("transactionID", DbType::I8),
@@ -225,7 +225,7 @@ pub(super) fn history_header() -> DbRowDescriptor {
 pub(super) async fn price_history(c: &Client, type_ids: &[i32]) -> Result<HashMap<i32, (Value, Value)>, CallError> {
     let region = c.session.int("regionid").unwrap_or(0);
     let today = today();
-    let rows = listings::price_history(&c.db, region, type_ids, FILETIME_DAY, today - PRICE_HISTORY_DAYS * FILETIME_DAY).await.map_err(db_err)?;
+    let rows = listings::price_history(&c.db, region, type_ids, FILETIME_DAY, today.saturating_sub(crate::config::game().market.price_history_days.saturating_mul(FILETIME_DAY))).await.map_err(db_err)?;
     let header = history_header();
     let mut days: HashMap<i32, (Vec<Value>, Vec<Value>)> = type_ids.iter().map(|t| (*t, (vec![], vec![]))).collect();
     for r in &rows {
