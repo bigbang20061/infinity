@@ -1,10 +1,11 @@
 //! GM per-item dogma base overrides. The slash role gate is owned by the parent service.
 //! Mirrors godma item attributes and the client brain's hull preAssignment effects;
-//! overrides live in game.item_attributes and follow singleton item identity.
+//! overrides live in game.item_attributes and follow singleton item identity. Owned
+//! drone queries include effective fit values; no drone gameplay RPC is provided.
 //! Charges, characters, structures, NPCs and stacked items are not supported.
 use super::{slash_error, Client, CallError};
 use crate::{dao::items::{dogma as dao, fit as fit_dao, loading::{Item, ItemQuery}}, messages};
-use crate::consts::{CATEGORY_CHARGE, CATEGORY_ENTITY, CATEGORY_MODULE, CATEGORY_OWNER};
+use crate::consts::{CATEGORY_CHARGE, CATEGORY_DRONE, CATEGORY_ENTITY, CATEGORY_MODULE, CATEGORY_OWNER};
 use crate::services::{combat, db_err, fit::{self, Fit, Key}, items::load_items, effects::{notify, propulsion}};
 use marshal::Value;
 
@@ -75,6 +76,12 @@ async fn item(c: &Client, id: i64) -> Result<Item, CallError> {
         .ok_or_else(|| slash_error(messages::gm::gm_dogma_invalid_target(&id.to_string())))
 }
 
+fn drone_query_key(item: &Item, action: Action<'_>, char_id: Option<i64>) -> Option<Key> {
+    (matches!(action, Action::Query(_))
+        && item.category_id == i64::from(CATEGORY_DRONE)
+        && char_id == Some(item.owner_id)).then_some(Key::Drone(item.item_id))
+}
+
 pub(super) async fn command(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
     let (target, action) = parse(args).ok_or_else(|| slash_error(messages::gm::GM_DOGMA_USAGE.into()))?;
     let ship = c.session.int("shipid");
@@ -115,7 +122,10 @@ pub(super) async fn command(c: &mut Client, args: &[&str]) -> Result<String, Cal
     if let Some(reason) = denied(attr, |name, id| c.sde.dogma.attributes_by_name(name).any(|a| a.attribute_id == id)) {
         return Err(slash_error(reason.into()));
     }
-    let key = if Some(id) == ship { Some(Key::Ship) } else if modules.iter().any(|m| m.item_id == id) { Some(Key::Module(id)) } else { None };
+    let drone_key = drone_query_key(&item, action, c.session.int("charid"));
+    let key = if matches!(action, Action::Query(_)) && item.category_id == i64::from(CATEGORY_DRONE) {
+        drone_key
+    } else if Some(id) == ship { Some(Key::Ship) } else if modules.iter().any(|m| m.item_id == id) { Some(Key::Module(id)) } else { None };
     if !matches!(action, Action::Query(_)) {
         let cycle = ["duration", "speed", "capacitorNeed", "reloadTime"];
         if combat::active_modules().contains(&id)
@@ -128,7 +138,11 @@ pub(super) async fn command(c: &mut Client, args: &[&str]) -> Result<String, Cal
     if matches!(action, Action::Reset(_)) && old_override.is_none() { return Ok(messages::gm::gm_dogma_noop(id, attr)); }
     let fallback = fit::base_attribute(c.sde.types.get(item.type_id), c.sde.dogma.attribute(attr), attr);
     let char_id = c.session.int("charid").unwrap_or(0);
-    let old_fit = if key.is_some() { Some(Fit::load(&c.db, c.sde.clone(), char_id, ship.unwrap()).await?) } else { None };
+    let old_fit = if drone_key.is_some() {
+        Some(Fit::drone(&c.db, c.sde.clone(), char_id, id).await?)
+    } else if key.is_some() {
+        Some(Fit::load(&c.db, c.sde.clone(), char_id, ship.unwrap()).await?)
+    } else { None };
     let old_base = old_fit.as_ref().zip(key).map(|(fit, key)| fit.base(key, attr)).unwrap_or(old_override.unwrap_or(fallback));
     let old_effective = old_fit.as_ref().zip(key).map(|(fit, key)| fit.value(key, attr));
     match action {
@@ -171,3 +185,6 @@ pub(super) async fn command(c: &mut Client, args: &[&str]) -> Result<String, Cal
     }
     Ok(result)
 }
+
+#[cfg(test)]
+mod tests;

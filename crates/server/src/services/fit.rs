@@ -1,20 +1,11 @@
-//! Server-side effective attributes for the active character, ship, fitted modules
-//! and charges. Static attributes, effects and modifiers come from the shared SDE;
-//! fitted items, per-item base overrides, charges and skill levels come from the runtime game database.
-//! Client modifier classes and domains: `dogma/effects/modifiers.py:8-25,48-140`;
-//! operation precedence and stacking categories:
-//! `dogma/const.py:7-51`.
-//!
-//! This implements ItemModifier, LocationModifier, LocationGroupModifier,
-//! LocationRequiredSkillModifier and OwnerRequiredSkillModifier for its fitted
-//! character/ship domains, operations PreAssign through PostAssign, and stacking
-//! penalties. Other modifier functions and operations, including PostPercentUnNerfed
-//! and the special skill relationship, are not evaluated; this is not full client
-//! dogma parity. Passive, online and running activation effects are considered;
-//! audited Python modifiers are supplemented in the SDE at startup.
-//! Skill traversal excludes implants and boosters; propulsion speed uses a server formula.
-//! ponytail: the audited SDE has no skill effect whose fittingUsageChance attribute
-//! exists on its skill type; if that changes, load that field and filter such effects.
+//! Effective dogma attributes for characters, ships, fittings, skills, active
+//! brain items, drones and explicitly supplied incoming projections. Modifier
+//! rows and defaults come from the SDE; owned items and overrides come from the
+//! game database. Mirrors `dogma/effects/modifiers.py`, `dogma/const.py`, and
+//! `dogma/attributes/skillLevelAttribute.py`. Projection lifetime and overload
+//! activation are not managed here; callers provide a fit snapshot.
+//! ponytail: skill effects with fittingUsageChance require loading and filtering
+//! that attribute if such a skill appears in the SDE.
 
 use super::{db_err, CallError};
 use crate::consts::{ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_REQUIRED_SKILL_1, ATTR_SPEED_FACTOR, CATEGORY_CHARGE, CATEGORY_SHIP, EFFECT_AFTERBURNER, EFFECT_MICROWARPDRIVE, EFFECT_SKILL, TYPE_CHARACTER};
@@ -24,8 +15,7 @@ use crate::sde::{dogma::{Attribute, Modifier}, types::TypeData, Sde};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-/// SDE dgmAttributeTypes: skillLevel.
-pub(super) const ATTR_SKILL_LEVEL: i32 = 280;
+use crate::consts::{ATTR_SKILL_LEVEL, ATTR_SKILL_POINTS, ATTR_SKILL_TIME_CONSTANT, CATEGORY_DRONE, FLAG_IMPLANT};
 /// SDE dgmAttributeTypes: requiredSkill1 through requiredSkill6.
 const ATTR_REQUIRED_SKILLS: [i32; 6] = [ATTR_REQUIRED_SKILL_1, 183, 184, 1285, 1289, 1290];
 /// SDE invCategories: Skill, exempt from stacking penalties.
@@ -60,6 +50,16 @@ pub(crate) const OP_POST_DIV: i32 = 5;
 pub(crate) const OP_POST_PERCENT: i32 = 6;
 /// SDE dogma modifier operation: PostAssign.
 pub(crate) const OP_POST_ASSIGN: i32 = 7;
+/// Dogma PostPercentUnNerfed, evaluated after PostPercent.
+pub(crate) const OP_POST_PERCENT_UNNERFED: i32 = 8;
+/// Dogma effect category: targeted.
+const EFFECT_CATEGORY_TARGET: i32 = 2;
+/// Client dogma/attributes/stackingNurfedAttribute.py uses eight stacking denominators.
+const STACKING_LIMIT: usize = 8;
+/// Dogma effect category: overload.
+const EFFECT_CATEGORY_OVERLOAD: i32 = 5;
+/// Dogma interim attribute used by the web falloff Python effect.
+const ATTR_SPEED_FACTOR_INTERIM: i32 = 2148;
 /// Dogma stacking penalty curve divisor, used by the server fitting formula.
 const STACKING_PENALTY_DIVISOR: f64 = 2.67;
 /// Server dogma stacking penalty curve squares the normalized modifier index.
@@ -71,25 +71,32 @@ const MODIFIER_SOURCE_ITEM_TYPE: i32 = -1;
 
 
 /// An item in the fit.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Key {
     Char,
     Ship,
     Module(i64),
-    /// The charge loaded in a module.
     Charge(i64),
     Skill(i32),
+    Implant(i64),
+    Booster(i64),
+    Drone(i64),
+    Projected(i64),
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Location { Ship, Char, Space }
 
 struct Node {
     type_id: i32,
     // Positions remain stable in the immutable types owned by the retained Arc<Sde>.
     data_position: Option<usize>,
-    /// Located in the ship (modules, charges).
-    in_ship: bool,
+    location: Location,
     online: bool,
-    /// A module running its activation effect.
     active: bool,
+    overloaded: bool,
+    projected_effect: Option<i32>,
+    charge_type: Option<i32>,
     level: Option<i32>,
     overrides: Vec<(i32, f64)>,
 }
@@ -124,41 +131,78 @@ pub struct Fit {
 }
 
 impl Fit {
-    /// Load the character, its skills, `ship`, its fitted modules and loaded charges.
-    pub async fn load(db: &Db, sde: Arc<Sde>, char_id: i64, ship: i64) -> Result<Fit, CallError> {
-        let char_type: i32 = TYPE_CHARACTER;
+    /// Load a fit that cannot carry projections. In-space callers must use
+    /// `load_projected` once their system supplies projection snapshots.
+    pub async fn load(db: &(impl crate::db::executor::Executor + ?Sized), sde: Arc<Sde>, char_id: i64, ship: i64) -> Result<Fit, CallError> {
+        Self::load_projected(db, sde, char_id, ship, Vec::new()).await
+    }
+
+    /// Load the fit and explicit source-effective incoming projected effects.
+    pub(crate) async fn load_projected(db: &(impl crate::db::executor::Executor + ?Sized), sde: Arc<Sde>, char_id: i64, ship: i64, projections: Vec<super::effects::projection::Projection>) -> Result<Fit, CallError> {
         let ship_type = crate::dao::items::inventory::type_id(db, ship).await.map_err(db_err)?.unwrap_or(0);
-        let skills = crate::dao::skills::levels::levels(db, char_id).await.map_err(db_err)?;
+        let skills = crate::dao::skills::training::current(db, char_id).await.map_err(db_err)?;
         let modules = fit_dao::modules(db, ship).await.map_err(db_err)?;
         let charges = fit_dao::charges(db, ship).await.map_err(db_err)?;
-        let ids: Vec<i64> = std::iter::once(ship).chain(modules.iter().map(|m| m.item_id)).collect();
+        let brain = fit_dao::brain_items(db, char_id).await.map_err(db_err)?;
+        let drones = fit_dao::drones(db, char_id, ship).await.map_err(db_err)?;
+        let ids: Vec<i64> = [ship, char_id].into_iter().chain(modules.iter().map(|m| m.item_id))
+            .chain(brain.iter().map(|m| m.item_id)).chain(drones.iter().map(|m| m.item_id)).collect();
         let mut overrides: HashMap<i64, Vec<(i32, f64)>> = HashMap::new();
         for row in crate::dao::items::dogma::overrides_for(db, &ids).await.map_err(db_err)? {
             overrides.entry(row.item_id).or_default().push((row.attribute_id, row.value));
         }
+        for values in overrides.values_mut() { values.sort_by_key(|entry| entry.0); }
+        let mut character: HashMap<i32, f64> = super::skills::attributes::base_character_attributes(db, &sde, char_id).await?
+            .into_iter().filter_map(|(attr, value)| i32::try_from(attr).ok().map(|attr| (attr, value))).collect();
+        character.extend(overrides.remove(&char_id).unwrap_or_default());
+        let mut character: Vec<_> = character.into_iter().collect();
+        character.sort_by_key(|v| v.0);
         let active = super::combat::active_modules();
         let mut nodes = HashMap::new();
-        nodes.insert(Key::Char, Node { type_id: char_type, data_position: sde.types.position(char_type), in_ship: false, online: true, active: false, level: None, overrides: Vec::new() });
-        nodes.insert(Key::Ship, Node { type_id: ship_type, data_position: sde.types.position(ship_type), in_ship: false, online: true, active: false, level: None, overrides: overrides.remove(&ship).unwrap_or_default() });
+        let node = |type_id, location, online, active, level, overrides| Node {
+            type_id, data_position: sde.types.position(type_id), location, online, active,
+            overloaded: false, projected_effect: None, charge_type: None, level, overrides,
+        };
+        nodes.insert(Key::Char, node(TYPE_CHARACTER, Location::Char, true, false, None, character));
+        nodes.insert(Key::Ship, node(ship_type, Location::Space, true, false, None, overrides.remove(&ship).unwrap_or_default()));
         for r in &skills {
-            let t = r.type_id;
-            nodes.insert(Key::Skill(t), Node { type_id: t, data_position: sde.types.position(t), in_ship: false, online: true, active: false, level: Some(r.level), overrides: Vec::new() });
+            let rank = sde.types.get(r.type_id).and_then(|d| d.fit_attribute(ATTR_SKILL_TIME_CONSTANT)).unwrap_or(0.0);
+            let level = super::skills::formulas::level_from_points(r.skill_points, rank);
+            nodes.insert(Key::Skill(r.type_id), node(r.type_id, Location::Char, true, false, Some(level), vec![(ATTR_SKILL_POINTS, r.skill_points as f64)]));
         }
         let mut module_by_flag = HashMap::new();
         for r in &modules {
-            let (id, t, online, flag) = (r.item_id, r.type_id, r.online, r.flag_id);
-            module_by_flag.insert(flag, id);
-            nodes.insert(Key::Module(id), Node { type_id: t, data_position: sde.types.position(t), in_ship: true, online, active: online && active.contains(&id), level: None, overrides: overrides.remove(&id).unwrap_or_default() });
+            module_by_flag.insert(r.flag_id, r.item_id);
+            nodes.insert(Key::Module(r.item_id), node(r.type_id, Location::Ship, r.online, r.online && active.contains(&r.item_id), None, overrides.remove(&r.item_id).unwrap_or_default()));
         }
         for r in &charges {
-            let (flag, t) = (r.flag_id, r.type_id);
-            if let Some(m) = module_by_flag.get(&flag) {
-                nodes.insert(Key::Charge(*m), Node { type_id: t, data_position: sde.types.position(t), in_ship: true, online: true, active: false, level: None, overrides: Vec::new() });
+            if let Some(m) = module_by_flag.get(&r.flag_id) {
+                nodes.insert(Key::Charge(*m), node(r.type_id, Location::Ship, true, false, None, Vec::new()));
             }
+        }
+        for r in &brain {
+            let key = if r.flag_id == FLAG_IMPLANT { Key::Implant(r.item_id) } else { Key::Booster(r.item_id) };
+            nodes.insert(key, node(r.type_id, Location::Char, true, false, None, overrides.remove(&r.item_id).unwrap_or_default()));
+        }
+        for r in &drones {
+            if sde.types.get(r.type_id).and_then(|d| d.category_id) == Some(CATEGORY_DRONE) {
+                nodes.insert(Key::Drone(r.item_id), node(r.type_id, Location::Space, true, false, None, overrides.remove(&r.item_id).unwrap_or_default()));
+            }
+        }
+        for p in projections {
+            let mut values = p.values;
+            if let Some(raw) = values.iter().find(|v| v.0 == ATTR_SPEED_FACTOR).map(|v| v.1) {
+                if !values.iter().any(|v| v.0 == ATTR_SPEED_FACTOR_INTERIM) { values.push((ATTR_SPEED_FACTOR_INTERIM, raw)); }
+            }
+            values.sort_by_key(|v| v.0);
+            let mut n = node(p.source_type, Location::Space, true, true, None, values);
+            n.projected_effect = Some(p.effect_id);
+            n.charge_type = p.charge_type;
+            nodes.insert(Key::Projected(p.source_module), n);
         }
         let mut skill_effects = Vec::new();
         for r in &skills {
-            if r.level <= 0 { continue; }
+            if nodes.get(&Key::Skill(r.type_id)).and_then(|n| n.level).unwrap_or(0) <= 0 { continue; }
             if let Some(data) = sde.types.get(r.type_id) {
                 for entry in data.effects() {
                     if entry.effect_id == EFFECT_SKILL { continue; }
@@ -181,10 +225,48 @@ impl Fit {
         Ok(Fit { nodes, passive_modifiers, passive_by_attribute, sde, memo: Mutex::new(HashMap::new()) })
     }
 
-    /// Visit passive skill modifiers in stable skill and effect order, including
-    /// Python effects absent from the SDE modifier table.
-    pub(crate) fn passive_skill_modifiers(&self, visit: impl FnMut(Key, &Modifier)) {
-        self.visit_passive_modifiers(0..self.passive_modifiers.len(), visit);
+    /// Load the selected character ship and one owned drone, including launched drones.
+    pub(crate) async fn drone(db: &Db, sde: Arc<Sde>, char_id: i64, drone_item: i64) -> Result<Fit, CallError> {
+        use crate::dao::items::loading::{load_items, ItemQuery};
+        let item = load_items(db, ItemQuery::Id(drone_item)).await.map_err(db_err)?
+            .into_iter().find(|item| item.owner_id == char_id && sde.types.get(item.type_id).and_then(|d| d.category_id) == Some(CATEGORY_DRONE))
+            .ok_or_else(|| CallError::Internal(anyhow::anyhow!("owned drone not found")))?;
+        let ship = crate::dao::characters::selection::ship_id(db, char_id).await.map_err(db_err)?
+            .ok_or_else(|| CallError::Internal(anyhow::anyhow!("character has no selected ship")))?;
+        let mut fit = Self::load(db, sde, char_id, ship).await?;
+        let mut overrides: Vec<_> = crate::dao::items::dogma::overrides_for(db, &[drone_item]).await.map_err(db_err)?
+            .into_iter().map(|r| (r.attribute_id, r.value)).collect();
+        overrides.sort_by_key(|v| v.0);
+        fit.nodes.insert(Key::Drone(drone_item), Node {
+            type_id: item.type_id, data_position: fit.sde.types.position(item.type_id),
+            location: Location::Space, online: true, active: false, overloaded: false,
+            projected_effect: None, charge_type: None, level: None, overrides,
+        });
+        fit.memo.get_mut().unwrap().clear();
+        Ok(fit)
+    }
+
+    /// Visit passive skill and active brain-item modifiers in stable order.
+    pub(crate) fn brain_modifiers(&self, mut visit: impl FnMut(Key, &Modifier)) {
+        self.visit_passive_modifiers(0..self.passive_modifiers.len(), &mut visit);
+        let mut keys: Vec<_> = self.nodes.keys().copied().filter(|k| matches!(k, Key::Implant(_) | Key::Booster(_))).collect();
+        keys.sort_unstable();
+        for key in keys {
+            let node = &self.nodes[&key];
+            if let Some(data) = node.data_position.map(|i| self.sde.types.at_position(i)) {
+                for entry in data.effects() {
+                    if let Some(effect) = self.sde.dogma.effect(entry.effect_id) {
+                        if effect.effect_category.unwrap_or(0) == EFFECT_CATEGORY_PASSIVE {
+                            for modifier in effect.modifiers() { visit(key, modifier); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn source_type(&self, source: Key) -> Option<i32> {
+        self.nodes.get(&source).map(|node| node.type_id)
     }
 
     fn visit_passive_modifiers(&self, indices: impl IntoIterator<Item = usize>, mut visit: impl FnMut(Key, &Modifier)) {
@@ -219,33 +301,14 @@ impl Fit {
     /// Does modifier `m` from `source` apply to `target`?
     fn applies(&self, source: Key, m: &Modifier, target: Key) -> bool {
         let Some(t) = self.nodes.get(&target) else { return false };
-        let domain_item = match m.domain.as_str() {
-            "itemID" => Some(source),
-            "shipID" => Some(Key::Ship),
-            "charID" => Some(Key::Char),
-            "otherID" => match source {
-                Key::Module(id) => Some(Key::Charge(id)),
-                Key::Charge(id) => Some(Key::Module(id)),
-                _ => None,
-            },
-            _ => None,
-        };
+        let group = t.data_position.and_then(|i| self.sde.types.at_position(i).group_id);
         let required = |skill: Option<i32>| {
             let skill = self.required_skill(source, skill);
             skill.is_some_and(|s| t.data_position.is_some_and(|i| {
                 let data = self.sde.types.at_position(i);
                 ATTR_REQUIRED_SKILLS.iter().filter_map(|a| data.fit_attribute(*a)).any(|v| v as i32 == s && s > 0) }))
         };
-        match m.func.as_str() {
-            "ItemModifier" => domain_item == Some(target),
-            // Location modifiers reach what is inside the ship (modules, charges); the
-            // character "location" holds its skills and implants, which no bonus targets.
-            "LocationModifier" => domain_item == Some(Key::Ship) && t.in_ship,
-            "LocationGroupModifier" => domain_item == Some(Key::Ship) && t.in_ship && m.group == Some(t.data_position.and_then(|i| self.sde.types.at_position(i).group_id).unwrap_or(0)),
-            "LocationRequiredSkillModifier" => domain_item == Some(Key::Ship) && t.in_ship && required(m.skill),
-            "OwnerRequiredSkillModifier" => domain_item == Some(Key::Char) && t.in_ship && required(m.skill),
-            _ => false,
-        }
+        modifier_applies(source, m, target, t, group, required(m.skill))
     }
 
     /// The effective value of `attr` on `key`.
@@ -254,10 +317,12 @@ impl Fit {
     }
 
     fn value_guarded(&self, key: Key, attr: i32, visiting: &mut HashSet<(Key, i32)>) -> f64 {
-        if let Some(v) = self.memo.lock().unwrap().get(&(key, attr)) {
-            return *v;
+        if let Some(value) = self.memo.lock().unwrap().get(&(key, attr)).copied() {
+            return value;
         }
         let base = self.base(key, attr);
+        if attr == ATTR_SKILL_LEVEL && matches!(key, Key::Skill(_)) { return base; }
+        if matches!(key, Key::Projected(_)) { return base; }
         if !visiting.insert((key, attr)) {
             return base;
         }
@@ -271,21 +336,27 @@ impl Fit {
         });
         if self.sde.types.modifies_attribute(attr) {
             let stackable = self.sde.dogma.attribute(attr).and_then(|m| m.stackable).unwrap_or(true);
-            for (&source, node) in &self.nodes {
+            let mut sources: Vec<_> = self.nodes.keys().copied().collect();
+            sources.sort_unstable();
+            for source in sources {
+                let node = &self.nodes[&source];
                 if matches!(source, Key::Skill(_)) { continue; }
                 let Some(data) = node.data_position.map(|i| self.sde.types.at_position(i)) else { continue };
                 for (effect, m) in data.modifiers(&self.sde.dogma, attr) {
-                    let running = match effect.effect_category.unwrap_or(0) {
-                        EFFECT_CATEGORY_PASSIVE => true,
-                        EFFECT_CATEGORY_ONLINE => node.online,
-                        EFFECT_CATEGORY_ACTIVE => node.active,
-                        _ => false,
-                    };
-                    if !running { continue; }
+                    if !effect_running(source, node, effect.effect_id, effect.effect_category.unwrap_or(0), &m.domain) { continue; }
                     if !self.applies(source, m, key) { continue; }
-                    let v = self.value_guarded(source, m.modifying, visiting);
-                    let exempt = matches!(data.category_id.unwrap_or(0), CATEGORY_SHIP | CATEGORY_CHARGE | CATEGORY_SKILL | CATEGORY_IMPLANT | CATEGORY_SUBSYSTEM);
+                    let v = if matches!(source, Key::Projected(_)) {
+                        projected_value(node, Some(data), self.sde.dogma.attribute(m.modifying), m.modifying)
+                    } else { self.value_guarded(source, m.modifying, visiting) };
+                    let exempt = stacking_exempt(data.category_id.unwrap_or(0));
                     mods.push((m.op, v, !stackable && !exempt));
+                }
+                if let Some(charge) = node.charge_type.and_then(|t| self.sde.types.get(t)) {
+                    for (_, m) in charge.modifiers(&self.sde.dogma, attr) {
+                        if m.domain != "targetID" || !self.applies(source, m, key) { continue; }
+                        let value = projected_value(node, Some(charge), self.sde.dogma.attribute(m.modifying), m.modifying);
+                        mods.push((m.op, value, false));
+                    }
                 }
             }
         }
@@ -296,6 +367,56 @@ impl Fit {
         let value = apply(base, &mods);
         self.memo.lock().unwrap().insert((key, attr), value);
         value
+    }
+}
+
+fn stacking_exempt(category: i32) -> bool {
+    matches!(category, CATEGORY_SHIP | CATEGORY_CHARGE | CATEGORY_SKILL | CATEGORY_IMPLANT | CATEGORY_SUBSYSTEM)
+}
+
+fn projected_value(node: &Node, data: Option<&TypeData>, meta: Option<&Attribute>, attr: i32) -> f64 {
+    node.base(data, meta, attr)
+}
+
+fn effect_running(source: Key, node: &Node, effect_id: i32, category: i32, domain: &str) -> bool {
+    if matches!(source, Key::Projected(_)) {
+        return node.projected_effect == Some(effect_id) && domain == "targetID";
+    }
+    match category {
+        EFFECT_CATEGORY_PASSIVE => true,
+        EFFECT_CATEGORY_ONLINE => node.online,
+        EFFECT_CATEGORY_ACTIVE => node.active,
+        EFFECT_CATEGORY_TARGET => false,
+        EFFECT_CATEGORY_OVERLOAD => node.online && node.overloaded,
+        _ => false,
+    }
+}
+
+fn modifier_applies(source: Key, m: &Modifier, target: Key, node: &Node, group: Option<i32>, required: bool) -> bool {
+    let domain = match m.domain.as_str() {
+        "itemID" => Some(source),
+        "shipID" => Some(Key::Ship),
+        "charID" => Some(Key::Char),
+        "targetID" if matches!(source, Key::Projected(_)) => Some(Key::Ship),
+        "otherID" => match source {
+            Key::Module(id) => Some(Key::Charge(id)),
+            Key::Charge(id) => Some(Key::Module(id)),
+            _ => None,
+        },
+        _ => None,
+    };
+    let located = match domain {
+        Some(Key::Ship) => node.location == Location::Ship || matches!(target, Key::Drone(_)),
+        Some(Key::Char) => (target != Key::Char && node.location == Location::Char) || matches!(target, Key::Drone(_)),
+        _ => false,
+    };
+    match m.func.as_str() {
+        "ItemModifier" => domain == Some(target),
+        "LocationModifier" => located,
+        "LocationGroupModifier" => located && m.group.is_some() && m.group == group,
+        "LocationRequiredSkillModifier" => located && required,
+        "OwnerRequiredSkillModifier" => domain == Some(Key::Char) && (node.location == Location::Ship || matches!(target, Key::Ship | Key::Drone(_))) && required,
+        _ => false,
     }
 }
 
@@ -310,7 +431,7 @@ impl Fit {
         for (&key, node) in &self.nodes {
             let effects = node.data_position.map(|i| self.sde.types.at_position(i).effects()).unwrap_or(&[]);
             let mwd = effects.iter().any(|effect| effect.effect_id == EFFECT_MICROWARPDRIVE);
-            if !node.active || !(mwd || effects.iter().any(|effect| effect.effect_id == EFFECT_AFTERBURNER)) {
+            if !matches!(key, Key::Module(_)) || !node.active || !(mwd || effects.iter().any(|effect| effect.effect_id == EFFECT_AFTERBURNER)) {
                 continue;
             }
             let mass = self.value_guarded(Key::Ship, ATTR_MASS, visiting).max(1.0);
@@ -345,7 +466,7 @@ fn apply(base: f64, mods: &[(i32, f64, bool)]) -> f64 {
         up.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
         down.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         for list in [up, down] {
-            for (i, f) in list.into_iter().enumerate() {
+            for (i, f) in list.into_iter().take(STACKING_LIMIT).enumerate() {
                 out *= 1.0 + (f - 1.0) * (-((i as f64) / STACKING_PENALTY_DIVISOR).powi(STACKING_PENALTY_EXPONENT)).exp();
             }
         }
@@ -358,6 +479,7 @@ fn apply(base: f64, mods: &[(i32, f64, bool)]) -> f64 {
     v = multiply(v, of(OP_POST_MUL).map(|m| (m.1, m.2)).collect());
     v = multiply(v, of(OP_POST_DIV).filter(|m| m.1 != 0.0).map(|m| (1.0 / m.1, m.2)).collect());
     v = multiply(v, of(OP_POST_PERCENT).map(|m| (1.0 + m.1 / PERCENT_SCALE, m.2)).collect());
+    v = multiply(v, of(OP_POST_PERCENT_UNNERFED).map(|m| (1.0 + m.1 / PERCENT_SCALE, false)).collect());
     if let Some(m) = of(OP_POST_ASSIGN).last() {
         v = m.1;
     }

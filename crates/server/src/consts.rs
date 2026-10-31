@@ -57,6 +57,8 @@ pub const CATEGORY_MODULE: i32 = 7;
 pub const CATEGORY_CHARGE: i32 = 8;
 /// SDE invCategories: Entity.
 pub const CATEGORY_ENTITY: i32 = 11;
+/// SDE invCategories: Drone.
+pub const CATEGORY_DRONE: i32 = 18;
 /// SDE invTypes: Hacking skill.
 pub const SKILL_HACKING: i32 = 21718;
 /// SDE invTypes: Archaeology skill.
@@ -79,6 +81,12 @@ pub const FACTION_ANGEL_CARTEL: i64 = 500011;
 // SDE dogma attribute and effect IDs.
 /// SDE dgmEffects: skillEffect, skill-point bookkeeping rather than a modifier.
 pub const EFFECT_SKILL: i32 = 132;
+/// SDE dgmAttributeTypes: skillTimeConstant.
+pub const ATTR_SKILL_TIME_CONSTANT: i32 = 275;
+/// SDE dgmAttributeTypes: skillPoints.
+pub const ATTR_SKILL_POINTS: i32 = 276;
+/// SDE dgmAttributeTypes: skillLevel.
+pub const ATTR_SKILL_LEVEL: i32 = 280;
 
 /// SDE dgmAttributeTypes: damageMultiplier.
 pub const ATTR_DAMAGE_MULTIPLIER: i32 = 64;
@@ -513,6 +521,12 @@ pub const FLAG_SUBSYSTEM_FIRST: i32 = 125;
 pub const FLAG_SUBSYSTEM_LAST: i32 = 132;
 /// Client inventorycommon.const.flagPilot.
 pub const FLAG_PILOT: i32 = 57;
+/// Client inventorycommon.const.flagDroneBay.
+pub const FLAG_DRONE_BAY: i32 = 87;
+/// Client inventorycommon.const.flagBooster.
+pub const FLAG_BOOSTER: i32 = 88;
+/// Client inventorycommon.const.flagImplant.
+pub const FLAG_IMPLANT: i32 = 89;
 /// Client inventorycommon.const.flagCorpSAG1; other divisions follow it.
 pub const FLAG_CORP_SAG1: i32 = 115;
 /// Client inventorycommon.const.locationJunkyard: deleted items.

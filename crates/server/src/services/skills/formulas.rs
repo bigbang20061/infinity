@@ -16,3 +16,15 @@ pub(super) fn sp_for_level(rank: f64, level: i64) -> i64 {
     }
     (SKILL_POINT_BASE * rank * SKILL_LEVEL_BASE.powf(SKILL_LEVEL_EXPONENT * (level.min(MAX_SKILL_LEVEL) - 1) as f64)).ceil() as i64
 }
+
+/// Client characterskills/util.py GetSkillLevelRaw.
+pub(crate) fn level_from_points(points: i64, rank: f64) -> i32 {
+    let base = rank * SKILL_POINT_BASE;
+    if base > points as f64 || base == 0.0 {
+        return 0;
+    }
+    (1 + ((points as f64 / base).ln() / (SKILL_LEVEL_BASE.ln() * SKILL_LEVEL_EXPONENT)) as i32).min(MAX_SKILL_LEVEL as i32)
+}
+
+#[cfg(test)]
+mod tests;
