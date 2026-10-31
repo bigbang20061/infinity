@@ -2,7 +2,7 @@
 //! Fixtures are frozen carbonengine output; no native runtime or database is needed.
 
 use super::*;
-use super::destiny_reference::{replay, ship, STREAM_TICKS};
+use super::destiny_reference::{replay, replay_fractions, ship, STREAM_TICKS};
 
 struct Scenario { name: &'static str, fixture: &'static str }
 
@@ -78,20 +78,12 @@ fn commands(system: &mut System, name: &str) {
             for i in 0..4 {
                 let point = [x, i as f64 * 10000.0, 0.0];
                 let factor = if i % 2 == 0 { 3000 } else { 13000 };
-                system.command(101 + i, move |b, stamp, _| {
+                system.command(101 + i, move |b, _, _| {
                     b.warp_factor = factor;
-                    let away = sub(b.pos, point);
-                    let length = len(away).max(1.0);
-                    let to = add(point, scale(away, 20000.0 / length));
-                    let distance = dist(to, b.pos);
-                    let tau = (b.mass * b.agility as f64 / 1e6).max(0.1);
-                    let align = -tau * 0.25f64.ln();
-                    b.mode = MODE_WARP; b.goto = to; b.speed_fraction = 1.0;
-                    b.warp = Some(Warp { from: b.pos, to, start: b.last_ms,
-                        duration: seconds_to_ms_f64(align + warp_duration(factor as f64, distance)), factor });
-                    b.effect_stamp = stamp;
+                    b.warp_to(point, 20000.0, factor);
                     vec![]
                 });
+                system.command(101 + i, |b, _, _| { b.set_speed_fraction(1.0); vec![] });
             }
         }
         _ => unreachable!(),
@@ -122,3 +114,8 @@ scenario_tests!(missile_trajectory, missile_stream, "missileflight", "fixtures/m
 scenario_tests!(warp_1au_trajectory, warp_1au_stream, "warp-1au", "fixtures/warp-1au.jsonl");
 scenario_tests!(warp_150km_trajectory, warp_150km_stream, "warp-150km", "fixtures/warp-150km.jsonl");
 scenario_tests!(warp_50au_trajectory, warp_50au_stream, "warp-50au", "fixtures/warp-50au.jsonl");
+
+#[test] fn warp_50au_fractions() {
+    let name = "warp-50au";
+    replay_fractions(name, include_str!("fixtures/warp-50au-fractions.jsonl"), setup(name), |system| commands(system, name));
+}

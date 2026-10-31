@@ -1,4 +1,5 @@
-//! The beyonce remote ballpark service; uses the space actor and SDE gate data. NPC workers are outside its scope.
+//! The beyonce remote ballpark service uses the space actor and SDE gate data.
+//! Belt rats spawn after actual warp exit; pending callbacks do not survive cancellation or restart.
 use super::*;
 
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
@@ -78,18 +79,26 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             let Some((id, pos, radius, warp_in)) = found else {
                 return Some(Ok(Value::None));
             };
+            let on_exit: Option<Timer> = if !by_pilot {
+                c.session.int("solarsystemid").map(|system| {
+                    let db = c.db.clone();
+                    let world = std::sync::Arc::downgrade(&c.world);
+                    let user = c.login.user_id;
+                    Box::new(move |s: &mut space::System| {
+                        s.defer(async move {
+                            let Some(world) = world.upgrade() else { return };
+                            if let Err(e) = crate::services::exploration::belt_rats(&db, &world, user, system, id, pos).await {
+                                warn!(user, "belt rats at {}: {}", id, crate::services::exploration::err_text(e));
+                            }
+                        });
+                    }) as Timer
+                })
+            } else { None };
             // Suns, planets, moons and belts land at their warp-in point, not off the surface.
-            let warped = match warp_in {
-                Some(point) => warp_to(c, None, point, min_range),
-                None => warp_to(c, Some((pos, radius)), pos, min_range),
-            };
-            // Warping to an asteroid belt brings out its rats.
-            if let (Ok(_), false, Some(system)) = (&warped, by_pilot, c.session.int("solarsystemid")) {
-                if let Err(e) = crate::services::exploration::belt_rats(&c.db, &c.world, c.login.user_id, system, id, pos).await {
-                    warn!(user = c.login.user_id, "belt rats at {}: {}", id, crate::services::exploration::err_text(e));
-                }
+            match warp_in {
+                Some(point) => warp_to(c, None, point, min_range, on_exit),
+                None => warp_to(c, Some((pos, radius)), pos, min_range, on_exit),
             }
-            warped
         }
         ("beyonce", "CmdStargateJump") => {
             let from_gate = a.first().and_then(|v| v.as_int()).unwrap_or(0);

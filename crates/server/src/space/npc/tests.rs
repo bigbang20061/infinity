@@ -7,9 +7,9 @@ fn ball(id: i64, pilot: Option<i64>, x: f64) -> Ball {
         char_id: pilot, signature_radius: pilot.map(|_| 1.0), mode: MODE_STOP, radius: 1.0, mass: 1e6,
         max_vel: 0.0, agility: 1.0, speed_fraction: 0.0,
         pos: [x, 0.0, 0.0], vel: [0.0; 3], goto: [0.0; 3],
-        old_pos: [x, 0.0, 0.0], old_vel: [0.0; 3], segment_acceleration: None, segment_warp: None,
+        old_pos: [x, 0.0, 0.0], old_vel: [0.0; 3], segment_acceleration: None,
         follow_id: 0, follow_range: 0.0, free: true, global: false, interactive: pilot.is_some(),
-        massive: true, warp: None, warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0,
+        massive: true, warp: crate::space::WarpState::default(), warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0,
         cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0,
         slim: Vec::new(),
     }
@@ -48,7 +48,7 @@ fn nearest_hostile_excludes_cloak_warp_and_outside_aggro() {
     cloaked.cloak = 1;
     s.insert(cloaked);
     let mut warping = ball(3, Some(12), 3.0);
-    warping.mode = MODE_WARP;
+    warping.warp_to([1_000_000.0, 0.0, 0.0], 0.0, 3000);
     s.insert(warping);
     s.insert(ball(4, Some(13), 101.0));
     s.add_aggressor(1000, 12);

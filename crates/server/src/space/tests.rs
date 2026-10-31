@@ -40,18 +40,17 @@ fn effect_stamp_balls() -> (Ball, Ball) {
         char_id: None, mode: MODE_MISSILE, radius: 2.5, signature_radius: None,
         mass: 10.0, max_vel: 20.0, agility: 0.5, speed_fraction: 0.75,
         pos: [1.0, 2.0, 3.0], vel: [4.0, 5.0, 6.0], goto: [7.0, 8.0, 9.0],
-        old_pos: [1.0, 2.0, 3.0], old_vel: [4.0, 5.0, 6.0], segment_acceleration: None, segment_warp: None,
+        old_pos: [1.0, 2.0, 3.0], old_vel: [4.0, 5.0, 6.0], segment_acceleration: None,
         follow_id: 987, follow_range: 42.0, free: true, global: false, massive: false, interactive: false,
-        warp: None, warp_factor: 3, last_ms: 1_234_567, interpolation_anchor_ms: 1_234_567, effect_stamp: 1_234, cloak: 0, cloak_until: 0,
+        warp: WarpState::default(), warp_factor: 3, last_ms: 1_234_567, interpolation_anchor_ms: 1_234_567, effect_stamp: 1_234, cloak: 0, cloak_until: 0,
         health: [1.0; DAMAGE_LAYER_COUNT], launcher: 654, slim: vec![],
     };
     let mut warp = missile.clone();
     warp.mode = MODE_WARP;
     warp.interactive = true;
-    warp.warp = Some(Warp {
-        from: [1.0, 2.0, 3.0], to: [7.0, 8.0, 9.0],
-        start: 2_345_678, duration: 5000.0, factor: 3,
-    });
+    warp.warp.length = 20.0;
+    warp.warp.min_range = 10.0;
+    warp.warp.factor = 3;
     warp.effect_stamp = 2_345;
     (missile, warp)
 }
@@ -61,7 +60,7 @@ fn missile_and_warp_wire_bytes_match_explicit_interactivity() {
     let (missile, warp) = effect_stamp_balls();
     for (ball, expected) in [
         (missile, "7b000000000000000500002040000000000000f03f0000000000000040000000000000084001000000000000244000ffffffffffffffff0c000000220000000000a0410000000000001040000000000000144000000000000018400000003f0000403fffdb03000000000000000028428e02000000000000d20400000000000000001c4000000000000020400000000000002240"),
-        (warp, "7b000000000000000300002040000000000000f03f0000000000000040000000000000084009000000000000244000ffffffffffffffff0c000000220000000000a0410000000000001040000000000000144000000000000018400000003f0000403fff0000000000001c4000000000000020400000000000002240290900008039422edcc8244000000000000000000300000000000000"),
+        (warp, "7b000000000000000300002040000000000000f03f0000000000000040000000000000084009000000000000244000ffffffffffffffff0c000000220000000000a0410000000000001040000000000000144000000000000018400000003f0000403fff0000000000001c400000000000002040000000000000224029090000000000000000344000000000000024400300000000000000"),
     ] {
         let mut bytes = Vec::new();
         ball.write(&mut bytes);
@@ -100,7 +99,8 @@ fn goto_direction_stores_absolute_point_and_serializes_it() {
     ball.pos = [1e16, 2e16, 3e16];
     ball.goto_direction([0.0, 3.0, 0.0]);
     assert_eq!(ball.mode, MODE_GOTO);
-    assert!(ball.warp.is_none());
+    assert!(!ball.is_warping());
+    assert_eq!((ball.warp.length, ball.warp.min_range, ball.warp.factor), (20.0, 10.0, 3));
     assert_eq!(ball.goto, [1e16, 1.2e17, 3e16]);
     let mut bytes = Vec::new();
     ball.write(&mut bytes);

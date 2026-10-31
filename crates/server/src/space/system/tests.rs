@@ -7,9 +7,9 @@ fn ball(id: i64, pilot: Option<i64>, x: f64) -> Ball {
         char_id: pilot, signature_radius: pilot.map(|_| 1.0), mode: MODE_STOP, radius: 1.0, mass: 1e6,
         max_vel: 100.0, agility: 1.0, speed_fraction: 0.0,
         pos: [x, 0.0, 0.0], vel: [0.0; 3], goto: [0.0; 3],
-        old_pos: [x, 0.0, 0.0], old_vel: [0.0; 3], segment_acceleration: None, segment_warp: None,
+        old_pos: [x, 0.0, 0.0], old_vel: [0.0; 3], segment_acceleration: None,
         follow_id: 0, follow_range: 0.0, free: true, global: false, interactive: pilot.is_some(),
-        massive: true, warp: None, warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0,
+        massive: true, warp: WarpState::default(), warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 0,
         cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0,
         slim: Vec::new(),
     }
@@ -57,21 +57,8 @@ fn completed_segment_samples_use_shared_drag_and_clamp() {
 }
 
 #[test]
-fn warp_segment_survives_landing_and_static_modes_stay_fixed() {
-    let mut b = ball(1, None, 0.0);
-    b.mode = MODE_WARP;
-    b.warp = Some(Warp { from: [0.0; 3], to: [120.0, 0.0, 0.0], start: 0, duration: 1500.0, factor: 1 });
+fn static_modes_stay_fixed() {
     let positions = HashMap::new();
-    b.evolve_behavior_for_ball(1000, 30_000, &positions, 0);
-    b.evolve_position(1000);
-    assert_eq!(b.position_at(30_000), [0.0; 3]);
-    assert_eq!(b.position_at(30_500), [40.0, 0.0, 0.0]);
-    b.evolve_behavior_for_ball(2000, 2000, &positions, 1);
-    b.evolve_position(2000);
-    assert!(b.warp.is_none());
-    assert_eq!(b.position_at(2000), [80.0, 0.0, 0.0]);
-    assert_eq!(b.position_at(2500), [120.0, 0.0, 0.0]);
-    assert_eq!(b.position_at(3000), b.pos);
     let mut fixed = ball(2, None, 7.0);
     fixed.mode = MODE_RIGID;
     fixed.free = false;
@@ -302,21 +289,14 @@ fn closed_observers_are_pruned_even_when_cold() {
 fn warp_advances_on_logical_second_boundaries() {
     let mut s = System::default();
     let mut b = ball(1, None, 0.0);
-    b.mode = MODE_WARP;
-    b.warp = Some(Warp { from: b.pos, to: [100.0, 0.0, 0.0], start: 0,
-        duration: 2000.0, factor: 3000 });
-    b.effect_stamp = 0;
+    b.vel = [100.0, 0.0, 0.0];
+    assert_eq!(b.warp_to([1_000_000.0, 0.0, 0.0], 0.0, 3000), WarpOutcome::Align);
     s.insert(b);
     s.tick(600);
-    assert_eq!(s.ball(1).unwrap().pos, [0.0, 0.0, 0.0]);
+    assert_eq!(s.ball(1).unwrap().effect_stamp, -1);
     s.tick(1000);
-    assert_eq!(s.ball(1).unwrap().pos, [50.0, 0.0, 0.0]);
-    s.tick(2000);
-    let b = s.ball(1).unwrap();
-    assert_eq!(b.pos, [100.0, 0.0, 0.0]);
-    assert_eq!(b.mode, MODE_STOP);
-    assert!(b.warp.is_none());
-    assert_eq!(b.vel, [0.0; 3]);
+    assert!(s.ball(1).unwrap().is_warping());
+    assert_eq!(s.ball(1).unwrap().effect_stamp, 0);
 }
 
 #[test]
@@ -559,4 +539,183 @@ fn membership_and_uncloak_are_fifo_and_captured() {
         assert_eq!(parts[0].as_int(), Some(5));
     }
     assert_eq!(s.ball(2).unwrap().cloak, 0);
+}
+
+fn queue_warp(s: &mut System, point: V3) {
+    s.command(1, move |b, _, _| { b.warp_to(point, 0.0, 3000); Vec::new() });
+}
+
+#[test]
+fn warp_exit_fires_once_after_stop_and_defers_work() {
+    let mut s = System::new(0, Arc::default(), 0);
+    let mut b = ball(1, None, 0.0);
+    b.vel = [100.0, 0.0, 0.0];
+    s.insert(b);
+    let (jobs, mut worker) = mpsc::unbounded_channel();
+    s.deferred_jobs = Some(jobs);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    queue_warp(&mut s, [1_000_000.0, 0.0, 0.0]);
+    s.on_warp_exit(1, move |s| {
+        let b = s.ball(1).unwrap();
+        assert_eq!(b.mode, MODE_STOP);
+        assert!(b.pos[0] > 900_000.0);
+        s.defer(async move { tx.send(()).unwrap(); });
+    });
+    for tick in 1..=100 {
+        s.tick(tick * 1000);
+        if s.ball(1).unwrap().mode == MODE_STOP { break; }
+    }
+    assert_eq!(s.ball(1).unwrap().mode, MODE_STOP);
+    assert!(rx.try_recv().is_err());
+    let job = worker.try_recv().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    runtime.block_on(job);
+    assert_eq!(rx.try_recv(), Ok(()));
+    s.tick(101_000);
+    assert!(worker.try_recv().is_err());
+}
+
+#[test]
+fn short_warp_callback_runs_at_fifo_boundary() {
+    let mut s = System::new(0, Arc::default(), 0);
+    s.insert(ball(1, None, 0.0));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    queue_warp(&mut s, [1000.0, 0.0, 0.0]);
+    s.on_warp_exit(1, move |s| {
+        assert_eq!(s.ball(1).unwrap().mode, MODE_GOTO);
+        tx.send(()).unwrap();
+    });
+    assert!(rx.try_recv().is_err());
+    s.tick(1000);
+    assert_eq!(rx.try_recv(), Ok(()));
+}
+
+#[test]
+fn warp_intent_is_replaced_cleared_or_cancelled_but_not_by_property_changes() {
+    let mut s = System::new(0, Arc::default(), 0);
+    s.insert(ball(1, None, 0.0));
+    let target = [1_000_000.0, 0.0, 0.0];
+    queue_warp(&mut s, target);
+    s.on_warp_exit(1, |_| {});
+    s.tick(1000);
+    assert!(s.warp_exits.contains_key(&1));
+    s.command(1, |b, _, _| { b.set_max_speed(200.0); Vec::new() });
+    s.tick(2000);
+    assert!(s.warp_exits.contains_key(&1));
+    queue_warp(&mut s, [2_000_000.0, 0.0, 0.0]);
+    s.on_warp_exit(1, |_| {});
+    s.tick(3000);
+    assert!(s.warp_exits.contains_key(&1));
+    s.clear_warp_exit(1);
+    queue_warp(&mut s, [3_000_000.0, 0.0, 0.0]);
+    s.tick(4000);
+    assert!(!s.warp_exits.contains_key(&1));
+    s.on_warp_exit(1, |_| {});
+    s.tick(5000);
+    s.command(1, |b, _, _| { b.goto_point([10.0, 0.0, 0.0]); Vec::new() });
+    s.tick(6000);
+    assert!(!s.warp_exits.contains_key(&1));
+    queue_warp(&mut s, target);
+    s.on_warp_exit(1, |_| {});
+    s.tick(7000);
+    assert!(s.warp_exits.contains_key(&1));
+    s.take(1);
+    assert!(!s.warp_exits.contains_key(&1));
+}
+
+#[test]
+fn activating_warp_releases_followers_before_evolution() {
+    let mut s = System::new(0, Arc::default(), 0);
+    let mut target = ball(1, None, 0.0);
+    target.vel = [100.0, 0.0, 0.0];
+    target.warp_to([1_000_000.0, 0.0, 0.0], 0.0, 3000);
+    let mut follower = ball(2, None, -1000.0);
+    follower.mode = MODE_FOLLOW;
+    follower.follow_id = 1;
+    s.insert(target);
+    s.insert(follower);
+    s.tick(1000);
+    assert!(s.ball(1).unwrap().is_warping());
+    assert_eq!(s.ball(2).unwrap().mode, MODE_STOP);
+}
+
+#[test]
+fn changed_warp_request_discards_old_callback_without_explicit_clear() {
+    let mut s = System::new(0, Arc::default(), 0);
+    s.insert(ball(1, None, 0.0));
+    queue_warp(&mut s, [1_000_000.0, 0.0, 0.0]);
+    s.on_warp_exit(1, |_| panic!("stale callback"));
+    s.tick(1000);
+    queue_warp(&mut s, [2_000_000.0, 0.0, 0.0]);
+    s.tick(2000);
+    assert!(!s.warp_exits.contains_key(&1));
+}
+
+#[test]
+fn warp_activation_releases_missiles_on_both_sides_of_sorted_target() {
+    let mut s = System::new(0, Arc::default(), 0);
+    let mut target = ball(2, None, 0.0);
+    target.owner_id = 7;
+    target.speed_fraction = 1.0;
+    target.vel = [100.0, 0.0, 0.0];
+    target.warp_factor = 3000;
+    assert_eq!(target.warp_to([1_000_000.0, 0.0, 0.0], 0.0, 3000), WarpOutcome::Align);
+    s.insert(target);
+    for id in [1, 3] {
+        let mut missile = ball(id, None, 0.0);
+        missile.owner_id = 7;
+        missile.speed_fraction = 1.0;
+        missile.vel = [100.0, 0.0, 0.0];
+        missile.warp_factor = 3000;
+        missile.mode = MODE_MISSILE;
+        missile.follow_id = 2;
+        missile.follow_range = -2.0;
+        missile.launcher = 9;
+        missile.effect_stamp = 42;
+        missile.goto = [1e16, 0.0, 0.0];
+        s.insert(missile);
+    }
+    s.tick(1000);
+    assert!(s.ball(2).unwrap().is_warping());
+    for id in [1, 3] {
+        let missile = s.ball(id).unwrap();
+        assert_eq!(missile.mode, MODE_GOTO);
+        assert!(!missile.massive);
+        assert_eq!((missile.effect_stamp, missile.follow_id, missile.launcher, missile.follow_range), (0, 0, 0, 0.0));
+        assert_eq!(missile.owner_id, 7);
+    }
+}
+
+#[test]
+fn warp_exit_callback_sees_completed_extra_step_and_fractional_segment() {
+    let mut s = System::new(0, Arc::default(), 0);
+    let mut ship = ball(1, None, 0.0);
+    ship.owner_id = 7;
+    ship.speed_fraction = 1.0;
+    ship.vel = [100.0, 0.0, 0.0];
+    ship.warp_factor = 3000;
+    s.insert(ship);
+    let mut other = ball(2, None, 0.0);
+    other.owner_id = 7;
+    other.speed_fraction = 1.0;
+    other.warp_factor = 3000;
+    other.vel = [20.0, 0.0, 0.0];
+    s.insert(other);
+    s.command(1, |b, _, _| { b.warp_to([1_000_000.0, 0.0, 0.0], 0.0, 3000); Vec::new() });
+    let (tx, rx) = std::sync::mpsc::channel();
+    s.on_warp_exit(1, move |s| {
+        let b = s.ball(1).unwrap();
+        assert_eq!(b.mode, MODE_STOP);
+        let mass = b.mass * b.agility as f64;
+        assert_eq!((b.pos, b.vel), integrate(b.old_pos, b.old_vel, [0.0; 3], mass, DESTINY_FRICTION, 1.0));
+        assert_eq!(b.position_at(b.interpolation_anchor_ms + 500),
+            integrate(b.old_pos, b.old_vel, [0.0; 3], mass, DESTINY_FRICTION, 0.5).0);
+        assert_eq!(s.ball(2).unwrap().last_ms, b.last_ms);
+        tx.send(()).unwrap();
+    });
+    for tick in 1..=100 {
+        s.tick(tick * 1000);
+        if s.ball(1).unwrap().mode == MODE_STOP { break; }
+    }
+    assert_eq!(rx.try_recv(), Ok(()));
 }

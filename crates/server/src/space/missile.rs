@@ -29,7 +29,6 @@ impl Ball {
         self.vel = direction;
         self.old_vel = self.vel;
         self.segment_acceleration = None;
-        self.segment_warp = None;
         if target.is_some_and(|t| t.3 != 0) { return; }
         if let Some(t) = aimed {
             self.missile_follow(t.0, t.2, owner, stamp);

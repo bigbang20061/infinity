@@ -3,7 +3,7 @@
 //! as consumed by `eve/client/script/remote/michelle.py`; ball state is transient.
 //! Formation followers and dynamical orientation are not implemented.
 
-use super::{Ball, MODE_FOLLOW, MODE_ORBIT, MODE_STOP};
+use super::{Ball, MODE_FOLLOW, MODE_MISSILE, MODE_ORBIT, MODE_STOP};
 
 /// Ballpark.cpp EvolveStop vertical velocity damping.
 const STOP_VERTICAL_DAMPING: f64 = 0.07;
@@ -13,15 +13,13 @@ const STOP_VERTICAL_RETAIN: f64 = 0.9345794392523364485981308411215;
 impl Ball {
     /// Stop without changing throttle or directly zeroing velocity.
     pub fn stop(&mut self) {
-        if matches!(self.mode, MODE_FOLLOW | MODE_ORBIT) {
+        if matches!(self.mode, MODE_FOLLOW | MODE_ORBIT | MODE_MISSILE) {
             self.effect_stamp = 0;
             self.follow_id = 0;
             self.launcher = 0;
             self.follow_range = 0.0;
         }
         self.mode = MODE_STOP;
-        // Legacy warp is an active alternative evolution path, removed in D5.
-        self.warp = None;
     }
 
     pub(super) fn evolve_stop(&mut self) {

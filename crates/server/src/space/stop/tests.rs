@@ -1,6 +1,6 @@
 use super::*;
 use crate::consts::DAMAGE_LAYER_COUNT;
-use crate::space::{MODE_GOTO, MODE_MISSILE, MODE_WARP, Warp};
+use crate::space::{MODE_GOTO, MODE_WARP, WarpState};
 use std::collections::HashMap;
 
 fn ball() -> Ball {
@@ -8,9 +8,9 @@ fn ball() -> Ball {
         id: 1, type_id: 1, owner_id: 2, corp_id: 3, alliance_id: 4, char_id: None,
         mode: MODE_GOTO, radius: 1.0, signature_radius: None, mass: 1e6, max_vel: 100.0,
         agility: 1.0, speed_fraction: 0.75, pos: [0.0; 3], vel: [10.0, 20.0, 30.0],
-        old_pos: [0.0; 3], old_vel: [0.0; 3], segment_acceleration: None, segment_warp: None,
+        old_pos: [0.0; 3], old_vel: [0.0; 3], segment_acceleration: None,
         goto: [1000.0, 0.0, 0.0], follow_id: 5, follow_range: 6.0, free: true,
-        global: false, massive: false, interactive: false, warp: None, warp_factor: 3,
+        global: false, massive: false, interactive: false, warp: WarpState::default(), warp_factor: 3,
         last_ms: 0, interpolation_anchor_ms: 0, effect_stamp: 7, cloak: 0, cloak_until: 0,
         health: [1.0; DAMAGE_LAYER_COUNT], launcher: 8, slim: vec![],
     }
@@ -21,14 +21,17 @@ fn stop_preserves_throttle_velocity_and_only_clears_follow_state() {
     for mode in [MODE_FOLLOW, MODE_ORBIT, MODE_GOTO, MODE_MISSILE, MODE_WARP] {
         let mut b = ball();
         b.mode = mode;
-        b.warp = Some(Warp { from: [0.0; 3], to: [1.0; 3], start: 0, duration: 1000.0, factor: 3 });
+        b.warp.length = 1000.0;
+        b.warp.min_range = 10.0;
+        b.warp.factor = 3;
         b.stop();
         assert_eq!(b.mode, MODE_STOP);
         assert_eq!(b.speed_fraction, 0.75);
         assert_eq!(b.vel, [10.0, 20.0, 30.0]);
-        assert!(b.warp.is_none());
-        let expected = if matches!(mode, MODE_FOLLOW | MODE_ORBIT) { (0, 0, 0, 0.0) } else { (7, 5, 8, 6.0) };
+        assert_eq!((b.warp.length, b.warp.min_range, b.warp.factor), (1000.0, 10.0, 3));
+        let expected = if matches!(mode, MODE_FOLLOW | MODE_ORBIT | MODE_MISSILE) { (0, 0, 0, 0.0) } else { (7, 5, 8, 6.0) };
         assert_eq!((b.effect_stamp, b.follow_id, b.launcher, b.follow_range), expected);
+        assert_eq!(b.owner_id, 2);
     }
 }
 

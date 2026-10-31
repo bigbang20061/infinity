@@ -400,7 +400,7 @@ async fn warp_to_location(c: &mut Client, agent: &Agent, call: &Call<'_>) -> Cal
                 return Ok(Value::None);
             }
             ensure_site(c, &m).await?;
-            super::ship::warp_to(c, None, m.pos, range)
+            super::ship::warp_to(c, None, m.pos, range, None)
         }
         "agenthomebase" => {
             let (station, _, system, pos) = agent_station(c, agent).await?;
@@ -408,7 +408,7 @@ async fn warp_to_location(c: &mut Client, agent: &Agent, call: &Call<'_>) -> Cal
                 return Ok(Value::None);
             }
             let radius = c.world.with(system, move |s| s.ball(station).map(|b| b.radius as f64)).await.flatten().unwrap_or(FALLBACK_STATION_RADIUS);
-            super::ship::warp_to(c, Some((pos, radius)), pos, range)
+            super::ship::warp_to(c, Some((pos, radius)), pos, range, None)
         }
         _ => Ok(Value::None),
     }

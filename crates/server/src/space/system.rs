@@ -15,9 +15,8 @@
 //! native cadence. The clamped interpolation anchor is actual execution time;
 //! the logical counter is not reset to wall time.
 //!
-//! DB effects run on workers; timers and non-position dynamic state do not
-//! survive restart. Full native movement, collision and bump physics are not
-//! implemented.
+//! DB effects run on workers; timers, warp-exit callbacks and non-position
+//! dynamic state do not survive restart. Collision and bump physics are not implemented.
 use super::*;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::future::Future;
@@ -31,7 +30,7 @@ const DESTRUCTION_EFFECT_EXPLOSION: i64 = 3;
 const MISSILE_AIMED_LAUNCH: bool = true;
 /// Server policy for ordinary missiles; destiny/src/Thunkers.cpp sets ball massiveness from this flag.
 const MISSILE_MASSIVE: bool = false;
-type Timer = Box<dyn FnOnce(&mut System) + Send>;
+pub(crate) type Timer = Box<dyn FnOnce(&mut System) + Send>;
 type Action = Box<dyn FnOnce(&mut System, i64) + Send>;
 
 #[derive(Default)]
@@ -43,10 +42,12 @@ pub struct System {
     registry: Arc<Pilots>,
     target_states: HashMap<i64, TargetState>,
     free_ids: Vec<i64>,
+    exited_ids: Vec<i64>,
     /// Celestial warp-in points (warpin.rs), by celestial ID.
     warp_ins: HashMap<i64, V3>,
     pending: Option<HashMap<i64, Vec<Value>>>,
     timers: BTreeMap<(i64, u64), Timer>,
+    warp_exits: HashMap<i64, Timer>,
     timer_sequence: u64,
     pub(super) ms: i64,
     current_time: i64,
@@ -92,6 +93,24 @@ impl System {
         }
     }
     pub fn warp_in(&self, id: i64) -> Option<V3> { self.warp_ins.get(&id).copied() }
+    /// Queue cancellation of any previous landing intent before a new warp request.
+    pub fn clear_warp_exit(&mut self, id: i64) {
+        self.actions.push_back((self.current_time, Box::new(move |s, _| { s.warp_exits.remove(&id); })));
+    }
+
+    /// Register the latest landing intent after its warp command in the FIFO.
+    /// The registration must follow a valid warp request in the same FIFO.
+    /// The production service validates before uncloak, clearing, and registration.
+    /// A valid duplicate native request may replace the latest consumer's intent.
+    pub fn on_warp_exit(&mut self, id: i64, f: impl FnOnce(&mut System) + Send + 'static) {
+        self.actions.push_back((self.current_time, Box::new(move |s, _| {
+            match s.balls.get(&id).map(|b| b.mode) {
+                Some(MODE_WARP) => { s.warp_exits.insert(id, Box::new(f)); }
+                Some(MODE_GOTO) => f(s),
+                _ => {}
+            }
+        })));
+    }
     pub(super) fn set_warp_in(&mut self, id: i64, point: V3) { self.warp_ins.insert(id, point); }
     pub fn ball(&self, id: i64) -> Option<&Ball> {
         self.balls.get(&id)
@@ -133,7 +152,6 @@ impl System {
         ball.old_pos = ball.pos;
         ball.old_vel = ball.vel;
         ball.segment_acceleration = None;
-        ball.segment_warp = None;
         self.take(ball.id);
         if let Some(char_id) = ball.char_id {
             self.pilots.insert(char_id, ball.id);
@@ -147,6 +165,7 @@ impl System {
     }
 
     pub fn take(&mut self, id: i64) -> Option<Ball> {
+        self.warp_exits.remove(&id);
         let ball = self.balls.remove(&id)?;
         self.stop_all_followers(id);
         self.snapshot_positions.remove(&id);
@@ -218,13 +237,27 @@ impl System {
                 let logical_ms = (self.current_time + 1) * MILLISECONDS_PER_SECOND;
                 let anchor_ms = if due > MAX_CATCHUP_STEPS { ms }
                     else { next_tick_ms + step * MILLISECONDS_PER_SECOND };
+                for index in 0..self.free_ids.len() {
+                    let id = self.free_ids[index];
+                    let b = self.balls.get_mut(&id).unwrap();
+                    let aligning = b.mode == MODE_WARP && !b.is_warping();
+                    b.evolve_behavior_for_ball(logical_ms, anchor_ms, &self.target_states, self.current_time);
+                    let activated = aligning && b.is_warping();
+                    self.target_states.get_mut(&id).unwrap().vel = b.vel;
+                    if activated { self.stop_all_followers(id); }
+                }
+                self.exited_ids.clear();
                 for id in &self.free_ids {
                     let b = self.balls.get_mut(id).unwrap();
-                    b.evolve_behavior_for_ball(logical_ms, anchor_ms, &self.target_states, self.current_time);
-                    self.target_states.get_mut(id).unwrap().vel = b.vel;
+                    let was_warping = b.is_warping();
+                    b.evolve_position(logical_ms);
+                    if was_warping && b.mode == MODE_STOP && self.warp_exits.contains_key(id) {
+                        self.exited_ids.push(*id);
+                    }
                 }
-                for id in &self.free_ids {
-                    self.balls.get_mut(id).unwrap().evolve_position(logical_ms);
+                for index in 0..self.exited_ids.len() {
+                    let id = self.exited_ids[index];
+                    if let Some(callback) = self.warp_exits.remove(&id) { callback(self); }
                 }
             }
             self.current_time += 1;
@@ -402,12 +435,17 @@ impl System {
         self.actions.push_back((self.current_time, Box::new(move |s, stamp| {
             let Some(mut ball) = s.balls.remove(&ship) else { return };
             ball.last_ms = s.current_time * MILLISECONDS_PER_SECOND;
+            let old_warp = (ball.mode == MODE_WARP).then_some(
+                (ball.effect_stamp, ball.goto, ball.warp.min_range.to_bits(), ball.warp.factor));
             let events = f(&mut ball, stamp, s);
+            if old_warp.is_some_and(|old| ball.mode != MODE_WARP
+                || old != (ball.effect_stamp, ball.goto, ball.warp.min_range.to_bits(), ball.warp.factor)) {
+                s.warp_exits.remove(&ship);
+            }
             ball.interpolation_anchor_ms = s.ms;
             ball.old_pos = ball.pos;
             ball.old_vel = ball.vel;
             ball.segment_acceleration = None;
-            ball.segment_warp = None;
             let visibility = (ball.id, ball.cloak);
             s.balls.insert(ship, ball);
             if !events.is_empty() { s.deliver(Some(visibility), events); }
