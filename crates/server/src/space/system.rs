@@ -16,7 +16,7 @@
 //! the logical counter is not reset to wall time.
 //!
 //! DB effects run on workers; timers, warp-exit callbacks and non-position
-//! dynamic state do not survive restart. Collision and bump physics are not implemented.
+//! dynamic state do not survive restart. Legacy sphere collisions do not emit bumps.
 use super::*;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::future::Future;
@@ -42,6 +42,7 @@ pub struct System {
     registry: Arc<Pilots>,
     target_states: HashMap<i64, TargetState>,
     free_ids: Vec<i64>,
+    collision_scratch: Vec<collision::Snapshot>,
     exited_ids: Vec<i64>,
     /// Celestial warp-in points (warpin.rs), by celestial ID.
     warp_ins: HashMap<i64, V3>,
@@ -203,6 +204,7 @@ impl System {
             && self.brains.is_empty() && self.observers.is_empty() && !self.balls.values().any(|b|
             (b.free && (b.mode != MODE_STOP || b.vel != [0.0; 3]))
             || (b.cloak != 0 && b.cloak_until > 0))
+            && !collision::stationary_contact(&self.balls)
     }
     pub fn tick(&mut self, ms: i64) {
         self.observers.retain(|_, (_, tx)| !tx.is_closed());
@@ -226,7 +228,8 @@ impl System {
                 let (stamp, action) = self.actions.pop_front().unwrap();
                 action(self, stamp);
             }
-            if self.balls.values().any(|b| b.free && (b.mode != MODE_STOP || b.vel != [0.0; 3])) {
+            if self.balls.values().any(|b| b.free && (b.mode != MODE_STOP || b.vel != [0.0; 3]))
+                || collision::stationary_contact(&self.balls) {
                 self.target_states.clear();
                 self.target_states.extend(self.balls.iter().map(|(&id, b)| (id, TargetState {
                     pos: b.pos, vel: b.vel, radius: b.radius,
@@ -246,11 +249,14 @@ impl System {
                     self.target_states.get_mut(&id).unwrap().vel = b.vel;
                     if activated { self.stop_all_followers(id); }
                 }
+                collision::freeze(&mut self.collision_scratch, &self.balls);
+                collision::apply(&self.collision_scratch, &mut self.balls);
                 self.exited_ids.clear();
-                for id in &self.free_ids {
+                for snapshot in self.collision_scratch.iter().filter(|snapshot| snapshot.free) {
+                    let id = &snapshot.id;
                     let b = self.balls.get_mut(id).unwrap();
                     let was_warping = b.is_warping();
-                    b.evolve_position(logical_ms);
+                    b.evolve_position(logical_ms, snapshot.time_factor);
                     if was_warping && b.mode == MODE_STOP && self.warp_exits.contains_key(id) {
                         self.exited_ids.push(*id);
                     }

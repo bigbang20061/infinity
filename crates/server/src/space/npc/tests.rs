@@ -177,7 +177,9 @@ fn sampled_acquisition_nearest_loss_and_shot_capture() {
     let mut moving = ball(1, Some(10), 50.0);
     moving.vel = [1000.0, 0.0, 0.0];
     s.insert(moving);
-    s.insert(ball(2, Some(11), 60.0));
+    let mut other = ball(2, Some(11), 60.0);
+    other.pos[1] = 10.0;
+    s.insert(other);
     s.tick(1000);
     assert!(s.ball(1).unwrap().pos[0] > 200.0);
     assert_eq!(s.sample_position(1).unwrap()[0], 50.0);

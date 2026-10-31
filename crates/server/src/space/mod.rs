@@ -24,8 +24,9 @@
 //! strictly below 100 km, without WarpFX.
 //!
 //! Missile flight uses native steering; the gameplay impact timer is separate.
-//! Warp follows native alignment and acceleration. Collisions, bumps, orientations,
-//! formations, miniballs, AddBalls2 and unsupported ball modes are not implemented.
+//! Warp follows native alignment and acceleration. Legacy scalar-sphere collisions
+//! are authoritative; bump events, orientations, formations, miniballs, AddBalls2
+//! and unsupported ball modes are not implemented.
 //! Shared vector distances are defined here for simulation and service callers.
 
 use crate::consts::{AU, DAMAGE_LAYER_COUNT, FILETIME_SECOND, SECONDS_PER_MINUTE};
@@ -48,6 +49,7 @@ mod goto;
 mod follow;
 mod orbit;
 mod missile;
+mod collision;
 mod warp;
 pub use warp::{WarpOutcome, WarpState};
 pub use npc::{HOSTILE_TO_ALL, NpcAction, NpcBrain, NpcConfig, NpcEffects, NpcFuture};
@@ -89,7 +91,7 @@ const DESTINY_FRICTION: f64 = 1e6;
 const INTEGRATE_TAYLOR_THRESHOLD: f64 = 1e-10;
 /// Existing server fallback for missing celestial radii.
 const CELESTIAL_FALLBACK_RADIUS: f64 = 1000.0;
-/// Existing server rigid-celestial representation.
+/// Carbonengine Potential fixed-body effective mass, also used for rigid celestials.
 const CELESTIAL_STATIC_MASS: f64 = 1e34;
 
 
@@ -208,10 +210,15 @@ pub struct Ball {
     pub slim: Vec<(&'static str, Value)>,
 }
 
+/// Native cached whole-tick exponential factor.
+fn integration_factor(mass: f64, friction: f64) -> f64 {
+    if mass <= 0.0 { 0.0 } else { (-friction / mass).exp() }
+}
+
 /// Carbonengine Ballpark::Integrate and Vector3d reciprocal-division ordering.
-fn integrate(position: V3, velocity: V3, acceleration: V3, mass: f64, friction: f64, time: f64) -> (V3, V3) {
+fn integrate(position: V3, velocity: V3, acceleration: V3, mass: f64, friction: f64, factor: f64, time: f64) -> (V3, V3) {
     if time == 0.0 { return (position, velocity); }
-    let time_factor = if mass <= 0.0 { 0.0 } else { (-friction / mass * time).exp() };
+    let time_factor = if time == 1.0 { factor } else if mass <= 0.0 { 0.0 } else { (-friction / mass * time).exp() };
     let friction2 = friction * friction;
     let ook2 = 1.0 / friction2;
     let ook = 1.0 / friction;
@@ -245,7 +252,7 @@ impl Ball {
         let mass = self.mass * self.agility as f64;
         let acceleration = self.segment_acceleration.unwrap();
         integrate(self.old_pos, self.old_vel, acceleration, mass, DESTINY_FRICTION,
-            ms_to_seconds(elapsed as f64)).0
+            0.0, ms_to_seconds(elapsed as f64)).0
     }
 
     fn flags(&self) -> u8 {
@@ -369,7 +376,7 @@ impl Ball {
         self.segment_acceleration = Some(acceleration);
     }
 
-    fn evolve_position(&mut self, ms: i64) {
+    fn evolve_position(&mut self, ms: i64, full_factor: f64) {
         if !self.free || ms <= self.last_ms {
             self.last_ms = self.last_ms.max(ms);
             return;
@@ -386,12 +393,13 @@ impl Ball {
                 self.old_vel = vel;
                 let mass = self.mass * self.agility as f64;
                 (self.pos, self.vel) = integrate(pos, vel, self.segment_acceleration.unwrap_or_default(),
-                    mass, DESTINY_FRICTION, ms_to_seconds((ms - self.last_ms) as f64));
+                    mass, DESTINY_FRICTION, full_factor, ms_to_seconds((ms - self.last_ms) as f64));
             }
         } else if let Some(acceleration) = self.segment_acceleration {
             let dt = ms_to_seconds((ms - self.last_ms) as f64);
             let mass = self.mass * self.agility as f64;
-            (self.pos, self.vel) = integrate(self.pos, self.vel, acceleration, mass, DESTINY_FRICTION, dt);
+            (self.pos, self.vel) = integrate(self.pos, self.vel, acceleration, mass, DESTINY_FRICTION,
+                full_factor, dt);
         }
         self.last_ms = ms;
     }

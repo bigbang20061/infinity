@@ -4,13 +4,22 @@ use super::*;
 fn integrate_zero_time_preserves_state_before_division() {
     let position = [1.0, -2.0, 3.0];
     let velocity = [4.0, 5.0, -6.0];
-    assert_eq!(integrate(position, velocity, [1.0; 3], 0.0, 0.0, 0.0), (position, velocity));
+    assert_eq!(integrate(position, velocity, [1.0; 3], 0.0, 0.0, 0.0, 0.0), (position, velocity));
 }
+#[test]
+fn integrate_uses_full_factor_only_for_whole_tick() {
+    let velocity = [2.0, 0.0, 0.0];
+    let full = integrate([0.0; 3], velocity, [0.0; 3], 1.0, 1.0, 0.25, 1.0);
+    assert_eq!(full.1[0], 0.5);
+    let partial = integrate([0.0; 3], velocity, [0.0; 3], 1.0, 1.0, 0.25, 0.5);
+    assert_eq!(partial.1[0], 2.0 * (-0.5_f64).exp());
+}
+
 
 #[test]
 fn integrate_taylor_low_drag_approaches_linear_motion() {
     let velocity = [2.0, -3.0, 4.0];
-    let (position, actual_velocity) = integrate([0.0; 3], velocity, [0.0; 3], 1.0, 1e-11, 1.0);
+    let (position, actual_velocity) = integrate([0.0; 3], velocity, [0.0; 3], 1.0, 1e-11, integration_factor(1.0, 1e-11), 1.0);
     for i in 0..3 {
         assert!((position[i] - velocity[i]).abs() < 1e-9);
         assert!((actual_velocity[i] - velocity[i]).abs() < 1e-9);
@@ -121,7 +130,7 @@ fn goto_tick_steers_toward_absolute_point_and_zero_has_no_thrust() {
     ball.goto_direction([0.0, -2.0, 0.0]);
     let ms = ball.last_ms + 1000;
     ball.evolve_behavior_for_ball(ms, 1000, &HashMap::new(), 0);
-    ball.evolve_position(ms);
+    ball.evolve_position(ms, integration_factor(ball.mass * ball.agility as f64, DESTINY_FRICTION));
     let target = ball.segment_acceleration.unwrap();
     assert_eq!(target[0], 0.0);
     assert!((target[1] + 3_000_000.0).abs() < 1e-9);
@@ -131,7 +140,7 @@ fn goto_tick_steers_toward_absolute_point_and_zero_has_no_thrust() {
     ball.goto_direction([0.0; 3]);
     let ms = ball.last_ms + 1000;
     ball.evolve_behavior_for_ball(ms, 2000, &HashMap::new(), 1);
-    ball.evolve_position(ms);
+    ball.evolve_position(ms, integration_factor(ball.mass * ball.agility as f64, DESTINY_FRICTION));
     assert_eq!(ball.segment_acceleration, Some([0.0; 3]));
     assert_eq!(ball.vel, [0.0; 3]);
 }
@@ -171,7 +180,7 @@ fn missing_follow_target_stops_and_clears_follow_state() {
     b.follow_range = 12.0;
     let ms = b.last_ms + 1000;
     b.evolve_behavior_for_ball(ms, 1000, &HashMap::new(), 0);
-    b.evolve_position(ms);
+    b.evolve_position(ms, integration_factor(b.mass * b.agility as f64, DESTINY_FRICTION));
     assert_eq!(b.mode, MODE_STOP);
     assert_eq!(b.follow_id, 0);
     assert_eq!(b.follow_range, 0.0);
