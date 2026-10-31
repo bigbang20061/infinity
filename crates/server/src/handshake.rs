@@ -203,11 +203,16 @@ fn is_marker(v: &Value, m: &str) -> bool {
     matches!(v.items(), Some([Value::None, tag, ..]) if tag.as_text().is_some_and(|t| t == m))
 }
 
-pub fn rand_i64() -> i64 {
+/// Returns 64 random bits.
+pub fn random_u64() -> u64 {
     use std::hash::{BuildHasher, Hasher};
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
     h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
-    (h.finish() >> RANDOM_ID_SHIFT) as i64
+    h.finish()
+}
+
+pub fn rand_i64() -> i64 {
+    (random_u64() >> RANDOM_ID_SHIFT) as i64
 }
 
 #[cfg(test)] mod tests;
