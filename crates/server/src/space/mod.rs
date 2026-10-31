@@ -105,7 +105,7 @@ const WARP_FACTOR_TO_DECELERATION: f64 = 1.0 / 3000.0;
 
 pub type V3 = [f64; 3];
 
-fn sub(a: V3, b: V3) -> V3 {
+pub(crate) fn sub(a: V3, b: V3) -> V3 {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 fn add(a: V3, b: V3) -> V3 {
