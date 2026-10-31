@@ -133,3 +133,42 @@ fn subject_requires_owned_fitted_module_on_permitted_ship() {
     module.category_id = i64::from(CATEGORY_SHIP);
     assert!(!valid(&hull, &module, Some(3), None, &effects, false, false));
 }
+
+#[test]
+fn online_dispatch_stops_current_cycle_and_notifies_actual_ship() {
+    let module = -9021;
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let mut st = state();
+        st.active.insert(module, ActiveModule { char_id: 2, stop: stop.clone() });
+        st.activation_generation.insert(module, stop.clone());
+    }
+    let (notify, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut outbox = Outbox::default();
+    outbox.operation(OnlineChanged { module, online: false, char_id: 2, ship_id: 3, notify });
+    assert!(!stop.load(Ordering::Relaxed));
+    assert!(rx.try_recv().is_err());
+    for entry in outbox.into_entries() {
+        if let OutboxEffect::Operation(change) = entry { apply_online_changed(change); }
+    }
+    assert!(stop.load(Ordering::Relaxed));
+    let st = state();
+    assert!(Arc::ptr_eq(&st.active[&module].stop, &stop));
+    assert!(Arc::ptr_eq(&st.activation_generation[&module], &stop));
+    drop(st);
+    let (event, args) = rx.try_recv().expect("effect notification");
+    assert_eq!(event, "OnGodmaShipEffect");
+    let env = super::super::environment::build(module, 2, 3, None, None, EFFECT_ONLINE);
+    assert_eq!(args[5], env);
+    assert_eq!(rx.try_recv().expect("attribute notification").0, "OnModuleAttributeChanges");
+    assert!(rx.try_recv().is_err());
+    let mut st = state();
+    st.active.remove(&module);
+    st.activation_generation.remove(&module);
+}
+
+#[test]
+fn passive_effect_list_is_not_online_capable() {
+    let passive = [crate::sde::types::TypeEffect { effect_id: 1 }];
+    assert!(!has_effect(&passive, EFFECT_ONLINE as i32));
+}
