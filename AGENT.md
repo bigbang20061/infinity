@@ -25,7 +25,7 @@ These rules apply to anyone changing this repository, coding agents and humans a
   - Values the SDE or dogma data provides are read from that data, not copied. For example, lock time comes from the ship's scan resolution and the target's signature radius, for players and NPCs alike.
   - Deployment settings (addresses, ports, capacities, the database connection) come from `Config` (`crates/server/src/config/`): the `config.toml` file, overridden by the environment variable named in `config.example.toml`. The server reads environment variables nowhere else.
   - Values an operator may tune (starting balances, fees and taxes, timers, limits, spawn ranges and sizes) are fields of the game configuration (`crates/server/src/config/`), each with a default and a comment naming its source, and are read through `config::game()`; they are never a module `const`. Values the client checks, values from the SDE and carbonengine destiny constants stay `const`.
-  - Player-visible text and client message names are never written inline; they are defined in `messages.rs` (see Player-visible text).
+  - Player-visible text and client message names are never written inline; they are defined in the `messages` module (see Player-visible text).
   - Unit conversions go through the shared helpers, never inline factors such as `* 10_000` or `/ 1000`.
   - Exempt: `0` and `1` as identities, array indices, and test fixtures.
 - **No duplicated helpers.** Before writing a helper, search for an existing one. A helper needed by more than one module lives in one shared place (see Shared helpers); never copy it into another module.
@@ -80,7 +80,7 @@ Any other tag starts nothing.
 | Database access and schema | `db/mod.rs` (`Db`: pool, statement methods, startup), `db/transaction.rs` (`Db::transaction`), `db/executor.rs` (`Executor`), `db/outbox.rs` (`Outbox`), `crates/server/sql/game_schema.sql` |
 | Static data (SDE) | `sde/mod.rs` (`Sde`: loaded once at startup, read-only, shared as `Arc<Sde>`; one module per dataset such as `types`, `dogma`, `map`, `industry`, `missions`), `dao/sde/` (the only static-data SQL, run once by the loader) |
 | Game data access (all `game.*` SQL) | `dao/`: one module per kind of data (`accounts`, `characters`, `items`, `wallets`, `skills`, `market`, `contracts`, ...); a feature's statements on shared data live in `dao/<data>/<feature>.rs` |
-| Player-visible text and client message names | `messages.rs` |
+| Player-visible text and client message names | `messages.rs` and `messages/<feature>.rs` |
 | Wire format | `crates/marshal` |
 
 ## 4. Conventions
@@ -145,10 +145,13 @@ Any other tag starts nothing.
 ### Player-visible text
 
 - The Infinity client runs in Simplified Chinese. Any text a player sees, such as notify messages, mail, agent lines and default names, is written in Simplified Chinese, matching the existing strings.
-- Every such text is defined once in `crates/server/src/messages.rs`, in the section for its feature, and call sites refer to it as `messages::NAME`.
+- Every such text is defined once in the `messages` module (`crates/server/src/messages.rs` and its children), and call sites refer to it by its module path.
+  - Text that predates the children stays in `messages.rs`, in the section for its feature (`messages::NAME`).
+  - GM slash-command text (help lines, replies and refusals) lives in `messages/gm.rs` (`messages::gm::NAME`).
+  - Any other new text goes in its feature's child, `messages/<feature>.rs` (`messages::<feature>::NAME`), declared with one `pub(crate) mod <feature>;` line in `messages.rs`. New text is not added to `messages.rs` itself, and nothing is re-exported.
   - Plain text is a `const`.
-  - Text that carries values is a function in the same file that returns `String`; no other file formats player-visible text.
-  - Client message names (the keys of the client's message catalogue passed to `user_error`, `CallError::User` or a notification, such as `CustomNotify`) are `MSG_` consts in their own section.
+  - Text that carries values is a function in the same file as its texts that returns `String`; no other file formats player-visible text.
+  - Client message names (the keys of the client's message catalogue passed to `user_error`, `CallError::User` or a notification, such as `CustomNotify`) are `MSG_` consts in their own section of `messages.rs`, one catalogue shared by every feature.
   - Reuse an existing entry when the meaning is the same; add a new one when it differs.
   - Not messages: names read from the SDE or written by players, and protocol identifiers such as service, method and notification names (`OnItemChange`).
 - Everything else (code, comments, logs, docs) stays in English.
