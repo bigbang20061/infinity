@@ -53,43 +53,43 @@ pub(super) fn parse<'a>(args: &[&'a str]) -> Option<(Target, Action<'a>)> {
 
 fn attribute(c: &Client, name: &str) -> Result<i32, CallError> {
     if let Ok(id) = name.parse::<i32>() {
-        return c.sde.dogma.attribute(id).map(|_| id).ok_or_else(|| slash_error(messages::gm_dogma_attribute(name)));
+        return c.sde.dogma.attribute(id).map(|_| id).ok_or_else(|| slash_error(messages::gm::gm_dogma_attribute(name)));
     }
     let mut ids: Vec<_> = c.sde.dogma.attributes_by_name(name).map(|a| a.attribute_id).collect();
     ids.sort_unstable();
     match ids.as_slice() {
         [id] => Ok(*id),
-        [] => Err(slash_error(messages::gm_dogma_attribute(name))),
-        _ => Err(slash_error(messages::gm_dogma_ambiguous(name, &ids.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")))),
+        [] => Err(slash_error(messages::gm::gm_dogma_attribute(name))),
+        _ => Err(slash_error(messages::gm::gm_dogma_ambiguous(name, &ids.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")))),
     }
 }
 
 pub(super) fn denied(id: i32, matches_runtime: impl Fn(&str, i32) -> bool) -> Option<&'static str> {
-    if CHARACTER_ATTRIBUTES.contains(&id) { return Some(messages::GM_DOGMA_CHARACTER); }
+    if CHARACTER_ATTRIBUTES.contains(&id) { return Some(messages::gm::GM_DOGMA_CHARACTER); }
     let runtime = ["isOnline", "damage", "charge", "skillPoints", "skillLevel", "armorDamage", "shieldCharge", "isIncapacitated", "quantity"];
-    runtime.iter().any(|name| matches_runtime(name, id)).then_some(messages::GM_DOGMA_RUNTIME)
+    runtime.iter().any(|name| matches_runtime(name, id)).then_some(messages::gm::GM_DOGMA_RUNTIME)
 }
 
 async fn item(c: &Client, id: i64) -> Result<Item, CallError> {
     load_items(&c.db, &c.sde, ItemQuery::Id(id)).await.map_err(db_err)?.into_iter().next()
-        .ok_or_else(|| slash_error(messages::gm_dogma_invalid_target(&id.to_string())))
+        .ok_or_else(|| slash_error(messages::gm::gm_dogma_invalid_target(&id.to_string())))
 }
 
 pub(super) async fn command(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
-    let (target, action) = parse(args).ok_or_else(|| slash_error(messages::GM_DOGMA_USAGE.into()))?;
+    let (target, action) = parse(args).ok_or_else(|| slash_error(messages::gm::GM_DOGMA_USAGE.into()))?;
     let ship = c.session.int("shipid");
     let modules = if let Some(ship) = ship { fit_dao::modules(&c.db, ship).await.map_err(db_err)? } else { Vec::new() };
     let id = match target {
-        Target::Ship => ship.ok_or_else(|| slash_error(messages::GM_DOGMA_NO_SHIP.into()))?,
+        Target::Ship => ship.ok_or_else(|| slash_error(messages::gm::GM_DOGMA_NO_SHIP.into()))?,
         Target::Item(id) => id,
         Target::Flag(flag) => modules.iter().find(|m| m.flag_id == flag).map(|m| m.item_id)
-            .ok_or_else(|| slash_error(messages::gm_dogma_invalid_target(&flag.to_string())))?,
+            .ok_or_else(|| slash_error(messages::gm::gm_dogma_invalid_target(&flag.to_string())))?,
     };
     let item = item(c, id).await?;
     if EXCLUDED_CATEGORIES.contains(&item.category_id) {
-        return Err(slash_error(messages::GM_DOGMA_FORBIDDEN_TARGET.into()));
+        return Err(slash_error(messages::gm::GM_DOGMA_FORBIDDEN_TARGET.into()));
     }
-    if !item.singleton { return Err(slash_error(messages::GM_DOGMA_SINGLETON.into())); }
+    if !item.singleton { return Err(slash_error(messages::gm::GM_DOGMA_SINGLETON.into())); }
     if action == Action::List {
         let mut items = vec![item];
         if matches!(target, Target::Ship) {
@@ -100,13 +100,13 @@ pub(super) async fn command(c: &mut Client, args: &[&str]) -> Result<String, Cal
         let mut lines = Vec::new();
         for i in &items {
             let name = c.sde.types.get(i.type_id).and_then(|t| t.name.as_deref()).unwrap_or("");
-            lines.push(messages::gm_dogma_list_item(i.flag_id, name, i.item_id));
+            lines.push(messages::gm::gm_dogma_list_item(i.flag_id, name, i.item_id));
             let mut found = false;
             for row in rows.iter().filter(|r| r.item_id == i.item_id) {
                 found = true;
-                lines.push(messages::gm_dogma_list_entry(row.attribute_id, row.value));
+                lines.push(messages::gm::gm_dogma_list_entry(row.attribute_id, row.value));
             }
-            if !found { lines.push(messages::GM_DOGMA_EMPTY.into()); }
+            if !found { lines.push(messages::gm::GM_DOGMA_EMPTY.into()); }
         }
         return Ok(lines.join("\n"));
     }
@@ -120,12 +120,12 @@ pub(super) async fn command(c: &mut Client, args: &[&str]) -> Result<String, Cal
         let cycle = ["duration", "speed", "capacitorNeed", "reloadTime"];
         if combat::active_modules().contains(&id)
             && cycle.iter().any(|name| c.sde.dogma.attributes_by_name(name).any(|a| a.attribute_id == attr)) {
-            return Err(slash_error(messages::GM_DOGMA_ACTIVE_CYCLE.into()));
+            return Err(slash_error(messages::gm::GM_DOGMA_ACTIVE_CYCLE.into()));
         }
     }
     let rows = dao::overrides(&c.db, id).await.map_err(db_err)?;
     let old_override = rows.iter().find(|r| r.attribute_id == attr).map(|r| r.value);
-    if matches!(action, Action::Reset(_)) && old_override.is_none() { return Ok(messages::gm_dogma_noop(id, attr)); }
+    if matches!(action, Action::Reset(_)) && old_override.is_none() { return Ok(messages::gm::gm_dogma_noop(id, attr)); }
     let fallback = fit::base_attribute(c.sde.types.get(item.type_id), c.sde.dogma.attribute(attr), attr);
     let char_id = c.session.int("charid").unwrap_or(0);
     let old_fit = if key.is_some() { Some(Fit::load(&c.db, c.sde.clone(), char_id, ship.unwrap()).await?) } else { None };
@@ -134,7 +134,7 @@ pub(super) async fn command(c: &mut Client, args: &[&str]) -> Result<String, Cal
     match action {
         Action::Set(_, value) => {
             if !dao::set_override(&c.db, id, attr, value).await.map_err(db_err)? {
-                return Err(slash_error(messages::GM_DOGMA_SINGLETON.into()));
+                return Err(slash_error(messages::gm::GM_DOGMA_SINGLETON.into()));
             }
         }
         Action::Reset(_) => dao::clear_override(&c.db, id, attr).await.map_err(db_err)?,
@@ -161,13 +161,13 @@ pub(super) async fn command(c: &mut Client, args: &[&str]) -> Result<String, Cal
         }
     }
     let overridden = match action { Action::Set(..) => true, Action::Reset(_) => false, _ => old_override.is_some() };
-    let mut result = messages::gm_dogma_result(id, attr_name, attr, old_base, new_base, old_effective.zip(new_effective), overridden);
-    if key.is_none() { result.push_str("\n"); result.push_str(messages::GM_DOGMA_BASE_ONLY); }
+    let mut result = messages::gm::gm_dogma_result(id, attr_name, attr, old_base, new_base, old_effective.zip(new_effective), overridden);
+    if key.is_none() { result.push_str("\n"); result.push_str(messages::gm::GM_DOGMA_BASE_ONLY); }
     let hull_foreign = item.category_id == i64::from(crate::consts::CATEGORY_SHIP)
         && attr != crate::consts::ATTR_CAPACITY
         && c.sde.types.get(item.type_id).is_none_or(|data| data.attribute(attr).is_none());
     if item.category_id == i64::from(CATEGORY_MODULE) || hull_foreign {
-        result.push_str("\n"); result.push_str(messages::GM_DOGMA_VISIBILITY);
+        result.push_str("\n"); result.push_str(messages::gm::GM_DOGMA_VISIBILITY);
     }
     Ok(result)
 }

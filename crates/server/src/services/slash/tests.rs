@@ -42,10 +42,10 @@ fn exact_balance_clamp_and_echo() {
     let plex_cap = CLIENT_MAX_PLEX.to_string();
     assert!(!exceeds_cap(&format!("000{plex_cap}"), &plex_cap));
     assert!(exceeds_cap(&format!("{plex_cap}0"), &plex_cap));
-    assert_eq!(messages::gm_balance("1.23", None), "balance 1.23 ISK");
-    assert_eq!(messages::gm_balance("999.01", Some(999.0)), "balance 999.01 ISK (client shows 999)");
-    assert_eq!(messages::gm_plex_balance("12", None), "vault 12 PLEX");
-    assert_eq!(messages::gm_plex_balance("1000", Some(999)), "vault 1000 PLEX (client shows 999)");
+    assert_eq!(messages::gm::gm_balance("1.23", None), "balance 1.23 ISK");
+    assert_eq!(messages::gm::gm_balance("999.01", Some(999.0)), "balance 999.01 ISK (client shows 999)");
+    assert_eq!(messages::gm::gm_plex_balance("12", None), "vault 12 PLEX");
+    assert_eq!(messages::gm::gm_plex_balance("1000", Some(999)), "vault 1000 PLEX (client shows 999)");
 }
 
 #[test]
@@ -69,8 +69,8 @@ fn dogma_runtime_and_character_attributes_are_denied_for_all_actions() {
     for args in [&["ship", "skillPoints"][..], &["ship", "skillPoints", "1"][..], &["ship", "skillPoints", "reset"][..]] {
         let (_, action) = parse(args).unwrap();
         assert_eq!(match action { Action::Query(a) | Action::Set(a, _) | Action::Reset(a) => a, Action::List => panic!("expected attribute action") }, "skillPoints");
-        assert_eq!(denied(9999, |name, id| name == "skillPoints" && id == 9999), Some(messages::GM_DOGMA_RUNTIME));
-        assert_eq!(denied(164, |_, _| false), Some(messages::GM_DOGMA_CHARACTER));
+        assert_eq!(denied(9999, |name, id| name == "skillPoints" && id == 9999), Some(messages::gm::GM_DOGMA_RUNTIME));
+        assert_eq!(denied(164, |_, _| false), Some(messages::gm::GM_DOGMA_CHARACTER));
         assert_eq!(denied(9999, |_, _| false), None);
     }
 }
