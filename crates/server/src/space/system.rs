@@ -17,7 +17,9 @@
 //!
 //! DB effects run on workers; timers, warp-exit callbacks and non-position
 //! dynamic state, including projected effects, do not survive restart. Legacy
-//! sphere collisions do not emit bumps.
+//! sphere collisions do not emit bumps. Taking, replacing or destroying an NPC
+//! releases its in-memory combat health and capacitor state; temporary player
+//! removal preserves that state.
 use super::*;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::future::Future;
@@ -181,6 +183,9 @@ impl System {
             if self.pilots.get(&char_id) == Some(&id) {
                 self.pilots.remove(&char_id);
             }
+        }
+        if self.brains.contains_key(&id) {
+            crate::services::combat::forget_ship(id);
         }
         self.npc_removed(id);
         Some(ball)

@@ -2,9 +2,10 @@
 //! destiny Orbit/Stop events. Combat attributes are loaded by services from SDE;
 //! Weapon, repair and projected effects use a sequential worker outside the actor.
 //! Projected cycles have independent actor timers and capture sampled positions;
-//! target generations prevent queued jobs from restoring an obsolete projection.
-//! Think intervals and AI target-loss range use combat configuration; projected
-//! scan resolution and dogma target range refresh separately under actor revisions.
+//! target generations prevent queued jobs from restoring an obsolete projection
+//! or applying to an obsolete target. Think intervals and AI target-loss range use
+//! combat configuration; projected scan resolution and dogma target range refresh
+//! separately under actor revisions.
 //! Brains and groups are transient; persistent NPC simulation is not supported.
 use super::*;
 use std::collections::HashSet;
@@ -123,6 +124,35 @@ impl System {
         brain.next_think_ms = self.ms.saturating_add(id.rem_euclid(crate::config::game().combat.npc_think_ms));
         self.brains.insert(id, brain);
         true
+    }
+    /// Whether the system has an NPC brain for this ball.
+    pub(crate) fn is_npc(&self, id: i64) -> bool {
+        self.brains.contains_key(&id)
+    }
+    /// Support is restricted to other NPC brains in a shared spawn group, or
+    /// to the same ball owner when the source has no spawn group.
+    pub(crate) fn npc_assist_eligible(&self, source: i64, target: i64) -> bool {
+        if source == target || !self.is_npc(source) || !self.is_npc(target) { return false; }
+        let Some((me, other)) = self.ball(source).zip(self.ball(target)) else { return false };
+        if me.char_id.is_some() || other.char_id.is_some() { return false; }
+        match self.member_groups.get(&source).filter(|groups| !groups.is_empty()) {
+            Some(groups) => self.member_groups.get(&target).is_some_and(|other_groups|
+                groups.iter().any(|group| other_groups.contains(group))),
+            None => me.owner_id == other.owner_id,
+        }
+    }
+    /// Select the lowest score among eligible NPCs, breaking ties by item ID.
+    /// The callback receives sampled balls and returns None for out-of-range or
+    /// otherwise unsuitable candidates. It must not await, access DB or call World.
+    /// Remote repairs can reuse this selector with their own score and range rules.
+    pub(crate) fn assist_target(&self, source: i64, mut score: impl FnMut(&Ball, &Ball) -> Option<f64>) -> Option<Ball> {
+        let me = self.sampled_ball(source)?;
+        self.brains.keys().filter_map(|&id| {
+            if !self.npc_assist_eligible(source, id) { return None; }
+            let target = self.sampled_ball(id)?;
+            let value = score(&me, &target).filter(|value| value.is_finite())?;
+            Some((value, target))
+        }).min_by(|(a, x), (b, y)| a.total_cmp(b).then_with(|| x.id.cmp(&y.id))).map(|(_, ball)| ball)
     }
     pub fn add_aggressor(&mut self, id: i64, pilot: i64) {
         if let Some(brain) = self.brains.get_mut(&id) { brain.aggressors.insert(pilot); }
@@ -243,7 +273,7 @@ impl System {
             brain.next_shot_ms = self.ms + brain.config.rate_of_fire_ms as i64;
         }
     }
-    /// Validate a queued NPC projection in the actor immediately before insertion.
+    /// Validate a queued NPC projection or effect in the actor immediately before it applies.
     pub(crate) fn npc_projection_valid(&self, id: i64, target: i64, generation: u64) -> bool {
         let Some(brain) = self.brains.get(&id) else { return false };
         brain.target_generation == generation && brain.announced

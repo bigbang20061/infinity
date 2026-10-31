@@ -1,4 +1,7 @@
-//! Combat mechanics; state and routing live in the parent module.
+//! Weapon groups, ship health and memory-only capacitor state; routing lives in the parent module.
+//! The client reads capacitor charge through clientDogmaLocation; player attributes come
+//! from fitted dogma and NPC attributes from the SDE. Capacitor state is not persisted;
+//! NPC projections are checked in the system actor before capacitor changes commit.
 //! Confirmed NPC destruction emits a kill event for a known attacker before rewards are attempted.
 use super::*;
 use crate::consts::CATEGORY_MODULE;
@@ -84,31 +87,163 @@ pub(super) fn recharge(level: f64, max: f64, tau_ms: f64, dt: f64) -> f64 {
         return 0.0;
     }
     let tau = (tau_ms / 1000.0).max(0.001);
-    let c = 1.0 + ((level / max).clamp(0.0, 1.0).sqrt() - 1.0) * (-5.0 * dt / tau).exp();
-    (max * c * c).min(max)
+    let c = 1.0 + ((level / max).clamp(0.0, 1.0).sqrt() - 1.0) * (-5.0 * dt.max(0.0) / tau).exp();
+    (max * c * c).clamp(0.0, max)
 }
 
 
 /// Use `amount` of the ship's capacitor; false (and nothing used) when there isn't enough.
 pub(in crate::services) fn drain_capacitor(cx: &Ctx, fit: &Fit, amount: f64) -> bool {
-    if amount <= 0.0 {
+    if !amount.is_finite() || amount <= 0.0 {
         return true;
     }
     let (max, tau) = (fit.value(Key::Ship, ATTR_CAPACITOR_CAPACITY), fit.value(Key::Ship, ATTR_RECHARGE_RATE));
     let now = filetime_now();
     let current = {
         let mut st = state();
-        let (level, at) = st.capacitor.get(&cx.ship_id).copied().unwrap_or((max, now));
-        let current = recharge(level, max, tau, (now - at) as f64 / FILETIME_SECOND as f64);
-        if current < amount {
+        let result = mutate(&mut st.capacitor, cx.ship_id, max, tau, now, Operation::RefuseDrain(amount));
+        if result.amount < amount {
             return false;
         }
-        st.capacitor.insert(cx.ship_id, (current - amount, now));
-        current
+        result.before
     };
     let change = attribute_change(cx.char_id, Value::Int(cx.ship_id), ATTR_CHARGE, Value::Float(current - amount), Value::Float(current));
     cx.notify("OnModuleAttributeChanges", vec![Value::list([change])]);
     true
+}
+
+/// Current capacitor capacity and recharged level.
+pub(crate) struct CapacitorSnapshot {
+    pub capacity: f64,
+    pub level: f64,
+}
+
+enum Operation {
+    Snapshot,
+    Inject(f64),
+    Drain(f64),
+    RefuseDrain(f64),
+}
+
+struct Mutation {
+    before: f64,
+    after: f64,
+    amount: f64,
+}
+
+fn mutate(entries: &mut HashMap<i64, (f64, i64)>, ship: i64, capacity: f64, tau: f64, now: i64, op: Operation) -> Mutation {
+    let capacity = if capacity.is_finite() { capacity.max(0.0) } else { 0.0 };
+    let (level, at) = entries.get(&ship).copied().unwrap_or((capacity, now));
+    let dt = now.saturating_sub(at).max(0) as f64 / FILETIME_SECOND as f64;
+    let before = recharge(level, capacity, tau, dt);
+    let positive = |amount: f64| if amount.is_finite() { amount.max(0.0) } else { 0.0 };
+    let (after, amount) = match op {
+        Operation::Snapshot => (before, 0.0),
+        Operation::Inject(amount) => {
+            let accepted = positive(amount).min(capacity - before);
+            (before + accepted, accepted)
+        }
+        Operation::Drain(amount) => {
+            let drained = positive(amount).min(before);
+            (before - drained, drained)
+        }
+        Operation::RefuseDrain(amount) => {
+            let amount = positive(amount);
+            if amount > before {
+                return Mutation { before, after: before, amount: 0.0 };
+            }
+            (before - amount, amount)
+        }
+    };
+    entries.insert(ship, (after, now));
+    Mutation { before, after, amount }
+}
+/// Read an NPC's recharged fraction synchronously from the shared combat state.
+pub(crate) fn npc_capacitor_fraction(sde: &crate::sde::Sde, ball: &Ball) -> Option<f64> {
+    let capacity = attr(sde, ball.type_id, ATTR_CAPACITOR_CAPACITY, 0.0);
+    if !capacity.is_finite() || capacity <= 0.0 { return None; }
+    let tau = attr(sde, ball.type_id, ATTR_RECHARGE_RATE, 0.0);
+    let now = filetime_now();
+    let (level, at) = state().capacitor.get(&ball.id).copied().unwrap_or((capacity, now));
+    let dt = now.saturating_sub(at).max(0) as f64 / FILETIME_SECOND as f64;
+    Some(recharge(level, capacity, tau, dt) / capacity)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum NpcCapacitorGuard {
+    Hostile { source: i64, target: i64, generation: u64 },
+    Assistance { source: i64, hostile: i64, target: i64, generation: u64, optimal: f64, falloff: f64 },
+}
+
+impl NpcCapacitorGuard {
+    pub(crate) fn valid(self, s: &crate::space::System) -> bool {
+        match self {
+            Self::Hostile { source, target, generation } => s.npc_projection_valid(source, target, generation),
+            Self::Assistance { source, hostile, target, generation, optimal, falloff } =>
+                s.npc_projection_valid(source, hostile, generation) && s.npc_assist_eligible(source, target)
+                && s.sampled_ball(source).zip(s.sampled_ball(target)).is_some_and(|(me, other)| {
+                    let distance = (crate::space::dist(me.pos, other.pos) - f64::from(me.radius) - f64::from(other.radius)).max(0.0);
+                    crate::services::effects::npc_capacitor::in_range(distance, optimal, falloff)
+                }),
+        }
+    }
+}
+
+
+async fn capacitor_operation(db: &Db, world: &World, system: i64, ship: i64, op: Operation, guard: Option<NpcCapacitorGuard>) -> Result<Option<(CapacitorSnapshot, f64)>, CallError> {
+    let Some((type_id, pilot)) = world.with(system, move |s| s.ball(ship).map(|b| (b.type_id, b.char_id))).await.flatten() else {
+        return Ok(None);
+    };
+    let (capacity, tau, revision) = if let Some(pilot) = pilot {
+        let fit = Fit::load_in_space(db, world, system, pilot, ship).await?;
+        (fit.value(Key::Ship, ATTR_CAPACITOR_CAPACITY), fit.value(Key::Ship, ATTR_RECHARGE_RATE), fit.projection_revision())
+    } else {
+        (attr(world.sde(), type_id, ATTR_CAPACITOR_CAPACITY, 0.0), attr(world.sde(), type_id, ATTR_RECHARGE_RATE, 0.0), None)
+    };
+    let capacity = if capacity.is_finite() { capacity.max(0.0) } else { 0.0 };
+    Ok(world.with(system, move |s| {
+        let ball = s.ball(ship)?;
+        if (ball.type_id, ball.char_id) != (type_id, pilot)
+            || revision.is_some_and(|revision| s.projection_revision(ship) != revision)
+            || guard.is_some_and(|guard| !guard.valid(s))
+        {
+            return None;
+        }
+        let result = {
+            let mut st = state();
+            mutate(&mut st.capacitor, ship, capacity, tau, filetime_now(), op)
+        };
+        if let Some(pilot) = pilot.filter(|_| result.amount > 0.0) {
+            let change = attribute_change(pilot, Value::Int(ship), ATTR_CHARGE, Value::Float(result.after), Value::Float(result.before));
+            s.notify_pilot(pilot, "OnModuleAttributeChanges", vec![Value::list([change])]);
+        }
+        Some((CapacitorSnapshot { capacity, level: result.after }, result.amount))
+    }).await.flatten())
+}
+
+/// Return the current capacitor for a ship present in the system.
+pub(crate) async fn capacitor_snapshot(db: &Db, world: &World, system: i64, ship: i64) -> Result<Option<CapacitorSnapshot>, CallError> {
+    Ok(capacitor_operation(db, world, system, ship, Operation::Snapshot, None).await?.map(|(snapshot, _)| snapshot))
+}
+
+/// Inject energy, returning the amount accepted.
+pub(crate) async fn inject(db: &Db, world: &World, system: i64, ship: i64, amount: f64) -> Result<f64, CallError> {
+    Ok(capacitor_operation(db, world, system, ship, Operation::Inject(amount), None).await?.map_or(0.0, |(_, amount)| amount))
+}
+
+/// Drain up to the requested amount, returning the amount actually drained.
+pub(crate) async fn drain_exact(db: &Db, world: &World, system: i64, ship: i64, amount: f64) -> Result<f64, CallError> {
+    Ok(capacitor_operation(db, world, system, ship, Operation::Drain(amount), None).await?.map_or(0.0, |(_, amount)| amount))
+}
+
+/// Inject energy only while the NPC projection remains valid.
+pub(crate) async fn inject_guarded(db: &Db, world: &World, system: i64, ship: i64, amount: f64, guard: NpcCapacitorGuard) -> Result<f64, CallError> {
+    Ok(capacitor_operation(db, world, system, ship, Operation::Inject(amount), Some(guard)).await?.map_or(0.0, |(_, amount)| amount))
+}
+
+/// Drain energy only while the NPC projection remains valid.
+pub(crate) async fn drain_exact_guarded(db: &Db, world: &World, system: i64, ship: i64, amount: f64, guard: NpcCapacitorGuard) -> Result<f64, CallError> {
+    Ok(capacitor_operation(db, world, system, ship, Operation::Drain(amount), Some(guard)).await?.map_or(0.0, |(_, amount)| amount))
 }
 
 /// A ship's hit points and resistances, from its fit.
@@ -198,6 +333,7 @@ pub(super) async fn damage_npc(db: &Db, world: &World, system: i64, target: i64,
     let dealt = absorb(&mut hp.now, &hp.resonance, raw);
     if hp.now[2] <= 0.0 && (hp.max[2] > 0.0 || hp.now.iter().all(|v| *v <= 0.0)) {
         let destroyed = world.destroy_ball(system, target).await;
+        forget_ship(target);
         forget_target(world, target);
         if let Some(ball) = destroyed {
             info!("ball {target} (type {}) destroyed", ball.type_id);
@@ -450,6 +586,7 @@ fn loot_category(published: Option<bool>, category: Option<i32>) -> Option<i32> 
 }
 
 #[cfg(test)] mod loot_tests;
+#[cfg(test)] mod tests;
 
 
 

@@ -2,6 +2,8 @@ use super::*;
 use crate::services::effects::{projection::Projection, EffectKind, JammingType};
 use crate::space::System;
 
+mod auto_reload_db;
+
 #[test]
 fn bank_master_resolves_any_group_member() {
     use crate::dao::items::charges::Bank;
@@ -93,4 +95,14 @@ fn removed_locks_clear_only_matching_outgoing_projections() {
     remove_target_projections_in_system(&mut s, 1, &[2, 3]);
     assert_eq!(s.projections_on(2).len(), 1);
     assert!(s.projections_on(3).is_empty());
+}
+
+#[test]
+fn compatible_groups_and_sizes_are_required() {
+    assert!(charge_matches([10.0, 20.0].into_iter(), Some(20), Some(2.0), Some(2.0)));
+    assert!(!charge_matches([10.0].into_iter(), Some(20), Some(2.0), Some(2.0)));
+    assert!(!charge_matches([20.0].into_iter(), Some(20), Some(2.0), Some(1.0)));
+    assert!(!charge_matches([20.0].into_iter(), Some(20), Some(2.0), None));
+    assert!(!charge_matches([].into_iter(), None, None, None));
+    assert!(charge_matches([20.0].into_iter(), Some(20), None, None));
 }

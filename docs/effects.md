@@ -28,10 +28,11 @@ inventory of every unsupported SDE effect.
 | Kind or family | Status |
 |---|---|
 | Turret, missile, local shield/armour/hull repair, propulsion, mining | Existing behaviour uses the shared lifecycle. |
+| Capacitor boosters, neutralizers, nosferatu, capacitor transfer and fueled local repair | Supported through the shared lifecycle. Charged ancillary shield boosters bypass capacitor discharge without an amount multiplier; fueled ancillary armor repair pays normal capacitor and uses its fitted charge multiplier. Uncharged ancillary repairs use their normal capacitor cost and base amount. |
 | Modifier-only and online effects | Supported through the modifier and online paths, subject to validation and scope. |
 | Hacking and probe launch | Classified for existing exploration paths; classification alone does not guarantee every item or call path. |
 | Projected web, warp disruption and scrambling, target painting, sensor damping, tracking and guidance disruption, remote sensor and tracking enhancement | Runtime projections use the shared Fit evaluator and actor-owned lifetimes. Warp scramble status refuses warp entry; a scram that blocks propulsion stops a running microwarpdrive and refuses a new activation, without stopping afterburners. |
-| ECM, capacitor warfare and transfer, fueled and remote repair | Classified separately; classification alone does not imply projected modifier support. |
+| ECM and remote repair | Known later families, visibly refused until their behaviour is implemented. |
 | Smartbomb, Vorton, cloak, micro jump drive, salvage, tractor, scans, target assistance and bombs | Known later families, visibly refused until implemented. |
 | Explicitly excluded capital, industrial, structure and other out-of-scope groups | Refused even when an effect has modifiers. |
 
@@ -42,15 +43,38 @@ All paths below are under `crates/server/src/`.
 - `services/effects/registry.rs`: numeric classification, scope and resolved
   effect metadata; `mod.rs` defines the kinds.
 - `services/effects/lifecycle.rs`: activation, cycles, repeat and stopping;
-  `weapons.rs`, `repair.rs`, `propulsion.rs`, `mining.rs` and `hacking.rs`
-  contain the existing family-specific work; `projected.rs` constructs projected effects.
+  `weapons.rs`, `repair.rs`, `capacitor.rs`, `propulsion.rs`, `mining.rs` and
+  `hacking.rs` contain the family-specific work; `projected.rs` constructs
+  projected effects.
 - `services/effects/environment.rs` and `notify.rs`: effect environment and
   notification payloads; `unsupported.rs` owns refusal diagnostics.
 - `services/combat/` retains targeting, ammunition, health, damage and NPC
   state. `services/fit.rs` evaluates attributes. Space actor timers schedule
   cycle work.
+- Capacitor transfer does not yet propagate Crimewatch assistance; neutralizers
+  and nosferatu use the existing offensive aggression path. Reloads use the
+  existing ammunition reservation and actor deadline mechanism. When an ancillary
+  repairer stops with an empty magazine, compatible cargo charges are reserved
+  for automatic reload; a running module does not reload automatically.
+- Charge-sensitive cycles check pending reloads and guard consumption against the
+  cycle-start fitted charge type. If a reload wins after capacitor discharge,
+  the refused cycle refunds that discharge through the normal capacitor injection
+  path. Recharge, intervening capacitor operations and the capacity clamp can
+  change the final level before the refund; this is not an atomic reservation.
 - `sde/dogma.rs` loads dogma data; `sde/dogma/python_effects.rs` supplements
   Python-only modifiers.
+
+## NPC capacitor assistance
+
+NPC capacitor transfers select another live NPC brain in the same system. If
+the source belongs to a spawn group, the recipient must share one of its groups;
+otherwise it must have the same ball owner. The hostile player target is never
+an assistance recipient. Among recipients with a non-full capacitor and a
+positive optimal/falloff range multiplier at sampled surface distance, the
+lowest recharged capacitor fraction wins, with item ID breaking ties. No
+eligible recipient means no transfer. The existing NPC effect timer drives the
+attempt; the commit rechecks the hostile target generation, recipient
+eligibility and range. NPC assistance does not generate Crimewatch flags.
 
 ## Wire contract
 
@@ -110,6 +134,11 @@ expiry and source or target departure remove the relevant contribution.
 Finite cycles expire after their duration plus exactly one destiny tick of
 grace; an indefinite duration has no expiry. Refreshes reevaluate Fit outside
 the actor and queue kinematics through destiny. Runtime state is lost on restart.
+
+A scram-blocked microwarpdrive is removed from the active Fit input immediately,
+while its running cycle remains owned until the normal stop publishes the real
+stop notification and performs its teardown. Ordinary deactivation continues
+to affect Fit until the cycle ends.
 
 The deterministic D7 range multiplier uses sampled surface distance: strength
 is 1 through inclusive optimal, then `0.5^(((distance - optimal) / falloff)^2)`.

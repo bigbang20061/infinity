@@ -11,6 +11,8 @@
 //! Character brains compile passive skills and active implant and booster modifiers; structure effects
 //! and implant/booster injection or expiry are unsupported.
 //! Brain versions are in-memory and reset when the server restarts.
+//! Ship priming reports the in-space capacitor's lazily recharged runtime level;
+//! ships not present in a running system use their fitted capacity.
 pub(crate) mod brain;
 
 
@@ -219,16 +221,20 @@ async fn ship_info(c: &Client) -> Result<Vec<(Value, Value)>, CallError> {
     let items = load_items(&c.db, &c.sde, ItemQuery::IdOrLocationExceptFlag(ship_id, FLAG_HANGAR)).await.map_err(db_err)?;
     let online = online_modules(c, ship_id).await?;
     let mut out = Vec::new();
-    // Runtime state the HUD reads: a full capacitor (with skills), and the ship's shield,
-    // armor and structure as combat left them.
-    combat::refill_capacitor(ship_id);
+    // Runtime state the HUD reads, including the current recharged capacitor.
     let char_id = c.session.int("charid").unwrap_or(0);
-    let fit = if let Some(system) = c.session.int("solarsystemid") {
+    let system = c.session.int("solarsystemid");
+    let fit = if let Some(system) = system {
         fit::Fit::load_in_space(&c.db, &c.world, system, char_id, ship_id).await?
     } else {
         fit::Fit::load(&c.db, c.sde.clone(), char_id, ship_id).await?
     };
-    let (cap, shield_max) = (fit.value(fit::Key::Ship, ATTR_CAPACITOR_CAPACITY), fit.value(fit::Key::Ship, ATTR_SHIELD_CAPACITY));
+    let (cap_max, shield_max) = (fit.value(fit::Key::Ship, ATTR_CAPACITOR_CAPACITY), fit.value(fit::Key::Ship, ATTR_SHIELD_CAPACITY));
+    let cap = if let Some(system) = system {
+        combat::groups_health::capacitor_snapshot(&c.db, &c.world, system, ship_id).await?.map_or(cap_max, |snapshot| snapshot.level)
+    } else {
+        cap_max
+    };
     let (shield, armor_damage, hull_damage) = combat::ship_condition(ship_id).unwrap_or((shield_max, 0.0, 0.0));
     for item in items {
         let mut attrs = type_attributes(c, item.type_id);

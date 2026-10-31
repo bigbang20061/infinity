@@ -10,6 +10,9 @@ impl Loot { fn from_row(row: &Row) -> Self { Self { type_id: row.get("type_id") 
 pub(crate) async fn delete_charge(ex: &(impl Executor + ?Sized), ship: i64, flag: i32) -> Result<u64, Error> {
     ex.execute("DELETE FROM game.module_charges WHERE ship_id = $1 AND flag_id = $2", &[&ship, &flag]).await
 }
+pub(crate) async fn delete_empty_charge(ex: &(impl Executor + ?Sized), ship: i64, flag: i32) -> Result<u64, Error> {
+    ex.execute("DELETE FROM game.module_charges WHERE ship_id = $1 AND flag_id = $2 AND quantity = 0", &[&ship, &flag]).await
+}
 pub(crate) async fn consume_charge(ex: &(impl Executor + ?Sized), ship: i64, flag: i32) -> Result<Option<Loaded>, Error> {
     Ok(ex.query_opt("UPDATE game.module_charges SET quantity = quantity - 1 WHERE ship_id = $1 AND flag_id = $2 AND quantity > 0 RETURNING type_id, quantity", &[&ship, &flag]).await?.as_ref().map(Loaded::from_row))
 }
