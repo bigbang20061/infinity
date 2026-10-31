@@ -131,6 +131,10 @@ async fn database_gm_mutations_materialize_overdue_training_before_queue_changes
     let skills = training::current(&tx, character).await.expect("read skills");
     let completed = skills.iter().find(|s| s.type_id == other).expect("completed skill");
     assert_eq!((completed.level, completed.skill_points), (1, 250));
+    let history = crate::dao::skills::history::list(&tx, character, 1000).await.expect("history");
+    assert!(history.iter().any(|row| row.skill_type_id == target && row.event_type_id == super::super::history::REMOVED && row.absolute_points == 250));
+    assert!(history.iter().any(|row| row.skill_type_id == target && row.event_type_id == super::super::history::GM_GIVE && row.absolute_points == 0));
+    assert!(history.iter().any(|row| row.skill_type_id == other && row.event_type_id == super::super::history::TRAINING_COMPLETE && row.absolute_points == 250));
     tx.rollback().await.expect("rollback");
 }
 

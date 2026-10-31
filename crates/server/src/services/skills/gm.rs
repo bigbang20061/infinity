@@ -76,9 +76,13 @@ async fn write_levels<E>(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<E>, 
     let plan: BTreeMap<_, _> = levels.iter().copied().collect();
     let types = plan.keys().copied().collect();
     let mut infos = clean_queue(tx, outbox, sde, char_id, &types, now, finished).await?;
+    let before: BTreeMap<_, _> = training::current(tx, char_id).await.map_err(db_err)?.into_iter().map(|s| (s.type_id, (s.level, s.skill_points))).collect();
     for (type_id, level) in plan {
         let sp = sp_for_level(skill_type(sde, type_id).rank, level as i64);
         training::set_level(tx, char_id, type_id, level, sp).await.map_err(db_err)?;
+        if before.get(&type_id).is_none_or(|&(old_level, old_sp)| old_level != level || old_sp != sp) {
+            crate::dao::skills::history::append(tx, char_id, type_id, super::history::GM_GIVE, sp, now).await.map_err(db_err)?;
+        }
         infos.push((Value::Int(type_id as i64), skill_info(sde, type_id, level, sp, now)));
     }
     if !infos.is_empty() {
@@ -99,7 +103,11 @@ pub(crate) async fn remove<E>(tx: &(impl Executor + ?Sized), outbox: &mut Outbox
     }
     let sorted: Vec<_> = types.into_iter().collect();
     let removed = training::remove(tx, char_id, &sorted).await.map_err(db_err)?;
-    let infos: Vec<_> = removed.into_iter().map(|s| (Value::Int(s.type_id as i64), skill_info(sde, s.type_id, 0, -1, now))).collect();
+    let mut infos = Vec::new();
+    for s in removed {
+        crate::dao::skills::history::append(tx, char_id, s.type_id, super::history::REMOVED, s.skill_points, now).await.map_err(db_err)?;
+        infos.push((Value::Int(s.type_id as i64), skill_info(sde, s.type_id, 0, -1, now)));
+    }
     if !infos.is_empty() {
         outbox.notify_pilot(char_id, "OnServerSkillsRemoved", vec![Value::Dict(infos), Value::Int(now)]);
     }

@@ -12,6 +12,8 @@ mod skill_handler;
 mod training;
 pub(crate) mod completion;
 pub(crate) mod gm;
+mod history;
+mod respec;
 #[cfg(test)]
 mod tests;
 

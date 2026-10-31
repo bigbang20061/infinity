@@ -16,6 +16,7 @@ pub(crate) mod lua;
 pub(crate) mod loyalty;
 pub(crate) mod standings;
 pub(crate) mod trade;
+pub(crate) mod skills;
 
 // Client fitting and online UserError catalogue keys.
 pub(crate) const MSG_FITTING_HAS_SKILL_PREREQUISITES: &str = "FittingHasSkillPrerequisites";
@@ -690,6 +691,14 @@ pub(crate) const MSG_NOT_CLOSE_ENOUGH_TO_JUMP: &str = "NotCloseEnoughToJump";
 pub(crate) const MSG_NOT_ENOUGH_MONEY: &str = "NotEnoughMoney";
 /// Client message `OnlyCEOCanResign`.
 pub(crate) const MSG_ONLY_CEO_CAN_RESIGN: &str = "OnlyCEOCanResign";
+/// Client `eve/client/script/ui/shared/neocom/attributes.py:241` validation.
+pub(crate) const MSG_RESPEC_ATTRIBUTES_TOO_LOW: &str = "RespecAttributesTooLow";
+/// Client `eve/client/script/ui/shared/neocom/attributes.py:243` validation.
+pub(crate) const MSG_RESPEC_ATTRIBUTES_TOO_HIGH: &str = "RespecAttributesTooHigh";
+/// Client `eve/client/script/ui/shared/neocom/attributes.py:250` validation.
+pub(crate) const MSG_RESPEC_ATTRIBUTES_MISALLOCATED: &str = "RespecAttributesMisallocated";
+/// Client `eve/client/script/ui/shared/neocom/attributes.py:267` entitlement refusal.
+pub(crate) const MSG_RESPEC_TOO_SOON: &str = "RespecTooSoon";
 /// Client message `RepackageBeforeSelling`.
 pub(crate) const MSG_REPACKAGE_BEFORE_SELLING: &str = "RepackageBeforeSelling";
 /// Client message `ShipNotFound`.

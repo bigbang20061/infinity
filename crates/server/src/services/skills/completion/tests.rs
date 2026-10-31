@@ -25,6 +25,10 @@ async fn completion_emits_one_lua_event_per_new_level_and_none_on_replay() {
         _ => None,
     }).collect();
     assert_eq!(levels, vec![1, 2]);
+    let history = crate::dao::skills::history::list(&db, f.character, 50).await.unwrap();
+    assert_eq!(history.len(), 2);
+    assert!(history.iter().all(|row| row.event_type_id == super::super::history::TRAINING_COMPLETE));
+    assert_eq!(history.iter().map(|row| row.absolute_points).collect::<Vec<_>>(), vec![200, 100]);
     fixture::cleanup(&db, f).await.unwrap();
 }
 #[tokio::test]

@@ -118,6 +118,24 @@ CREATE TABLE IF NOT EXISTS game.skills (
     PRIMARY KEY (character_id, type_id)
 );
 
+-- Skill history and authoritative character remaps (dao/skills/history, dao/characters/attributes).
+CREATE TABLE IF NOT EXISTS game.skill_history (
+    history_id bigserial PRIMARY KEY,
+    character_id bigint NOT NULL REFERENCES game.characters ON DELETE CASCADE,
+    skill_type_id integer NOT NULL,
+    event_type_id integer NOT NULL,
+    absolute_points bigint NOT NULL,
+    log_date bigint NOT NULL
+);
+CREATE INDEX IF NOT EXISTS skill_history_character_date_idx ON game.skill_history (character_id, log_date DESC, history_id DESC);
+CREATE TABLE IF NOT EXISTS game.character_respec (
+    character_id bigint PRIMARY KEY REFERENCES game.characters ON DELETE CASCADE,
+    bases integer[],
+    free_respecs bigint NOT NULL,
+    last_respec_date bigint,
+    next_timed_respec bigint
+);
+
 -- Active training queue; times are FILETIME (100ns since 1601) like the client's.
 CREATE TABLE IF NOT EXISTS game.skill_queue (
     character_id bigint NOT NULL REFERENCES game.characters,

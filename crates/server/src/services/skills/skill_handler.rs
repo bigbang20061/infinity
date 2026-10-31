@@ -1,12 +1,11 @@
 //! Bound skillHandler calls; no specific client module path is established.
 //! Uses game.skills, game.skill_queue, game.characters and startup SDE data
 //! through the training and attribute helpers.
-//! History, boosters, implants, penalties and several other calls use fixed answers.
-//! The reported free respec count is an operator policy.
+//! History and remaps are persisted; boosters, implants and penalties remain fixed answers.
 use super::*;
 use super::attributes::character_attributes;
 use super::training::{skills_dict, queue_list, save_queue};
-use crate::client::{filetime_now, short};
+use crate::client::short;
 use marshal::Value;
 use tracing::warn;
 
@@ -48,13 +47,10 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             .await
             .map(|a| Value::Dict(a.into_iter().map(|(k, v)| (Value::Int(k), Value::Float(v))).collect())),
         (SKILL_HANDLER, "GetBoosters") | (SKILL_HANDLER, "GetImplants") => Ok(Value::Dict(vec![])),
-        (SKILL_HANDLER, "GetSkillHistory") => Ok(Value::list([])),
+        (SKILL_HANDLER, "GetSkillHistory") => super::history::get(c, me, call.kwargs.get("maxresults").or_else(|| call.args.first())).await,
         (SKILL_HANDLER, "GetPenaltySkillPoints") | (SKILL_HANDLER, "GetDiminishedSpFromInjectors") => Ok(Value::Int(0)),
-        (SKILL_HANDLER, "GetRespecInfo") => Ok(keyval([
-            ("freeRespecs", Value::Int(crate::config::game().characters.free_respecs)),
-            ("lastRespecDate", Value::None),
-            ("nextTimedRespec", Value::Int(filetime_now())),
-        ])),
+        (SKILL_HANDLER, "GetRespecInfo") => super::respec::get(c, me).await,
+        (SKILL_HANDLER, "RespecCharacter") => super::respec::apply(c, me, call.args.first().unwrap_or(&Value::None)).await,
         (SKILL_HANDLER, m) => {
             warn!(
                 user = c.login.user_id,

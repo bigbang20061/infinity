@@ -1,0 +1,5 @@
+//! Skill service player-facing refusals.
+//! These messages cover invalid history requests, remaps and unavailable remap entitlements.
+pub(crate) const INVALID_REMAP: &str = "属性重置的数值无效。";
+pub(crate) const REMAP_UNAVAILABLE: &str = "当前没有可用的属性重置次数。";
+pub(crate) const INVALID_HISTORY_REQUEST: &str = "技能历史记录请求无效。";

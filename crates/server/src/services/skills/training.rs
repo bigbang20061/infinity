@@ -56,10 +56,6 @@ pub(super) fn skill_info(sde: &crate::sde::Sde, type_id: i32, level: i32, points
     ])
 }
 
-/// Collect finished entries and restore the remaining queue positions.
-async fn collect_finished(db: &(impl Executor + ?Sized), char_id: i64, now: i64) -> Result<Vec<(i32, i32, i64)>, CallError> {
-    Ok(queue_dao::collect_finished(db, char_id, now).await.map_err(db_err)?.into_iter().map(|r| (r.type_id, r.to_level, r.dest_sp)).collect())
-}
 
 // None level means banking only: it must not create a missing skill row.
 pub(super) fn plan_skills(done: &[(i32, i32, i64)], training: Option<(i32, i64)>) -> BTreeMap<i32, (Option<i32>, i64)> {
@@ -98,15 +94,21 @@ pub(super) fn queue_training_events<X>(outbox: &mut Outbox<X>, char_id: i64, fin
 /// Complete due rows in the caller's serialized mutation transaction.
 pub(super) async fn complete_tx<E>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<E>, char_id: i64, now: i64) -> Result<Vec<(i32, i32)>, CallError> {
     let levels = training_dao::current(db, char_id).await.map_err(db_err)?.into_iter().map(|r| (r.type_id, r.level)).collect();
-    let done = collect_finished(db, char_id, now).await?;
+    let rows = queue_dao::collect_finished(db, char_id, now).await.map_err(db_err)?;
+    let done: Vec<_> = rows.iter().map(|r| (r.type_id, r.to_level, r.dest_sp)).collect();
     training_dao::write_skills(db, char_id, &plan_skills(&done, None)).await.map_err(db_err)?;
     let finished = completed_levels(&done, levels);
+    for &(type_id, level) in &finished {
+        if let Some(row) = rows.iter().find(|r| r.type_id == type_id && r.to_level == level) {
+            crate::dao::skills::history::append(db, char_id, type_id, super::history::TRAINING_COMPLETE, row.dest_sp, row.end_time).await.map_err(db_err)?;
+        }
+    }
     queue_training_events(outbox, char_id, &finished);
     Ok(finished)
 }
 
 /// SP accrued so far by the entry currently in training, if any.
-async fn in_training_sp(db: &(impl Executor + ?Sized), char_id: i64, now: i64) -> Result<Option<(i32, i64)>, CallError> {
+pub(super) async fn in_training_sp(db: &(impl Executor + ?Sized), char_id: i64, now: i64) -> Result<Option<(i32, i64)>, CallError> {
     let r = queue_dao::active(db, char_id).await.map_err(db_err)?;
     Ok(r.and_then(|r| {
         let (start, end) = (r.start_time?, r.end_time?);
@@ -157,9 +159,9 @@ pub(super) async fn queue_list_db(db: &(impl Executor + ?Sized), char_id: i64) -
     ))
 }
 
-async fn save_queue_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox, sde: &std::sync::Arc<crate::sde::Sde>, char_id: i64, entries: Vec<(i64, i64, i64)>, activate: bool, notify: bool, now: i64) -> Result<Vec<(i32, i32)>, CallError> {
+pub(super) async fn save_queue_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox, sde: &std::sync::Arc<crate::sde::Sde>, char_id: i64, entries: Vec<(i64, i64, i64)>, activate: bool, notify: bool, now: i64, mut finished: Vec<(i32, i32)>) -> Result<Vec<(i32, i32)>, CallError> {
     crate::dao::characters::selection::lock_character(tx, char_id).await.map_err(db_err)?;
-    let mut finished = complete_tx(tx, outbox, char_id, now).await?;
+    finished.extend(complete_tx(tx, outbox, char_id, now).await?);
     let training = in_training_sp(tx, char_id, now).await?;
     training_dao::write_skills(tx, char_id, &plan_skills(&[], training)).await.map_err(db_err)?;
     let attrs = character_attributes_db(tx, sde, char_id).await?;
@@ -213,7 +215,7 @@ pub(super) async fn save_queue(c: &mut Client, char_id: i64, queue: &Value, acti
             let entries = entries.clone();
             let sde = sde.clone();
             Box::pin(async move {
-                save_queue_tx(tx, outbox, &sde, char_id, entries, activate, notify, now).await
+                save_queue_tx(tx, outbox, &sde, char_id, entries, activate, notify, now, vec![]).await
             })
         },
         |finished, outbox| async move {

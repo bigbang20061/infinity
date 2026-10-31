@@ -1,5 +1,5 @@
 //! Character training attributes, mirroring characterskills/util.py.
-//! Base values use game.characters and startup SDE bloodlines, with a fallback.
+//! Base values use persisted remaps or startup SDE bloodlines as fallback.
 //! Effective values use Fit, including active character implants and boosters.
 use super::{db_err, CallError};
 use crate::client::Client;
@@ -25,8 +25,11 @@ pub(super) async fn character_attributes_db(db: &(impl Executor + ?Sized), sde: 
     Ok(CHAR_ATTRIBUTES.iter().map(|&attr| (attr, fit.value(Key::Char, attr as i32))).collect())
 }
 
-/// Bloodline-derived starting values for the character node, before modifiers.
+/// Persisted remap or bloodline-derived starting values before modifiers.
 pub(crate) async fn base_character_attributes(db: &(impl Executor + ?Sized), sde: &crate::sde::Sde, char_id: i64) -> Result<HashMap<i64, f64>, CallError> {
+    if let Some(bases) = crate::dao::characters::attributes::respec(db, char_id).await.map_err(db_err)?.and_then(|r| r.bases) {
+        return Ok(CHAR_ATTRIBUTES.iter().zip(bases).map(|(a, value)| (*a, value as f64)).collect());
+    }
     let id = crate::dao::characters::attributes::bloodline(db, char_id).await.map_err(db_err)?;
     let r = sde.characters.bloodline(id as i64).ok_or_else(|| CallError::Internal(anyhow::anyhow!("missing bloodline {id} for character {char_id}")))?;
     let values = [r.charisma, r.intelligence, r.memory, r.perception, r.willpower];
