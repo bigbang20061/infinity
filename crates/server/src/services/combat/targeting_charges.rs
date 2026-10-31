@@ -126,12 +126,7 @@ pub(crate) async fn bank(db: &(impl Executor + ?Sized), ship: i64, master: i64) 
 
 /// Resolve a bank member to its master, or return an ungrouped module unchanged.
 pub(in crate::services) async fn master_for_member(ex: &(impl Executor + ?Sized), ship: i64, member: i64) -> Result<i64, CallError> {
-    let rows = crate::dao::items::charges::banks(ex, ship).await.map_err(db_err)?;
-    Ok(bank_master(&rows, member))
-}
-
-fn bank_master(rows: &[crate::dao::items::charges::Bank], member: i64) -> i64 {
-    rows.iter().find(|row| row.slave_id == member).map_or(member, |row| row.master_id)
+    crate::dao::items::charges::bank_of(ex, ship, member).await.map_err(db_err)
 }
 
 /// Empty a module's charges into `location`/`flag` (cargo by default).

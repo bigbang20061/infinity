@@ -5,6 +5,7 @@
 //! implement localisation, data-derived names, or protocol identifiers.
 
 pub(crate) mod bounty;
+pub(crate) mod combat;
 pub(crate) mod contacts;
 pub(crate) mod effects;
 pub(crate) mod gm;
@@ -587,6 +588,8 @@ pub(crate) const MINMATAR_CATEGORY_NAME: &str = "米玛塔尔";
 pub(crate) const OTHER_FACTION_CATEGORY_NAME: &str = "其他";
 
 // Client message-catalogue names
+/// Client catalogue key from clientDogmaLocation.LinkWeapons.
+pub(crate) const MSG_CANT_LINK_MODULE_NOT_ONLINE: &str = "CantLinkModuleNotOnline";
 /// Client fittingDogmaLocation.py refusal for an activation-blocked module.
 pub(crate) const MSG_MODULE_IS_BLOCKED: &str = "ModuleIsBlocked";
 /// Client message `BkmMustBeInFlight`.

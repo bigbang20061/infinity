@@ -6,6 +6,9 @@
 //! not belong here. Shared gateway protocol units are included. This module
 //! provides no data lookup or runtime state.
 
+/// `dogma/const.py` dgmGroupableGroupIDs: weapon groups permitted in banks.
+pub const GROUPABLE_GROUP_IDS: [i64; 19] = [53, 55, 56, 74, 506, 507, 508, 509, 510, 511, 512, 524, 771, 1245, 1327, 1328, 1562, 1673, 1674];
+
 // FILETIME durations and timestamps.
 /// Windows FILETIME epoch offset: 100 ns ticks from 1601-01-01 to 1970-01-01.
 pub const FILETIME_UNIX_EPOCH: i64 = 116_444_736_000_000_000;

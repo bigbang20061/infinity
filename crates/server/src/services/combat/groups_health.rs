@@ -1,4 +1,4 @@
-//! Weapon groups, ship health and memory-only capacitor state; routing lives in the parent module.
+//! Ship health and memory-only capacitor state; routing lives in the parent module.
 //! The client reads capacitor charge through clientDogmaLocation; player attributes come
 //! from fitted dogma and NPC attributes from the SDE. Capacitor state is not persisted;
 //! NPC projections are checked in the system actor before capacitor changes commit.
@@ -9,77 +9,6 @@
 use super::*;
 use crate::consts::CATEGORY_MODULE;
 
-// ---------------------------------------------------------------- weapon groups
-
-/// `{masterID: [slaveIDs]}` for a ship.
-
-
-pub(super) async fn link(db: &(impl Executor + ?Sized), ship: i64, master: i64, slave: i64) -> Result<(), CallError> {
-    if master == slave {
-        return Ok(());
-    }
-    // A master joining another group brings its own slaves along.
-    crate::dao::items::combat::link(db, ship, master, slave).await.map_err(db_err)?;
-    Ok(())
-}
-
-pub(super) async fn weapon_groups(c: &mut Client, call: &Call<'_>) -> CallResult {
-    let int = |i: usize| call.args.get(i).and_then(|v| v.as_int()).unwrap_or(0);
-    let ship = int(0);
-    let db = c.db.clone();
-    let method = match call.method {
-        "LinkWeapons" => "LinkWeapons",
-        "MergeModuleGroups" => "MergeModuleGroups",
-        "PeelAndLink" => "PeelAndLink",
-        "LinkAllWeapons" => "LinkAllWeapons",
-        "UnlinkModule" => "UnlinkModule",
-        "UnlinkAllModules" => "UnlinkAllModules",
-        _ => "",
-    };
-    let (master, other) = (int(1), int(2));
-    let fallback_ship = if ship != 0 { ship } else { c.session.int("shipid").unwrap_or(0) };
-    db.transaction(
-        |db, _outbox: &mut Outbox| Box::pin(async move {
-    match method {
-        "LinkWeapons" | "MergeModuleGroups" | "PeelAndLink" => {
-            if method == "PeelAndLink" {
-                crate::dao::items::combat::peel_and_link(db, ship, master, other).await.map_err(db_err)?;
-            } else {
-                link(db, ship, master, other).await?;
-            }
-            banks(db, ship).await
-        }
-        // Group every online high-slot module with the others of its type.
-        "LinkAllWeapons" => {
-            crate::dao::items::combat::clear_banks(db, ship).await.map_err(db_err)?;
-            let rows = crate::dao::items::combat::fitted_weapons(db, ship, *HI_SLOTS.start(), *HI_SLOTS.end()).await.map_err(db_err)?;
-            let mut masters: HashMap<i32, i64> = HashMap::new();
-            for r in rows {
-                let (id, type_id) = (r.item_id, r.type_id);
-                match masters.get(&type_id) {
-                    Some(&m) => link(db, ship, m, id).await?,
-                    None => {
-                        masters.insert(type_id, id);
-                    }
-                }
-            }
-            banks(db, ship).await
-        }
-        // Takes the last module off a group; returns it.
-        "UnlinkModule" => {
-            let slave = crate::dao::items::combat::unlink_last(db, ship, master).await.map_err(db_err)?;
-            Ok(slave.map(Value::Int).unwrap_or(Value::None))
-        }
-        "UnlinkAllModules" => {
-            crate::dao::items::combat::clear_banks(db, ship).await.map_err(db_err)?;
-            Ok(Value::None)
-        }
-        _ => banks(db, fallback_ship).await,
-    }
-        }),
-        |value, outbox| async move { dispatch_client(value, outbox, c) },
-    ).await
-}
 
 // ---------------------------------------------------------------- capacitor and hit points
 
