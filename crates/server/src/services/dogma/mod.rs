@@ -150,7 +150,7 @@ async fn online_modules(c: &Client, ship_id: i64) -> Result<Vec<i64>, CallError>
 
 /// Set fitted modules online and notify the controlling client after commit.
 pub(super) async fn gm_online(c: &mut Client, ship: i64) -> Result<usize, CallError> {
-    use super::effects::lifecycle::{apply_online_changed, set_online_core, OnlineChanged, OnlinePolicy};
+    use super::effects::online::{apply_online_changed, set_online_core, OnlineChanged, OnlinePolicy};
     use crate::db::outbox::{Effect, Outbox};
     let policy = OnlinePolicy::from_client(c)?;
     let db = c.db.clone();
@@ -347,7 +347,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
             let ship = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
             let module = call.args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
             let online = call.method == "SetModuleOnline";
-            super::effects::lifecycle::set_online(c, ship, module, online).await
+            super::effects::online::set_online(c, ship, module, online).await
         }
         _ => {
             warn!(
