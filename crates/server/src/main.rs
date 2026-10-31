@@ -68,6 +68,11 @@ async fn main() -> Result<()> {
         services::CallError::User { msg, .. } => anyhow::anyhow!(msg),
     })?;
     lua::start(&cfg, &db, &sde, &world).await?;
+    let restored = services::bounty::restore_activations(&db, &world).await.map_err(|error| match error {
+        services::CallError::Internal(e) => e,
+        services::CallError::User { msg, .. } => anyhow::anyhow!(msg),
+    })?;
+    info!(restored, "restored active kill rights");
     let (scheduler_stop, scheduler_shutdown) = tokio::sync::watch::channel(false);
     let mut scheduler_task = scheduler::runner::start(db.clone(), world.clone(), services::scheduler_registrations(), cfg.scheduler.clone(), scheduler_shutdown)?;
     scheduler::seed(&db).await?;

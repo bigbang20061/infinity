@@ -17,6 +17,8 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
   - Targeting, ammunition, weapon groups, turrets and missiles, and capacitor.
   - NPC AI, bounties, wrecks and loot.
   - Crimewatch: timers, criminal flags, security status, CONCORD and killmails.
+  - Player bounties on characters, corporations and alliances, with contributions, leaderboards and search. A pilot who destroys a target's ship is paid from the matching bounty pools, at most 20% of the destroyed value, once per killmail.
+  - Kill rights: illegal aggression earns the victim an expiring right against the aggressor, which the victim can activate or sell to anyone or to one pilot. Activating it makes the aggressor a suspect anyone may shoot; the right is used up when the aggressor dies while it is active.
 - **Skills.** Training queue. Skill plans are served through the public gateway.
 - **Economy.**
   - Regional market: seeded NPC orders, escrow, taxes and fees, history.
@@ -47,8 +49,9 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
   - modules whose effect is not implemented yet, among them electronic warfare, capacitor warfare and transfer, remote repair, smartbombs, micro jump drives, salvagers, tractor beams and bombs. Activating one is refused with a message, and `/effects unsupported` lists the effects tried since the server started.
   - game events for Lua scripts other than the ballpark being bound, and vetoes from scripts
   - in direct trades: items from cargo, from inside a container or from a corporation hangar, the active ship, fitted modules and charges, and PLEX; types that cannot be traded are refused anywhere in an offered container or ship
+  - the GM bounty reimbursement and bounty cache calls
 - Some runtime state lives only in memory and is lost when the server restarts:
-  - fleets, combat and Crimewatch timers, ship damage, and in-progress hacking;
+  - fleets, combat and Crimewatch timers, ship damage, and in-progress hacking; a suspect flag from an activated kill right is the exception and is restored with its original deadline;
   - everything spawned into space (NPCs, wrecks, scheduled effects);
   - a ship's velocity, warp and cloak, so a restarted ship starts at rest.
 - A reload still running when the server stops is not resumed. At the next start its charges go back to the ship's cargo hold.
@@ -175,6 +178,7 @@ Some keys switch behaviour on or off rather than set a number:
 | `combat.bounty_multiplier` | `1.0` | Scales the ISK paid for NPC kills (`0` = none). Loot and security status gains are unaffected. |
 | `industry.job_time_multiplier` | `1.0` | Scales industry job durations (below 1 is faster). Materials and costs are unchanged; the duration the client shows before a job starts does not include it. |
 | `crimewatch.concord_enabled` | `true` | With `false`, CONCORD does not respond. Criminal flags, timers and security status penalties still apply. |
+| `bounty.kill_right_lifetime_days` / `.kill_right_suspect_secs` | `30` / `900` | How long an earned kill right lasts, and how long activating one makes the aggressor a suspect. Both must be positive. |
 
 ## Database
 

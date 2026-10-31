@@ -3,6 +3,7 @@
 //! comes only from the TOML file and compiled defaults. No runtime reload is supported.
 
 pub mod deployment;
+pub mod bounty;
 pub mod game;
 pub mod scheduler;
 pub mod lua;
@@ -28,6 +29,7 @@ pub struct Config {
     pub cdn: deployment::CdnConfig,
     pub scheduler: scheduler::SchedulerConfig,
     pub lua: lua::LuaConfig,
+    pub bounty: bounty::BountyConfig,
     pub accounts: game::economy::AccountsConfig,
     pub characters: game::economy::CharactersConfig,
     pub market: game::economy::MarketConfig,
@@ -64,6 +66,7 @@ impl PartialEq for Config {
             && self.cdn == other.cdn
             && self.scheduler == other.scheduler
             && self.lua == other.lua
+            && self.bounty == other.bounty
             && self.accounts == other.accounts
             && self.characters == other.characters
             && self.market == other.market
@@ -201,6 +204,7 @@ impl Config {
 
     pub fn game_config(&self) -> GameConfig {
         GameConfig {
+            bounty: self.bounty.clone(),
             accounts: self.accounts.clone(),
             characters: self.characters.clone(),
             market: self.market.clone(),

@@ -114,7 +114,7 @@ impl Owner {
         }
     }
 }
-pub(crate) async fn owners(ex: &impl Executor, ids: &[i64], character: i64, corporation: i64, alliance: i64) -> Result<Vec<Owner>, Error> {
+pub(crate) async fn owners(ex: &(impl Executor + ?Sized), ids: &[i64], character: i64, corporation: i64, alliance: i64) -> Result<Vec<Owner>, Error> {
     let rows = ex.query(
         "SELECT character_id, name, $2::bigint AS type_id, gender_id, NULL::bigint AS name_id FROM game.characters WHERE character_id = ANY($1::bigint[])\n             UNION ALL SELECT corporation_id, name, $3::bigint, 0, NULL FROM game.corporations WHERE corporation_id = ANY($1::bigint[])\n             UNION ALL SELECT alliance_id, name, $4::bigint, 0, NULL FROM game.alliances WHERE alliance_id = ANY($1::bigint[])",
         &[&ids, &character, &corporation, &alliance],

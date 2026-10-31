@@ -923,3 +923,36 @@ SELECT setval('game.items_item_id_seq', GREATEST(
     (SELECT max(trade_id) FROM game.trades),
     1000000000000
 ), true);
+
+-- Player bounties and kill rights (dao/bounties.rs, dao/kill_rights.rs).
+CREATE TABLE IF NOT EXISTS game.bounties (
+    target_id bigint PRIMARY KEY,
+    kind smallint NOT NULL,
+    amount numeric(36,2) NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS game.bounty_contributions (
+    contribution_id bigserial PRIMARY KEY,
+    target_id bigint NOT NULL,
+    placer_id bigint NOT NULL,
+    amount numeric(36,2) NOT NULL,
+    placed_at bigint NOT NULL
+);
+CREATE TABLE IF NOT EXISTS game.bounty_payouts (
+    killmail_id bigint PRIMARY KEY,
+    hunter_id bigint NOT NULL,
+    amount numeric(36,2) NOT NULL,
+    paid_at bigint NOT NULL
+);
+CREATE TABLE IF NOT EXISTS game.kill_rights (
+    kill_right_id bigserial PRIMARY KEY,
+    from_id bigint NOT NULL,
+    to_id bigint NOT NULL,
+    created_at bigint NOT NULL,
+    expiry bigint NOT NULL,
+    price numeric(36,2),
+    restricted_to bigint,
+    activated_until bigint,
+    activated_by bigint,
+    used_at bigint
+);
+CREATE UNIQUE INDEX IF NOT EXISTS kill_rights_unused_pair ON game.kill_rights (from_id, to_id) WHERE used_at IS NULL;

@@ -16,6 +16,7 @@ mod agency;
 mod alliances;
 mod bills;
 mod bookmarks;
+pub(crate) mod bounty;
 mod calendar;
 mod character;
 mod clones;
@@ -68,6 +69,8 @@ pub(crate) fn scheduler_registrations() -> Vec<crate::scheduler::Registration> {
         periodic(CONTRACTS, contracts::settle_auctions, game.contracts.maintenance_secs as u64),
         periodic(BILLS, bills::run_billing, game.corporations.bills_maintenance_secs as u64),
         trade::timeout_registration(),
+        crate::scheduler::register(bounty::kill_rights::EXPIRY_KIND, bounty::kill_rights::expire),
+        crate::scheduler::register(bounty::payout::KIND, bounty::payout::handle),
     ]
 }
 
@@ -325,6 +328,9 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
                 }
             }
             if let Some(r) = crimewatch::dispatch(c, call).await {
+                return r;
+            }
+            if let Some(r) = bounty::dispatch(c, call).await {
                 return r;
             }
             if let Some(r) = calendar::dispatch(c, call).await {
