@@ -133,11 +133,11 @@ impl System {
         self.ball(id).map(|ball| ball.position_at(self.ms))
     }
 
-    /// Clone only the requested ball and materialize its sampled position.
+    /// Clone only the requested ball and materialize its sampled position and velocity.
     pub fn sampled_ball(&self, id: i64) -> Option<Ball> {
         self.ball(id).map(|ball| {
             let mut sampled = ball.clone();
-            sampled.pos = ball.position_at(self.ms);
+            (sampled.pos, sampled.vel) = ball.state_at(self.ms);
             sampled
         })
     }

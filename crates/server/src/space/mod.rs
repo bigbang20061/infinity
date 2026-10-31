@@ -19,6 +19,7 @@
 //! `System::sampled_ball` sample the completed segment from its old state and
 //! frozen inputs, using the same native `Ballpark::Integrate` arithmetic as ticks
 //! and a wall-clock anchor, not fractional destiny stamps or separate substeps.
+//! Sampled balls carry position and velocity from the same instant.
 //!
 //! GOTO stores an absolute point; direction commands project from the current
 //! position while their events retain the raw direction. `Ballpark::WarpTo`
@@ -240,21 +241,26 @@ fn integrate(position: V3, velocity: V3, acceleration: V3, mass: f64, friction: 
 
 impl Ball {
 
-    /// Stateless view of the most recently completed logical movement segment.
+    /// Stateless position view of the most recently completed movement segment.
     pub fn position_at(&self, t_ms: i64) -> V3 {
+        self.state_at(t_ms).0
+    }
+
+    /// Sample position and velocity together without changing the tick state.
+    fn state_at(&self, t_ms: i64) -> (V3, V3) {
         let elapsed = t_ms.saturating_sub(self.interpolation_anchor_ms).clamp(0, MILLISECONDS_PER_SECOND);
         if self.is_warping() {
             let t = (self.last_ms / MILLISECONDS_PER_SECOND - self.effect_stamp - 1) as f64
                 + ms_to_seconds(elapsed as f64);
-            return self.warp_distance(self.old_pos, self.old_vel, t, true).0;
+            let (pos, vel, _) = self.warp_distance(self.old_pos, self.old_vel, t, true);
+            return (pos, vel);
         }
-        if self.segment_acceleration.is_none() { return self.pos; }
-        if elapsed == 0 { return self.old_pos; }
-        if elapsed == MILLISECONDS_PER_SECOND { return self.pos; }
+        let Some(acceleration) = self.segment_acceleration else { return (self.pos, self.vel); };
+        if elapsed == 0 { return (self.old_pos, self.old_vel); }
+        if elapsed == MILLISECONDS_PER_SECOND { return (self.pos, self.vel); }
         let mass = self.mass * self.agility as f64;
-        let acceleration = self.segment_acceleration.unwrap();
         integrate(self.old_pos, self.old_vel, acceleration, mass, DESTINY_FRICTION,
-            0.0, ms_to_seconds(elapsed as f64)).0
+            0.0, ms_to_seconds(elapsed as f64))
     }
 
     fn flags(&self) -> u8 {
