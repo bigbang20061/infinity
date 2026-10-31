@@ -472,6 +472,45 @@ fn catchup_clamps_wall_delay_without_rebasing_logical_time() {
 }
 
 #[test]
+fn nonaligned_stall_resumes_on_next_wall_second() {
+    let mut s = System::new(0, Arc::default(), 10_500);
+    let mut b = ball(1, None, 0.0);
+    b.vel = [1.0, 0.0, 0.0];
+    s.insert(b);
+    let mut rx = watch(&mut s, 1, 1);
+    s.tick(15_000);
+    s.tick(30_123);
+    assert_eq!(s.current_time(), 16);
+    let b = s.ball(1).unwrap();
+    assert_eq!(b.last_ms, 16_000);
+    assert_eq!(b.interpolation_anchor_ms, 30_123);
+    let midpoint = integrate(b.old_pos, b.old_vel, [0.0; 3], 1e6, DESTINY_FRICTION, 0.5).0;
+    assert_ne!(midpoint, b.old_pos);
+    s.tick(30_623);
+    assert_eq!(s.sample_position(1), Some(midpoint));
+    s.command(1, |b, stamp, _| {
+        b.vel = [2.0, 0.0, 0.0];
+        vec![event(stamp, "GotoDirection", vec![Value::Int(b.id)])]
+    });
+    let before = s.ball(1).unwrap().pos;
+    s.tick(30_999);
+    assert_eq!(s.current_time(), 16);
+    assert_eq!(s.ball(1).unwrap().pos, before);
+    assert!(rx.try_recv().is_err());
+    s.tick(31_000);
+    assert_eq!(s.current_time(), 17);
+    let b = s.ball(1).unwrap();
+    assert_eq!(b.last_ms, 17_000);
+    assert_eq!(b.interpolation_anchor_ms, 31_000);
+    assert_eq!(b.old_pos, before);
+    assert!(b.pos[0] > before[0]);
+    let events = rx.try_recv().unwrap();
+    let Value::Tuple(parts) = &events[0] else { panic!("event") };
+    assert_eq!(parts[0].as_int(), Some(16));
+    assert_eq!(name(&events[0]), b"GotoDirection");
+}
+
+#[test]
 fn ordinary_catchup_anchors_to_last_deadline() {
     let mut s = System::new(0, Arc::default(), 0);
     let mut b = ball(1, None, 0.0);

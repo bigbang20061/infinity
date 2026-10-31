@@ -1,7 +1,9 @@
 //! Actor-owned ballpark state and visibility, mirroring michelle.py and destiny.
 //! Celestials are supplied by the facade from SDE; dynamic state is in memory.
 //! Destiny actions apply at whole-second boundaries before fixed one-second motion;
-//! timers and NPC decisions run at 100 ms, and snapshots follow motion. DB effects
+//! after bounded catchup, the next whole wall second replaces carbon's post-stall
+//! deadline while the clamped segment retains its actual execution-time anchor.
+//! Timers and NPC decisions run at 100 ms, and snapshots follow motion. DB effects
 //! use workers; timers and non-position dynamic state do not survive a restart.
 use super::*;
 use std::collections::{BTreeMap, HashSet, VecDeque};
@@ -52,7 +54,7 @@ impl System {
     pub fn new(id: i64, registry: Arc<Pilots>, unix_ms: i64) -> Self {
         let current_time = unix_ms.div_euclid(MILLISECONDS_PER_SECOND);
         Self { id, registry, ms: unix_ms, current_time,
-            next_tick_ms: Some((current_time + 1) * MILLISECONDS_PER_SECOND), ..Self::default() }
+            next_tick_ms: Some(next_aligned_ms(unix_ms, MILLISECONDS_PER_SECOND)), ..Self::default() }
     }
     pub fn current_time(&self) -> i64 { self.current_time }
     /// Schedule relative to this actor's current millisecond clock. Due timers
@@ -167,7 +169,7 @@ impl System {
         } else { 0 };
         let steps = if due > MAX_CATCHUP_STEPS {
             tracing::warn!(system = self.id, due, "destiny tick catchup clamped");
-            self.next_tick_ms = Some(ms.saturating_add(MILLISECONDS_PER_SECOND));
+            self.next_tick_ms = Some(next_aligned_ms(ms, MILLISECONDS_PER_SECOND));
             1
         } else {
             self.next_tick_ms = Some(next_tick_ms + due * MILLISECONDS_PER_SECOND);

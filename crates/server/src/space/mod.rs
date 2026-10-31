@@ -16,9 +16,10 @@
 //! GOTO stores an absolute point; direction commands project from the current position.
 //!
 //! Celestials come from the SDE; dynamic balls stay in memory. Each system
-//! owns an actor with 100 ms timers and NPC decisions. Destiny actions retain the
-//! enqueue-time logical stamp and apply before fixed one-second motion; late
-//! catchup is bounded. NPC effects and deferred jobs run outside the actor.
+//! owns an actor with wall-aligned 100 ms timers and NPC decisions. Destiny actions
+//! retain the enqueue-time logical stamp and apply before fixed one-second motion.
+//! Catchup is bounded; after a clamp the next whole wall second is used, deliberately
+//! differing from carbon's post-stall deadline. NPC effects and deferred jobs run outside the actor.
 //! Timers fire on ticks in deadline and scheduling order; missile flight timers start
 //! when the launch action applies. Timers are not persistent.
 //! Changed pilot positions are periodically saved to game.items and flushed at shutdown.
@@ -157,6 +158,10 @@ pub fn lock_time_ms(scan_resolution: f64, signature_radius: f64) -> u64 {
 /// Simulation clock in Unix milliseconds (not a Destiny event stamp).
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64
+}
+/// Strictly next wall-clock boundary for a positive interval in milliseconds.
+fn next_aligned_ms(unix_ms: i64, interval_ms: i64) -> i64 {
+    unix_ms.saturating_add(interval_ms - unix_ms.rem_euclid(interval_ms))
 }
 
 

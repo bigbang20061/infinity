@@ -1,4 +1,4 @@
-//! Per-system unbounded closure mailbox and 100 ms timer/NPC driver.
+//! Per-system unbounded closure mailbox and wall-aligned 100 ms timer/NPC driver.
 //! Destiny motion advances only on whole-second boundaries; no database or protocol decoding.
 //! NPC effects are sequential; deferred jobs run concurrently outside the actor.
 use super::*;
@@ -41,6 +41,16 @@ pub(super) async fn after(handle: Option<SystemHandle>, delay_ms: u64) -> bool {
     }
     rx.await.is_ok()
 }
+fn aligned_interval(wall_ms: i64, instant: Instant) -> tokio::time::Interval {
+    let offset = next_aligned_ms(wall_ms, TICK_INTERVAL_MS as i64) - wall_ms;
+    let mut interval = tokio::time::interval_at(
+        instant + Duration::from_millis(offset as u64),
+        Duration::from_millis(TICK_INTERVAL_MS),
+    );
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    interval
+}
+
 pub(super) fn start(mut system: System, id: i64, systems: Weak<Mutex<HashMap<i64, SystemHandle>>>, db: Db) -> SystemHandle {
     npc::start_worker(&mut system);
     let (tx, mut rx) = mpsc::unbounded_channel::<Job>();
@@ -50,8 +60,7 @@ pub(super) fn start(mut system: System, id: i64, systems: Weak<Mutex<HashMap<i64
         tx: handle.tx.downgrade(), gate: handle.gate.clone(), written: handle.written.clone(), db,
     });
     let task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(TICK_INTERVAL_MS));
-        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut interval = aligned_interval(now_ms(), Instant::now());
         loop {
             tokio::select! {
                 message = rx.recv() => match message {
