@@ -21,6 +21,7 @@ pub(crate) mod mining;
 pub(crate) mod pending_reloads;
 pub(crate) mod positions;
 pub(crate) mod quantities;
+pub(crate) mod repair;
 pub(crate) mod ship;
 pub(crate) mod social;
 pub(crate) mod transfers;

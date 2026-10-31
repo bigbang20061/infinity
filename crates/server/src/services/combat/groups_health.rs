@@ -118,6 +118,16 @@ pub(super) struct ShipStats {
     pub(super) shield_tau_ms: f64,
 }
 
+impl ShipStats {
+    pub(super) fn from_fit(fit: &Fit) -> Self {
+        Self {
+            max: ATTR_HP.map(|a| fit.value(Key::Ship, a)),
+            resonance: ATTR_RESONANCE.map(|layer| layer.map(|a| fit.value(Key::Ship, a))),
+            shield_tau_ms: fit.value(Key::Ship, ATTR_SHIELD_RECHARGE_RATE),
+        }
+    }
+}
+
 /// A player ship's condition: shield (recharging since `shield_at`), armor and structure left.
 #[derive(Clone)]
 pub(super) struct Condition {
@@ -128,11 +138,7 @@ pub(super) struct Condition {
 
 pub(super) async fn ship_stats(db: &Db, world: &World, system: i64, char_id: i64, ship: i64) -> Result<ShipStats, CallError> {
     let fit = Fit::load_in_space(db, world, system, char_id, ship).await?;
-    Ok(ShipStats {
-        max: ATTR_HP.map(|a| fit.value(Key::Ship, a)),
-        resonance: ATTR_RESONANCE.map(|layer| layer.map(|a| fit.value(Key::Ship, a))),
-        shield_tau_ms: fit.value(Key::Ship, ATTR_SHIELD_RECHARGE_RATE),
-    })
+    Ok(ShipStats::from_fit(&fit))
 }
 
 /// (shieldCharge, armorDamage, damage) of a ship that has taken damage since it was last
@@ -212,6 +218,10 @@ pub(super) async fn damage_npc(db: &Db, world: &World, system: i64, target: i64,
 /// Damage a player's ship; at zero structure it explodes and its pilot is told to eject
 /// (`__ship_destroyed`, handled by the pilot's connection).
 pub(super) async fn damage_player(db: &Db, world: &World, system: i64, ship: i64, char_id: i64, raw: [f64; 4], attacker: Option<i64>) -> Result<f64, CallError> {
+    let _lock = super::super::market::lock().await;
+    if world.ball(system, ship).await.is_none_or(|ball| ball.char_id != Some(char_id)) {
+        return Ok(0.0);
+    }
     // Resistances and hit points as fitted right now (hardeners running, modules offline...).
     let stats = ship_stats(db, world, system, char_id, ship).await?;
     let known = state().condition.get(&ship).cloned();
@@ -264,6 +274,10 @@ pub(crate) async fn damage(db: &Db, world: &World, system: i64, target: i64, tar
 
 /// Repair a player's ship layer (0 shield, 1 armor, 2 structure) by `amount`.
 pub(crate) async fn repair_player(db: &Db, world: &World, system: i64, ship: i64, char_id: i64, layer: usize, amount: f64) -> Result<(), CallError> {
+    let _lock = super::super::market::lock().await;
+    if world.ball(system, ship).await.is_none_or(|ball| ball.char_id != Some(char_id)) {
+        return Ok(());
+    }
     let known = state().condition.get(&ship).cloned();
     // An undamaged ship has nothing to repair.
     let Some(mut cond) = known else { return Ok(()) };
@@ -287,32 +301,40 @@ pub(crate) async fn repair_player(db: &Db, world: &World, system: i64, ship: i64
 }
 /// Set the damage fraction of selected layers of the active player ship.
 pub(crate) async fn set_damage(c: &Client, system: i64, ship: i64, char_id: i64, layers: [bool; 3], fraction: f64) -> Result<(), CallError> {
+    let _lock = super::super::market::lock().await;
+    if c.world.ball(system, ship).await.is_none_or(|ball| ball.char_id != Some(char_id)) {
+        return Ok(());
+    }
     let stats = ship_stats(&c.db, &c.world, system, char_id, ship).await?;
     let now = filetime_now();
-    let mut st = state();
-    let mut cond = st.condition.get(&ship).cloned().unwrap_or_else(|| Condition {
+    let mut cond = state().condition.get(&ship).cloned().unwrap_or_else(|| Condition {
         now: stats.max, stats: stats.clone(), shield_at: now,
     });
     cond.now[0] = recharge(cond.now[0], cond.stats.max[0], cond.stats.shield_tau_ms, (now - cond.shield_at) as f64 / FILETIME_SECOND as f64);
     let old = cond.now;
-    cond.now = set_damage_layers(cond.now, stats.max, layers, fraction);
+    let old_max = cond.stats.max;
+    cond.now = set_damage_layers(cond.now, old_max, stats.max, layers, fraction);
     let max = stats.max;
     cond.stats = stats;
     cond.shield_at = now;
+    save_condition_locked(&c.db, ship, &cond).await?;
     let changes = vec![
         attribute_change(char_id, Value::Int(ship), ATTR_SHIELD_CHARGE, Value::Float(cond.now[0]), Value::Float(old[0])),
-        attribute_change(char_id, Value::Int(ship), ATTR_ARMOR_DAMAGE, Value::Float(max[1] - cond.now[1]), Value::Float(max[1] - old[1])),
-        attribute_change(char_id, Value::Int(ship), ATTR_HULL_DAMAGE, Value::Float(max[2] - cond.now[2]), Value::Float(max[2] - old[2])),
+        attribute_change(char_id, Value::Int(ship), ATTR_ARMOR_DAMAGE, Value::Float(max[1] - cond.now[1]), Value::Float(old_max[1] - old[1])),
+        attribute_change(char_id, Value::Int(ship), ATTR_HULL_DAMAGE, Value::Float(max[2] - cond.now[2]), Value::Float(old_max[2] - old[2])),
     ];
     let health = [0, 1, 2].map(|i| if max[i] > 0.0 { (cond.now[i] / max[i]).clamp(0.0, 1.0) } else { 0.0 });
-    st.condition.insert(ship, cond);
-    drop(st);
+    state().condition.insert(ship, cond);
     c.world.notify_pilot(char_id, "OnModuleAttributeChanges", vec![Value::List(changes)]);
     c.world.set_health(system, ship, health);
     Ok(())
 }
-fn set_damage_layers(now: [f64; 3], max: [f64; 3], layers: [bool; 3], fraction: f64) -> [f64; 3] {
-    [0, 1, 2].map(|i| if layers[i] { max[i] * (1.0 - fraction) } else { now[i].min(max[i]) })
+fn set_damage_layers(now: [f64; 3], old_max: [f64; 3], max: [f64; 3], layers: [bool; 3], fraction: f64) -> [f64; 3] {
+    [0, 1, 2].map(|i| {
+        if layers[i] { max[i] * (1.0 - fraction) }
+        else if i == 0 { now[i].min(max[i]) }
+        else { (max[i] - (old_max[i] - now[i])).clamp(0.0, max[i].max(0.0)) }
+    })
 }
 
 

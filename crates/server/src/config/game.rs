@@ -45,6 +45,8 @@ pub struct GameConfig {
     pub store: economy::StoreConfig,
     /// Industry policy.
     pub industry: economy::IndustryConfig,
+    /// Station repair policy.
+    pub repair: economy::RepairConfig,
     /// Missions policy.
     pub missions: world::MissionsConfig,
     /// Standings policy.
@@ -84,6 +86,7 @@ impl GameConfig {
         self.trade.validate()?;
         self.store.validate()?;
         self.industry.validate()?;
+        self.repair.validate()?;
         self.missions.validate()?;
         self.standings.validate()?;
         self.combat.validate()?;

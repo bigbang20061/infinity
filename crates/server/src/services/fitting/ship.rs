@@ -1,5 +1,6 @@
 //! Station ship boarding and assembly, mirroring the client ship service.
 //! Uses game items and characters; corporation and structure access is unsupported.
+//! Boarding saves the previous ship's condition and loads the new ship's dogma overrides.
 use crate::services::dogma::ship_state;
 use crate::services::inventory::notify_item_change;
 use crate::services::{db_err, user_error, value_ids, Call, CallResult};
@@ -28,6 +29,10 @@ async fn board(c: &mut Client, ship_id: i64) -> CallResult {
     if !ship.singleton {
         return Err(user_error(messages::MSG_CANT_BOARD_UNASSEMBLED_SHIP, vec![]));
     }
+    if let Some(old) = c.session.int("shipid") {
+        crate::services::combat::save_condition(&c.db, old).await?;
+    }
+    crate::services::combat::load_docked_condition(&c.db, &c.world, char_id, ship_id).await?;
     crate::dao::characters::selection::set_ship(&c.db, char_id, ship_id).await.map_err(db_err)?;
     info!(user = c.login.user_id, "character {char_id} boarded ship {ship_id}");
     c.change_session(vec![("shipid", Value::Int(ship_id))]);

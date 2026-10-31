@@ -3,6 +3,7 @@
 //! `eve/client/script/remote/michelle.py`; gate destinations are consumed by
 //! `eve/client/script/parklife/autopilot.py`. Ship attributes and celestial
 //! data come from the SDE; locations are persisted in game tables.
+//! Ship shield, armor and hull condition are persisted in item dogma overrides.
 //!
 //! Movement commands apply at destiny boundaries; jump waits and arrival cloak
 //! expiry use the actor tick. Gate range and live warp targets use positions
@@ -87,6 +88,7 @@ pub(super) async fn ship_ball(c: &Client, ship_id: i64, pos: [f64; 3]) -> Result
     let mass = fitted(ATTR_MASS, mass);
     let radius = r.radius.unwrap_or(DEFAULT_SHIP_RADIUS) as f32;
     let security = super::crimewatch::security_status(&c.db, char_id).await?;
+    let health = super::combat::load_condition_with_fit(&c.db, ship_id, &fit).await?;
     Ok(Ball {
         id: ship_id,
         type_id,
@@ -118,7 +120,7 @@ pub(super) async fn ship_ball(c: &Client, ship_id: i64, pos: [f64; 3]) -> Result
         effect_stamp: 0,
         cloak: 0,
         cloak_until: 0,
-        health: [1.0; 3],
+        health,
         launcher: 0,
         slim: vec![("securityStatus", Value::Float(security))],
     })
@@ -139,15 +141,28 @@ fn check_weapons_timer(c: &Client, what: &str) -> Result<(), CallError> {
     }
 }
 
+/// Quiesce condition mutations before removing the ball and capturing its final state.
+async fn remove_and_save(c: &Client, system: i64, ship: i64) -> Result<(), CallError> {
+    let ball = {
+        let _lock = super::market::lock().await;
+        c.world.remove_ball(system, ship).await
+    }.ok_or_else(|| CallError::Internal(anyhow::anyhow!("ship {ship} is no longer in system {system}")))?;
+    if let Err(error) = super::combat::save_condition(&c.db, ship).await {
+        if let Err(restore) = c.world.add_ship(system, ball).await {
+            tracing::warn!(ship, %restore, "failed to restore ship after condition save failure");
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
 async fn dock(c: &mut Client, station: i64) -> CallResult {
     let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) else {
         return Err(CallError::User { msg: messages::MSG_DOCKING_REQUEST_DENIED.into(), dict: vec![] });
     };
     check_weapons_timer(c, messages::WEAPONS_TIMER_DOCK)?;
     super::combat::reset(c);
-    // Station services patch the ship up.
-    super::combat::repair(ship);
-    c.world.remove_ball(system, ship).await;
+    remove_and_save(c, system, ship).await?;
     c.world.unobserve(c.login.client_id);
     item_dao::dock(&c.db, ship, station, FLAG_HANGAR).await.map_err(db_err)?;
     character_dao::dock(&c.db, c.session.int("charid").unwrap_or(0), station, system).await.map_err(db_err)?;
@@ -268,7 +283,7 @@ pub(super) async fn jump_out_and_arrive(c: &mut Client, system: i64, ship: i64, 
     }
 
     super::combat::reset(c);
-    c.world.remove_ball(system, ship).await;
+    remove_and_save(c, system, ship).await?;
     c.world.unobserve(c.login.client_id);
     item_dao::position(&c.db, ship, dest_system, pos).await.map_err(db_err)?;
     character_dao::location(&c.db, char_id, dest_system, constellation, region).await.map_err(db_err)?;
@@ -335,7 +350,7 @@ pub(super) async fn teleport(c: &mut Client, dest_system: i64, pos: V3) -> Resul
     };
     c.world.system(dest_system).await.map_err(CallError::Internal)?;
     super::combat::reset(c);
-    c.world.remove_ball(system, ship).await;
+    remove_and_save(c, system, ship).await?;
     item_dao::position(&c.db, ship, dest_system, pos).await.map_err(db_err)?;
     let ball = ship_ball(c, ship, pos).await?;
     if dest_system == system {

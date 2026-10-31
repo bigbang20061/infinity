@@ -10,6 +10,23 @@ const MAX_STARTING_PLEX: i64 = i64::MAX;
 
 /// 15 significant digits (f64 DBL_DIG): the largest two-decimal amount that survives decimal → f64 → PostgreSQL float8::numeric unchanged.
 const MAX_STARTING_ISK: f64 = 9_999_999_999_999.99;
+/// Station repair pricing policy.
+#[derive(Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RepairConfig {
+    /// Server policy: multiplier applied to computed base price per hitpoint.
+    pub cost_multiplier: f64,
+}
+impl Default for RepairConfig {
+    fn default() -> Self { Self { cost_multiplier: 1.0 } }
+}
+impl RepairConfig {
+    pub(super) fn validate(&self) -> Result<()> {
+        anyhow::ensure!(self.cost_multiplier.is_finite() && self.cost_multiplier > 0.0, "repair.cost_multiplier must be finite and positive");
+        Ok(())
+    }
+}
+
 
 /// Direct trade policy.
 #[derive(Clone, PartialEq, Deserialize)]
