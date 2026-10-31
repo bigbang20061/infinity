@@ -205,6 +205,8 @@ pub struct Ball {
     pub free: bool,
     pub global: bool,
     pub massive: bool,
+    /// Destiny isInteractive, independent of movement; Partitionable.cpp AddBall and Thunkers WriteBallToStream.
+    pub interactive: bool,
     pub warp: Option<Warp>,
     pub warp_factor: i64,
     /// Last integration time in logical destiny milliseconds.
@@ -277,7 +279,7 @@ impl Ball {
         (if self.free { FLAG_FREE } else { 0 })
             | (if self.global { FLAG_GLOBAL } else { 0 })
             | (if self.massive { FLAG_MASSIVE } else { 0 })
-            | if self.free { FLAG_INTERACTIVE } else { 0 }
+            | if self.interactive { FLAG_INTERACTIVE } else { 0 }
     }
 
     /// Ballpark::WriteBallToStream (no miniballs, no dynamical orientation).
@@ -625,6 +627,7 @@ impl World {
                     free: false,
                     global: true,
                     massive: true,
+                    interactive: false,
                     warp: None,
                     warp_factor: 0,
                     last_ms: tick,

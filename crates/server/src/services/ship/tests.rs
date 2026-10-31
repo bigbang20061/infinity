@@ -17,7 +17,7 @@ fn ship() -> Ball {
         segment_target: Some([11.0, 12.0, 13.0]),
         segment_warp: Some(Warp { from: [1.0; 3], to: [2.0; 3], start: 10, duration: 20.0, factor: 3 }),
         goto: [0.0; 3], follow_id: 0, follow_range: 0.0,
-        free: true, global: false, massive: false,
+        free: true, global: false, massive: false, interactive: false,
         warp: Some(Warp { from: [1.0; 3], to: [2.0; 3], start: 10, duration: 20.0, factor: 3 }),
         warp_factor: 3000, last_ms: 1000, interpolation_anchor_ms: 500, effect_stamp: 42,
         cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: vec![],

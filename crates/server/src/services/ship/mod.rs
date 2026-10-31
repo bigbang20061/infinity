@@ -105,6 +105,7 @@ pub(super) async fn ship_ball(c: &Client, ship_id: i64, pos: [f64; 3]) -> Result
         free: true,
         global: false,
         massive: true,
+        interactive: true,
         warp: None,
         warp_factor: ((warp_mult * base_warp * 1000.0).round() as i64).max(500),
         last_ms: now_ms(),

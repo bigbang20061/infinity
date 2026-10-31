@@ -147,6 +147,7 @@ fn rock_ball(id: i64, type_id: i32, pos: V3, radius: f32) -> Ball {
         free: false,
         global: false,
         massive: true,
+        interactive: false,
         warp: None,
         warp_factor: 0,
         last_ms: now_ms(),

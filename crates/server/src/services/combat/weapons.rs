@@ -264,6 +264,7 @@ pub(super) async fn launch_missile(db: Db, world: Arc<World>, system: i64, from:
         free: true,
         global: false,
         massive: false,
+        interactive: false,
         warp: None,
         warp_factor: 0,
         last_ms: launch_ms,
