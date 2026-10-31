@@ -15,6 +15,7 @@ pub(crate) mod propulsion;
 pub(crate) mod weapons;
 pub(crate) mod hacking;
 pub(crate) mod lifecycle;
+mod behaviors;
 pub(crate) mod online;
 pub(crate) mod fitting;
 mod repair;
