@@ -35,10 +35,10 @@
 //! - beyonce.CmdWarpToStuff('scan', targetID); wormholeMgr.WormholeJump(wormholeID).
 
 mod scan_mgr;
-mod wormhole_mgr;
+pub(crate) mod wormhole_mgr;
 mod generation;
 mod scanning;
-mod sites;
+pub(crate) mod sites;
 mod landing;
 
 use generation::*;
@@ -53,6 +53,7 @@ use crate::db::executor::Executor;
 use crate::db::outbox::{dispatch_client, Effect, Outbox};
 use crate::messages;
 use crate::sde::Sde;
+use crate::services::fit::PERCENT_SCALE;
 use crate::space::{dist, kg_to_tonnes, minutes_to_seconds, now_ms, seconds_to_ms, Ball, World, MODE_RIGID, V3};
 use marshal::Value;
 use std::collections::{HashMap, HashSet};
@@ -646,7 +647,8 @@ pub(super) async fn gm_sites(c: &mut Client) -> Result<String, CallError> {
             _ => messages::GM_SITE_COMBAT.into(),
         };
         let kind = if s.kind == Kind::Anomaly { messages::GM_SITE_ANOMALY } else { messages::GM_SITE_SIGNATURE };
-        lines.push(messages::gm_site_row(&s.target, kind, &what, name));
+        let strength = (s.kind == Kind::Signature).then_some(s.ease * PERCENT_SCALE);
+        lines.push(messages::gm::gm_site_row_strength(&s.target, kind, &what, name, strength));
     }
     lines.sort();
     Ok(lines.join("\n"))

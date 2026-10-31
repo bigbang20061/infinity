@@ -33,17 +33,17 @@ pub(super) enum Target { Ship, Item(i64), Flag(i32) }
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum Action<'a> { List, Query(&'a str), Reset(&'a str), Set(&'a str, f64) }
 
-pub(super) fn parse<'a>(args: &[&'a str]) -> Option<(Target, Action<'a>)> {
-    let target = match *args.first()? {
+pub(super) fn parse(args: &[String]) -> Option<(Target, Action<'_>)> {
+    let target = match args.first()?.as_str() {
         "ship" => Target::Ship,
         s if s.starts_with("flag:") => Target::Flag(s[5..].parse::<i32>().ok().filter(|v| *v >= 0)?),
         s => Target::Item(s.parse::<i64>().ok().filter(|v| *v > 0)?),
     };
     let action = match &args[1..] {
-        ["list"] => Action::List,
+        [attr] if attr == "list" => Action::List,
         [attr] if !attr.is_empty() => Action::Query(attr),
-        [attr, "reset"] if !attr.is_empty() && *attr != "list" => Action::Reset(attr),
-        [attr, value] if !attr.is_empty() && *attr != "list" => {
+        [attr, value] if !attr.is_empty() && attr != "list" && value == "reset" => Action::Reset(attr),
+        [attr, value] if !attr.is_empty() && attr != "list" => {
             let value = value.parse::<f64>().ok().filter(|v| v.is_finite())?;
             Action::Set(attr, value)
         }
@@ -82,7 +82,7 @@ fn drone_query_key(item: &Item, action: Action<'_>, char_id: Option<i64>) -> Opt
         && char_id == Some(item.owner_id)).then_some(Key::Drone(item.item_id))
 }
 
-pub(super) async fn command(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
+pub(super) async fn command(c: &mut Client, args: &[String]) -> Result<String, CallError> {
     let (target, action) = parse(args).ok_or_else(|| slash_error(messages::gm::GM_DOGMA_USAGE.into()))?;
     let ship = c.session.int("shipid");
     let modules = if let Some(ship) = ship { fit_dao::modules(&c.db, ship).await.map_err(db_err)? } else { Vec::new() };

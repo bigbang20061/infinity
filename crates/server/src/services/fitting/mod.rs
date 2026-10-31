@@ -13,7 +13,7 @@
 //! Corporation, array and player-structure access is not modeled.
 
 
-mod ship;
+pub(super) mod ship;
 mod repackaging_svc;
 mod char_fitting_mgr;
 mod corp_fitting_mgr;

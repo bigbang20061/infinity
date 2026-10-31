@@ -25,6 +25,10 @@ pub(crate) async fn split(ex: &(impl Executor + ?Sized), item: &Item, quantity: 
 }
 pub(crate) async fn delete(ex: &(impl Executor + ?Sized), id: i64) -> Result<(), Error> { ex.execute("DELETE FROM game.items WHERE item_id = $1", &[&id]).await?; Ok(()) }
 pub(crate) async fn slot_flags(ex: &(impl Executor + ?Sized), ship: i64) -> Result<Vec<SlotFlag>, Error> { Ok(ex.query("SELECT flag_id FROM game.items WHERE location_id = $1", &[&ship]).await?.iter().map(SlotFlag::from_row).collect()) }
-pub(crate) async fn move_item(ex: &(impl Executor + ?Sized), id: i64, location: i64, flag: i32, owner: i64, singleton: bool, fitting: bool) -> Result<(), Error> { ex.execute("UPDATE game.items SET location_id = $2, flag_id = $3, owner_id = $4, singleton = $5,
-                                online = online AND $6, x = NULL, y = NULL, z = NULL WHERE item_id = $1", &[&id, &location, &flag, &owner, &singleton, &fitting]).await?; Ok(()) }
+pub(crate) async fn move_item(ex: &(impl Executor + ?Sized), item: &Item, location: i64, flag: i32, owner: i64, singleton: bool, fitting: bool) -> Result<bool, Error> {
+    Ok(ex.execute("UPDATE game.items SET location_id = $2, flag_id = $3, owner_id = $4, singleton = $5,
+                   online = online AND $6, x = NULL, y = NULL, z = NULL
+                   WHERE item_id = $1 AND owner_id = $7 AND location_id = $8 AND flag_id = $9 AND quantity = $10 AND singleton = $11",
+        &[&item.item_id, &location, &flag, &owner, &singleton, &fitting, &item.owner_id, &item.location_id, &item.flag_id, &item.quantity, &item.singleton]).await? != 0)
+}
 pub(crate) async fn rename(ex: &(impl Executor + ?Sized), id: i64, name: &str, owner: i64) -> Result<(), Error> { ex.execute("UPDATE game.items SET name = $2 WHERE item_id = $1 AND owner_id = $3", &[&id, &name, &owner]).await?; Ok(()) }

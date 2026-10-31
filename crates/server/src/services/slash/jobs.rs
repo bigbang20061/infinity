@@ -6,11 +6,11 @@ use crate::{client::filetime_now, dao::jobs, db::{Db, Error}, messages, schedule
 #[derive(Debug, PartialEq, Eq)]
 enum Command<'a> { List, Retry(&'a str), Cancel(&'a str) }
 
-fn parse<'a>(args: &[&'a str]) -> Option<Command<'a>> {
+fn parse(args: &[String]) -> Option<Command<'_>> {
     match args {
         [] => Some(Command::List),
-        ["retry", id] if !id.is_empty() => Some(Command::Retry(id)),
-        ["cancel", id] if !id.is_empty() => Some(Command::Cancel(id)),
+        [action, id] if action.as_str() == "retry" && !id.is_empty() => Some(Command::Retry(id.as_str())),
+        [action, id] if action.as_str() == "cancel" && !id.is_empty() => Some(Command::Cancel(id.as_str())),
         _ => None,
     }
 }
@@ -34,7 +34,7 @@ async fn retry(db: &Db, id: &str) -> Result<bool, Error> {
     ).await
 }
 
-pub(super) async fn command(db: &Db, args: &[&str]) -> Result<String, CallError> {
+pub(super) async fn command(db: &Db, args: &[String]) -> Result<String, CallError> {
     match parse(args).ok_or_else(|| slash_error(messages::scheduler::USAGE.into()))? {
         Command::List => {
             let counts = jobs::counts(db).await.map_err(db_err)?;

@@ -331,8 +331,6 @@ pub(crate) const GM_SITE_COMBAT: &str = "combat";
 pub(crate) const GM_SITE_ANOMALY: &str = "anomaly";
 /// Signature label in a GM site list.
 pub(crate) const GM_SITE_SIGNATURE: &str = "signature";
-/// A row in a GM site list.
-pub(crate) fn gm_site_row(target: &str, kind: &str, what: &str, name: &str) -> String { format!("{} {kind} {what} {}", target, name) }
 
 // Fitting (services/fitting.rs)
 /// Insufficient item quantity.

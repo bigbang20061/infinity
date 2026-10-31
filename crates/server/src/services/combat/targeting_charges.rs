@@ -105,14 +105,24 @@ pub(crate) async fn loaded(db: &(impl Executor + ?Sized), ship: i64, flag: i32) 
 
 use super::super::items::deposit;
 
-/// Modules of a weapon group, master first.
+/// Modules of a weapon group, master first. The input must be the master.
 pub(crate) async fn bank(db: &(impl Executor + ?Sized), ship: i64, master: i64) -> Result<Vec<i64>, CallError> {
     let rows = crate::dao::items::charges::slaves(db, ship, master).await.map_err(db_err)?;
     Ok(std::iter::once(master).chain(rows.iter().map(|r| r.slave_id)).collect())
 }
 
+/// Resolve a bank member to its master, or return an ungrouped module unchanged.
+pub(in crate::services) async fn master_for_member(ex: &(impl Executor + ?Sized), ship: i64, member: i64) -> Result<i64, CallError> {
+    let rows = crate::dao::items::charges::banks(ex, ship).await.map_err(db_err)?;
+    Ok(bank_master(&rows, member))
+}
+
+fn bank_master(rows: &[crate::dao::items::charges::Bank], member: i64) -> i64 {
+    rows.iter().find(|row| row.slave_id == member).map_or(member, |row| row.master_id)
+}
+
 /// Empty a module's charges into `location`/`flag` (cargo by default).
-pub(super) async fn unload<X: Send>(db: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<X>, owner: i64, ship: i64, module: &Item, location: i64, flag: i32) -> Result<(), CallError> {
+pub(in crate::services) async fn unload<X: Send>(db: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<X>, owner: i64, ship: i64, module: &Item, location: i64, flag: i32) -> Result<(), CallError> {
     let Some((type_id, qty)) = loaded(db, ship, module.flag_id).await? else { return Ok(()) };
     crate::dao::items::combat::delete_charge(db, ship, module.flag_id).await.map_err(db_err)?;
     outbox.notify_client("OnModuleAttributeChanges", vec![quantity_change(owner, ship, module.flag_id, type_id, 0, qty as i64)]);
@@ -137,6 +147,19 @@ pub(super) async fn load_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
     let modules = module_ids(call.args.get(1));
     let charge_ids = value_id_list(call.args.get(2));
     let charge_location = call.args.get(3).and_then(|v| v.as_int());
+    load_ammo_core(c, ship, modules, charge_ids, charge_location).await
+}
+
+pub(in crate::services) async fn load_ammo_core(c: &mut Client, ship: i64, modules: Vec<i64>, charge_ids: Vec<i64>, charge_location: Option<i64>) -> CallResult {
+    load_ammo_impl(c, ship, modules, charge_ids, charge_location, None).await.map(|_| Value::None)
+}
+
+/// Generate a charge stack in the same transaction that reserves it for reload.
+pub(in crate::services) async fn gm_load_ammo(c: &mut Client, ship: i64, modules: Vec<i64>, source: i64, type_id: i32, quantity: i32) -> Result<usize, CallError> {
+    load_ammo_impl(c, ship, modules, Vec::new(), Some(source), Some((type_id, quantity))).await
+}
+
+async fn load_ammo_impl(c: &mut Client, ship: i64, modules: Vec<i64>, charge_ids: Vec<i64>, charge_location: Option<i64>, generated: Option<(i32, i32)>) -> Result<usize, CallError> {
     let active_ship = c.session.int("shipid");
     let station = c.session.int("stationid");
     let session_owner = c.session.int("charid");
@@ -147,7 +170,7 @@ pub(super) async fn load_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
     let loads = db.transaction(
         |tx, outbox: &mut Outbox| {
             let modules = modules.clone();
-            let charge_ids = charge_ids.clone();
+            let mut charge_ids = charge_ids.clone();
             let sde = sde.clone();
             Box::pin(async move {
                 let refuse = || notify_error(messages::INSUFFICIENT_AMMUNITION);
@@ -178,9 +201,16 @@ pub(super) async fn load_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
                     }
                     if is_ship { &[FLAG_CARGO, FLAG_AMMO_HOLD, FLAG_FLEET_HANGAR] } else { &[FLAG_HANGAR] }
                 };
+                if let Some((type_id, quantity)) = generated {
+                    let flag = if station == Some(source) { FLAG_HANGAR } else { FLAG_CARGO };
+                    let id = crate::dao::items::transfers::insert(tx, type_id, owner, source, flag, quantity).await.map_err(db_err)?;
+                    notify_item_change(tx, &sde, outbox, id, vec![(IX_LOCATION_ID, Value::Int(0))]).await?;
+                    charge_ids.push(id);
+                }
                 let mut all = Vec::new();
                 for m in modules {
-                    for id in bank(tx, ship, m).await? {
+                    let master = if generated.is_some() { master_for_member(tx, ship, m).await? } else { m };
+                    for id in bank(tx, ship, master).await? {
                         if !all.contains(&id) { all.push(id); }
                     }
                 }
@@ -230,9 +260,9 @@ pub(super) async fn load_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
                         }
                         None => 0,
                     };
-                    let need = reserve_quantities(&mut items, &selected, type_id, max.saturating_sub(have));
-                    let now = max - need;
-                    if now > have { loads.push((module_id, module.flag_id, type_id, now, have)); }
+                    if let Some(now) = reserve_load(&mut items, &selected, type_id, max, have) {
+                        loads.push((module_id, module.flag_id, type_id, now, have));
+                    }
                 }
                 let changes = items.iter().filter_map(|(&id, (item, quantity))| {
                     (*quantity != item.quantity).then(|| (id, QuantityChange::new(item, (*quantity > 0).then_some(*quantity))))
@@ -262,45 +292,60 @@ pub(super) async fn load_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
         },
         |value, outbox| async move { dispatch_client(value, outbox, client) },
     ).await?;
-    let Some(&(first, _, type_id, _, _)) = loads.first().map(|pending| &pending.load) else { return Ok(Value::None) };
+    let count = loads.len();
+    if loads.is_empty() { return Ok(0); }
     let notify = c.notify_tx.clone();
     if c.session.int("solarsystemid").is_none() {
         apply_loads(&db, &c.world, &notify, ship, loads).await?;
-        return Ok(Value::None);
+        return Ok(count);
     }
-    let reload_ms = match Fit::load(&c.db, c.sde.clone(), owner, ship).await?.value(Key::Module(first), ATTR_RELOAD_TIME) {
-        ms if ms > 0.0 => ms,
-        _ => DEFAULT_RELOAD_MS,
+    let fit = Fit::load(&c.db, c.sde.clone(), owner, ship).await?;
+    let groups = if generated.is_some() {
+        group_loads(loads, |module| fit.value(Key::Module(module), ATTR_RELOAD_TIME))
+    } else {
+        let first = loads[0].load;
+        let ms = match fit.value(Key::Module(first.0), ATTR_RELOAD_TIME) { ms if ms > 0.0 => ms, _ => DEFAULT_RELOAD_MS };
+        BTreeMap::from([((filetime_ticks_from_ms(ms), first.2), loads.into_iter().map(|load| (load, ms)).collect())])
     };
     let start = filetime_now();
-    let until = start + filetime_ticks_from_ms(reload_ms);
-    let ids: Vec<i64> = loads.iter().map(|l| l.load.0).collect();
-    {
-        let mut st = state();
-        for id in &ids {
-            st.reloading.insert(*id, until);
-        }
-    }
-    // (moduleIDs, chargeTypeID, reloadTime ms): the HUD's reload ramp and "done in N s" message.
-    c.notify("OnChargeBeingLoadedToModule", vec![Value::list(ids.iter().map(|i| Value::Int(*i))), Value::Int(type_id as i64), Value::Int(reload_ms as i64)]);
-    let timers = ids.iter().map(|i| attribute_change(owner, Value::Int(*i), ATTR_NEXT_ACTIVATION_TIME, Value::Int(until), Value::Int(start))).collect();
-    c.notify("OnModuleAttributeChanges", vec![Value::List(timers)]);
-    info!(user = c.login.user_id, "reloading {} module(s) with {type_id} in {reload_ms:.0} ms", ids.len());
     let system = c.session.int("solarsystemid").unwrap();
-    let world = c.world.clone();
-    c.world.schedule(system, seconds_to_ms(ms_to_seconds(reload_ms)), move |s| {
-        s.defer(async move {
-            if let Err(e) = apply_loads(&db, &world, &notify, ship, loads).await {
-                warn!("reload of {ids:?} failed: {}", match e {
-                    CallError::Internal(e) => format!("{e:#}"),
-                    CallError::User { msg, .. } => msg,
-                });
-            }
+    for ((ticks, type_id), loads) in groups {
+        let until = start + ticks;
+        let reload_ms = loads[0].1;
+        let loads: Vec<_> = loads.into_iter().map(|(load, _)| load).collect();
+        let ids: Vec<i64> = loads.iter().map(|l| l.load.0).collect();
+        {
             let mut st = state();
-            clear_reload_markers(&mut st.reloading, &ids, until);
+            for id in &ids { st.reloading.insert(*id, until); }
+        }
+        // (moduleIDs, chargeTypeID, reloadTime ms): the HUD's reload ramp.
+        c.notify("OnChargeBeingLoadedToModule", vec![Value::list(ids.iter().map(|i| Value::Int(*i))), Value::Int(type_id as i64), Value::Int(reload_ms as i64)]);
+        let timers = ids.iter().map(|i| attribute_change(owner, Value::Int(*i), ATTR_NEXT_ACTIVATION_TIME, Value::Int(until), Value::Int(start))).collect();
+        c.notify("OnModuleAttributeChanges", vec![Value::List(timers)]);
+        info!(user = c.login.user_id, "reloading {} module(s) with {type_id} in {reload_ms:.0} ms", ids.len());
+        let world = c.world.clone();
+        let db = db.clone();
+        let notify = notify.clone();
+        c.world.schedule(system, seconds_to_ms(ms_to_seconds(reload_ms)), move |s| {
+            s.defer(async move {
+                if let Err(e) = apply_loads(&db, &world, &notify, ship, loads).await {
+                    warn!("reload of {ids:?} failed: {}", match e {
+                        CallError::Internal(e) => format!("{e:#}"),
+                        CallError::User { msg, .. } => msg,
+                    });
+                }
+                let mut st = state();
+                clear_reload_markers(&mut st.reloading, &ids, until);
+            });
         });
-    });
-    Ok(Value::None)
+    }
+    Ok(count)
+}
+
+fn reserve_load(items: &mut BTreeMap<i64, (Item, i32)>, selected: &[i64], type_id: i32, max: i32, have: i32) -> Option<i32> {
+    let need = reserve_quantities(items, selected, type_id, max.saturating_sub(have));
+    let now = max - need;
+    (now > have).then_some(now)
 }
 
 pub(super) fn reserve_quantities(items: &mut BTreeMap<i64, (Item, i32)>, selected: &[i64], type_id: i32, mut need: i32) -> i32 {
@@ -319,6 +364,15 @@ pub(super) type ReservedLoad = (i64, i32, i32, i32, i32);
 struct PendingLoad {
     reload_id: i64,
     load: ReservedLoad,
+}
+
+fn group_loads(loads: Vec<PendingLoad>, duration: impl Fn(i64) -> f64) -> BTreeMap<(i64, i32), Vec<(PendingLoad, f64)>> {
+    let mut groups = BTreeMap::new();
+    for load in loads {
+        let ms = match duration(load.load.0) { ms if ms > 0.0 => ms, _ => DEFAULT_RELOAD_MS };
+        groups.entry((filetime_ticks_from_ms(ms), load.load.2)).or_insert_with(Vec::new).push((load, ms));
+    }
+    groups
 }
 
 pub(super) fn clear_reload_markers(reloading: &mut HashMap<i64, i64>, ids: &[i64], until: i64) {
@@ -381,6 +435,10 @@ pub(super) async fn unload_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
         None => (ship, None),
     };
     let flag = flag.unwrap_or(if location == ship { FLAG_CARGO } else { FLAG_HANGAR });
+    unload_ammo_core(c, ship, modules, location, flag).await
+}
+
+pub(in crate::services) async fn unload_ammo_core(c: &mut Client, ship: i64, modules: Vec<i64>, location: i64, flag: i32) -> CallResult {
     let owner = c.session.int("charid");
     let db = c.db.clone();
     let sde = c.sde.clone();
@@ -404,3 +462,5 @@ pub(super) async fn unload_ammo(c: &mut Client, call: &Call<'_>) -> CallResult {
 }
 
 
+
+#[cfg(test)] mod tests;

@@ -49,6 +49,15 @@ pub(crate) async fn shift_security(ex: &(impl Executor + ?Sized), char_id: i64, 
     Ok(Security::from_row(&row).security_status)
 }
 
+/// Replace a character's security status exactly.
+pub(crate) async fn set_security(ex: &(impl Executor + ?Sized), char_id: i64, value: f64) -> Result<f64, db::Error> {
+    let row = ex.query_one(
+        "UPDATE game.characters SET security_status = $2 WHERE character_id = $1 RETURNING security_status",
+        &[&char_id, &value],
+    ).await?;
+    Ok(Security::from_row(&row).security_status)
+}
+
 pub(crate) async fn corporation(ex: &(impl Executor + ?Sized), char_id: i64) -> Result<Option<i64>, db::Error> {
     let row = ex.query_opt("SELECT corporation_id FROM game.characters WHERE character_id = $1", &[&char_id]).await?;
     Ok(row.as_ref().map(|r| Corporation::from_row(r).corporation_id))

@@ -14,7 +14,11 @@
 //! Dogma overrides require singleton items; modules and hull-foreign attributes
 //! have limited client display support. Unsupported commands return a slash error.
 //! Teleports to live balls use the system actor's sampled position; stored positions remain unchanged.
+//! Quoted arguments are grouped by the shared parser. Skill, item, NPC, social
+//! and exploration commands delegate to their owning services and game data.
 //! Durable job inspection and control use `game.jobs`; job payloads are not displayed.
+//! Listings are limited to 50 rows; full help remains available. Teleport
+//! extensions and hit-chance administration are not supported here.
 
 use super::{db_err, Call, CallError, CallResult};
 use super::sql_pattern::matches_pattern;
@@ -23,9 +27,17 @@ use crate::consts::{CLIENT_MAX_ISK, CLIENT_MAX_PLEX, FLAG_CARGO, FLAG_HANGAR, GM
 use crate::messages;
 use marshal::Value;
 use tracing::info;
+mod args;
 mod dogma;
 mod jobs;
 mod effects;
+mod skills;
+mod items;
+mod npc;
+mod combat;
+mod social;
+mod info;
+mod wormholes;
 
 /// Server design: clearance in metres when teleporting to an item.
 const TELEPORT_CLEARANCE: f64 = 5000.0;
@@ -37,9 +49,13 @@ const ISK_DECIMALS: usize = 2;
 /// `game_schema.sql`: account PLEX balance is numeric(36, 0).
 const PLEX_DIGITS: usize = 36;
 
+/// Server design: maximum rows returned by a GM listing.
+const LIST_ROW_LIMIT: usize = 50;
+
 const COMMANDS: &[(&str, &str)] = &[
     ("tr", messages::gm::GM_HELP_TELEPORT),
     ("wh", messages::gm::GM_HELP_WORMHOLE),
+    ("wormhole", messages::gm::GM_HELP_WORMHOLE),
     ("scanall", messages::gm::GM_HELP_SCAN_ALL),
     ("sites", messages::gm::GM_HELP_SITES),
     ("create", messages::gm::GM_HELP_CREATE),
@@ -52,6 +68,34 @@ const COMMANDS: &[(&str, &str)] = &[
     ("dogma", messages::gm::GM_HELP_DOGMA),
     ("jobs", messages::scheduler::HELP),
     ("effects", messages::gm::GM_HELP_EFFECTS),
+    ("giveskill", messages::gm::GM_HELP_GIVESKILL),
+    ("allskills", messages::gm::GM_HELP_ALLSKILLS),
+    ("removeskill", messages::gm::GM_HELP_REMOVESKILL),
+    ("givestarterskills", messages::gm::GM_HELP_GIVESTARTERSKILLS),
+    ("ship", messages::gm::GM_HELP_SHIP),
+    ("spawn", messages::gm::GM_HELP_SPAWN),
+    ("fit", messages::gm::GM_HELP_FIT),
+    ("unload", messages::gm::GM_HELP_UNLOAD),
+    ("load", messages::gm::GM_HELP_LOAD),
+    ("online", messages::gm::GM_HELP_ONLINE),
+    ("iteminfo", messages::gm::GM_HELP_ITEMINFO),
+    ("typeinfo", messages::gm::GM_HELP_TYPEINFO),
+    ("entity", messages::gm::GM_HELP_ENTITY),
+    ("npc", messages::gm::GM_HELP_NPC),
+    ("npcclear", messages::gm::GM_HELP_NPCCLEAR),
+    ("wreck", messages::gm::GM_HELP_WRECK),
+    ("container", messages::gm::GM_HELP_CONTAINER),
+    ("dmg", messages::gm::GM_HELP_DMG),
+    ("lp", messages::gm::GM_HELP_LP),
+    ("addlp", messages::gm::GM_HELP_ADDLP),
+    ("setlp", messages::gm::GM_HELP_SETLP),
+    ("secstatus", messages::gm::GM_HELP_SECSTATUS),
+    ("missioncomplete", messages::gm::GM_HELP_MISSIONCOMPLETE),
+    ("corpcreate", messages::gm::GM_HELP_CORPCREATE),
+    ("setalliance", messages::gm::GM_HELP_SETALLIANCE),
+    ("joinalliance", messages::gm::GM_HELP_JOINALLIANCE),
+    ("session", messages::gm::GM_HELP_SESSION),
+    ("setstanding", messages::gm::GM_HELP_SETSTANDING),
     ("help", messages::gm::GM_HELP_HELP),
 ];
 
@@ -63,6 +107,19 @@ fn help() -> String {
     let mut entries: Vec<String> = COMMANDS.iter().map(|(_, usage)| (*usage).to_owned()).collect();
     if crate::lua::enabled() { entries.extend(crate::lua::command_help().into_iter().map(|(_, help)| help)); }
     entries.join("\n")
+}
+
+fn limit_list(mut text: String, header: bool) -> String {
+    let Some(end) = text.match_indices('\n').nth(LIST_ROW_LIMIT - 1 + usize::from(header)).map(|(i, _)| i) else {
+        return text;
+    };
+    let omitted = text[end + 1..].lines().count();
+    if omitted > 0 {
+        text.truncate(end);
+        text.push('\n');
+        text.push_str(&messages::gm::gm_rows_truncated(omitted));
+    }
+    text
 }
 
 
@@ -85,10 +142,10 @@ async fn resolve_type(c: &Client, arg: &str) -> Result<(i32, String), CallError>
 }
 
 /// /tr me <destination>
-async fn tr(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
+async fn tr(c: &mut Client, args: &[String]) -> Result<String, CallError> {
     let dest = match args {
-        ["me", dest, ..] => *dest,
-        [dest] if *dest != "me" => *dest,
+        [me, dest, ..] if me == "me" => dest.as_str(),
+        [dest] if dest != "me" => dest.as_str(),
         _ => return Err(slash_error(messages::gm::GM_TELEPORT_USAGE.into())),
     };
     let Ok(id) = dest.parse::<i64>() else { return Err(slash_error(messages::gm::gm_invalid_id(dest))) };
@@ -137,7 +194,7 @@ async fn tr(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
     Err(slash_error(messages::gm::gm_target_not_found(id)))
 }
 
-async fn create(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
+async fn create(c: &mut Client, args: &[String]) -> Result<String, CallError> {
     let Some(what) = args.first() else { return Err(slash_error(messages::gm::GM_CREATE_USAGE.into())) };
     let qty: i32 = args.get(1).and_then(|q| q.parse().ok()).unwrap_or(1).clamp(1, 1_000_000_000);
     let (type_id, name) = resolve_type(c, what).await?;
@@ -153,7 +210,7 @@ async fn create(c: &mut Client, args: &[&str]) -> Result<String, CallError> {
     Ok(messages::gm::gm_created_item(qty, &name, type_id))
 }
 
-fn parse_amount(args: &[&str], integer_digits: usize, decimals: usize) -> Option<String> {
+fn parse_amount(args: &[String], integer_digits: usize, decimals: usize) -> Option<String> {
     let [arg] = args else { return None };
     let amount = arg.replace(',', "");
     let (integer, fraction) = match amount.split_once('.') {
@@ -191,7 +248,7 @@ fn wallet_error(error: crate::db::Error) -> CallError {
     }
 }
 
-async fn wallet(c: &mut Client, args: &[&str], command: &str) -> Result<String, CallError> {
+async fn wallet(c: &mut Client, args: &[String], command: &str) -> Result<String, CallError> {
     let (usage, digits, decimals) = match command {
         "setisk" => (messages::gm::GM_SET_ISK_USAGE, ISK_INTEGER_DIGITS, ISK_DECIMALS),
         "addisk" => (messages::gm::GM_ADD_ISK_USAGE, ISK_INTEGER_DIGITS, ISK_DECIMALS),
@@ -242,11 +299,14 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
 
     let line = call.args.first().and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
     let line = line.trim().trim_start_matches('/');
-    let mut words = line.split_whitespace();
-    let command = words.next().unwrap_or("").to_lowercase();
-    let args: Vec<&str> = words.collect();
+    let words = match args::tokenize(line) {
+        Ok(words) => words,
+        Err(error) => return Some(Err(error)),
+    };
+    let command = words.first().map(|s| s.to_lowercase()).unwrap_or_default();
+    let args = words.get(1..).unwrap_or_default();
     if crate::lua::enabled() {
-        if let Some(result) = crate::lua::command(c, &command, &args).await {
+        if let Some(result) = crate::lua::command(c, &command, args).await {
             return Some(result.map(Value::unicode));
         }
     }
@@ -260,20 +320,33 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     }
     info!(user = c.login.user_id, "slash: /{line}");
     let result = match command.as_str() {
-        "tr" => tr(c, &args).await,
-        "wh" | "wormhole" => super::exploration::gm_wormhole(c).await,
+        "tr" => tr(c, args).await,
+        "wh" | "wormhole" => wormholes::command(c, &command, args).await,
         "scanall" => super::exploration::gm_scan_all(c).await,
         "sites" => super::exploration::gm_sites(c).await,
-        "create" | "createitem" => create(c, &args).await,
-        "setisk" | "addisk" | "setplex" | "addplex" => wallet(c, &args, &command).await,
+        "create" | "createitem" => create(c, args).await,
+        "setisk" | "addisk" | "setplex" | "addplex" => wallet(c, args, &command).await,
         "heal" => heal(c).await,
-        "dogma" => dogma::command(c, &args).await,
-        "jobs" => jobs::command(&c.db, &args).await,
-        "effects" => effects::command(&args),
+        "dogma" => dogma::command(c, args).await,
+        "jobs" => jobs::command(&c.db, args).await,
+        "effects" => effects::command(args),
+        "giveskill" | "allskills" | "removeskill" | "givestarterskills" => skills::command(c, &command, args).await,
+        // eve/devtools/script/svc_slash.py:1310-1313 passes this item ID to ship.Board.
+        "spawn" => return Some(items::spawn(c, args).await.map(Value::Int)),
+        "ship" | "fit" | "unload" | "load" | "online" | "iteminfo" | "typeinfo" => items::command(c, &command, args).await,
+        "entity" | "npc" | "npcclear" | "wreck" | "container" => npc::command(c, &command, args).await,
+        "dmg" => combat::command(c, &command, args).await,
+        "lp" | "addlp" | "setlp" | "missioncomplete" | "corpcreate" | "setalliance" | "joinalliance" => social::command(c, &command, args).await,
+        "secstatus" | "session" => info::command(c, &command, args).await,
+        "setstanding" => social::command(c, &command, args).await,
         "help" => Ok(help()),
         other => Err(slash_error(messages::gm::gm_unknown_command(other, &help()))),
     };
-    Some(result.map(Value::unicode))
+    let listing = matches!(command.as_str(), "sites" | "session" | "lp" | "iteminfo" | "typeinfo")
+        || (matches!(command.as_str(), "wh" | "wormhole") && args.first().is_some_and(|s| s.eq_ignore_ascii_case("status")))
+        || (command == "dogma" && args.get(1).is_some_and(|s| s == "list"));
+    let header = matches!(command.as_str(), "session" | "lp" | "typeinfo");
+    Some(result.map(|text| Value::unicode(if listing { limit_list(text, header) } else { text })))
 }
 
 #[cfg(test)]

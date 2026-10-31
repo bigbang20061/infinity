@@ -27,7 +27,7 @@ mod contracts;
 mod corps;
 mod corpwallet;
 mod crimewatch;
-mod dogma;
+pub(crate) mod dogma;
 mod effects;
 mod exploration;
 mod fit;

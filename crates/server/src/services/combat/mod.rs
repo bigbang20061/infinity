@@ -181,7 +181,7 @@ pub fn reset(c: &Client) {
 
 mod reload_recovery;
 pub(crate) use reload_recovery::recover_pending_reloads;
-pub(super) mod targeting_charges;
+pub(crate) mod targeting_charges;
 use targeting_charges::*;
 pub(crate) mod groups_health;
 use groups_health::*;
@@ -251,6 +251,11 @@ pub fn forget_ship(ship: i64) {
     st.condition.remove(&ship);
     st.capacitor.remove(&ship);
 }
+/// Clear targeting and cached health after a GM removes a spawned ball.
+pub(crate) fn forget_gm_spawn(world: &World, id: i64) {
+    forget_target(world, id);
+}
+
 
 pub(super) async fn destroy_player_ship(world: &World, system: i64, ship: i64, char_id: i64) {
     state().condition.remove(&ship);

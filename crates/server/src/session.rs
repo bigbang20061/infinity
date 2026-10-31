@@ -21,6 +21,11 @@ impl Session {
         self.get(key).as_int()
     }
 
+    /// Inspect session attributes without modifying the distributed session.
+    pub(crate) fn attributes(&self) -> impl Iterator<Item = (&str, &Value)> {
+        self.attrs.iter().map(|(key, value)| (key.as_str(), value))
+    }
+
     /// Apply updates; returns the `{attr: (old, new)}` pairs that actually changed.
     pub fn apply(&mut self, updates: Vec<(&str, Value)>) -> Vec<(Value, Value)> {
         let mut change = Vec::new();
@@ -34,3 +39,6 @@ impl Session {
         change
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -119,12 +119,14 @@ pub(super) fn combat_site(sde: &Sde, system: i64, info: &SystemInfo, kind: Kind,
 
 /// A wormhole out of `system` (of `class`) to a class drawn from `targets`, with its K162
 /// in the destination. Returns (wormhole site, K162 site).
-pub(super) fn wormhole_pair(
+pub(super) async fn wormhole_pair(
+    db: &Db,
     sde: &Sde,
     system: i64,
     class: i64,
     targets: &[i64],
     taken: &mut HashSet<String>,
+    destination_targets: &mut HashMap<i64, HashSet<String>>,
 ) -> Result<Option<(Site, Site)>, CallError> {
     let mut types: Vec<(i32, i64)> = sde.types.group_types(GROUP_WORMHOLE).iter().filter_map(|&type_id| {
         if type_id == TYPE_K162 { return None; }
@@ -155,9 +157,13 @@ pub(super) fn wormhole_pair(
         .and_then(|id| sde.map.region(id)).and_then(|r| r.nebula_id).unwrap_or(0);
     let born = filetime_now();
     let mut here = new_site(system, exploration_site_position(sde, system), Kind::Signature, STRENGTH_WORMHOLE, WORMHOLE_SCAN_EASE, taken);
-    // The far side's target IDs are drawn from its own system's set when it is generated;
-    // a clash there is harmless (results are per system).
-    let mut there = new_site(dest_system, exploration_site_position(sde, dest_system), Kind::Signature, STRENGTH_WORMHOLE, WORMHOLE_SCAN_EASE, &mut HashSet::new());
+    if !destination_targets.contains_key(&dest_system) {
+        let mut used: HashSet<String> = crate::dao::exploration::sites(db, dest_system).await.map_err(db_err)?
+            .into_iter().map(|s| s.target).collect();
+        used.extend(system_sites(dest_system).into_iter().map(|s| s.target));
+        destination_targets.insert(dest_system, used);
+    }
+    let mut there = new_site(dest_system, exploration_site_position(sde, dest_system), Kind::Signature, STRENGTH_WORMHOLE, WORMHOLE_SCAN_EASE, destination_targets.get_mut(&dest_system).unwrap());
     let base = Wormhole {
         type_id,
         dest_system,
@@ -217,7 +223,7 @@ pub(super) async fn ensure_loaded(db: &Db, world: &Arc<World>, system: i64) -> R
         }
     } else {
         let taken = stored.iter().map(|s| s.target.clone()).collect();
-        generate(world.sde(), system, taken)?
+        generate(db, world.sde(), system, taken).await?
     };
     for s in &new {
         save_site(db, s).await?;
@@ -253,6 +259,7 @@ pub(super) async fn ensure_loaded(db: &Db, world: &Arc<World>, system: i64) -> R
 /// Wormhole space always has a connection out to known space: if the system has none (it
 /// collapsed, or was never made), a new one opens.
 pub(super) async fn ensure_static_exit(db: &Db, world: &World, system: i64) -> Result<(), CallError> {
+    let _guard = load_lock().lock().await;
     let has_exit = system_sites(system).iter().any(|s| s.wormhole.as_ref().is_some_and(|w| (7..=9).contains(&w.dest_class)));
     if has_exit {
         return Ok(());
@@ -262,7 +269,7 @@ pub(super) async fn ensure_static_exit(db: &Db, world: &World, system: i64) -> R
         return Ok(());
     }
     let mut taken: HashSet<String> = system_sites(system).into_iter().map(|s| s.target).collect();
-    let Some((here, there)) = wormhole_pair(world.sde(), system, info.class, &[7, 8, 9], &mut taken)? else { return Ok(()) };
+    let Some((here, there)) = wormhole_pair(db, world.sde(), system, info.class, &[7, 8, 9], &mut taken, &mut HashMap::new()).await? else { return Ok(()) };
     save_site(db, &here).await?;
     save_site(db, &there).await?;
     info!("exploration: {system} gets a new exit {} -> {}", here.target, there.system);
@@ -277,7 +284,7 @@ pub(super) async fn ensure_static_exit(db: &Db, world: &World, system: i64) -> R
 
 /// A system's sites, generated the first time anyone looks. Wormholes also create their
 /// far end in the destination system.
-pub(super) fn generate(sde: &Sde, system: i64, mut taken: HashSet<String>) -> Result<Vec<Site>, CallError> {
+pub(super) async fn generate(db: &Db, sde: &Sde, system: i64, mut taken: HashSet<String>) -> Result<Vec<Site>, CallError> {
     let info = system_info(sde, system)?;
     let mut new = vec![];
     let jspace = (1..=6).contains(&info.class);
@@ -310,8 +317,9 @@ pub(super) fn generate(sde: &Sde, system: i64, mut taken: HashSet<String>) -> Re
         let into: &[i64] = &[1, 2, 3, 4, 5, 6];
         if info.class == 7 { vec![into] } else { vec![into, &[7, 8, 9]] }
     };
+    let mut destination_targets = HashMap::new();
     for targets in wormholes {
-        if let Some((here, there)) = wormhole_pair(sde, system, info.class, targets, &mut taken)? {
+        if let Some((here, there)) = wormhole_pair(db, sde, system, info.class, targets, &mut taken, &mut destination_targets).await? {
             new.push(here);
             new.push(there);
         }

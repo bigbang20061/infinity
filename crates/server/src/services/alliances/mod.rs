@@ -25,7 +25,7 @@ use crate::space::World;
 use marshal::{DbRowDescriptor, DbType, Value};
 use tracing::info;
 
-mod corp_registry;
+pub(crate) mod corp_registry;
 mod alliance_registry;
 
 /// Client appConst.allianceApplicationNew.

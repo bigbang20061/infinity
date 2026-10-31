@@ -21,6 +21,8 @@ use tracing::{debug, info, warn};
 const FILETIME_TICKS_PER_MS: i64 = 10_000;
 /// Windows FILETIME tick duration in nanoseconds.
 const FILETIME_TICK_NS: u32 = 100;
+/// Internal pilot-channel request to recompile a brain.
+pub(crate) const BRAIN_REFRESH: &str = "__brain";
 
 pub struct Client {
     pub conn: Writer,
@@ -181,6 +183,13 @@ impl Client {
                     Some((event, args)) = self.notify_rx.recv() => {
                         if event == "__ship_destroyed" {
                             services::ship_destroyed(&mut self, &args).await;
+                        } else if event == BRAIN_REFRESH {
+                            if let Err(error) = services::dogma::brain::update(&mut self).await {
+                                match error {
+                                    CallError::Internal(error) => warn!("skill brain refresh failed: {error:#}"),
+                                    CallError::User { msg, .. } => warn!("skill brain refresh failed: {msg}"),
+                                }
+                            }
                         } else if event == "__session" {
                             // Another task changed this pilot's session (corporation membership): [(key, value)].
                             let pairs: Vec<(String, Value)> = args

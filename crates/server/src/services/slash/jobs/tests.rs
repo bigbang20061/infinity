@@ -6,10 +6,10 @@ use crate::scheduler::Job;
 #[test]
 fn grammar_requires_exact_arguments() {
     assert_eq!(parse(&[]), Some(Command::List));
-    assert_eq!(parse(&["retry", "a"]), Some(Command::Retry("a")));
-    assert_eq!(parse(&["cancel", "a"]), Some(Command::Cancel("a")));
+    assert_eq!(parse(&["retry".into(), "a".into()]), Some(Command::Retry("a")));
+    assert_eq!(parse(&["cancel".into(), "a".into()]), Some(Command::Cancel("a")));
     for args in [&["list"][..], &["list", "extra"][..], &["retry"][..], &["retry", ""][..], &["cancel"][..], &["cancel", "a", "extra"][..], &["unknown"][..]] {
-        assert_eq!(parse(args), None);
+        assert_eq!(parse(&args.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>()), None);
     }
 }
 
@@ -19,7 +19,7 @@ async fn cancelled_periodic_job_is_restored_by_seed() {
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
     assert!(jobs::counts(&db).await.unwrap().is_empty());
     scheduler::seed(&db).await.unwrap();
-    assert!(command(&db, &["cancel", scheduler::BILLS]).await.is_ok());
+    assert!(command(&db, &["cancel".into(), scheduler::BILLS.into()]).await.is_ok());
     assert!(!jobs::upcoming(&db).await.unwrap().iter().any(|job| job.id == scheduler::BILLS));
     scheduler::seed(&db).await.unwrap();
     let counts = jobs::counts(&db).await.unwrap();
@@ -57,8 +57,8 @@ async fn operator_stats_retry_and_cancel() {
     assert_eq!(row.attempt, 0);
     assert_eq!(row.last_error, None);
     let running = jobs::claim(&db, filetime_now(), i64::MAX, 1, &[]).await.unwrap().pop().unwrap();
-    assert!(command(&db, &["cancel", &id]).await.is_ok());
+    assert!(command(&db, &["cancel".into(), id.clone()]).await.is_ok());
     assert_eq!(jobs::ack(&db, &id, running.token).await.unwrap(), 0);
     assert!(!retry(&db, &id).await.unwrap());
-    assert!(command(&db, &["cancel", &id]).await.is_err());
+    assert!(command(&db, &["cancel".into(), id.clone()]).await.is_err());
 }

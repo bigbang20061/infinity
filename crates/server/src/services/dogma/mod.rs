@@ -8,7 +8,8 @@
 //! behavior, not a validated client fallback. Effective fitting is the subset in
 //! `services/fit.rs`, not a complete implementation of client dogma.
 //! Module online changes use the shared effects lifecycle; fitting resource policy is unsupported.
-//! Character brains compile passive skills; implants, boosters and structures are unsupported.
+//! Character brains compile passive skills and active implant and booster modifiers; structure effects
+//! and implant/booster injection or expiry are unsupported.
 //! Brain versions are in-memory and reset when the server restarts.
 pub(crate) mod brain;
 
@@ -143,6 +144,45 @@ async fn character_info(c: &Client) -> Result<Value, CallError> {
 async fn online_modules(c: &Client, ship_id: i64) -> Result<Vec<i64>, CallError> {
     Ok(dogma_dao::online(&c.db, ship_id).await.map_err(db_err)?
         .into_iter().map(|r| r.item_id).collect())
+}
+
+/// Set fitted modules online and notify the controlling client after commit.
+pub(super) async fn gm_online(c: &mut Client, ship: i64) -> Result<usize, CallError> {
+    use super::effects::lifecycle::{apply_online_changed, set_online_core, OnlineChanged, OnlinePolicy};
+    use crate::db::outbox::{Effect, Outbox};
+    let policy = OnlinePolicy::from_client(c)?;
+    let db = c.db.clone();
+    let sde = c.sde.clone();
+    let world = c.world.clone();
+    db.transaction(
+        move |tx, outbox: &mut Outbox<OnlineChanged>| {
+            let sde = sde.clone();
+            let policy = policy.clone();
+            Box::pin(async move {
+                load_items(tx, &sde, ItemQuery::Id(ship)).await.map_err(db_err)?.into_iter().next()
+                    .filter(|item| item.owner_id == policy.owner && item.category_id == i64::from(crate::consts::CATEGORY_SHIP))
+                    .ok_or_else(|| super::notify_error(crate::messages::gm::GM_ITEM_NOT_FOUND))?;
+                let mut fitted = load_items(tx, &sde, ItemQuery::LocationOwner(ship, policy.owner)).await.map_err(db_err)?;
+                fitted.sort_unstable_by_key(|item| item.item_id);
+                let mut count = 0;
+                for item in fitted.iter().filter(|item| item.category_id == i64::from(crate::consts::CATEGORY_MODULE)
+                    && item.singleton && super::inventory::is_fitting_flag(item.flag_id)
+                    && super::effects::lifecycle::has_effect(sde.types.effects(item.type_id), EFFECT_ONLINE as i32)) {
+                    count += usize::from(set_online_core(tx, &sde, &policy, outbox, ship, item.item_id, true).await?);
+                }
+                Ok(count)
+            })
+        },
+        |count, outbox| async move {
+            for entry in outbox.into_entries() {
+                match entry {
+                    Effect::Operation(change) => apply_online_changed(change),
+                    Effect::Notification(notification) => notification.dispatch(&world, Some(&mut *c))?,
+                }
+            }
+            Ok(count)
+        },
+    ).await
 }
 
 /// `(instanceCache, instanceFlagQuantityCache, weaponBanks, heatStates)` for a ship being made

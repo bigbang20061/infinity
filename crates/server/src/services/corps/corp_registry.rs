@@ -235,12 +235,36 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
 /// `AddCorporation(name, ticker, description, url, taxRate, shape1..3, color1..3, typeface,
 /// applicationsEnabled, friendlyFire, lpTaxRate)` -> corporationID.
 async fn found(c: &Client, call: &Call<'_>) -> CallResult {
+    let int = |i: usize| call.args.get(i).and_then(|v| v.as_int()).map(|v| v as i32);
+    let input = FoundInput {
+        name: trimmed_arg_text(call, 0),
+        ticker: trimmed_arg_text(call, 1).to_uppercase(),
+        description: trimmed_arg_text(call, 2),
+        url: trimmed_arg_text(call, 3),
+        tax: call.args.get(4).and_then(|v| v.as_float()).unwrap_or(0.0).clamp(0.0, 1.0),
+        recruiting: call.args.get(12).and_then(|v| v.as_int()).unwrap_or(1) != 0,
+        friendly: matches!(call.args.get(13), Some(Value::Bool(true))),
+        shapes: [int(5), int(6), int(7), int(8), int(9), int(10), int(11)],
+    };
+    found_core(c, input, false).await.map(Value::Int)
+}
+
+struct FoundInput {
+    name: String,
+    ticker: String,
+    description: String,
+    url: String,
+    tax: f64,
+    recruiting: bool,
+    friendly: bool,
+    shapes: [Option<i32>; 7],
+}
+
+async fn found_core(c: &Client, input: FoundInput, gm: bool) -> Result<i64, CallError> {
     let (db, world) = (&c.db, &*c.world);
     let sde = c.sde.clone();
     let me = c.session.int("charid").unwrap_or(0);
-    let int = |i: usize| call.args.get(i).and_then(|v| v.as_int()).map(|v| v as i32);
-    let (name, ticker, description, url) = (trimmed_arg_text(call, 0), trimmed_arg_text(call, 1).to_uppercase(), trimmed_arg_text(call, 2), trimmed_arg_text(call, 3));
-    let tax = call.args.get(4).and_then(|v| v.as_float()).unwrap_or(0.0).clamp(0.0, 1.0);
+    let FoundInput { name, ticker, description, url, tax, recruiting, friendly, shapes } = input;
     let Some(station) = c.session.int("stationid") else {
         return Err(notify_error(messages::STATION_DOCK_REQUIRED_TO_CREATE_CORP));
     };
@@ -250,9 +274,11 @@ async fn found(c: &Client, call: &Call<'_>) -> CallResult {
     if !(ORG_SHORT_NAME_MIN_LENGTH..=ORG_SHORT_NAME_MAX_LENGTH).contains(&ticker.chars().count()) || !ticker.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
         return Err(notify_error(messages::CORP_SHORT_NAME_INVALID));
     }
-    let skill = crate::dao::skills::levels::level(db, me, SKILL_CORPORATION_MANAGEMENT).await.map_err(db_err)?.unwrap_or(0);
-    if i64::from(skill) < crate::config::game().corporations.min_management_skill_level {
-        return Err(notify_error(messages::CORPORATION_MANAGEMENT_SKILL_REQUIRED));
+    if !gm {
+        let skill = crate::dao::skills::levels::level(db, me, SKILL_CORPORATION_MANAGEMENT).await.map_err(db_err)?.unwrap_or(0);
+        if i64::from(skill) < crate::config::game().corporations.min_management_skill_level {
+            return Err(notify_error(messages::CORPORATION_MANAGEMENT_SKILL_REQUIRED));
+        }
     }
     let (current, _) = membership(db, me).await?;
     if is_player_corp(current) && ceo_of(db, current).await? == Some(me) {
@@ -268,15 +294,14 @@ async fn found(c: &Client, call: &Call<'_>) -> CallResult {
     }
     let _trading = super::super::market::lock().await;
     let now = filetime_now();
-    let recruiting = call.args.get(12).and_then(|v| v.as_int()).unwrap_or(1) != 0;
-    let friendly = matches!(call.args.get(13), Some(Value::Bool(true)));
-    let shapes = [int(5), int(6), int(7), int(8), int(9), int(10), int(11)];
     let id = db.transaction(
         |tx, outbox| {
             let (name, ticker, description, url) = (name.clone(), ticker.clone(), description.clone(), url.clone());
             let sde = sde.clone();
             Box::pin(async move {
-                super::super::wallets::debit(tx, outbox, me, STARTUP_COST).await?;
+                if !gm {
+                    super::super::wallets::debit(tx, outbox, me, STARTUP_COST).await?;
+                }
                 let id = registry::create(tx, &registry::NewCorporation {
                     name: &name, ticker: &ticker, description: &description, url: &url,
                     tax, ceo: me, station, recruiting, friendly, shapes, now,
@@ -288,7 +313,21 @@ async fn found(c: &Client, call: &Call<'_>) -> CallResult {
         |id, outbox| async move { dispatch_world(id, outbox, world) },
     ).await?;
     info!("corporations: {me} founded {id} [{ticker}] {name}");
-    Ok(Value::Int(id))
+    Ok(id)
+}
+
+/// Found a corporation without the player skill or startup fee requirements.
+pub(crate) async fn gm_found(c: &mut Client, name: &str, ticker: &str) -> Result<i64, CallError> {
+    found_core(c, FoundInput {
+        name: name.trim().to_owned(),
+        ticker: ticker.trim().to_uppercase(),
+        description: String::new(),
+        url: String::new(),
+        tax: 0.0,
+        recruiting: true,
+        friendly: false,
+        shapes: [None; 7],
+    }, true).await
 }
 
 

@@ -22,6 +22,64 @@ use marshal::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use tracing::{debug, info, warn};
+use crate::db::{executor::Executor, outbox::{Effect as OutboxEffect, Outbox}};
+use crate::sde::Sde;
+use crate::space::NotifyTx;
+
+#[derive(Clone)]
+pub(in crate::services) struct OnlinePolicy {
+    pub owner: i64,
+    pub active_ship: Option<i64>,
+    pub station: Option<i64>,
+    pub notify: NotifyTx,
+}
+
+pub(in crate::services) struct OnlineChanged {
+    pub module: i64,
+    pub online: bool,
+    pub char_id: i64,
+    pub ship_id: i64,
+    pub notify: NotifyTx,
+}
+
+impl OnlinePolicy {
+    pub(in crate::services) fn from_client(c: &Client) -> Result<Self, CallError> {
+        Ok(Self {
+            owner: c.session.int("charid").ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?,
+            active_ship: c.session.int("shipid"),
+            station: c.session.int("stationid"),
+            notify: c.notify_tx.clone(),
+        })
+    }
+}
+
+pub(in crate::services) async fn set_online_core<E: From<OnlineChanged> + Send>(
+    ex: &(impl Executor + ?Sized), sde: &Sde, policy: &OnlinePolicy, outbox: &mut Outbox<E>,
+    ship: i64, item: i64, online: bool,
+) -> Result<bool, CallError> {
+    let refuse = || notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION);
+    let (hull, module) = subject_core(ex, sde, policy, ship, item, EFFECT_ONLINE as i32, false).await?;
+    let was_online = crate::dao::items::dogma::online(ex, ship).await.map_err(db_err)?.iter().any(|entry| entry.item_id == item);
+    if was_online == online { return Ok(false); }
+    let changed = crate::dao::items::combat::set_online(ex, item, ship, policy.owner, module.flag_id, module.type_id, hull.type_id, hull.location_id, hull.flag_id, hull.singleton, online).await.map_err(db_err)?;
+    if changed == 0 { return Err(refuse()); }
+    outbox.operation(OnlineChanged { module: item, online, char_id: policy.owner, ship_id: ship, notify: policy.notify.clone() }.into());
+    Ok(true)
+}
+
+pub(in crate::services) fn apply_online_changed(change: OnlineChanged) {
+    if !change.online {
+        if let Some(active) = state().active.get(&change.module) {
+            active.stop.store(true, Ordering::Relaxed);
+        }
+    }
+    let now = filetime_now();
+    let environment = super::environment::build(change.module, change.char_id, change.ship_id, None, None, EFFECT_ONLINE);
+    let effect = super::notify::ship_effect_args(change.module, EFFECT_ONLINE, environment, change.online, now, -1.0, -1, now);
+    let attr = attribute_change(change.char_id, Value::Int(change.module), ATTR_IS_ONLINE, Value::Int(change.online as i64), Value::Int(!change.online as i64));
+    let _ = change.notify.send(("OnGodmaShipEffect".into(), effect));
+    let _ = change.notify.send(("OnModuleAttributeChanges".into(), vec![Value::list([attr])]));
+}
 
 /// Existing server module duration fallback, in milliseconds.
 const DEFAULT_MODULE_DURATION_MS: f64 = 1000.0;
@@ -318,6 +376,10 @@ async fn on_activate(cx: &Ctx, fit: &Fit, activation: &Activation) -> Result<(),
     }
 }
 
+pub(in crate::services) fn has_effect(effects: &[crate::sde::types::TypeEffect], effect: i32) -> bool {
+    effects.iter().any(|entry| entry.effect_id == effect)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn valid_subject(hull: &Item, module: &Item, owner: i64, ship: i64, active_ship: Option<i64>, station: Option<i64>, effects: &[crate::sde::types::TypeEffect], effect: i32, require_online: bool, online: bool) -> bool {
     hull.item_id == ship && hull.owner_id == owner && hull.category_id == i64::from(CATEGORY_SHIP)
@@ -325,22 +387,26 @@ pub(super) fn valid_subject(hull: &Item, module: &Item, owner: i64, ship: i64, a
         && module.owner_id == owner && module.location_id == ship && module.singleton
         && module.category_id == i64::from(CATEGORY_MODULE)
         && super::super::inventory::is_fitting_flag(module.flag_id)
-        && effects.iter().any(|entry| entry.effect_id == effect)
+        && has_effect(effects, effect)
         && (!require_online || online)
 }
 
-pub(super) async fn subject(c: &Client, ship: i64, item_id: i64, effect: i32, require_online: bool) -> Result<Item, CallError> {
+async fn subject_core(ex: &(impl Executor + ?Sized), sde: &Sde, policy: &OnlinePolicy, ship: i64, item_id: i64, effect: i32, require_online: bool) -> Result<(Item, Item), CallError> {
     let refuse = || notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION);
-    let owner = c.session.int("charid").ok_or_else(refuse)?;
-    let hull = load_items(&c.db, &c.sde, ItemQuery::Id(ship)).await.map_err(db_err)?.into_iter().next().ok_or_else(refuse)?;
-    let module = load_items(&c.db, &c.sde, ItemQuery::Id(item_id)).await.map_err(db_err)?.into_iter().next().ok_or_else(refuse)?;
+    let hull = load_items(ex, sde, ItemQuery::Id(ship)).await.map_err(db_err)?.into_iter().next().ok_or_else(refuse)?;
+    let module = load_items(ex, sde, ItemQuery::Id(item_id)).await.map_err(db_err)?.into_iter().next().ok_or_else(refuse)?;
     let online = if require_online {
-        crate::dao::items::dogma::online(&c.db, ship).await.map_err(db_err)?.iter().any(|entry| entry.item_id == item_id)
+        crate::dao::items::dogma::online(ex, ship).await.map_err(db_err)?.iter().any(|entry| entry.item_id == item_id)
     } else { false };
-    if !valid_subject(&hull, &module, owner, ship, c.session.int("shipid"), c.session.int("stationid"), c.sde.types.effects(module.type_id), effect, require_online, online) {
+    if !valid_subject(&hull, &module, policy.owner, ship, policy.active_ship, policy.station, sde.types.effects(module.type_id), effect, require_online, online) {
         return Err(refuse());
     }
-    Ok(module)
+    Ok((hull, module))
+}
+
+pub(super) async fn subject(c: &Client, ship: i64, item_id: i64, effect: i32, require_online: bool) -> Result<Item, CallError> {
+    let policy = OnlinePolicy::from_client(c)?;
+    Ok(subject_core(&c.db, &c.sde, &policy, ship, item_id, effect, require_online).await?.1)
 }
 
 /// Activate(itemID, effectName, targetID, repeat)
@@ -429,28 +495,26 @@ pub(crate) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
 
 /// Change online state for an authorized fitted module, including docked hangar ships.
 pub(crate) async fn set_online(c: &mut Client, ship: i64, item_id: i64, online: bool) -> CallResult {
-    let module = subject(c, ship, item_id, EFFECT_ONLINE as i32, false).await?;
-    let owner = c.session.int("charid").ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
-    let hull = load_items(&c.db, &c.sde, ItemQuery::Id(ship)).await.map_err(db_err)?.into_iter().next()
-        .ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
-    if !valid_subject(&hull, &module, owner, ship, c.session.int("shipid"), c.session.int("stationid"), c.sde.types.effects(module.type_id), EFFECT_ONLINE as i32, false, false) {
-        return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
-    }
-    let was_online = crate::dao::items::dogma::online(&c.db, ship).await.map_err(db_err)?.iter().any(|entry| entry.item_id == item_id);
-    if was_online == online { return Ok(Value::None); }
-    let changed = crate::dao::items::combat::set_online(&c.db, item_id, ship, owner, module.flag_id, module.type_id, hull.type_id, hull.location_id, hull.flag_id, hull.singleton, online).await.map_err(db_err)?;
-    if changed == 0 { return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION)); }
-    let cx = Ctx { db: c.db.clone(), world: c.world.clone(), notify: c.notify_tx.clone(), char_id: owner, ship_id: ship, system_id: c.session.int("solarsystemid").unwrap_or(0) };
-    if !online {
-        if let Some(stop) = state().active.get(&item_id) {
-            stop.stop.store(true, Ordering::Relaxed);
-        }
-    }
-    ship_effect(&cx, item_id, EFFECT_ONLINE, None, None, online, filetime_now(), -1.0, -1);
-    let change = attribute_change(cx.char_id, Value::Int(item_id), ATTR_IS_ONLINE, Value::Int(online as i64), Value::Int(!online as i64));
-    cx.notify("OnModuleAttributeChanges", vec![Value::list([change])]);
-    info!(user = c.login.user_id, "module {item_id} {}", if online { "online" } else { "offline" });
-    Ok(Value::None)
+    let policy = OnlinePolicy::from_client(c)?;
+    let db = c.db.clone();
+    let sde = c.sde.clone();
+    db.transaction(
+        move |tx, outbox: &mut Outbox<OnlineChanged>| {
+            let policy = policy.clone();
+            let sde = sde.clone();
+            Box::pin(async move { set_online_core(tx, &sde, &policy, outbox, ship, item_id, online).await })
+        },
+        |changed, outbox| async move {
+            for entry in outbox.into_entries() {
+                match entry {
+                    OutboxEffect::Operation(change) => apply_online_changed(change),
+                    OutboxEffect::Notification(notification) => notification.dispatch(&c.world, None)?,
+                }
+            }
+            if changed { info!(user = c.login.user_id, "module {item_id} {}", if online { "online" } else { "offline" }); }
+            Ok(Value::None)
+        },
+    ).await
 }
 
 /// Deactivate(itemID, effectName): stop after the current cycle.

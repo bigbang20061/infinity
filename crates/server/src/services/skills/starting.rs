@@ -9,10 +9,14 @@ use crate::client::Client;
 
 /// Grant the race's starting skills to a new character (sde chr_races.skills).
 pub(crate) async fn grant_starting_skills(c: &Client, char_id: i64, race_id: i32) -> Result<(), CallError> {
-    for skill in c.sde.characters.race(race_id as i64).into_iter().flat_map(|race| &race.skills) {
-        let (type_id, level) = (skill.type_id, skill.level);
+    for (type_id, level) in starting_levels(&c.sde, race_id) {
         let rank = skill_type(&c.sde, type_id).rank;
         crate::dao::skills::training::starting_skill(&c.db, char_id, type_id, level, sp_for_level(rank, level as i64)).await.map_err(db_err)?;
     }
     Ok(())
+}
+
+pub(super) fn starting_levels(sde: &crate::sde::Sde, race_id: i32) -> impl Iterator<Item = (i32, i32)> + '_ {
+    sde.characters.race(race_id as i64).into_iter().flat_map(|race| &race.skills)
+        .map(|skill| (skill.type_id, skill.level))
 }

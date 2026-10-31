@@ -124,17 +124,23 @@ pub async fn lp_balance(db: &(impl Executor + ?Sized), char_id: i64, corp: i64) 
     Ok(crate::dao::wallets::loyalty::balance(db, char_id, corp).await.map_err(db_err)?.unwrap_or(0))
 }
 
+/// Positive loyalty balances held by a character.
+pub(crate) async fn lp_balances(db: &Db, char_id: i64) -> Result<Vec<(i64, i64)>, CallError> {
+    Ok(crate::dao::wallets::loyalty::list(db, char_id).await.map_err(db_err)?
+        .into_iter().map(|row| (row.corp_id, row.amount)).collect())
+}
+
 /// Add (or, negative, take) loyalty points with `corp`; taking more than there is fails.
 pub async fn add_lp<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, char_id: i64, corp: i64, amount: i64) -> Result<(), CallError> {
     if amount == 0 || corp == 0 {
         return Ok(());
     }
-    let before = lp_balance(db, char_id, corp).await?;
-    if before + amount < 0 {
+    let Some(after) = crate::dao::wallets::loyalty::add(db, char_id, corp, amount).await.map_err(db_err)? else {
+        let before = lp_balance(db, char_id, corp).await?;
         return Err(notify_error(&messages::loyalty_balance_message(before)));
-    }
-    crate::dao::wallets::loyalty::add(db, char_id, corp, amount).await.map_err(db_err)?;
-    outbox.notify_pilot(char_id, "OnLPChange", vec![Value::str("lp"), Value::Int(corp), Value::Int(before), Value::Int(before + amount)]);
+    };
+    let before = after - amount;
+    outbox.notify_pilot(char_id, "OnLPChange", vec![Value::str("lp"), Value::Int(corp), Value::Int(before), Value::Int(after)]);
     Ok(())
 }
 

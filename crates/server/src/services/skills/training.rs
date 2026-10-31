@@ -45,7 +45,7 @@ pub(super) fn skill_type(sde: &crate::sde::Sde, type_id: i32) -> SkillType {
 }
 
 /// Collect finished entries and restore the remaining queue positions.
-async fn collect_finished(db: &(impl Executor + ?Sized), char_id: i64, now: i64) -> Result<Vec<(i32, i32, i64)>, CallError> {
+pub(super) async fn collect_finished(db: &(impl Executor + ?Sized), char_id: i64, now: i64) -> Result<Vec<(i32, i32, i64)>, CallError> {
     Ok(queue_dao::collect_finished(db, char_id, now).await.map_err(db_err)?.into_iter().map(|r| (r.type_id, r.to_level, r.dest_sp)).collect())
 }
 
@@ -67,7 +67,7 @@ pub(super) fn plan_skills(done: &[(i32, i32, i64)], training: Option<(i32, i64)>
 }
 
 /// Apply training progress up to now: finished entries become trained levels.
-async fn advance_training(db: &(impl Executor + ?Sized), char_id: i64, now: i64) -> Result<Vec<(i32, i32)>, CallError> {
+pub(super) async fn advance_training(db: &(impl Executor + ?Sized), char_id: i64, now: i64) -> Result<Vec<(i32, i32)>, CallError> {
     let done = collect_finished(db, char_id, now).await?;
     training_dao::write_skills(db, char_id, &plan_skills(&done, None)).await.map_err(db_err)?;
     Ok(done.into_iter().map(|(type_id, level, _)| (type_id, level)).collect())
@@ -132,7 +132,7 @@ pub(super) async fn queue_list(c: &mut Client, char_id: i64) -> Result<Value, Ca
     queue_list_db(&c.db, char_id).await
 }
 
-async fn queue_list_db(db: &(impl Executor + ?Sized), char_id: i64) -> Result<Value, CallError> {
+pub(super) async fn queue_list_db(db: &(impl Executor + ?Sized), char_id: i64) -> Result<Value, CallError> {
     let rows = queue_dao::list(db, char_id).await.map_err(db_err)?;
     let opt = |v: Option<i64>| v.map(Value::Int).unwrap_or(Value::None);
     Ok(Value::List(

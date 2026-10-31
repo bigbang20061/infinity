@@ -2,9 +2,9 @@ use super::*;
 
 #[test]
 fn unsupported_arguments_are_exact() {
-    assert!(valid_args(&["unsupported"]));
+    assert!(valid_args(&["unsupported".into()]));
     for args in [&[][..], &["unsupported", "extra"][..], &["other"][..], &["Unsupported"][..]] {
-        assert!(!valid_args(args));
+        assert!(!valid_args(&args.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>()));
     }
 }
 

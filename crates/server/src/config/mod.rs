@@ -49,6 +49,7 @@ pub struct Config {
     pub mail: game::social::MailConfig,
     pub calendar: game::social::CalendarConfig,
     pub space: game::social::SpaceConfig,
+    pub gm: game::gm::GmConfig,
     #[serde(skip)]
     source: String,
 }
@@ -86,6 +87,7 @@ impl PartialEq for Config {
             && self.mail == other.mail
             && self.calendar == other.calendar
             && self.space == other.space
+            && self.gm == other.gm
     }
 }
 
@@ -224,6 +226,7 @@ impl Config {
             mail: self.mail.clone(),
             calendar: self.calendar.clone(),
             space: self.space.clone(),
+            gm: self.gm.clone(),
         }
     }
 

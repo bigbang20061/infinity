@@ -1,7 +1,7 @@
 //! Skill service routing and shared mechanics, mirroring characterskills/util.py.
 //! Uses game.skills, game.skill_queue, game.characters and startup SDE bloodline,
 //! race and type attribute data through its submodules.
-//! Attribute modifiers and several skill handler features are not modelled.
+//! Effective character attributes use Fit modifiers; several skill handler features are not modelled.
 use super::{db_err, keyval, Call, CallError, CallResult};
 use crate::client::Client;
 pub(crate) mod attributes;
@@ -10,6 +10,7 @@ pub(crate) mod starting;
 mod skill_mgr2;
 mod skill_handler;
 mod training;
+pub(crate) mod gm;
 #[cfg(test)]
 mod tests;
 

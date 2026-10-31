@@ -20,9 +20,13 @@ async fn unallied_ceo_corp(db: &Db, me: i64) -> Result<i64, CallError> {
 }
 /// `CreateAlliance(allianceName, shortName, description, url)` on the founder's corpRegistry.
 async fn create(c: &Client, call: &Call<'_>) -> CallResult {
+    let (name, short_name, description, url) = (trimmed_arg_text(call, 0), trimmed_arg_text(call, 1).to_uppercase(), trimmed_arg_text(call, 2), trimmed_arg_text(call, 3));
+    create_core(c, name, short_name, description, url, false).await.map(Value::Int)
+}
+
+async fn create_core(c: &Client, name: String, short_name: String, description: String, url: String, gm: bool) -> Result<i64, CallError> {
     let (db, world) = (&c.db, &*c.world);
     let me = c.session.int("charid").unwrap_or(0);
-    let (name, short_name, description, url) = (trimmed_arg_text(call, 0), trimmed_arg_text(call, 1).to_uppercase(), trimmed_arg_text(call, 2), trimmed_arg_text(call, 3));
     let corp = unallied_ceo_corp(db, me).await?;
     if !(ORG_NAME_MIN_LENGTH..=ORG_NAME_MAX_LENGTH).contains(&name.chars().count()) {
         return Err(notify_error(messages::ALLIANCE_NAME_LENGTH_INVALID));
@@ -40,7 +44,9 @@ async fn create(c: &Client, call: &Call<'_>) -> CallResult {
         |tx, outbox| {
             let (name, short_name, description, url) = (name.clone(), short_name.clone(), description.clone(), url.clone());
             Box::pin(async move {
-                super::super::wallets::corp_debit(tx, outbox, corp, ACCOUNT_CASH, CREATION_COST).await?;
+                if !gm {
+                    super::super::wallets::corp_debit(tx, outbox, corp, ACCOUNT_CASH, CREATION_COST).await?;
+                }
                 let id = dao::create(tx, &name, &short_name, &description, &url, corp, me, now).await.map_err(db_err)?;
                 dao::delete_corp_applications(tx, corp).await.map_err(db_err)?;
                 set_alliance(tx, outbox, corp, Some(id), now).await?;
@@ -50,7 +56,23 @@ async fn create(c: &Client, call: &Call<'_>) -> CallResult {
         |id, outbox| async move { dispatch_world(id, outbox, world) },
     ).await?;
     info!("alliances: {me} of {corp} founded {id} <{short_name}> {name}");
-    Ok(Value::Int(id))
+    Ok(id)
+}
+
+/// Found an alliance without charging the corporation creation fee.
+pub(crate) async fn gm_create(c: &mut Client, name: &str, ticker: &str) -> Result<i64, CallError> {
+    create_core(c, name.trim().to_owned(), ticker.trim().to_uppercase(), String::new(), String::new(), true).await
+}
+
+/// Admit the caller's corporation without an application or executor approval.
+pub(crate) async fn gm_join(c: &mut Client, alliance: i64) -> Result<(), CallError> {
+    let db = &c.db;
+    let me = c.session.int("charid").unwrap_or(0);
+    let corp = unallied_ceo_corp(db, me).await?;
+    if !dao::exists(db, alliance).await.map_err(db_err)? {
+        return Err(notify_error(messages::ALLIANCE_NOT_FOUND));
+    }
+    super::alliance_registry::admit(db, &c.world, alliance, corp).await
 }
 /// GetSuggestedAllianceShortNames(name) -> [KeyVal(shortName)]
 fn suggested_short_names(name: &str) -> Value {

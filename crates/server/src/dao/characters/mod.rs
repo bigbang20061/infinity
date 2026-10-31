@@ -12,6 +12,7 @@ pub(crate) mod combat;
 pub(crate) mod contacts;
 pub(crate) mod creation;
 pub(crate) mod crimewatch;
+pub(crate) mod lookup;
 pub(crate) mod members;
 pub(crate) mod persistence;
 pub(crate) mod roles;

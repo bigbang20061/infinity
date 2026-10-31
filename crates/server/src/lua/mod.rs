@@ -75,13 +75,13 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     }
 }
 
-pub async fn command(c: &mut Client, name: &str, args: &[&str]) -> Option<Result<String, CallError>> {
+pub async fn command(c: &mut Client, name: &str, args: &[String]) -> Option<Result<String, CallError>> {
     let host = HOST.get()?;
     if name == "lua" {
         if c.login.role & GM_ROLES == 0 { return Some(Err(crate::services::notify_error(crate::messages::gm::GM_ROLE_REQUIRED))); }
         return Some(match args {
-            ["reload"] => match host.reload().await { Ok(()) => Ok(crate::messages::gm::LUA_RELOADED.into()), Err(error) => Ok(crate::messages::gm::lua_reload_failed(&format!("{error:#}"))) },
-            ["list"] => {
+            [arg] if arg == "reload" => match host.reload().await { Ok(()) => Ok(crate::messages::gm::LUA_RELOADED.into()), Err(error) => Ok(crate::messages::gm::lua_reload_failed(&format!("{error:#}"))) },
+            [arg] if arg == "list" => {
                 let registry = host.snapshot();
                 let mut entries: Vec<_> = registry.claims.rpc.iter().map(|((svc, method), h)| format!("{}: {}::{}", h.script, svc, method)).collect();
                 entries.extend(registry.claims.commands.iter().map(|(name, cmd)| format!("{}: /{}", cmd.handler.script, name)));
@@ -96,7 +96,7 @@ pub async fn command(c: &mut Client, name: &str, args: &[&str]) -> Option<Result
     let registry = host.snapshot();
     let command = registry.claims.commands.get(name)?;
     if command.gm && c.login.role & GM_ROLES == 0 { return Some(Err(crate::services::notify_error(crate::messages::gm::GM_ROLE_REQUIRED))); }
-    let args = match registry.lua.create_sequence_from(args.iter().copied()) { Ok(args) => vec![mlua::Value::Table(args)], Err(error) => return Some(Err(CallError::Internal(error.into()))) };
+    let args = match registry.lua.create_sequence_from(args.iter().map(String::as_str)) { Ok(args) => vec![mlua::Value::Table(args)], Err(error) => return Some(Err(CallError::Internal(error.into()))) };
     Some(match invoke(c, &registry, &command.handler, args).await {
         Ok(mut values) => match values.pop_front() { Some(mlua::Value::String(s)) => s.to_str().map(|s| s.to_owned()).map_err(|e| CallError::Internal(e.into())), _ => Err(CallError::Internal(anyhow::anyhow!("Lua command must return a string"))) },
         Err(error) => Err(error),

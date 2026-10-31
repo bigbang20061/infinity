@@ -2,15 +2,26 @@
 //! The client slash service consumes these strings; they read no database and
 //! implement neither gameplay behavior nor localisation.
 
+/// An argument quote was not closed.
+pub(crate) const GM_ARGS_UNCLOSED_QUOTE: &str = "引号未闭合。";
+/// A command requires a selected character.
+pub(crate) const GM_ARGS_NO_CHARACTER: &str = "当前没有选择角色。";
+pub(crate) fn gm_args_missing(index: usize) -> String { format!("缺少第 {index} 个参数。") }
+pub(crate) fn gm_args_integer(text: &str) -> String { format!("无效的整数：{text}") }
+pub(crate) fn gm_args_number(text: &str) -> String { format!("无效的数值：{text}") }
+pub(crate) fn gm_args_unknown_target(text: &str) -> String { format!("找不到角色：{text}") }
+pub(crate) fn gm_args_unknown_owner(text: &str) -> String { format!("找不到所有者：{text}") }
+pub(crate) fn gm_rows_truncated(count: usize) -> String { format!("另有 {count} 行未显示。") }
+
 // GM slash commands (services/slash.rs)
 /// Teleport command help.
 pub(crate) const GM_HELP_TELEPORT: &str = "/tr me <itemID|characterID|solarSystemID|stationID|celestialID> — teleport";
 /// Wormhole command help.
-pub(crate) const GM_HELP_WORMHOLE: &str = "/wh — teleport next to a wormhole (scanned down for you)";
+pub(crate) const GM_HELP_WORMHOLE: &str = "/wh [status|ensure|random|clear] — 虫洞操作；无参数时前往虫洞";
 /// Scan-all command help.
 pub(crate) const GM_HELP_SCAN_ALL: &str = "/scanall — scan every signature in this system to 100%";
 /// Site listing command help.
-pub(crate) const GM_HELP_SITES: &str = "/sites — list this system's anomalies and signatures";
+pub(crate) const GM_HELP_SITES: &str = "/sites — 列出当前星系的异常和信号强度";
 /// Create command help.
 pub(crate) const GM_HELP_CREATE: &str = "/create <typeID|name> [qty] — into your hangar (docked) or cargo";
 /// Create-item command help.
@@ -126,3 +137,113 @@ pub(crate) const LUA_HELP: &str = "用法：/lua reload 或 /lua list";
 pub(crate) const LUA_RELOADED: &str = "脚本已重新加载。";
 pub(crate) fn lua_reload_failed(error: &str) -> String { format!("脚本重新加载失败：{error}") }
 pub(crate) fn lua_list(list: &str) -> String { format!("Lua 脚本：\n{list}") }
+
+// Skill administration.
+pub(crate) const GM_HELP_GIVESKILL: &str = "/giveskill <角色> <技能|all|super> [等级] — 设置技能等级";
+pub(crate) const GM_HELP_ALLSKILLS: &str = "/allskills [角色] — 设置全部已发布技能";
+pub(crate) const GM_HELP_REMOVESKILL: &str = "/removeskill <角色> <技能|all> — 移除技能";
+pub(crate) const GM_HELP_GIVESTARTERSKILLS: &str = "/givestarterskills <角色> — 补充初始技能";
+pub(crate) const GM_SKILL_LEVEL_INVALID: &str = "技能等级必须为 0 至 5。";
+pub(crate) fn gm_skill_usage(command: &str) -> String {
+    match command {
+        "giveskill" => "用法：/giveskill <角色> <技能|all|super> [等级]",
+        "allskills" => "用法：/allskills [角色]",
+        "removeskill" => "用法：/removeskill <角色> <技能|all>",
+        "givestarterskills" => "用法：/givestarterskills <角色>",
+        _ => "无效的技能指令。",
+    }.into()
+}
+pub(crate) fn gm_skill_not_skill(skill: &str) -> String { format!("{skill} 不是技能。") }
+pub(crate) fn gm_skill_done(command: &str, target: i64) -> String { format!("{command} 已应用于角色 {target}。") }
+
+
+// Item administration.
+pub(crate) const GM_HELP_SHIP: &str = "/ship <类型> [角色] — 创建飞船";
+pub(crate) const GM_HELP_SPAWN: &str = "/spawn <类型> — 停靠时创建飞船并返回物品ID";
+pub(crate) const GM_HELP_FIT: &str = "/fit <角色> <类型或物品ID> [数量] — 装配模块";
+pub(crate) const GM_HELP_UNLOAD: &str = "/unload me <物品ID或类型ID> — 卸下模块";
+pub(crate) const GM_HELP_LOAD: &str = "/load me <类型ID> <数量> — 装填弹药";
+pub(crate) const GM_HELP_ONLINE: &str = "/online <飞船ID|me> — 上线模块";
+pub(crate) const GM_HELP_ITEMINFO: &str = "/iteminfo <物品ID> — 查看物品";
+pub(crate) const GM_HELP_TYPEINFO: &str = "/typeinfo <类型> — 查看类型";
+pub(crate) const GM_SHIP_TYPE_REQUIRED: &str = "指定类型不是飞船";
+pub(crate) const GM_SHIP_DOCKED_REQUIRED: &str = "目标角色必须停靠在空间站";
+pub(crate) const GM_ITEM_NOT_FOUND: &str = "找不到指定物品";
+pub(crate) const GM_ITEM_USAGE: &str = "物品命令参数无效";
+pub(crate) const GM_ITEM_TARGET_SELF: &str = "此命令仅支持当前角色";
+pub(crate) const GM_ITEM_SHIP_USAGE: &str = "用法：/ship <类型> [目标]";
+pub(crate) const GM_ITEM_SPAWN_USAGE: &str = "用法：/spawn <类型>";
+pub(crate) const GM_ITEM_FIT_USAGE: &str = "用法：/fit <目标> <类型或物品ID> [数量]";
+pub(crate) const GM_ITEM_UNLOAD_USAGE: &str = "用法：/unload me <物品ID或类型ID>";
+pub(crate) const GM_ITEM_LOAD_USAGE: &str = "用法：/load me <类型ID> <数量>";
+pub(crate) const GM_ITEM_ONLINE_USAGE: &str = "用法：/online <飞船ID|me>";
+pub(crate) const GM_ITEM_INFO_USAGE: &str = "用法：/iteminfo <物品ID>";
+pub(crate) const GM_TYPE_INFO_USAGE: &str = "用法：/typeinfo <类型>";
+pub(crate) const GM_FIT_REFUSED: &str = "无法装配：目标、物品或可用槽位无效。";
+pub(crate) fn gm_item_created(id: i64, name: &str) -> String { format!("已创建飞船 {name}（{id}）") }
+pub(crate) fn gm_item_fitted(count: usize) -> String { format!("已装配 {count} 个模块") }
+pub(crate) fn gm_item_unloaded(count: usize) -> String { format!("已卸下 {count} 个模块") }
+pub(crate) fn gm_item_loaded(count: usize) -> String { format!("已向 {count} 个兼容模块提交装填请求") }
+pub(crate) fn gm_item_online(count: usize) -> String { format!("已上线 {count} 个模块") }
+pub(crate) fn gm_item_info(item_id: i64, type_id: i32, owner: i64, location: i64, flag: i32, quantity: i32, singleton: bool) -> String { format!("物品 {item_id}：类型 {type_id}，所有者 {owner}，位置 {location}，标志 {flag}，数量 {quantity}，单例 {singleton}") }
+pub(crate) fn gm_type_info(type_id: i32, name: &str, group: i32, category: i32) -> String { format!("类型 {type_id}：{name}，组 {group}，分类 {category}") }
+pub(crate) fn gm_type_attribute(id: i32, value: f64) -> String { format!("属性 {id}：{value}") }
+
+// NPC, debris and damage administration.
+pub(crate) const GM_HELP_ENTITY: &str = "/entity deploy <数量> <typeID> — 生成 NPC";
+pub(crate) const GM_HELP_NPC: &str = "/npc <类型或组> [数量] [距离] — 生成 NPC";
+pub(crate) const GM_HELP_NPCCLEAR: &str = "/npcclear [半径|system] — 清除 GM 生成的 NPC";
+pub(crate) const GM_HELP_WRECK: &str = "/wreck [类型] [距离] — 生成残骸";
+pub(crate) const GM_HELP_CONTAINER: &str = "/container [类型] [距离] — 生成货柜";
+pub(crate) const GM_HELP_DMG: &str = "/dmg <shield|armor|hull|all> <百分比> — 设置舰船损伤";
+pub(crate) const GM_NPC_USAGE: &str = "用法：/npc <类型或组> [数量] [距离]；/entity deploy <数量> <typeID>";
+pub(crate) const GM_NPC_CLEAR_USAGE: &str = "用法：/npcclear [半径|system]";
+pub(crate) const GM_DEBRIS_USAGE: &str = "用法：/wreck 或 /container [类型] [距离]";
+pub(crate) const GM_DAMAGE_USAGE: &str = "用法：/dmg <shield|armor|hull|all> <0至100的百分比>";
+pub(crate) const GM_DAMAGE_SET: &str = "舰船损伤已设置。";
+pub(crate) fn gm_npc_spawned(count: usize) -> String { format!("已生成 {count} 个NPC。") }
+pub(crate) fn gm_npc_cleared(count: usize) -> String { format!("已移除 {count} 个GM生成的NPC。") }
+pub(crate) fn gm_debris_spawned(id: i64) -> String { format!("已生成太空物体 {id}。") }
+// Social, progress and session commands.
+pub(crate) const GM_HELP_LP: &str = "/lp [角色] — 查看忠诚点";
+pub(crate) const GM_HELP_ADDLP: &str = "/addlp <军团> <数量> — 增减忠诚点";
+pub(crate) const GM_HELP_SETLP: &str = "/setlp <军团> <数量> — 设置忠诚点";
+pub(crate) const GM_SOCIAL_USAGE: &str = "无效的社会指令";
+pub(crate) const GM_LP_USAGE: &str = "用法：/lp [角色]";
+pub(crate) const GM_LP_CHANGE_USAGE: &str = "用法：/addlp 或 /setlp 军团 数量";
+pub(crate) const GM_LP_CORPORATION_REQUIRED: &str = "必须指定军团";
+pub(crate) const GM_LP_BALANCE_INVALID: &str = "忠诚点余额不能为负数或超出范围";
+pub(crate) fn gm_lp_list(target: i64, rows: &[(i64, i64)]) -> String { let mut s = format!("角色 {target} 的忠诚点："); for (corp, amount) in rows { s.push_str(&format!("\n{corp}: {amount}")); } s }
+pub(crate) fn gm_lp_changed(corp: i64, amount: i64) -> String { format!("军团 {corp} 的忠诚点余额：{amount}") }
+pub(crate) const GM_HELP_SECSTATUS: &str = "/secstatus [安全等级] [角色] — 查看或设置安全等级";
+pub(crate) const GM_HELP_SESSION: &str = "/session — 查看会话属性";
+pub(crate) const GM_INFO_USAGE: &str = "无效的信息指令";
+pub(crate) const GM_SESSION_USAGE: &str = "用法：/session";
+pub(crate) const GM_SECSTATUS_USAGE: &str = "用法：/secstatus [安全等级] [角色]（范围 -10 至 10）；其他玩家的总览将在球体重建时更新";
+pub(crate) fn gm_secstatus(character: i64, value: f64) -> String { format!("角色 {character} 的安全等级：{value}") }
+pub(crate) fn gm_session(sid: i64, rows: &[(&str, String)]) -> String { let mut s = format!("会话 {sid}："); for (key, value) in rows { s.push_str(&format!("\n{key}: {value}")); } s }
+pub(crate) fn gm_site_row_strength(target: &str, kind: &str, what: &str, name: &str, strength: Option<f64>) -> String { match strength { Some(v) => format!("{target} {kind} {what} {name} 信号强度 {v:.1}%"), None => format!("{target} {kind} {what} {name}") } }
+pub(crate) const GM_HELP_CORPCREATE: &str = "/corpcreate <名称> <简称> — 创建军团";
+pub(crate) const GM_HELP_SETALLIANCE: &str = "/setalliance <名称> <简称> — 创建联盟";
+pub(crate) const GM_HELP_JOINALLIANCE: &str = "/joinalliance <联盟> — 加入联盟";
+pub(crate) const GM_ORG_CREATE_USAGE: &str = "用法：/corpcreate 或 /setalliance 名称 简称";
+pub(crate) const GM_JOINALLIANCE_USAGE: &str = "用法：/joinalliance 联盟";
+pub(crate) fn gm_org_created(id: i64) -> String { format!("已创建组织 {id}") }
+pub(crate) fn gm_joinalliance(id: i64) -> String { format!("已加入联盟 {id}") }
+// Mission administration.
+pub(crate) const GM_HELP_MISSIONCOMPLETE: &str = "/missioncomplete [代理人ID|all] — 完成任务目标（分支交互任务除外）";
+pub(crate) const GM_MISSIONCOMPLETE_USAGE: &str = "用法：/missioncomplete [代理人ID|all]；all 跳过分支交互任务";
+pub(crate) fn gm_missioncomplete(count: usize) -> String { format!("已完成 {count} 个任务目标（不含分支交互任务）") }
+pub(crate) const GM_MISSION_INTERACTION_UNSUPPORTED: &str = "分支交互任务需要手动选择，无法通过此命令完成。";
+// Wormhole administration.
+pub(crate) const GM_WH_USAGE: &str = "用法：/wh status|ensure|clear [here] 或 /wh random [数量] [here]";
+pub(crate) const GM_WH_NONE: &str = "当前星系没有可用虫洞。";
+pub(crate) const GM_WH_ENSURED: &str = "当前星系已有可用虫洞。";
+pub(crate) fn gm_wh_status_row(target: &str, type_id: i32, dest_system: i64, dest_class: i64, mass_used: f64, mass_max: f64) -> String {
+    format!("{target} 类型 {type_id} → 星系 {dest_system}（等级 {dest_class}），质量 {mass_used:.0}/{mass_max:.0} 千克")
+}
+pub(crate) fn gm_wh_created(count: usize) -> String { format!("已创建 {count} 个虫洞连接。") }
+pub(crate) fn gm_wh_cleared(count: usize) -> String { format!("已清除 {count} 个虫洞连接。") }
+pub(crate) const GM_HELP_SETSTANDING: &str = "/setstanding <所属方> <角色> <声望值> [原因] — 设置声望";
+pub(crate) const GM_SETSTANDING_USAGE: &str = "用法：/setstanding 所属方 角色 声望值 [原因]（范围 -10 至 10）";
+pub(crate) fn gm_setstanding(owner: i64, character: i64, value: f64) -> String { format!("已设置 {owner} 对 {character} 的声望为 {value}") }

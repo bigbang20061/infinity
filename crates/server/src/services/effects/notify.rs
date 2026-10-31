@@ -17,7 +17,7 @@ pub(in crate::services) fn ship_effect(cx: &Ctx, module: i64, effect_id: i64, ta
 }
 
 #[allow(clippy::too_many_arguments)]
-fn ship_effect_args(module: i64, effect_id: i64, environment: Value, start: bool, started: i64, duration_ms: f64, repeat: i64, now: i64) -> Vec<Value> {
+pub(in crate::services) fn ship_effect_args(module: i64, effect_id: i64, environment: Value, start: bool, started: i64, duration_ms: f64, repeat: i64, now: i64) -> Vec<Value> {
     vec![
         Value::Int(module),
         Value::Int(effect_id),

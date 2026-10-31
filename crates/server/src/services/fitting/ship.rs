@@ -55,18 +55,39 @@ fn assembly_source_change(original: i32, remaining: i32) -> Vec<(i64, Value)> {
 
 /// AssembleShip(itemIDs, name=, subSystems=) -> the assembled ship's itemID (or IDs).
 async fn assemble(c: &mut Client, call: &Call<'_>) -> CallResult {
+    let ids = value_ids(call.args.first());
+    let name = call.kwargs.get("name").and_then(|v| v.as_text()).map(|t| t.into_owned());
+    let assembled = assemble_ships(c, ids, name).await?;
+    Ok(match assembled.as_slice() {
+        [one] => Value::Int(*one),
+        _ => Value::list(assembled.into_iter().map(Value::Int)),
+    })
+}
+
+/// Assemble packaged hulls with the same transaction and notifications as AssembleShip.
+pub(in crate::services) async fn assemble_ships(c: &mut Client, ids: Vec<i64>, name: Option<String>) -> Result<Vec<i64>, crate::services::CallError> {
     let char_id = c.session.int("charid").unwrap_or(0);
     let station = c.session.int("stationid");
     let active_ship = c.session.int("shipid");
-    let ids = value_ids(call.args.first());
-    let name = call.kwargs.get("name").and_then(|v| v.as_text()).map(|t| t.into_owned());
     let db = c.db.clone();
     let sde = std::sync::Arc::clone(&c.sde);
-    let assembled = db.transaction(
+    db.transaction(
         move |tx, outbox: &mut Outbox| {
             let (ids, name) = (ids.clone(), name.clone());
             let sde = std::sync::Arc::clone(&sde);
             Box::pin(async move {
+                assemble_core(tx, &sde, outbox, char_id, station, active_ship, ids, name).await
+            })
+        },
+        |assembled, outbox| async move { dispatch_client(assembled, outbox, c) },
+    ).await
+}
+
+async fn assemble_core(
+    tx: &(impl crate::db::executor::Executor + ?Sized), sde: &crate::sde::Sde,
+    outbox: &mut Outbox, char_id: i64, station: Option<i64>, active_ship: Option<i64>,
+    ids: Vec<i64>, name: Option<String>,
+) -> Result<Vec<i64>, crate::services::CallError> {
                 // Simulate requests in their original order, but write each source once
                 // in primary-key order before inserting any generated hulls.
                 let mut sources = BTreeMap::new();
@@ -120,14 +141,44 @@ async fn assemble(c: &mut Client, call: &Call<'_>) -> CallResult {
                     assembled.push(ship_id);
                 }
                 Ok(assembled)
+}
+
+/// Create and assemble a hull atomically in the target character's station hangar.
+pub(in crate::services) async fn gm_create_ship(c: &mut Client, owner: i64, type_id: i32) -> Result<i64, crate::services::CallError> {
+    if c.sde.types.get(type_id).and_then(|t| t.category_id) != Some(CATEGORY_SHIP) {
+        return Err(crate::services::notify_error(messages::gm::GM_SHIP_TYPE_REQUIRED));
+    }
+    let db = c.db.clone();
+    let sde = c.sde.clone();
+    let caller = c.session.int("charid");
+    let world = c.world.clone();
+    db.transaction(
+        move |tx, outbox: &mut Outbox| {
+            let sde = sde.clone();
+            Box::pin(async move {
+                let station = crate::dao::items::transfers::docked(tx, owner).await.map_err(db_err)?
+                    .ok_or_else(|| crate::services::notify_error(messages::gm::GM_SHIP_DOCKED_REQUIRED))?;
+                let id = crate::dao::items::transfers::insert(tx, type_id, owner, station, FLAG_HANGAR, 1).await.map_err(db_err)?;
+                notify_item_change(tx, &sde, outbox, id, vec![(IX_LOCATION_ID, Value::Int(0))]).await?;
+                let assembled = assemble_core(tx, &sde, outbox, owner, Some(station), None, vec![id], None).await?;
+                assembled.into_iter().next().ok_or_else(|| crate::services::notify_error(messages::gm::GM_SHIP_TYPE_REQUIRED))
             })
         },
-        |assembled, outbox| async move { dispatch_client(assembled, outbox, c) },
-    ).await?;
-    Ok(match assembled.as_slice() {
-        [one] => Value::Int(*one),
-        _ => Value::list(assembled.into_iter().map(Value::Int)),
-    })
+        |id, outbox| async move {
+            if caller == Some(owner) {
+                dispatch_client(id, outbox, c)
+            } else {
+                for entry in outbox.into_entries() {
+                    match entry {
+                        crate::db::outbox::Effect::Notification(crate::db::outbox::Notification::DirectClient { event, args }) => world.notify_pilot(owner, &event, args),
+                        crate::db::outbox::Effect::Notification(notification) => notification.dispatch(&world, Some(c))?,
+                        crate::db::outbox::Effect::Operation(never) => match never {},
+                    }
+                }
+                Ok(id)
+            }
+        },
+    ).await
 }
 
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {

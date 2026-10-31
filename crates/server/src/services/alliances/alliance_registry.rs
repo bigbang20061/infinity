@@ -6,7 +6,7 @@
 //! Wars, bills, sovereignty, capital systems and prime time are not supported.
 use super::*;
 /// Join an accepted corporation to the alliance.
-async fn admit(db: &Db, world: &World, alliance: i64, corp: i64) -> Result<(), CallError> {
+pub(super) async fn admit(db: &Db, world: &World, alliance: i64, corp: i64) -> Result<(), CallError> {
     let allied = dao::live_corporation_alliance(db, corp).await.map_err(db_err)?
         .ok_or_else(|| notify_error(messages::CORP_NOT_FOUND))?;
     if allied.is_some() {

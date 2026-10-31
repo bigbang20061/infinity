@@ -47,6 +47,8 @@ pub const TYPE_CAPSULE: i32 = 670;
 pub const GROUP_PLANET: i32 = 7;
 /// SDE invGroups: Asteroid Belt.
 pub const GROUP_ASTEROID_BELT: i32 = 9;
+/// SDE invGroups: Wreck.
+pub const GROUP_WRECK: i32 = 186;
 /// SDE invCategories: Owner.
 pub const CATEGORY_OWNER: i32 = 1;
 /// SDE invCategories: Ship.
@@ -57,6 +59,8 @@ pub const CATEGORY_MODULE: i32 = 7;
 pub const CATEGORY_CHARGE: i32 = 8;
 /// SDE invCategories: Entity.
 pub const CATEGORY_ENTITY: i32 = 11;
+/// SDE invCategories: Skill.
+pub const CATEGORY_SKILL: i32 = 16;
 /// SDE invCategories: Drone.
 pub const CATEGORY_DRONE: i32 = 18;
 /// SDE invTypes: Hacking skill.

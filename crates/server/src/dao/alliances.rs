@@ -7,6 +7,8 @@
 use crate::db::{executor::Executor, Error};
 use tokio_postgres::Row;
 
+pub(crate) mod lookup;
+
 struct ExecutorCorp {
     executor_corp_id: Option<i64>,
 }
