@@ -28,6 +28,7 @@ fn candidates_only_include_changed_pilot_ids_and_generations() {
     assert!(candidates(&s).next().is_none());
     s.command(1, |b, _, _| { b.pos[0] = 5.0; Vec::new() });
     s.command(3, |b, _, _| { b.pos[0] = 5.0; Vec::new() });
+    s.tick(1000);
     let generation = s.snapshot_positions[&1].0;
     assert_eq!(candidates(&s).collect::<Vec<_>>(), vec![(1, generation)]);
 }
@@ -42,6 +43,7 @@ fn changed_pilots_retry_conflicts_and_acknowledge_only_written_positions() {
     for id in 1..=3 {
         s.command(id, |b, _, _| { b.pos[0] = 5.0; Vec::new() });
     }
+    s.tick(1000);
     let positions = changed(&s);
     assert_eq!(positions.len(), 2);
     acknowledge(&mut s, positions, &[1].into_iter().collect());
@@ -57,10 +59,12 @@ fn old_acknowledgement_cannot_mark_reinserted_ship_written() {
     let mut s = System::default();
     s.insert(ball(1, Some(10), 0.0));
     s.command(1, |b, _, _| { b.pos[0] = 5.0; Vec::new() });
+    s.tick(1000);
     let old = changed(&s);
     s.take(1);
     s.insert(ball(1, Some(10), 0.0));
     s.command(1, |b, _, _| { b.pos[0] = 5.0; Vec::new() });
+    s.tick(2000);
     acknowledge(&mut s, old, &[1].into_iter().collect());
     assert_eq!(changed(&s).len(), 1);
 }
@@ -73,4 +77,23 @@ fn no_pilots_keep_cold_skip_and_no_deadline() {
     assert!(s.is_cold());
     assert_eq!(s.snapshot_due, 0);
     assert!(changed(&s).is_empty());
+}
+
+#[test]
+fn candidates_follow_boundary_motion_not_mailbox_time() {
+    let mut s = System::default();
+    s.insert(ball(1, Some(10), 0.0));
+    s.command(1, |b, _, _| {
+        b.mode = MODE_GOTO;
+        b.goto = [1.0, 0.0, 0.0];
+        b.speed_fraction = 1.0;
+        Vec::new()
+    });
+    s.tick(999);
+    assert!(candidates(&s).next().is_none());
+    s.tick(1000);
+    let positions = changed(&s);
+    assert_eq!(positions.len(), 1);
+    assert!(positions[0].pos[0] > 0.0);
+    assert_eq!(positions[0].pos, s.ball(1).unwrap().pos);
 }

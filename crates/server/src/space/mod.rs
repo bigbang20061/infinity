@@ -12,10 +12,11 @@
 //! complete client simulation parity.
 //!
 //! Celestials come from the SDE; dynamic balls stay in memory. Each system
-//! owns an actor with a 100 ms tick and closure messages. Destiny stamps remain
-//! whole seconds. NPC decisions, spawn groups and closure timers live in the actor;
-//! NPC combat effects run sequentially and deferred jobs concurrently outside it.
-//! Timers fire on ticks in deadline and scheduling order; timers are not persistent.
+//! owns an actor with 100 ms timers and NPC decisions. Destiny actions retain the
+//! enqueue-time logical stamp and apply before fixed one-second motion; late
+//! catchup is bounded. NPC effects and deferred jobs run outside the actor.
+//! Timers fire on ticks in deadline and scheduling order; missile flight timers start
+//! when the launch action applies. Timers are not persistent.
 //! Changed pilot positions are periodically saved to game.items and flushed at shutdown.
 //! Other dynamic ball state is not persisted here.
 //! Shared vector distances are defined here for simulation and service callers.
@@ -120,8 +121,6 @@ fn norm(a: V3) -> V3 {
     }
 }
 
-/// Convert Unix milliseconds to a whole-second destiny stamp.
-pub fn destiny_stamp(unix_ms: i64) -> i64 { unix_ms / MILLISECONDS_PER_SECOND }
 /// Convert milliseconds to seconds.
 pub fn ms_to_seconds(ms: f64) -> f64 { ms / MILLISECONDS_PER_SECOND as f64 }
 /// Convert minutes to seconds without discarding fractional minutes.
@@ -146,10 +145,6 @@ pub fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64
 }
 
-/// Destiny event stamp in whole Unix seconds.
-pub fn now_tick() -> i64 {
-    destiny_stamp(now_ms())
-}
 
 #[derive(Clone)]
 pub struct Warp {
@@ -188,7 +183,7 @@ pub struct Ball {
     pub massive: bool,
     pub warp: Option<Warp>,
     pub warp_factor: i64,
-    /// Last integration time in Unix milliseconds; missiles retain their launch time.
+    /// Last integration time in logical destiny milliseconds.
     pub last_ms: i64,
     /// carbonengine destiny AddBall, LaunchMissile and RealWarp effect stamp, in destiny ticks;
     /// independent of integration milliseconds.
@@ -498,7 +493,7 @@ impl World {
         if systems.get(&system_id).is_some_and(|h| h.is_closed()) { systems.remove(&system_id); }
         if systems.contains_key(&system_id) { return Ok(()); }
         let tick = now_ms();
-        let mut system = System::new(system_id, self.pilots.clone());
+        let mut system = System::new(system_id, self.pilots.clone(), tick);
         for r in self.sde.map.celestials(system_id) {
             let Some(type_id) = r.type_id.and_then(|id| i32::try_from(id).ok()) else { continue };
             let Some(ty) = self.sde.types.get(type_id) else { continue };
@@ -631,8 +626,8 @@ impl World {
     pub fn set_health(&self, system: i64, id: i64, health: [f64; DAMAGE_LAYER_COUNT]) {
         self.post(system, move |s| s.set_health(id, health));
     }
-    pub fn broadcast(&self, system: i64, about: i64, events: Vec<Value>) {
-        self.post(system, move |s| s.broadcast(about, events));
+    pub fn broadcast(&self, system: i64, about: i64, factory: impl FnOnce(i64) -> Vec<Value> + Send + 'static) {
+        self.post(system, move |s| s.broadcast(about, factory(s.current_time())));
     }
     pub fn command(&self, system: i64, ship: i64, f: impl FnOnce(&mut Ball, i64, &System) -> Vec<Value> + Send + 'static) {
         self.post(system, move |s| s.command(ship, f));

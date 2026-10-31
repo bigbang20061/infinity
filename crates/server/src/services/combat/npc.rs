@@ -76,8 +76,9 @@ pub(super) async fn npc_shot(db: &Db, world: &Arc<World>, system: i64, id: i64, 
     }
     if stats.damage.iter().any(|d| *d > 0.0) && gap <= stats.optimal + stats.falloff * NPC_TURRET_REACH_FALLOFF_MULTIPLIER {
         if let Some(guid) = stats.fx.as_deref() {
-            let fx = fire_fx(id, None, guid, Some(ship), None, true, stats.rate_of_fire_ms, 1);
-            world.broadcast(system, id, vec![fx]);
+            let guid = guid.to_owned();
+            let duration = stats.rate_of_fire_ms;
+            world.broadcast(system, id, move |stamp| vec![fire_fx(stamp, id, None, &guid, Some(ship), None, true, duration, 1)]);
         }
         let multiplier = turret_roll(gap, stats.optimal, stats.falloff);
         let dealt = if multiplier > 0.0 { damage(db, world, system, ship, victim.char_id, stats.damage.map(|d| d * multiplier), None).await? } else { 0.0 };

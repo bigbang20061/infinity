@@ -17,7 +17,7 @@ fn setup(owner: Option<i64>) -> (System, mpsc::UnboundedReceiver<EffectJob>, mps
     let registry = Arc::new(Pilots::default());
     let (notify, notifications) = mpsc::unbounded_channel();
     registry.register_pilot(10, notify);
-    let mut s = System::new(1, registry);
+    let mut s = System::new(1, registry, 0);
     let (tx, rx) = mpsc::unbounded_channel();
     s.effect_jobs = Some(tx);
     s.insert(ball(1000, None, 0.0));
@@ -48,6 +48,9 @@ fn nearest_hostile_excludes_cloak_warp_and_outside_aggro() {
     s.add_aggressor(1000, 15);
     s.tick(1000);
     assert_eq!(s.brains[&1000].target.unwrap().0, 5);
+    assert_eq!(s.ball(1000).unwrap().mode, MODE_STOP);
+    assert_eq!(s.ball(1000).unwrap().speed_fraction, 0.0);
+    s.tick(2000);
     assert_eq!(s.ball(1000).unwrap().mode, MODE_ORBIT);
     assert_eq!(s.ball(1000).unwrap().speed_fraction, 1.0);
 }
@@ -67,10 +70,11 @@ fn target_loss_stops_and_notifies_beyond_double_aggro() {
     let (tx, mut events) = mpsc::unbounded_channel();
     s.observe(1, 1, tx);
     s.tick(0);
-    events.try_recv().unwrap();
     s.command(1, |b, _, _| { b.pos = [201.0, 0.0, 0.0]; vec![] });
     s.tick(1000);
+    events.try_recv().unwrap();
     assert!(s.brains[&1000].target.is_none());
+    s.tick(2000);
     assert_eq!(s.ball(1000).unwrap().mode, MODE_STOP);
     assert_eq!(s.ball(1000).unwrap().speed_fraction, 0.0);
     let batch = events.try_recv().unwrap();
@@ -130,8 +134,9 @@ fn failed_lock_reacquires_and_ignores_stale_completion() {
     s.insert(ball(1, Some(10), 50.0));
     s.tick(0);
     let old_deadline = s.brains[&1000].target.unwrap().2;
-    s.brains.get_mut(&1000).unwrap().next_think_ms = old_deadline + 1;
     s.command(1, |b, _, _| { b.cloak = 1; vec![] });
+    s.tick(1000);
+    s.brains.get_mut(&1000).unwrap().next_think_ms = old_deadline + 1;
     s.tick(old_deadline);
     assert!(s.brains[&1000].target.is_none());
     assert!(!s.brains[&1000].announced);
@@ -140,7 +145,7 @@ fn failed_lock_reacquires_and_ignores_stale_completion() {
     assert!(jobs.try_recv().is_err());
 
     s.command(1, |b, _, _| { b.cloak = 0; vec![] });
-    s.tick(old_deadline + 1);
+    s.tick((old_deadline / 1000 + 1) * 1000);
     let new_target = s.brains[&1000].target.unwrap();
     assert!(new_target.2 > old_deadline);
     s.complete_npc_lock(1000, 1, 10, old_deadline);

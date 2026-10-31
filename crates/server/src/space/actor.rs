@@ -1,5 +1,5 @@
-//! Per-system unbounded closure mailbox and 100 ms simulation driver.
-//! Mirrors destiny's ballpark advancement; no database or client protocol decoding.
+//! Per-system unbounded closure mailbox and 100 ms timer/NPC driver.
+//! Destiny motion advances only on whole-second boundaries; no database or protocol decoding.
 //! NPC effects are sequential; deferred jobs run concurrently outside the actor.
 use super::*;
 use std::sync::Weak;
@@ -55,7 +55,7 @@ pub(super) fn start(mut system: System, id: i64, systems: Weak<Mutex<HashMap<i64
         loop {
             tokio::select! {
                 message = rx.recv() => match message {
-                    Some(job) => { system.evolve_all(now_ms()); job(&mut system); }
+                    Some(job) => job(&mut system),
                     None => break,
                 },
                 scheduled = interval.tick() => {

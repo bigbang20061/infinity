@@ -88,20 +88,61 @@ fn name(event: &Value) -> &[u8] {
 
 #[test]
 fn command_stamps_seconds_and_borrows_other_balls() {
-    let mut s = System::default();
+    let mut s = System::new(0, Arc::default(), 12_345);
     s.insert(ball(1, Some(100), 0.0));
     s.insert(ball(2, None, 10.0));
     let mut rx = watch(&mut s, 1, 1);
-    s.evolve_all(12_345);
     s.command(1, |b, stamp, others| {
         assert!(others.ball(1).is_none());
         b.goto = others.ball(2).unwrap().pos;
         vec![event(stamp, "GotoDirection", vec![Value::Int(b.id)])]
     });
+    assert_eq!(s.ball(1).unwrap().goto, [0.0; 3]);
+    assert!(rx.try_recv().is_err());
+    s.tick(12_999);
+    assert!(rx.try_recv().is_err());
+    s.tick(13_000);
     let events = rx.try_recv().unwrap();
     let Value::Tuple(parts) = &events[0] else { panic!("event") };
     assert_eq!(parts[0].as_int(), Some(12));
     assert_eq!(s.ball(1).unwrap().goto, [10.0, 0.0, 0.0]);
+}
+
+#[test]
+fn missile_impact_delay_starts_at_launch_boundary() {
+    let mut s = System::new(0, Arc::default(), 12_100);
+    let mut rx = watch(&mut s, 1, 1);
+    let fired = Arc::new(Mutex::new(Vec::new()));
+    let observed = fired.clone();
+    let mut missile = ball(3, None, 0.0);
+    missile.massive = false;
+    s.launch_missile(missile, 4, 5, 500, move |s| {
+        assert_eq!(s.ball(3).unwrap().mode, MODE_MISSILE);
+        observed.lock().unwrap().push(s.now_ms());
+    });
+    let b = s.ball(3).unwrap();
+    assert_eq!(b.mode, MODE_STOP);
+    assert_eq!(b.speed_fraction, 0.0);
+    assert_eq!(b.follow_id, 0);
+    assert_eq!(b.launcher, 0);
+    s.tick(12_600);
+    assert!(fired.lock().unwrap().is_empty());
+    assert!(rx.try_recv().is_err());
+    s.tick(13_000);
+    let events = rx.try_recv().unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(name(&events[0]), b"AddBalls");
+    assert_eq!(name(&events[1]), b"LaunchMissile");
+    let Value::Tuple(parts) = &events[1] else { panic!("event") };
+    assert_eq!(parts[0].as_int(), Some(12));
+    let b = s.ball(3).unwrap();
+    assert_eq!((b.mode, b.follow_id, b.launcher, b.effect_stamp), (MODE_MISSILE, 4, 5, 12));
+    assert_eq!(b.speed_fraction, 1.0);
+    assert!(fired.lock().unwrap().is_empty());
+    s.tick(13_499);
+    assert!(fired.lock().unwrap().is_empty());
+    s.tick(13_500);
+    assert_eq!(*fired.lock().unwrap(), [13_500]);
 }
 
 #[test]
@@ -119,6 +160,8 @@ fn cloak_visibility_and_tick_lapse_are_batched_per_observer() {
     s.tick(999);
     assert!(own.try_recv().is_err());
     s.tick(1000);
+    assert_ne!(s.ball(1).unwrap().cloak, 0);
+    s.tick(2000);
     assert_eq!(s.ball(1).unwrap().cloak, 0);
     assert_eq!(name(&own.try_recv().unwrap()[0]), b"UncloakBall");
     assert_eq!(name(&other.try_recv().unwrap()[0]), b"AddBalls");
@@ -130,7 +173,7 @@ fn pilot_removal_issues_jump_queue_key() {
     let registry = Arc::new(Pilots { capacity: 1, ..Pilots::default() });
     let (tx, mut rx) = mpsc::unbounded_channel();
     registry.register_pilot(200, tx);
-    let mut s = System::new(42, registry);
+    let mut s = System::new(42, registry, 0);
     s.insert(ball(1, Some(100), 0.0));
     assert_eq!(s.request_entry(200), Err(1));
     rx.try_recv().unwrap();
@@ -154,17 +197,19 @@ fn closed_observers_are_pruned_even_when_cold() {
 }
 
 #[test]
-fn warp_arrives_at_millisecond_deadline() {
+fn warp_advances_on_logical_second_boundaries() {
     let mut s = System::default();
     let mut b = ball(1, None, 0.0);
     b.mode = MODE_WARP;
-    b.warp = Some(Warp { from: b.pos, to: [100.0, 0.0, 0.0], start: 100,
-        duration: 1000.0, factor: 3000 });
-    b.effect_stamp = destiny_stamp(100);
+    b.warp = Some(Warp { from: b.pos, to: [100.0, 0.0, 0.0], start: 0,
+        duration: 2000.0, factor: 3000 });
+    b.effect_stamp = 0;
     s.insert(b);
     s.tick(600);
+    assert_eq!(s.ball(1).unwrap().pos, [0.0, 0.0, 0.0]);
+    s.tick(1000);
     assert_eq!(s.ball(1).unwrap().pos, [50.0, 0.0, 0.0]);
-    s.tick(1100);
+    s.tick(2000);
     let b = s.ball(1).unwrap();
     assert_eq!(b.pos, [100.0, 0.0, 0.0]);
     assert_eq!(b.mode, MODE_STOP);
@@ -174,7 +219,7 @@ fn warp_arrives_at_millisecond_deadline() {
 
 #[test]
 fn set_state_contains_visible_balls_ego_damage_and_system() {
-    let mut s = System::new(42, Arc::default());
+    let mut s = System::new(42, Arc::default(), 0);
     s.insert(ball(1, Some(100), 0.0));
     let mut hidden = ball(2, Some(200), 1.0);
     hidden.cloak = CLOAK_RESTORE;
@@ -222,7 +267,7 @@ fn constant_target_integration_is_step_size_independent() {
 fn timers_fire_by_deadline_not_insertion_order_without_firing_early() {
     let mut s = System::default();
     let fired = Arc::new(Mutex::new(Vec::new()));
-    s.evolve_all(1000);
+    s.tick(1000);
     for (delay, label) in [(250, 3), (101, 2), (50, 1)] {
         let fired = fired.clone();
         s.schedule(delay, move |s| fired.lock().unwrap().push((label, s.ms)));
@@ -294,4 +339,48 @@ fn absolute_deadlines_preserve_cadence_and_tie_order() {
     s.tick(200);
     s.tick(300);
     assert_eq!(*result.lock().unwrap(), [(1, 200), (2, 200), (3, 300)]);
+}
+
+#[test]
+fn catchup_clamps_wall_delay_without_rebasing_logical_time() {
+    let mut s = System::new(0, Arc::default(), 10_500);
+    let mut b = ball(1, None, 0.0);
+    b.vel = [1.0, 0.0, 0.0];
+    s.insert(b);
+    s.tick(15_000);
+    assert_eq!(s.current_time(), 15);
+    let before = s.ball(1).unwrap().pos[0];
+    s.tick(30_000);
+    assert_eq!(s.current_time(), 16);
+    assert!(s.ball(1).unwrap().pos[0] > before);
+    s.tick(30_999);
+    assert_eq!(s.current_time(), 16);
+    s.tick(31_000);
+    assert_eq!(s.current_time(), 17);
+}
+
+#[test]
+fn membership_and_uncloak_are_fifo_and_captured() {
+    let mut s = System::new(0, Arc::default(), 5_200);
+    let mut rx = watch(&mut s, 1, 99);
+    let mut b = ball(1, None, 0.0);
+    b.last_ms = 999_999;
+    s.add_ship(b);
+    assert_eq!(s.ball(1).unwrap().last_ms, 5_000);
+    s.remove_ball(1).unwrap();
+    let mut hidden = ball(2, None, 0.0);
+    hidden.cloak = CLOAK_RESTORE;
+    s.add_ship(hidden);
+    assert!(s.uncloak(2));
+    assert!(!s.uncloak(2));
+    assert_ne!(s.ball(2).unwrap().cloak, 0);
+    assert!(rx.try_recv().is_err());
+    s.tick(6_000);
+    let events = rx.try_recv().unwrap();
+    assert_eq!(events.iter().map(name).collect::<Vec<_>>(), vec![b"AddBalls".as_slice(), b"RemoveBalls", b"AddBalls"]);
+    for event in events {
+        let Value::Tuple(parts) = event else { panic!("event") };
+        assert_eq!(parts[0].as_int(), Some(5));
+    }
+    assert_eq!(s.ball(2).unwrap().cloak, 0);
 }

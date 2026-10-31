@@ -15,7 +15,7 @@
 //! the game's curve), reloading takes the module's reload time in space, and spawned NPCs
 //! (spawn_npc) engage their mission runner and whoever shoots them: orbit, lock, shoot back
 //! and repair themselves; a pilot's ship can be destroyed. Active modules apply their effects
-//! (hardeners through fit, propulsion speed via destiny, repairers each cycle), and a kill
+//! (hardeners through fit, propulsion speed via queued destiny commands, repairers each cycle), and a kill
 //! pays the NPC's bounty and leaves a wreck with loot.
 //! NPC effects, charge dimensions and wreck mappings come from immutable SDE datasets;
 //! loot prices come from `game.retail_prices` and static eligibility is applied before sampling.
@@ -49,7 +49,7 @@ use crate::db::executor::Executor;
 use crate::db::outbox::{Outbox, dispatch_client, dispatch_world};
 use crate::messages;
 use crate::sde::Sde;
-use crate::space::{dist, event, lock_time_ms, metres_to_km, ms_to_seconds, seconds_to_ms, now_ms, now_tick, Ball, NotifyTx, NpcAction, NpcBrain, NpcConfig, NpcEffects, NpcFuture, System, World, MODE_MISSILE, MODE_WARP};
+use crate::space::{dist, event, lock_time_ms, metres_to_km, ms_to_seconds, seconds_to_ms, now_ms, Ball, NotifyTx, NpcAction, NpcBrain, NpcConfig, NpcEffects, NpcFuture, System, World, MODE_WARP};
 use marshal::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};

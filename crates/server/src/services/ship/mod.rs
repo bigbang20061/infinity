@@ -1,6 +1,6 @@
 //! Undocking, flying and docking: the `ship` service (bound per location) and
 //! the `beyonce` remote ballpark (bound per solar system).
-//! Movement and jump waits run in per-system actors; arrival cloak expiry is handled by the actor tick.
+//! Movement commands apply at destiny boundaries; jump waits and arrival cloak expiry use the actor tick.
 //! Local-chat invites use an outside-space delay for session settlement.
 //! Uses ship attributes and celestial data from the SDE and persists locations in game tables.
 //! Ship loss commits before its independently best-effort killmail and insurance operations.
@@ -12,7 +12,7 @@ use crate::consts::{ATTR_AGILITY, ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_SIGNATURE_R
 use crate::db::outbox::{Effect, Outbox};
 use crate::dao::{characters::{ship as character_dao, selection}, items::{ship as item_dao, creation}};
 use crate::messages;
-use crate::space::{self, event, now_ms, now_tick, seconds_to_ms_f64, warp_duration, Ball, Warp, V3, CLOAK_RESTORE, MODE_FOLLOW, MODE_GOTO, MODE_ORBIT, MODE_STOP, MODE_WARP};
+use crate::space::{self, event, now_ms, seconds_to_ms_f64, warp_duration, Ball, Warp, V3, CLOAK_RESTORE, MODE_FOLLOW, MODE_GOTO, MODE_ORBIT, MODE_STOP, MODE_WARP};
 use marshal::Value;
 use tracing::{info, warn};
 
@@ -286,7 +286,7 @@ pub(super) async fn jump_out_and_arrive(c: &mut Client, system: i64, ship: i64, 
         c.world.schedule(dest_system, WORMHOLE_EFFECT_STOP_DELAY_MS, move |s| {
             s.broadcast(
                 ship,
-                vec![special_fx_stop(now_tick(), ship, "effects.CloakRegardless")],
+                vec![special_fx_stop(s.current_time(), ship, "effects.CloakRegardless")],
             );
         });
     }
@@ -480,7 +480,7 @@ pub(super) fn warp_to(c: &mut Client, object: Option<(V3, f64)>, point: V3, min_
         b.goto = to;
         b.speed_fraction = 1.0;
         b.warp = Some(Warp { from: b.pos, to, start: b.last_ms, duration: seconds_to_ms_f64(align + warp_duration(b.warp_factor as f64, distance)), factor: b.warp_factor });
-        b.effect_stamp = space::destiny_stamp(b.last_ms);
+        b.effect_stamp = t;
         // Destiny only enters warp once aligned at 75% of max velocity, and thrust scales
         // with the speed fraction (Ball::IsAlignedForWarp, GotoThrust): warp at full throttle,
         // or a stopped ship sits aligning until the 180 s MAX_ALIGN_TICKS fallback.
