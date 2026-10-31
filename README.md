@@ -10,7 +10,7 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
 
 - **Login and characters.** GPS handshake with the Placebo crypto pack. An account is created the first time a new user name logs in. Character selection and creation. Every account is treated as Omega.
 - **Stations and items.** Inventory and hangars, and the assets window with asset search. Boarding, assembling and repackaging ships. Saved fittings, ship insurance, jump clones and reprocessing. Private notes in the info window.
-- **Dogma.** Effective attributes are computed on the server from skills, hull, modules and charges, including stacking penalties.
+- **Dogma.** Effective attributes are computed on the server from skills, hull, modules and charges, including stacking penalties. Passive skill bonuses are also sent to the client as its character brain, so the fitting window and the HUD show them; the brain is sent again when finished skill training is recorded.
 - **Space.** Undock and dock, approach, align, orbit and follow, warp, and stargate jumps. Each solar system runs as its own actor, so systems advance independently and never block each other. Ships move on the client's one-second destiny tick: a command is stamped with the tick the system is on and takes effect before the next step, as on the client, and flight toward a distant point (go-to and align) uses carbonengine destiny's integration, so other pilots see the same course. Timers and NPCs run every 100 ms and read positions interpolated between ticks, as the client draws them. A per-system pilot cap with a jump queue is optional.
 - **Combat.**
   - Targeting, ammunition, weapon groups, turrets and missiles, and capacitor.

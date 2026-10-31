@@ -204,6 +204,12 @@ impl Fit {
         Ok(Fit { nodes, passive_modifiers, passive_by_attribute, sde, memo: Mutex::new(HashMap::new()) })
     }
 
+    /// Visit passive skill modifiers in stable skill and effect order, including
+    /// Python effects absent from the SDE modifier table.
+    pub(crate) fn passive_skill_modifiers(&self, visit: impl FnMut(Key, &Modifier)) {
+        self.visit_passive_modifiers(0..self.passive_modifiers.len(), visit);
+    }
+
     fn visit_passive_modifiers(&self, indices: impl IntoIterator<Item = usize>, mut visit: impl FnMut(Key, &Modifier)) {
         for index in indices {
             let (source, handle) = &self.passive_modifiers[index];
