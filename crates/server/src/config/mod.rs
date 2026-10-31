@@ -4,6 +4,7 @@
 
 pub mod deployment;
 pub mod game;
+pub mod scheduler;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -24,6 +25,7 @@ pub struct Config {
     pub images: deployment::ImagesConfig,
     pub gateway: deployment::GatewayConfig,
     pub cdn: deployment::CdnConfig,
+    pub scheduler: scheduler::SchedulerConfig,
     pub accounts: game::economy::AccountsConfig,
     pub characters: game::economy::CharactersConfig,
     pub market: game::economy::MarketConfig,
@@ -57,6 +59,7 @@ impl PartialEq for Config {
             && self.images == other.images
             && self.gateway == other.gateway
             && self.cdn == other.cdn
+            && self.scheduler == other.scheduler
             && self.accounts == other.accounts
             && self.characters == other.characters
             && self.market == other.market
@@ -183,6 +186,7 @@ impl Config {
         self.images.validate()?;
         self.gateway.validate()?;
         self.cdn.validate()?;
+        self.scheduler.validate()?;
         self.game_config().validate()?;
         Ok(())
     }
@@ -235,4 +239,4 @@ pub fn game() -> &'static GameConfig {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

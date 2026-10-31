@@ -12,6 +12,9 @@
 //! game.market_transactions (wallet transactions and price history). Ranges in jumps use
 //! the startup-loaded SDE map. Fees, tax, duration, history and maintenance cadence are
 //! configured market policies. The SQL startup seed is the static-data exception.
+//! Order expiry scans run as durable periodic jobs registered through the services scheduler
+//! and persisted in game.jobs, not detached maintenance sleeps. Internal scan errors warn
+//! but the scan still completes.
 
 use crate::dao::items::loading::ItemQuery;
 use super::items::load_items;
@@ -29,6 +32,7 @@ use crate::messages;
 use crate::space::World;
 use marshal::{DbRowDescriptor, DbType, Value};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::{Arc, OnceLock};
 use tracing::{info, warn};
 mod lists;
@@ -564,14 +568,12 @@ async fn cancel(c: &Client, order_id: i64) -> CallResult {
     })}, |value, outbox| async move { dispatch_market(value, outbox, world) }).await
 }
 
-/// Close players' orders past their duration, once a minute.
-pub async fn expire_orders(db: Db, sde: Arc<crate::sde::Sde>, world: Arc<World>) {
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(crate::config::game().market.maintenance_secs as u64)).await;
-        if let Err(CallError::Internal(e)) = expire(&db, &sde, &world).await {
-            warn!("expiring market orders failed: {e:#}");
-        }
-    }
+/// Execute one scheduler-driven expiry scan.
+pub(crate) fn expire_orders(db: Db, world: Arc<World>, _: crate::scheduler::Job) -> std::pin::Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
+    Box::pin(async move {
+        if let Err(CallError::Internal(e)) = expire(&db, world.sde(), &world).await { warn!("expiring market orders failed: {e:#}"); }
+        Ok(())
+    })
 }
 
 async fn expire(db: &Db, sde: &Arc<crate::sde::Sde>, world: &World) -> Result<(), CallError> {

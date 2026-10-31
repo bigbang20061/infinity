@@ -6,6 +6,9 @@
 //! another period. A corporation can have its accountants' chosen bill types paid automatically
 //! from a wallet division (billMgr automatic payment settings). Advance billing and maintenance
 //! cadence are operator policies. An office whose rent goes unpaid isn't taken away.
+//! Billing scans run as durable periodic jobs registered through the services scheduler
+//! and persisted in game.jobs, not detached maintenance sleeps. Internal scan errors warn
+//! but the scan still completes.
 
 use super::{db_err, has_role_or_is_ceo, keyval, notify_error, Call, CallError, CallResult};
 use crate::dao::characters::members;
@@ -17,6 +20,7 @@ use crate::db::outbox::dispatch_world;
 use crate::messages;
 use crate::space::World;
 use marshal::Value;
+use std::future::Future;
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -95,6 +99,8 @@ pub(super) async fn pay(db: &Db, world: &World, bill: i64, corp: Option<i64>, ke
 
 /// Issue rent bills that have come due and pay those set to be paid automatically.
 async fn run(db: &Db, world: &World) -> Result<(), CallError> {
+    static RUN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _run = RUN_LOCK.lock().await;
     let now = filetime_now();
     let ahead = crate::config::game().corporations.advance_billing_days.saturating_mul(FILETIME_DAY);
     let due = bills_dao::due(db, now, ahead, BILL_RENTAL, UNPAID).await.map_err(db_err)?;
@@ -102,7 +108,10 @@ async fn run(db: &Db, world: &World) -> Result<(), CallError> {
         let (office, corp, station, until) = (r.office_id, r.corporation_id, r.station_id, r.rented_until);
         let landlord = world.sde().map.station(station).and_then(|st| st.owner_id).unwrap_or(1_000_001);
         let amount = super::offices::rent_price(world.sde(), station);
-        bills_dao::issue(db, BILL_RENTAL, corp, landlord, amount, until, office, station, now).await.map_err(db_err)?;
+        {
+            let _trading = super::market::lock().await;
+            bills_dao::issue(db, BILL_RENTAL, corp, landlord, amount, until, office, station, now).await.map_err(db_err)?;
+        }
         info!("bills: billed {corp} {amount:.0} ISK rent for office {office}");
         announce(db, world, corp).await?;
     }
@@ -118,14 +127,12 @@ async fn run(db: &Db, world: &World) -> Result<(), CallError> {
     Ok(())
 }
 
-/// Run billing at the configured maintenance cadence.
-pub async fn run_billing(db: Db, world: Arc<World>) {
-    loop {
-        if let Err(CallError::Internal(e)) = run(&db, &world).await {
-            warn!("billing failed: {e:#}");
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(crate::config::game().corporations.bills_maintenance_secs as u64)).await;
-    }
+/// Execute one scheduler-driven billing scan.
+pub(crate) fn run_billing(db: Db, world: Arc<World>, _: crate::scheduler::Job) -> std::pin::Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
+    Box::pin(async move {
+        if let Err(CallError::Internal(e)) = run(&db, &world).await { warn!("billing failed: {e:#}"); }
+        Ok(())
+    })
 }
 
 /// An accountant, director or the CEO of `corp`.

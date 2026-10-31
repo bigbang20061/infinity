@@ -870,3 +870,20 @@ CREATE TABLE IF NOT EXISTS game.asteroid_fields (
     grown_at    bigint NOT NULL,
     depleted_at bigint
 );
+
+-- Durable scheduler (dao/jobs.rs); all timestamps are FILETIME ticks.
+CREATE SEQUENCE IF NOT EXISTS game.jobs_lease_seq;
+CREATE TABLE IF NOT EXISTS game.jobs (
+    job_id text PRIMARY KEY,
+    kind text NOT NULL,
+    due_at bigint NOT NULL,
+    payload text NOT NULL DEFAULT '{}',
+    state text NOT NULL CHECK (state IN ('scheduled', 'running', 'dead')),
+    attempt integer NOT NULL DEFAULT 0,
+    lease_until bigint,
+    lease_token bigint,
+    last_error text,
+    created_at bigint NOT NULL,
+    updated_at bigint NOT NULL
+);
+CREATE INDEX IF NOT EXISTS jobs_due ON game.jobs (state, due_at);

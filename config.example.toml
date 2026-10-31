@@ -56,6 +56,14 @@ bind = "0.0.0.0:26002"              # env: GATEWAY_BIND; existing public gateway
 [cdn]
 bind = "0.0.0.0:80"                 # env: CDN_BIND; existing plain HTTP content listener
 
+[scheduler]
+poll_secs = 5                       # maximum polling interval
+lease_secs = 60                     # handlers must finish within this lease
+max_concurrent = 8                  # maximum simultaneous handlers
+retry_base_secs = 30                # retry backoff base
+dead_letter_attempts = 25           # failures before dead-lettering
+drain_secs = 10                     # bounded shutdown drain
+
 # Game parameters have no environment overrides.
 
 [accounts]
@@ -179,6 +187,7 @@ bills_maintenance_secs = 600        # server billing maintenance cadence
 advance_billing_days = 7            # server advance-billing policy
 
 [contracts]
+maintenance_secs = 60               # existing auction settlement cadence
 expiry_min_minutes = 60             # existing contract expiry lower bound
 expiry_max_days = 90                # existing contract expiry upper bound
 courier_min_days = 1                # existing courier duration lower bound

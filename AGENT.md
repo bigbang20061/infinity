@@ -73,6 +73,7 @@ Any other tag starts nothing.
 | Remote service dispatch | `services/mod.rs` (`dispatch`), one module per feature under `services/`, and `services/fixed.rs` (constant answers for services that are not modelled) |
 | Server-side dogma | `services/fit.rs` (effective attributes), `services/dogma.rs` (dogmaIM) |
 | Space simulation and destiny | `space/mod.rs` (`World` facade, `Ball`, destiny encoding, integration and interpolation, pilot registry and jump queues), `space/system.rs` (`System`: one system's state, destiny clock, action queue, tick, timers), `space/actor.rs` (per-system mailbox and the wall-aligned 100 ms loop), `space/npc.rs` (NPC brains, spawn groups, effects worker), `space/snapshot.rs` (periodic pilot position saves and the shutdown flush) |
+| Scheduled jobs | `scheduler/` (job registration, the claim runner, retries and the shutdown drain), `dao/jobs.rs` (`game.jobs`); handlers register in `services/mod.rs` |
 | Public gateway (gRPC) | `gateway/mod.rs`, `gateway/handlers.rs` |
 | Chat | `chat.rs` |
 | Image server and content CDN | `images.rs`, `cdn.rs` |
@@ -164,7 +165,7 @@ Any other tag starts nothing.
   - `world.with(system, move |s| ...).await` runs a closure inside the actor and returns its value (`None` if the system is not running).
   - `world.post(system, move |s| ...)` sends a write and does not wait. It can be called from synchronous code.
   - `world.schedule(system, delay_ms, move |s| ...)` runs a closure inside the actor on the first tick after the delay. `world.after(system, delay_ms).await` waits for that tick from async code (`false` if the system is not running). Every timed effect on something in space uses one of these: target locks, module cycles and effect durations, reloads, missile flight, jump delays, scans and probes, site and belt respawns, CONCORD response. Never `tokio::spawn` + `sleep` for them.
-  - `tokio::spawn` + `sleep` is only for work outside space: database maintenance loops (market, contracts, bills), chat, and character timers that follow the pilot across systems and stations (Crimewatch).
+  - Work outside space that must survive a restart (market order expiry, auction settlement, bills, and any new deadline kept in the database) is a scheduled job: register an idempotent handler and call `scheduler::schedule`/`cancel`. Scheduling inside a transaction wakes the runner from the post-commit dispatch. `tokio::spawn` + `sleep` is only for chat and for character timers that follow the pilot across systems and stations and need not survive a restart (Crimewatch).
   - `with`, `post` and `schedule` never load a system. Code that puts something into a system (`add_ship`, `observe`, `World::system`) loads it first.
 - Rules for closures that run inside a system, including `command`, on-cleared and timer closures:
   - Never `.await`, never touch the database, and never call `World`. Closures must be `Send + 'static`: use `move` and capture owned values.

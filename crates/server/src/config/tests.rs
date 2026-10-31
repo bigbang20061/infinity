@@ -262,3 +262,25 @@ fn postgres_conversion_uses_url_or_individual_fields_and_applies_common_options(
     };
     assert!(!error.contains("secret"), "{error}");
 }
+
+pub(crate) fn scheduler_database() -> deployment::DatabaseConfig {
+    crate::tests::init_config();
+    deployment::DatabaseConfig {
+        url: std::env::var("INFINITY_TEST_DATABASE_URL").expect("INFINITY_TEST_DATABASE_URL required for ignored scheduler tests"),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn scheduler_validation_rejects_invalid_limits() {
+    let mut config = Config::default();
+    assert!(config.validate().is_ok());
+    config.scheduler.lease_secs = config.scheduler.poll_secs;
+    assert!(config.validate().is_err());
+    config.scheduler = scheduler::SchedulerConfig::default();
+    config.scheduler.max_concurrent = 0;
+    assert!(config.validate().is_err());
+    config.scheduler = scheduler::SchedulerConfig::default();
+    config.contracts.maintenance_secs = 0;
+    assert!(config.validate().is_err());
+}

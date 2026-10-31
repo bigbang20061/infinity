@@ -19,6 +19,9 @@
 //! their notifications are delivered only after commit.
 //! Contract and item state comes from game tables; station ancestry comes from the loaded SDE.
 //! Creation limits and listing page sizes are operator policies in the contracts configuration.
+//! Auction settlement scans run as durable periodic jobs registered through the services
+//! scheduler and persisted in game.jobs, not detached maintenance sleeps. Internal scan
+//! errors warn but the scan still completes.
 
 mod lifecycle;
 mod lists;
@@ -43,11 +46,10 @@ use crate::sde::Sde;
 use crate::space::World;
 use marshal::{DbRowDescriptor, DbType, Value};
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use tracing::{info, warn};
 
-/// Existing server policy for auction maintenance cadence.
-const AUCTION_MAINTENANCE_INTERVAL_SECONDS: u64 = 60;
 
 const TYPE_PLASTIC_WRAP: i32 = 3468;
 
@@ -316,14 +318,12 @@ async fn num_outstanding(db: &(impl Executor + ?Sized), char_id: i64) -> Result<
 // ---------------------------------------------------------------- lifecycle
 
 
-/// Settle expired auctions with bids, once a minute.
-pub async fn settle_auctions(db: Db, sde: Arc<crate::sde::Sde>, world: Arc<World>) {
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(AUCTION_MAINTENANCE_INTERVAL_SECONDS)).await;
-        if let Err(CallError::Internal(e)) = settle_expired(&db, &sde, &world).await {
-            warn!("settling auctions failed: {e:#}");
-        }
-    }
+/// Execute one scheduler-driven auction settlement scan.
+pub(crate) fn settle_auctions(db: Db, world: Arc<World>, _: crate::scheduler::Job) -> std::pin::Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
+    Box::pin(async move {
+        if let Err(CallError::Internal(e)) = settle_expired(&db, world.sde(), &world).await { warn!("settling auctions failed: {e:#}"); }
+        Ok(())
+    })
 }
 
 
