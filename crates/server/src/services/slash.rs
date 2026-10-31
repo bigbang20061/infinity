@@ -9,8 +9,10 @@
 //! `game.characters` and `game.accounts`; client wallet displays are clamped to
 //! their protocol limits. Corporation wallets and target writes are unsupported.
 //!
-//! Type and celestial data come from the startup SDE snapshot; item positions and
-//! wallet balances come from game data. Unsupported commands return a slash error.
+//! Type and celestial data come from the startup SDE snapshot; item positions,
+//! per-item dogma base overrides and wallet balances come from game data.
+//! Dogma overrides require singleton items; modules and hull-foreign attributes
+//! have limited client display support. Unsupported commands return a slash error.
 //! Teleports to live balls use the system actor's sampled position; stored positions remain unchanged.
 
 use super::{db_err, Call, CallError, CallResult};
@@ -20,6 +22,7 @@ use crate::consts::{CLIENT_MAX_ISK, CLIENT_MAX_PLEX, FLAG_CARGO, FLAG_HANGAR, GM
 use crate::messages;
 use marshal::Value;
 use tracing::info;
+mod dogma;
 
 /// Server design: clearance in metres when teleporting to an item.
 const TELEPORT_CLEARANCE: f64 = 5000.0;
@@ -31,7 +34,7 @@ const ISK_DECIMALS: usize = 2;
 /// `game_schema.sql`: account PLEX balance is numeric(36, 0).
 const PLEX_DIGITS: usize = 36;
 
-const COMMANDS: [(&str, &str); 12] = [
+const COMMANDS: [(&str, &str); 13] = [
     ("tr", messages::GM_HELP_TELEPORT),
     ("wh", messages::GM_HELP_WORMHOLE),
     ("scanall", messages::GM_HELP_SCAN_ALL),
@@ -43,6 +46,7 @@ const COMMANDS: [(&str, &str); 12] = [
     ("setplex", messages::GM_HELP_SET_PLEX),
     ("addplex", messages::GM_HELP_ADD_PLEX),
     ("heal", messages::GM_HELP_HEAL),
+    ("dogma", messages::GM_HELP_DOGMA),
     ("help", messages::GM_HELP_HELP),
 ];
 
@@ -249,6 +253,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "create" | "createitem" => create(c, &args).await,
         "setisk" | "addisk" | "setplex" | "addplex" => wallet(c, &args, &command).await,
         "heal" => heal(c).await,
+        "dogma" => dogma::command(c, &args).await,
         "help" => Ok(help()),
         other => Err(slash_error(messages::gm_unknown_command(other, &help()))),
     };

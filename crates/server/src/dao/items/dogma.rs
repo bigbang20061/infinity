@@ -23,3 +23,21 @@ impl AttributeOverride {
 pub(crate) async fn overrides_for(ex: &(impl Executor + ?Sized), ids: &[i64]) -> Result<Vec<AttributeOverride>, Error> {
     Ok(ex.query("SELECT item_id, attribute_id, value FROM game.item_attributes WHERE item_id = ANY($1) ORDER BY item_id, attribute_id", &[&ids]).await?.iter().map(AttributeOverride::from_row).collect())
 }
+
+pub(crate) async fn overrides(ex: &(impl Executor + ?Sized), item: i64) -> Result<Vec<AttributeOverride>, Error> {
+    overrides_for(ex, &[item]).await
+}
+
+pub(crate) async fn set_override(ex: &(impl Executor + ?Sized), item: i64, attribute: i32, value: f64) -> Result<bool, Error> {
+    Ok(ex.execute("WITH target AS (SELECT item_id FROM game.items WHERE item_id = $1 AND singleton FOR UPDATE) INSERT INTO game.item_attributes (item_id, attribute_id, value) SELECT item_id, $2, $3 FROM target ON CONFLICT (item_id, attribute_id) DO UPDATE SET value = EXCLUDED.value", &[&item, &attribute, &value]).await? != 0)
+}
+
+pub(crate) async fn clear_override(ex: &(impl Executor + ?Sized), item: i64, attribute: i32) -> Result<(), Error> {
+    ex.execute("DELETE FROM game.item_attributes WHERE item_id = $1 AND attribute_id = $2", &[&item, &attribute]).await?;
+    Ok(())
+}
+
+pub(crate) async fn clear_overrides(ex: &(impl Executor + ?Sized), item: i64) -> Result<(), Error> {
+    ex.execute("DELETE FROM game.item_attributes WHERE item_id = $1", &[&item]).await?;
+    Ok(())
+}

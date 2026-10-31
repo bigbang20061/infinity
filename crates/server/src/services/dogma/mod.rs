@@ -2,7 +2,7 @@
 //! `eve/client/script/environment/godma.py:2440-2454` consumes all-info state,
 //! and `eve/client/script/environment/godma.py:1652-1676` reads active effects.
 //! Type attributes: `eve/common/script/dogma/baseDogmaLocation.py:1960-1967`.
-//! Static dogma and type data come from the shared SDE; items, charges and online
+//! Static dogma and type data come from the shared SDE; items, base overrides, charges and online
 //! state come from the runtime game database. For absent dogma rows, mass, capacity,
 //! volume and radius fall back to typed SDE type columns: this is server schema
 //! behavior, not a validated client fallback. Effective fitting is the subset in
@@ -73,6 +73,10 @@ fn type_attributes(c: &Client, type_id: i32) -> BTreeMap<i64, f64> {
         }
     }
     attrs
+}
+
+fn overlay_overrides(attrs: &mut BTreeMap<i64, f64>, overrides: impl IntoIterator<Item = (i32, f64)>) {
+    attrs.extend(overrides.into_iter().map(|(id, value)| (id as i64, value)));
 }
 
 /// godma's activeEffects for an online module: {effectID: (itemID, charID, shipID, targetID,
@@ -190,6 +194,7 @@ async fn ship_info(c: &Client) -> Result<Vec<(Value, Value)>, CallError> {
             None
         };
         if let Some(key) = key {
+            overlay_overrides(&mut attrs, fit.overrides(key).iter().copied());
             for (attr, value) in attrs.iter_mut() {
                 *value = fit.value(key, *attr as i32);
             }
@@ -266,7 +271,9 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
             let items = load_items(&c.db, &c.sde, ItemQuery::Id(item_id)).await.map_err(db_err)?;
             match items.into_iter().next() {
                 Some(item) => {
-                    let attrs = type_attributes(c, item.type_id);
+                    let mut attrs = type_attributes(c, item.type_id);
+                    overlay_overrides(&mut attrs, dogma_dao::overrides(&c.db, item.item_id).await.map_err(db_err)?
+                        .into_iter().map(|row| (row.attribute_id, row.value)));
                     let online = online_modules(c, item.location_id).await?.contains(&item.item_id);
                     let char_id = c.session.int("charid").unwrap_or(0);
                     let active = if online { online_effect(item.item_id, char_id, item.location_id) } else { vec![] };
@@ -303,3 +310,5 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
         }
     }
 }
+
+#[cfg(test)] mod tests;

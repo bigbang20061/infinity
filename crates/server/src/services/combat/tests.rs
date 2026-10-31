@@ -46,22 +46,24 @@ fn propulsion_and_missile_commands_wait_for_boundary_and_use_enqueue_stamp() {
     system.insert(ball.clone());
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     system.observe(1, 1, tx);
-    system.command(1, |b, stamp, _| propulsion_transition(b, stamp, 20.0, 30.0, 40.0));
+    queue_kinematics(&mut system, 1, Kinematics { speed: 20.0, mass: 30.0, agility: 0.25, signature: 40.0 });
     system.launch_missile(Ball { id: 2, ..ball }, 3, 1, 500, |_| {});
     system.tick(12_999);
     assert_eq!(system.ball(1).unwrap().max_vel, 1.0);
+    assert_eq!(system.ball(1).unwrap().agility, 1.0);
     assert_eq!(system.ball(2).unwrap().mode, crate::space::MODE_STOP);
     assert!(rx.try_recv().is_err());
     system.tick(13_000);
     let ship = system.ball(1).unwrap();
-    assert_eq!((ship.max_vel, ship.mass, ship.signature_radius), (20.0, 30.0, Some(40.0)));
+    assert_eq!((ship.max_vel, ship.mass, ship.agility, ship.signature_radius), (20.0, 30.0, 0.25, Some(40.0)));
     let missile = system.ball(2).unwrap();
     assert_eq!((missile.mode, missile.effect_stamp, missile.follow_id, missile.launcher), (crate::space::MODE_MISSILE, 12, 3, 1));
     let events = rx.try_recv().unwrap();
-    assert_eq!(events.len(), 4);
+    assert_eq!(events.len(), 5);
     assert_eq!(events[0], event(12, "SetMaxSpeed", vec![Value::Int(1), Value::Float(20.0)]));
     assert_eq!(events[1], event(12, "SetBallMass", vec![Value::Int(1), Value::Float(30.0)]));
-    assert_eq!(events[3], event(12, "LaunchMissile", vec![
+    assert_eq!(events[2], event(12, "SetBallAgility", vec![Value::Int(1), Value::Float(0.25)]));
+    assert_eq!(events[4], event(12, "LaunchMissile", vec![
         Value::Int(2), Value::Int(3), Value::Int(1), Value::Bool(true), Value::Bool(false),
     ]));
     assert_eq!(system.current_time(), 13);

@@ -125,7 +125,7 @@ struct Node {
     overrides: Vec<(i32, f64)>,
 }
 
-fn base_attribute(data: Option<&TypeData>, meta: Option<&Attribute>, attr: i32) -> f64 {
+pub(crate) fn base_attribute(data: Option<&TypeData>, meta: Option<&Attribute>, attr: i32) -> f64 {
     data.and_then(|t| t.fit_attribute(attr))
         .unwrap_or_else(|| meta.and_then(|m| m.default_value).unwrap_or(0.0))
 }
@@ -245,8 +245,17 @@ impl Fit {
             value => value,
         }
     }
+    pub(crate) fn overrides(&self, key: Key) -> &[(i32, f64)] {
+        self.nodes.get(&key).map_or(&[], |node| node.overrides.as_slice())
+    }
 
-    fn base(&self, key: Key, attr: i32) -> f64 {
+    pub(crate) fn type_has_attribute(&self, key: Key, attr: i32) -> bool {
+        self.nodes.get(&key).and_then(|node| node.data_position)
+            .is_some_and(|position| attr == crate::consts::ATTR_CAPACITY || self.sde.types.at_position(position).attribute(attr).is_some())
+    }
+
+
+    pub(crate) fn base(&self, key: Key, attr: i32) -> f64 {
         let Some(node) = self.nodes.get(&key) else { return 0.0 };
         node.base(node.data_position.map(|i| self.sde.types.at_position(i)), self.sde.dogma.attribute(attr), attr)
     }

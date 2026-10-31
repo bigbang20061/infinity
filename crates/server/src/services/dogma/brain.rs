@@ -1,4 +1,4 @@
-//! Passive skill brain compilation for dogmaIM and OnServerBrainUpdated.
+//! Passive skill and active-hull base override brain compilation for dogmaIM and OnServerBrainUpdated.
 //! Mirrors eve/client/script/dogma/allSkillsCharBrain.py and
 //! eve/common/script/dogma/effect.py, using Fit's SDE and learned skill nodes.
 //! Versions are in-memory; implants, boosters, structure effects and unsupported
@@ -45,10 +45,18 @@ fn combine(effects: &mut BTreeMap<Target, Effect>, target: Target, value: f64, s
     }
 }
 
+fn insert_hull_overrides(effects: &mut BTreeMap<Target, Effect>, overrides: &[(i32, f64)], present: impl Fn(i32) -> bool) {
+    for &(attribute, value) in overrides {
+        if present(attribute) {
+            effects.insert(Target { ship: true, attribute, kind: "M", operation: OP_PRE_ASSIGN, extra: None }, Effect { value, skills: Vec::new() });
+        }
+    }
+}
+
 fn wire(target: &Target, effect: Effect, to_item: i64) -> Value {
     let extras = Value::tuple(target.extra.into_iter().map(|id| Value::Int(id as i64)));
     // The constructor reads fromAttrib.invItem.typeID before state is restored.
-    let from = keyval([("invItem", keyval([("typeID", Value::Int(effect.skills[0] as i64))]))]);
+    let from = keyval([("invItem", keyval([("typeID", Value::Int(effect.skills.first().copied().unwrap_or(0) as i64))]))]);
     let state = Value::dict([
         ("fromAttrib", Value::None),
         ("value", Value::Float(effect.value)),
@@ -66,6 +74,7 @@ fn wire(target: &Target, effect: Effect, to_item: i64) -> Value {
 /// Compile from the same effective source values and modifier traversal as Fit.
 pub(crate) fn compile(fit: &Fit, char_id: i64, ship_id: i64) -> (Value, Value, Value) {
     let mut effects: BTreeMap<Target, Effect> = BTreeMap::new();
+    insert_hull_overrides(&mut effects, fit.overrides(Key::Ship), |attribute| fit.type_has_attribute(Key::Ship, attribute));
     fit.passive_skill_modifiers(|source, modifier| {
         let Key::Skill(skill) = source else { return };
         let ship = match modifier.domain.as_str() {

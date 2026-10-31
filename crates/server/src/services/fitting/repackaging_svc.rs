@@ -1,5 +1,5 @@
 //! Item repackaging, mirroring the client repackagingSvc service.
-//! Uses game items and SDE stations; each call writes atomically and notifies after commit.
+//! Uses game items, per-item dogma overrides and SDE stations; each call writes atomically and notifies after commit.
 //! Structure access is unsupported.
 use crate::services::inventory::notify_item_change;
 use crate::services::{db_err, user_error, Call, CallError, CallResult};
@@ -66,6 +66,7 @@ async fn repackage(c: &mut Client, call: &Call<'_>) -> CallResult {
                     if changed == 0 {
                         return Err(crate::services::notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
                     }
+                    crate::dao::items::dogma::clear_overrides(tx, id).await.map_err(db_err)?;
                     notify_item_change(tx, &sde, outbox, id, vec![(IX_SINGLETON, Value::Bool(true))]).await?;
                 }
                 Ok(())

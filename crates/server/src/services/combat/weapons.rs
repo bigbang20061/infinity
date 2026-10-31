@@ -52,16 +52,33 @@ pub(super) fn repair_kind(effect: &str) -> Option<(usize, i32)> {
     }
 }
 
-/// The ship's speed and mass as fitted now (propulsion running or not), for everyone's destiny.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) struct Kinematics { pub(super) speed: f64, pub(super) mass: f64, pub(super) agility: f64, pub(super) signature: f64 }
+
+pub(crate) fn kinematics(fit: &Fit) -> Kinematics {
+    Kinematics { speed: fit.value(Key::Ship, ATTR_MAX_VELOCITY), mass: fit.value(Key::Ship, ATTR_MASS),
+        agility: fit.value(Key::Ship, crate::consts::ATTR_AGILITY), signature: fit.value(Key::Ship, ATTR_SIGNATURE_RADIUS) }
+}
+
+pub(crate) fn queue_kinematics(system: &mut System, ship: i64, values: Kinematics) {
+    system.command(ship, move |b, stamp, _| {
+        let mut events = propulsion_transition(b, stamp, values.speed, values.mass, values.signature);
+        b.agility = values.agility as f32;
+        events.push(event(stamp, "SetBallAgility", vec![Value::Int(b.id), Value::Float(values.agility)]));
+        events
+    });
+}
+
+/// The ship's current fitted kinematics for everyone's destiny.
 pub(super) async fn apply_propulsion(cx: &Ctx, master: i64, generation: Arc<AtomicBool>, active: bool) {
     let Ok(fit) = Fit::load(&cx.db, cx.world.sde().clone(), cx.char_id, cx.ship_id).await else { return };
-    let (speed, mass, signature) = (fit.value(Key::Ship, ATTR_MAX_VELOCITY), fit.value(Key::Ship, ATTR_MASS), fit.value(Key::Ship, ATTR_SIGNATURE_RADIUS));
+    let values = kinematics(&fit);
     let ship = cx.ship_id;
     cx.world.post(cx.system_id, move |s| {
         let mut st = state();
         if !st.activation_generation.get(&master).is_some_and(|current| Arc::ptr_eq(current, &generation))
             || st.active.contains_key(&master) != active { return; }
-        s.command(ship, move |b, t, _| propulsion_transition(b, t, speed, mass, signature));
+        queue_kinematics(s, ship, values);
         if !active { st.activation_generation.remove(&master); }
     });
 }
