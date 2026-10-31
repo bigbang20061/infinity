@@ -8,6 +8,9 @@
 //! Wallet commands write exact values through the character and account DAOs to
 //! `game.characters` and `game.accounts`; client wallet displays are clamped to
 //! their protocol limits. Corporation wallets and target writes are unsupported.
+//! ISK wallet events report the difference between client-projected balances.
+//! ponytail: f64 precision and the client cap can mask exact changes; a typed
+//! event payload would be needed to expose exact decimal deltas.
 //!
 //! Type and celestial data come from the startup SDE snapshot; item positions,
 //! per-item dogma base overrides and wallet balances come from game data.
@@ -261,12 +264,17 @@ async fn wallet(c: &mut Client, args: &[String], command: &str) -> Result<String
     match command {
         "setisk" | "addisk" => {
             let char_id = c.session.int("charid").unwrap_or(0);
+            let before = crate::dao::wallets::characters::balance(&c.db, char_id).await.map_err(wallet_error)?;
             let (exact, balance) = if command == "setisk" {
                 crate::dao::wallets::characters::set_exact(&c.db, char_id, &amount).await
             } else {
                 crate::dao::wallets::characters::credit_exact(&c.db, char_id, &amount).await
             }.map_err(wallet_error)?;
             c.notify("OnAccountChange", vec![Value::str("cash"), Value::Int(char_id), Value::Float(balance)]);
+            let delta = balance - before;
+            let mut outbox = crate::db::outbox::Outbox::default();
+            outbox.event(crate::lua::events::GameEvent::WalletChanged { owner_id: char_id, account_key: crate::consts::ACCOUNT_CASH, balance, delta });
+            crate::db::outbox::dispatch_client((), outbox, c)?;
             let shown = exceeds_cap(&exact, &format!("{CLIENT_MAX_ISK:.0}")).then_some(balance);
             Ok(messages::gm::gm_balance(&exact, shown))
         }

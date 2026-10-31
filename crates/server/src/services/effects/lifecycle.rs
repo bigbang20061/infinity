@@ -610,6 +610,7 @@ pub(crate) async fn set_online(c: &mut Client, ship: i64, item_id: i64, online: 
                 match entry {
                     OutboxEffect::Operation(change) => apply_online_changed(change),
                     OutboxEffect::Notification(notification) => notification.dispatch(&c.world, None)?,
+                    OutboxEffect::Event(event) => crate::lua::on_event(event),
                 }
             }
             if changed { info!(user = c.login.user_id, "module {item_id} {}", if online { "online" } else { "offline" }); }

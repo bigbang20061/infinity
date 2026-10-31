@@ -2,10 +2,13 @@
 //! `carbon/common/script/net/machoNet.py` defines transport usurp behavior.
 //! Session state uses the game database and in-memory world; account ownership
 //! is process-local and does not coordinate separate server processes.
+//! A successful disconnect cleanup hands off the selected character's logoff event.
 
 use crate::conn::{Conn, Writer};
 use crate::consts::{FILETIME_SECOND, FILETIME_UNIX_EPOCH};
 use crate::db::Db;
+use crate::db::outbox::{dispatch_client, Outbox};
+use crate::lua::events::GameEvent;
 use crate::handshake::Login;
 use crate::macho::{cmd, Address, Packet, ERR_WRAPPEDEXCEPTION};
 use crate::services::{self, Call, CallError};
@@ -217,9 +220,16 @@ impl Client {
                 warn!(user = self.login.user_id, "usurp close failed: {e:#}");
             }
         }
+        let char_id = self.session.int("charid");
         let cleanup = self.leave_world().await;
         if let Err(e) = &cleanup {
             warn!(user = self.login.user_id, "leave world failed: {e:#}");
+        } else if let Some(char_id) = char_id {
+            let mut outbox = Outbox::default();
+            outbox.event(GameEvent::CharacterLoggedOff { user_id: self.login.user_id, char_id });
+            if dispatch_client((), outbox, &mut self).is_err() {
+                warn!(user = self.login.user_id, "logoff event dispatch failed");
+            }
         }
         let close = self.conn.close().await;
         if let Err(e) = &close {

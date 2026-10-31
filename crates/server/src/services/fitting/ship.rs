@@ -178,6 +178,7 @@ pub(in crate::services) async fn gm_create_ship(c: &mut Client, owner: i64, type
                         crate::db::outbox::Effect::Notification(crate::db::outbox::Notification::DirectClient { event, args }) => world.notify_pilot(owner, &event, args),
                         crate::db::outbox::Effect::Notification(notification) => notification.dispatch(&world, Some(c))?,
                         crate::db::outbox::Effect::Operation(never) => match never {},
+                        crate::db::outbox::Effect::Event(event) => crate::lua::on_event(event),
                     }
                 }
                 Ok(id)

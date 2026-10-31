@@ -6,6 +6,7 @@
 //! stored in the game database; site simulation is separate.
 //! Basic mission rewards and placement are operator policy, not a client-provided generator;
 //! complete live-server mission layouts and mechanics are not reproduced.
+//! Committed mission completions and reward wallet changes queue Lua events.
 use super::*;
 /// (ISK, LP) rewards by agent level.
 fn rewards(level: i64) -> (i64, i64) {
@@ -267,6 +268,9 @@ pub(super) async fn finish(c: &mut Client, m: &Mission, agent: &Agent, choice: O
                 if offered_interaction && crate::dao::missions::accept_offered(tx, me, mission_agent, mission_id, STATE_OFFERED, STATE_ACCEPTED, stamp).await.map_err(db_err)? == 0 {
                     return Err(super::super::notify_error(messages::MISSION_DELIVER_TO_STATION_HANGAR));
                 }
+                if offered_interaction {
+                    outbox.event(crate::lua::events::GameEvent::MissionAccepted { char_id: me, agent_id: mission_agent, mission_id });
+                }
                 if crate::dao::missions::remove_accepted(tx, me, mission_agent, mission_id, STATE_ACCEPTED).await.map_err(db_err)? == 0 {
                     return Err(super::super::notify_error(messages::MISSION_DELIVER_TO_STATION_HANGAR));
                 }
@@ -274,6 +278,7 @@ pub(super) async fn finish(c: &mut Client, m: &Mission, agent: &Agent, choice: O
                 if reward_isk > 0 {
                     let balance = crate::dao::wallets::characters::credit(tx, me, reward_isk as f64).await.map_err(db_err)?;
                     outbox.notify_client("OnAccountChange", vec![Value::str("cash"), Value::Int(me), Value::Float(balance)]);
+                    outbox.event(crate::lua::events::GameEvent::WalletChanged { owner_id: me, account_key: crate::consts::ACCOUNT_CASH, balance, delta: reward_isk as f64 });
                 }
                 super::standings::add_lp(tx, outbox, me, corp, reward_lp).await?;
                 super::standings::mission_completed(tx, outbox, me, agent_id, corp, faction, level).await?;
@@ -291,6 +296,7 @@ pub(super) async fn finish(c: &mut Client, m: &Mission, agent: &Agent, choice: O
                         crate::dao::missions::set_arc_state(tx, me, arc, id, state, state_stamp).await.map_err(db_err)?;
                     }
                 }
+                outbox.event(crate::lua::events::GameEvent::MissionCompleted { char_id: me, agent_id: mission_agent, mission_id });
                 outbox.notify_client("OnAgentMissionChange", vec![Value::str("completed"), Value::Int(mission_agent)]);
                 Ok(())
             })
@@ -302,6 +308,7 @@ pub(super) async fn finish(c: &mut Client, m: &Mission, agent: &Agent, choice: O
                 for entry in outbox.into_entries() {
                     match entry {
                         crate::db::outbox::Effect::Notification(notification) => notification.dispatch(&world, Some(&mut *client))?,
+                        crate::db::outbox::Effect::Event(event) => crate::lua::on_event(event),
                         crate::db::outbox::Effect::Operation(()) => despawn(client, me, mission_agent),
                     }
                 }

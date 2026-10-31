@@ -133,3 +133,41 @@ async fn database_gm_mutations_materialize_overdue_training_before_queue_changes
     assert_eq!((completed.level, completed.skill_points), (1, 250));
     tx.rollback().await.expect("rollback");
 }
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL, loaded SDE and an active character with two skills"]
+async fn database_gm_set_queues_only_completed_training_event_once() {
+    use crate::db::outbox::Effect;
+    use crate::lua::events::GameEvent;
+
+    let mut config = crate::config::tests::test_database();
+    config.schema_on_start = false;
+    let db = crate::db::Db::connect(&config).await.expect("database pool");
+    let sde = Sde::load(&db).await.expect("loaded SDE");
+    let (mut client, connection) = tokio_postgres::connect(&config.url, tokio_postgres::NoTls).await.expect("connect");
+    tokio::spawn(async move { connection.await.expect("connection"); });
+    let tx = client.transaction().await.expect("transaction");
+    let rows = tx.query("SELECT character_id, type_id FROM game.skills WHERE character_id = (SELECT s.character_id FROM game.skills s JOIN game.characters c ON c.character_id = s.character_id WHERE NOT c.deleted GROUP BY s.character_id HAVING count(*) >= 2 ORDER BY s.character_id LIMIT 1) ORDER BY type_id LIMIT 2 FOR UPDATE", &[]).await.expect("existing skills");
+    assert_eq!(rows.len(), 2);
+    let character: i64 = rows[0].get("character_id");
+    let trained: i32 = rows[0].get("type_id");
+    let granted: i32 = rows[1].get("type_id");
+    queue::clear(&tx, character).await.expect("clear queue");
+    training::set_level(&tx, character, trained, 1, 250).await.expect("reset trained skill");
+    let now = filetime_now();
+    let mut done = entry(0, trained, Some(now - 30), Some(now - 20));
+    done.to_level = 2;
+    done.dest_sp = 1415;
+    queue::insert(&tx, character, &done).await.expect("insert completed training");
+
+    let mut outbox = Outbox::default();
+    assert!(set_levels(&tx, &mut outbox, &sde, character, &[(granted, 3)]).await.is_ok(), "grant level");
+    assert!(set_levels(&tx, &mut outbox, &sde, character, &[(granted, 3)]).await.is_ok(), "repeat grant");
+    tx.rollback().await.expect("rollback without dispatch");
+    let events: Vec<_> = outbox.into_entries().into_iter().filter_map(|effect| match effect {
+        Effect::Event(event) => Some(event),
+        _ => None,
+    }).collect();
+    assert_eq!(events.len(), 1);
+    assert!(matches!(&events[0], GameEvent::SkillTrained { char_id, type_id, level } if *char_id == character && *type_id == trained && *level == 2));
+}

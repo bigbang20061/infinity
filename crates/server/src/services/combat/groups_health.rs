@@ -1,4 +1,5 @@
 //! Combat mechanics; state and routing live in the parent module.
+//! Confirmed NPC destruction emits a kill event for a known attacker before rewards are attempted.
 use super::*;
 use crate::consts::CATEGORY_MODULE;
 
@@ -200,6 +201,11 @@ pub(super) async fn damage_npc(db: &Db, world: &World, system: i64, target: i64,
         forget_target(world, target);
         if let Some(ball) = destroyed {
             info!("ball {target} (type {}) destroyed", ball.type_id);
+            if let Some(char_id) = attacker {
+                let mut outbox = Outbox::default();
+                outbox.event(crate::lua::events::GameEvent::NpcKilled { char_id, npc_id: target, type_id: ball.type_id, system_id: system });
+                dispatch_world((), outbox, world)?;
+            }
             if let Err(e) = reward_kill(db, world, system, &ball, attacker).await {
                 warn!("wreck of {target}: {}", match e {
                     CallError::Internal(e) => format!("{e:#}"),
@@ -358,6 +364,11 @@ pub(super) async fn reward_kill(db: &Db, world: &World, system: i64, npc: &Ball,
             let tax = corp_tax.map(|(_, rate)| super::super::market::round2(payout * rate)).unwrap_or(0.0);
             let balance = crate::dao::wallets::characters::credit(db, pilot, payout - tax).await.map_err(db_err)?;
             world.notify_pilot(pilot, "OnAccountChange", vec![Value::str("cash"), Value::Int(pilot), Value::Float(balance)]);
+            if payout - tax != 0.0 {
+                let mut outbox = Outbox::default();
+                outbox.event(crate::lua::events::GameEvent::WalletChanged { owner_id: pilot, account_key: ACCOUNT_CASH, balance, delta: payout - tax });
+                dispatch_world((), outbox, world)?;
+            }
             if let Some((corp, _)) = corp_tax.filter(|_| tax > 0.0) {
                 let mut outbox = Outbox::default();
                 super::super::wallets::corp_credit(db, &mut outbox, corp, ACCOUNT_CASH, tax).await?;

@@ -1,4 +1,5 @@
 //! Agent manager service and dialogue.
+//! Successful acceptance queues an event after the existing state and cargo writes.
 use super::*;
 // ---------------------------------------------------------------- client shapes
 
@@ -350,6 +351,7 @@ async fn do_action(c: &mut Client, agent: &Agent, action: Option<i64>) -> CallRe
                         if let Some((type_id, qty)) = cargo {
                             super::items::deposit(tx, &sde, outbox, me, station, FLAG_HANGAR, type_id, qty, 0).await?;
                         }
+                        outbox.event(crate::lua::events::GameEvent::MissionAccepted { char_id: me, agent_id, mission_id });
                         outbox.notify_client("OnAgentMissionChange", vec![Value::str("accepted"), Value::Int(agent_id)]);
                         Ok(())
                     })

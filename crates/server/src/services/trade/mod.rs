@@ -25,6 +25,7 @@ pub(crate) fn dispatch<T>(value: T, outbox: Outbox<TradeEffect>, world: &World) 
             Effect::Operation(TradeEffect::Put(trade)) => { state().lock().unwrap().insert(trade.id, trade); }
             Effect::Operation(TradeEffect::Remove(id)) => { state().lock().unwrap().remove(&id); }
             Effect::Operation(TradeEffect::WakeScheduler) => crate::scheduler::wake(),
+            Effect::Event(event) => crate::lua::on_event(event),
         }
     }
     Ok(value)

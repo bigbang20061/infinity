@@ -4,11 +4,14 @@
 //! Slot counts, name limits, starting ISK and deletion delay are operator policies.
 //! Selecting a character registers process-local presence; appearance editing is not interpreted here.
 //! Selection restores the active ship's persisted condition before entering the game.
+//! Successful selection and logoff hand off lifecycle events after session changes.
 
 use crate::dao::{accounts, characters, items, skills};
 use super::{db_err, keyval, trimmed_arg_text, Call, CallError, CallResult};
 use crate::client::{short, Client};
 use crate::consts::{ACCOUNT_CASH, FAR_FUTURE, FILETIME_SECOND, FILETIME_UNIX_EPOCH, FLAG_HANGAR};
+use crate::db::outbox::{dispatch_client, Outbox};
+use crate::lua::events::GameEvent;
 use crate::messages;
 use anyhow::Context;
 use marshal::Value;
@@ -148,6 +151,9 @@ pub async fn log_off(c: &mut Client) -> CallResult {
         "genderID", "bloodlineID", "raceID", "hqID", "stationid", "solarsystemid", "solarsystemid2", "constellationid", "regionid", "shipid",
     ];
     c.change_session(cleared.into_iter().map(|k| (k, Value::None)).collect());
+    let mut outbox = Outbox::default();
+    outbox.event(GameEvent::CharacterLoggedOff { user_id: c.login.user_id, char_id });
+    dispatch_client((), outbox, c)?;
     info!(user = c.login.user_id, "character {char_id} logged off to character selection");
     Ok(Value::Bool(true))
 }
@@ -230,6 +236,9 @@ async fn select_character(c: &mut Client, char_id: i64) -> Result<(), CallError>
     super::online_status::presence_changed(&c.db, &c.world, char_id, true).await;
     let role = c.session.int("role").unwrap_or(0);
     c.chat.set_profile(char_id, &r.name, r.gender_id as i64, corp, alliance, None, role);
+    let mut outbox = Outbox::default();
+    outbox.event(GameEvent::CharacterSelected { user_id: c.login.user_id, char_id });
+    dispatch_client((), outbox, c)?;
     info!(user = c.login.user_id, "character {char_id} entering game at station {station:?} / system {system}");
     Ok(())
 }

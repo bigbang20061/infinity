@@ -85,6 +85,7 @@ pub(crate) async fn force_complete(c: &mut Client, agent: Option<i64>) -> Result
                             }
                         }
                         Effect::Notification(notification) => notification.dispatch(&world, Some(&mut *client))?,
+                        Effect::Event(event) => crate::lua::on_event(event),
                     }
                 }
                 if let Some(error) = actor_error { return Err(error); }

@@ -132,6 +132,7 @@ async fn jump(c: &mut Client, me: i64, dest: i64, clone_id: i64) -> CallResult {
                 match effect {
                     Effect::Notification(notification) => notification.dispatch(&world, Some(&mut *c))?,
                     Effect::Operation(JumpEffect::Trade(trade_outbox)) => crate::services::trade::dispatch((), trade_outbox, &world)?,
+                    Effect::Event(event) => crate::lua::on_event(event),
                     Effect::Operation(JumpEffect::Session { station, system, constellation, region, capsule }) => c.change_session(vec![
                         ("stationid", Value::Int(station)), ("solarsystemid2", Value::Int(system)),
                         ("constellationid", Value::Int(constellation)), ("regionid", Value::Int(region)),
