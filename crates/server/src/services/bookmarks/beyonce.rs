@@ -1,5 +1,5 @@
 //! beyonce bookmark methods for `eve/client/script/ui/shared/bookmarks/bookmarkSvc.py`.
-//! Uses personal bookmark tables and space state; shared access-group folders are unsupported.
+//! Uses bookmark tables and space state for personal and shared folders.
 //! Live location bookmarks use the system actor's sampled position.
 use super::*;
 /// beyonce `BookmarkLocation(itemID, folderID, name, comment, expiry, subfolderID=)`: something in
@@ -16,7 +16,7 @@ async fn space_location(c: &Client, call: &Call<'_>) -> CallResult {
     let own = Some(item) == c.session.int("shipid");
     let (item, type_id) = if own { (None, Some(TYPE_SOLAR_SYSTEM)) } else { (Some(item), Some(ball.type_id)) };
     let folder = call.args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-    add(&c.db, me, folder, subfolder_arg(call, 5), item, type_id, system, ball.pos, &value_text(call.args.get(2), MAX_NAME), &value_text(call.args.get(3), MAX_DESCRIPTION), expiry(call, 4)).await
+    mutations::add(c, me, folder, subfolder_arg(call, 5), item, type_id, system, ball.pos, &value_text(call.args.get(2), MAX_NAME), &value_text(call.args.get(3), MAX_DESCRIPTION), expiry(call, 4)?).await
 }
 
 /// beyonce `BookmarkScanResult(locationID, name, comment, resultID, folderID, expiry, subfolderID=)`.
@@ -28,7 +28,7 @@ async fn scan_result(c: &Client, call: &Call<'_>) -> CallResult {
         return Err(notify_error(messages::BOOKMARK_REQUIRES_FULL_SCAN));
     };
     let folder = call.args.get(4).and_then(|v| v.as_int()).unwrap_or(0);
-    add(&c.db, me, folder, subfolder_arg(call, 6), None, Some(TYPE_SOLAR_SYSTEM), system, pos, &value_text(call.args.get(1), MAX_NAME), &value_text(call.args.get(2), MAX_DESCRIPTION), expiry(call, 5)).await
+    mutations::add(c, me, folder, subfolder_arg(call, 6), None, Some(TYPE_SOLAR_SYSTEM), system, pos, &value_text(call.args.get(1), MAX_NAME), &value_text(call.args.get(2), MAX_DESCRIPTION), expiry(call, 5)?).await
 }
 
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {

@@ -6,6 +6,7 @@
 //! This layer has no direct client mirror or wire contract; owning services supply those.
 //! Callers own policy, transactions, Outbox effects, refusals, notifications and World.
 
+pub(crate) mod access_groups;
 pub(crate) mod accounts;
 pub(crate) mod alliances;
 pub(crate) mod asteroids;
