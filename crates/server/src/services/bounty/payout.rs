@@ -6,7 +6,7 @@ use marshal::Value;
 use serde::{Deserialize, Serialize};
 use std::{future::Future, pin::Pin, sync::Arc};
 
-/// Retail EveJS playerBountyState.js payout fraction of the destroyed value.
+/// Server policy: cap player-bounty payouts at 20% of destroyed value to limit self-funded farming.
 const PAYOUT_FRACTION: f64 = 0.2;
 /// Wallet and bounty storage use two decimal places.
 const CENTS_PER_ISK: i64 = 100;
