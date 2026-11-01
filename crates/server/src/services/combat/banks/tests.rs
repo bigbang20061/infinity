@@ -81,8 +81,41 @@ async fn real_bank_rpcs_and_transactional_rules() {
     crate::tests::init_config();
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let sde = Arc::new(Sde::load(&db).await.unwrap());
-    let gun = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_MODULE) && t.group_id.is_some_and(|g| GROUPABLE_GROUP_IDS.contains(&i64::from(g))) && sde.types.effects(t.type_id).iter().any(|e| e.effect_id == crate::consts::dogma::EFFECT_ONLINE as i32)).expect("groupable online module in SDE").type_id;
-    let hull = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_SHIP)).expect("ship in SDE").type_id;
+    use crate::consts::dogma::{ATTR_CPU, ATTR_CPU_OUTPUT, ATTR_POWER, ATTR_POWER_OUTPUT, ATTR_HI_SLOTS, ATTR_TURRET_SLOTS_LEFT, ATTR_LAUNCHER_SLOTS_LEFT, EFFECT_TURRET_FITTED, EFFECT_LAUNCHER_FITTED, ATTR_REQUIRED_SKILLS, ATTR_REQUIRED_SKILL_LEVELS, ATTR_SKILL_TIME_CONSTANT};
+    /// SDE dogma effect hiPower, the client high-slot rack effect.
+    const EFFECT_HI_POWER: i32 = 12;
+    /// Client dogma.const.attributeMaxGroupFitted.
+    const MAX_GROUP_FITTED: i32 = 1544;
+    /// Client dogma.const.attributeMaxTypeFitted.
+    const MAX_TYPE_FITTED: i32 = 2431;
+    /// Client dogma.const.attributeMaxGroupOnline.
+    const MAX_GROUP_ONLINE: i32 = 978;
+    // These restrictions and limits mirror private constants in effects/fitting.rs:
+    // CAN_FIT_GROUPS, CAN_FIT_TYPES, MAX_GROUP_FITTED, MAX_TYPE_FITTED, and MAX_GROUP_ONLINE.
+    const HULL_RESTRICTIONS: [i32; 32] = [1298,1299,1300,1301,1872,1879,1880,1881,2065,2396,2476,2477,2478,2479,2480,2481,2482,2483,2484,2485,1302,1303,1304,1305,1944,2103,2463,2486,2487,2488,2758,5948];
+    let base = |ty: i32, attr: i32| crate::services::fit::base_attribute(sde.types.get(ty), sde.dogma.attribute(attr), attr);
+    let (gun, hull) = sde.types.iter().filter(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_MODULE)
+        && t.group_id.is_some_and(|g| GROUPABLE_GROUP_IDS.contains(&i64::from(g)))
+        && [crate::consts::dogma::EFFECT_ONLINE as i32, EFFECT_HI_POWER].iter().all(|id| t.effects().iter().any(|e| e.effect_id == *id))
+        && HULL_RESTRICTIONS.iter().all(|&a| base(t.type_id, a) <= 0.0)
+        && [MAX_GROUP_FITTED, MAX_TYPE_FITTED].iter().all(|&a| { let v = base(t.type_id, a); v <= 0.0 || v >= 8.0 })
+        && t.attribute(MAX_GROUP_ONLINE).is_none_or(|v| v >= 8.0))
+        .find_map(|gun| {
+            let turret = gun.effects().iter().any(|e| e.effect_id == EFFECT_TURRET_FITTED);
+            let launcher = gun.effects().iter().any(|e| e.effect_id == EFFECT_LAUNCHER_FITTED);
+            sde.types.iter().find(|h| h.published == Some(true) && h.category_id == Some(CATEGORY_SHIP)
+                && base(h.type_id, ATTR_HI_SLOTS) >= 8.0
+                && (!turret || base(h.type_id, ATTR_TURRET_SLOTS_LEFT) >= 8.0)
+                && (!launcher || base(h.type_id, ATTR_LAUNCHER_SLOTS_LEFT) >= 8.0)
+                && base(h.type_id, ATTR_CPU_OUTPUT) >= 8.0 * base(gun.type_id, ATTR_CPU)
+                && base(h.type_id, ATTR_POWER_OUTPUT) >= 8.0 * base(gun.type_id, ATTR_POWER))
+                .map(|h| (gun.type_id, h.type_id))
+        }).expect("unrestricted groupable gun and viable eight-slot hull in SDE");
+    let required: Vec<_> = ATTR_REQUIRED_SKILLS.iter().zip(ATTR_REQUIRED_SKILL_LEVELS).filter_map(|(&skill, level)| {
+        let id = base(gun, skill) as i32;
+        let level = base(gun, level) as i32;
+        (id > 0 && level > 0).then_some((id, level))
+    }).collect();
     let ammo: Vec<i32> = sde.types.iter().filter(|t| t.category_id == Some(CATEGORY_CHARGE)).take(2).map(|t| t.type_id).collect();
     assert_eq!(ammo.len(), 2);
     let now = filetime_now();
@@ -106,6 +139,14 @@ async fn real_bank_rpcs_and_transactional_rules() {
     let scenario = tokio::spawn(async move {
     let db = scenario_db;
     let guns = scenario_guns;
+    for (skill, level) in required {
+        let rank = sde.types.get(skill).and_then(|t| t.fit_attribute(ATTR_SKILL_TIME_CONSTANT)).expect("required skill rank");
+        let mut points = 1_i64;
+        while crate::services::skills::formulas::level_from_points(points, rank) < level {
+            points = points.checked_mul(2).expect("required skill level must be attainable");
+        }
+        db.execute("INSERT INTO game.skills (character_id,type_id,level,skill_points) VALUES ($1,$2,$3,$4) ON CONFLICT (character_id,type_id) DO UPDATE SET level=GREATEST(game.skills.level,EXCLUDED.level),skill_points=GREATEST(game.skills.skill_points,EXCLUDED.skill_points)", &[&owner, &skill, &level, &points]).await.unwrap();
+    }
     let world = World::new(db.clone(), sde.clone(), 0);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
@@ -187,6 +228,8 @@ async fn real_bank_rpcs_and_transactional_rules() {
     db.execute("DELETE FROM game.weapon_banks WHERE ship_id=$1", &[&ship]).await.unwrap();
     db.execute("DELETE FROM game.module_charges WHERE ship_id=$1", &[&ship]).await.unwrap();
     db.execute("DELETE FROM game.pending_reloads WHERE ship_id=$1", &[&ship]).await.unwrap();
+    db.execute("DELETE FROM game.item_attributes WHERE item_id=$1 OR item_id=ANY($2)", &[&ship, &&guns[..]]).await.unwrap();
+    db.execute("DELETE FROM game.skills WHERE character_id=$1", &[&owner]).await.unwrap();
     db.execute("DELETE FROM game.items WHERE location_id=$1", &[&ship]).await.unwrap();
     db.execute("DELETE FROM game.items WHERE item_id=$1", &[&ship]).await.unwrap();
     db.execute("DELETE FROM game.characters WHERE character_id=$1", &[&owner]).await.unwrap();
