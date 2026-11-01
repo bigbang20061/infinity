@@ -263,6 +263,11 @@ impl CrimewatchConfig {
 pub struct MiningConfig {
     /// Existing two-hour regrowth delay for an emptied belt in services/mining.rs.
     pub belt_regrowth_secs: i64,
+    /// Client horizon from eve/client/script/ui/shared/ledger/ledgerUtil.py NUM_DAYS_BACK;
+    /// retention deletion is server policy.
+    pub ledger_retention_days: i64,
+    /// Server policy default cleanup interval in seconds.
+    pub ledger_maintenance_secs: i64,
     /// Server design default ore rock counts in services/mining.rs.
     pub ore_rocks: [i64; 2],
     /// Server design default ore rock volumes in services/mining.rs.
@@ -287,6 +292,8 @@ impl Default for MiningConfig {
     fn default() -> Self {
         Self {
             belt_regrowth_secs: 7200,
+            ledger_retention_days: 90,
+            ledger_maintenance_secs: 3600,
             ore_rocks: [15, 25],
             ore_rock_m3: [4000.0, 25000.0],
             ice_rocks: [6, 11],
@@ -304,6 +311,10 @@ impl MiningConfig {
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(self.belt_regrowth_secs > 0, "mining.belt_regrowth_secs={} is outside its valid domain", self.belt_regrowth_secs);
         super::duration("mining.belt_regrowth_secs", self.belt_regrowth_secs, crate::consts::FILETIME_SECOND, true)?;
+        anyhow::ensure!(self.ledger_retention_days > 0, "mining.ledger_retention_days={} is outside its valid domain", self.ledger_retention_days);
+        super::duration("mining.ledger_retention_days", self.ledger_retention_days, crate::consts::FILETIME_DAY, false)?;
+        anyhow::ensure!(self.ledger_maintenance_secs > 0, "mining.ledger_maintenance_secs={} is outside its valid domain", self.ledger_maintenance_secs);
+        super::duration("mining.ledger_maintenance_secs", self.ledger_maintenance_secs, crate::consts::FILETIME_SECOND, true)?;
         anyhow::ensure!(self.ore_rocks.iter().all(|v| *v > 0) && self.ore_rocks[0] <= self.ore_rocks[1], "mining.ore_rocks={:?} must be a positive ordered range", self.ore_rocks);
         anyhow::ensure!(self.ore_rock_m3.iter().all(|v| v.is_finite() && *v > 0.0) && self.ore_rock_m3[0] <= self.ore_rock_m3[1], "mining.ore_rock_m3={:?} must be a positive ordered range", self.ore_rock_m3);
         anyhow::ensure!(self.ice_rocks.iter().all(|v| *v > 0) && self.ice_rocks[0] <= self.ice_rocks[1], "mining.ice_rocks={:?} must be a positive ordered range", self.ice_rocks);

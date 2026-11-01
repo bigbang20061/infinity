@@ -10,8 +10,15 @@ const ATTR_SURVEY_SCAN_RANGE: i32 = 197;
 fn scanner_range(configured: f64, ranges: impl Iterator<Item = f64>) -> f64 {
     ranges.filter(|range| range.is_finite() && *range > 0.0).reduce(f64::max).unwrap_or(configured)
 }
+pub(super) async fn dispatch(c: &Client, call: &Call<'_>) -> Option<CallResult> {
+    match call.method {
+        "perform_scan" => Some(Ok(perform_scan(c).await)),
+        _ => None,
+    }
+}
+
 /// miningScanMgr.perform_scan() -> [(asteroidID, typeID, quantity)] within reach.
-pub(super) async fn perform_scan(c: &Client) -> Value {
+async fn perform_scan(c: &Client) -> Value {
     let (Some(system), Some(ship), Some(character)) = (c.session.int("solarsystemid"), c.session.int("shipid"), c.session.int("charid")) else { return Value::None };
     let Ok(fit) = Fit::load_in_space(&c.db, &c.world, system, character, ship).await else { return Value::None };
     let Ok(modules) = crate::services::items::load_items(&c.db, &c.sde, crate::dao::items::loading::ItemQuery::Location(ship)).await else { return Value::None };

@@ -67,6 +67,25 @@ fn trade_timeout_is_parsed_and_must_be_positive() {
 }
 
 #[test]
+fn mining_ledger_policy_defaults_parsing_and_validation() {
+    let fixture = Fixture::new();
+    fixture.write("");
+    let defaults = Config::load_with(&fixture.path(), |_| None).unwrap().game_config();
+    assert_eq!((defaults.mining.ledger_retention_days, defaults.mining.ledger_maintenance_secs), (90, 3600));
+
+    fixture.write("[mining]\nledger_retention_days = 45\nledger_maintenance_secs = 120");
+    let config = Config::load_with(&fixture.path(), |_| None).unwrap().game_config();
+    assert_eq!((config.mining.ledger_retention_days, config.mining.ledger_maintenance_secs), (45, 120));
+
+    for key in ["ledger_retention_days", "ledger_maintenance_secs"] {
+        for value in ["0", "-1", "9223372036854775807"] {
+            let error = load_error(&format!("[mining]\n{key} = {value}"));
+            assert!(error.contains(&format!("mining.{key}")), "{error}");
+        }
+    }
+}
+
+#[test]
 fn salvage_policy_parses_and_rejects_invalid_bounds() {
     let fixture = Fixture::new();
     fixture.write("[salvage]\nsalvage_material_stacks = 2\nsalvage_quantity_min = 4\nsalvage_quantity_max = 5");

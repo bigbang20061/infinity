@@ -1,6 +1,6 @@
 //! Plain data access for accounts, alliances, asteroids, bills, bookmarks, bounties, calendar,
 //! characters, contracts, corporations, dynamic items, exploration, industry, insurance, items,
-//! kill rights, killmails, mail, market, missions, NPE, offices, orgs, skills, store and wallets.
+//! kill rights, killmails, mail, market, mining ledger, missions, NPE, offices, orgs, skills, store and wallets.
 //! Aggregates read and write `game` tables and use typed `sde` and `sde_native`
 //! static data; individual headers describe their sources and coverage.
 //! This layer has no direct client mirror or wire contract; owning services supply those.
@@ -28,6 +28,7 @@ pub(crate) mod lua_store;
 pub(crate) mod lp_offers;
 pub(crate) mod mail;
 pub(crate) mod market;
+pub(crate) mod mining_ledger;
 pub(crate) mod missions;
 pub(crate) mod npe;
 pub(crate) mod offices;

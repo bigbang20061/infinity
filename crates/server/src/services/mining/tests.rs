@@ -114,6 +114,8 @@ async fn delivery_outcomes_preserve_full_and_depleted_rows() {
         .expect("SDE must provide an ore and cargo and mining-hold fits supporting full and one-unit boundaries");
     let rock = crate::dao::asteroids::insert(&tx, 103, 104, ore.type_id, 5, 1.0, [0.0; 3]).await.unwrap();
     let mut pending = crate::space::drone::PendingMining { rock, type_id: ore.type_id, units: 2, waste_units: 0, crit_units: 0 };
+    let baseline = crate::dao::mining_ledger::list(&tx, 101, i64::MIN, i64::MAX).await.unwrap().len();
+    let mut delivered_count = 0;
     for (mining_hold, fit) in [false, true].into_iter().zip(fits) {
         let (_, capacity) = destination(&fit);
         let flag = if mining_hold { FLAG_MINING_HOLD } else { FLAG_CARGO };
@@ -123,11 +125,16 @@ async fn delivery_outcomes_preserve_full_and_depleted_rows() {
         let mut outbox = crate::db::outbox::Outbox::default();
         assert!(matches!(deliver(&tx, &mut outbox, &sde, 101, ship, 103, 107, &pending, destination(&fit)).await.ok().unwrap(), DeliveryOutcome::Full { flag: f } if f == flag));
         assert!(outbox.into_entries().is_empty());
+        assert_eq!(crate::dao::mining_ledger::list(&tx, 101, i64::MIN, i64::MAX).await.unwrap().len(), baseline + delivered_count);
         assert_eq!(crate::dao::asteroids::lock(&tx, 103, rock, ore.type_id).await.unwrap(), Some(5));
         tx.execute("UPDATE game.items SET quantity = quantity - 1 WHERE item_id = $1", &[&item]).await.unwrap();
         let mut outbox = crate::db::outbox::Outbox::default();
         assert!(matches!(deliver(&tx, &mut outbox, &sde, 101, ship, 103, 107, &pending, destination(&fit)).await.ok().unwrap(), DeliveryOutcome::Delivered(d) if !d.repeat()));
         assert_eq!(outbox.into_entries().len(), 2);
+        delivered_count += 1;
+        let logs = crate::dao::mining_ledger::list(&tx, 101, i64::MIN, i64::MAX).await.unwrap();
+        assert_eq!(logs.len(), baseline + delivered_count);
+        assert_eq!((logs[0].type_id, logs[0].solar_system_id, logs[0].quantity, logs[0].quantity_wasted), (ore.type_id, 103, 1, 0));
         tx.execute("UPDATE game.asteroids SET quantity = 5 WHERE asteroid_id = $1", &[&rock]).await.unwrap();
     }
     let hull = sde.types.iter().find(|t| t.category_id == Some(crate::consts::CATEGORY_SHIP)).unwrap();
@@ -139,6 +146,7 @@ async fn delivery_outcomes_preserve_full_and_depleted_rows() {
     assert!(matches!(deliver(&tx, &mut outbox, &sde, 101, 105, 103, 107, &pending, destination(&fit)).await.ok().unwrap(), DeliveryOutcome::Depleted { rock: r } if r == rock));
     pending.rock = rock + 1_000_000_000;
     assert!(matches!(deliver(&tx, &mut outbox, &sde, 101, 105, 103, 107, &pending, destination(&fit)).await.ok().unwrap(), DeliveryOutcome::Missing));
+    assert_eq!(crate::dao::mining_ledger::list(&tx, 101, i64::MIN, i64::MAX).await.unwrap().len(), baseline + delivered_count);
     assert!(outbox.into_entries().is_empty());
     tx.rollback().await.unwrap();
 }
@@ -181,6 +189,7 @@ async fn zero_row_retry_reconciles_suppressed_delivery_callback() {
     assert!(rock_type(rock, system).is_none());
     assert!(crate::dao::asteroids::lock(&db, system, rock, ore.type_id).await.unwrap().is_none());
     assert!(retry_outbox.into_entries().is_empty());
+    db.execute("DELETE FROM game.character_mining_ledger WHERE character_id=$1 AND solar_system_id=$2", &[&101_i64, &system]).await.unwrap();
     db.execute("DELETE FROM game.items WHERE location_id = $1 AND owner_id = $2", &[&ship, &101_i64]).await.unwrap();
 }
 
@@ -203,15 +212,20 @@ async fn laser_full_holds_notify_and_one_unit_still_extracts() {
     state().rocks.insert(rock, Rock { system: f.system, field: f.system, type_id: ore_type, quantity: 10 });
     f.world.add_ship(f.system, rock_ball(rock, ore_type, [0.0; 3], 1.0)).await.unwrap();
     let item = crate::dao::items::transfers::insert(&f.db, ore_type, f.owner, f.ship, FLAG_CARGO, 3).await.unwrap();
+    let baseline = crate::dao::mining_ledger::list(&f.db, f.owner, i64::MIN, i64::MAX).await.unwrap();
     let (notify, mut notices) = tokio::sync::mpsc::unbounded_channel();
     let fit = Fit::load(&f.db, f.sde.clone(), f.owner, f.ship).await.ok().unwrap();
     assert!(!extract(&f.db, &f.world, &notify, f.owner, f.ship, f.system, &fit, module, rock).await.ok().unwrap());
     assert!(format!("{:?}", notices.try_recv().unwrap()).contains(messages::CARGO_HOLD_FULL));
     assert_eq!(crate::dao::asteroids::lock(&f.db, f.system, rock, ore_type).await.unwrap(), Some(10));
+    assert_eq!(crate::dao::mining_ledger::list(&f.db, f.owner, i64::MIN, i64::MAX).await.unwrap(), baseline);
     f.db.execute("UPDATE game.items SET quantity = 2 WHERE item_id = $1", &[&item]).await.unwrap();
     assert!(!extract(&f.db, &f.world, &notify, f.owner, f.ship, f.system, &fit, module, rock).await.ok().unwrap());
     assert!(format!("{:?}", notices.try_recv().unwrap()).contains(messages::CARGO_HOLD_FULL));
     assert_eq!(crate::dao::asteroids::lock(&f.db, f.system, rock, ore_type).await.unwrap(), Some(9));
+    let logs = crate::dao::mining_ledger::list(&f.db, f.owner, i64::MIN, i64::MAX).await.unwrap();
+    assert_eq!(logs.len(), baseline.len() + 1);
+    assert_eq!((logs[0].type_id, logs[0].solar_system_id, logs[0].quantity, logs[0].quantity_wasted), (ore_type, f.system, 1, 0));
     f.set(f.ship, ATTR_MINING_HOLD, volume).await;
     let mining_stack = crate::dao::items::transfers::insert(&f.db, ore_type, f.owner, f.ship, FLAG_MINING_HOLD, 1).await.unwrap();
     let fit = Fit::load(&f.db, f.sde.clone(), f.owner, f.ship).await.ok().unwrap();
@@ -224,8 +238,54 @@ async fn laser_full_holds_notify_and_one_unit_still_extracts() {
     assert!(!extract(&f.db, &f.world, &notify, f.owner, f.ship, f.system, &fit, module, rock).await.ok().unwrap());
     assert!(format!("{:?}", notices.try_recv().unwrap()).contains(messages::MINING_HOLD_FULL));
     assert_eq!(crate::dao::asteroids::lock(&f.db, f.system, rock, ore_type).await.unwrap(), Some(9));
+    assert_eq!(crate::dao::mining_ledger::list(&f.db, f.owner, i64::MIN, i64::MAX).await.unwrap(), logs);
     state().rocks.remove(&rock);
     state().carry.remove(&module);
     crate::dao::asteroids::delete(&f.db, rock).await.unwrap();
     f.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
+async fn delivery_rollback_restores_all_resource_types_and_suppresses_dispatch() -> anyhow::Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let f = Fixture::new().await;
+    let mut rocks = Vec::new();
+    let result: anyhow::Result<()> = async {
+        for field in [Field::Ore, Field::Ice, Field::Gas] {
+            let (type_id, volume) = *field_types(&f.sde, field, 1.0, false).first().expect("SDE resource type");
+            let rock = crate::dao::asteroids::insert(&f.db, f.system, f.system, type_id, 5, 1.0, [0.0; 3]).await?;
+            rocks.push(rock);
+            let before = crate::dao::mining_ledger::list(&f.db, f.owner, i64::MIN, i64::MAX).await?;
+            let pending = crate::space::drone::PendingMining { rock, type_id, units: 3, waste_units: 10, crit_units: 0 };
+            let dispatched = AtomicBool::new(false);
+            let sde = f.sde.clone();
+            let owner = f.owner;
+            let ship = f.ship;
+            let system = f.system;
+            let result: Result<(), CallError> = f.db.transaction(|tx, outbox: &mut crate::db::outbox::Outbox| {
+                let sde = sde.clone();
+                let pending = pending.clone();
+                Box::pin(async move {
+                    assert!(matches!(deliver(tx, outbox, &sde, owner, ship, system, 1, &pending, (FLAG_CARGO, volume * 10.0)).await?, DeliveryOutcome::Delivered(_)));
+                    let logs = crate::dao::mining_ledger::list(tx, owner, i64::MIN, i64::MAX).await?;
+                    assert_eq!((logs[0].type_id, logs[0].quantity, logs[0].quantity_wasted), (type_id, 3, 2));
+                    Err(CallError::Internal(anyhow::anyhow!("injected rollback")))
+                })
+            }, |(), _outbox| async {
+                dispatched.store(true, Ordering::SeqCst);
+                Ok(())
+            }).await;
+            anyhow::ensure!(result.is_err(), "delivery transaction unexpectedly committed");
+            anyhow::ensure!(!dispatched.load(Ordering::SeqCst), "rolled-back outbox was dispatched");
+            anyhow::ensure!(crate::dao::asteroids::lock(&f.db, system, rock, type_id).await? == Some(5), "asteroid changed after rollback");
+            anyhow::ensure!(crate::dao::mining_ledger::list(&f.db, owner, i64::MIN, i64::MAX).await? == before, "ledger changed after rollback");
+            let count: i64 = f.db.query_one("SELECT count(*) AS n FROM game.items WHERE owner_id=$1 AND location_id=$2 AND type_id=$3", &[&owner, &ship, &type_id]).await?.get("n");
+            anyhow::ensure!(count == 0, "items changed after rollback");
+        }
+        Ok(())
+    }.await;
+    for rock in rocks { crate::dao::asteroids::delete(&f.db, rock).await?; }
+    f.cleanup().await;
+    result
 }

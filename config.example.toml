@@ -167,6 +167,8 @@ killmail_attacker_window_secs = 300 # existing window before older damage stops 
 
 [mining]
 belt_regrowth_secs = 7200           # existing delay before an emptied belt grows back
+ledger_retention_days = 90          # client ledger horizon; server retention deletion policy
+ledger_maintenance_secs = 3600      # server ledger cleanup interval
 ore_rocks = [15, 25]                # existing ore rocks per belt field range
 ore_rock_m3 = [4000, 25000]         # existing ore rock volume range
 ice_rocks = [6, 11]                 # existing ice rocks per field range

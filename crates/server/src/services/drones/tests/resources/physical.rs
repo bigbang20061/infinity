@@ -126,6 +126,7 @@ async fn physical_drone_mining_and_laser_share_extraction() -> Result<()> {
         for _ in 0..300 { if crate::services::combat::targeting_charges::targets_of(f.owner).contains(&rock) { locked = true; break; } tick(&f).await?; }
         ensure!(locked, "rock did not lock: {}", state(&f, id, rock).await);
         let initial = quantities(&f, rock, ore).await?;
+        let baseline = crate::dao::mining_ledger::list(&f.db, f.owner, i64::MIN, i64::MAX).await?;
         command(&mut f, id, "CmdMineRepeatedly", Some(rock)).await?;
         let first = pending(&f, id, rock, "full-hold intent").await?;
         ensure!(first.rock == rock && first.units > 0 && first.waste_units == 0, "unexpected mining intent");
@@ -133,6 +134,7 @@ async fn physical_drone_mining_and_laser_share_extraction() -> Result<()> {
             .map(|(drone, ship)| dist(drone, ship))).await.context("system stopped")?.context("drone or ship missing after mining")?;
         ensure!(travelled >= 7_000.0, "mining intent did not follow the physical journey: ship distance {travelled}");
         ensure!(quantities(&f, rock, ore).await? == initial, "pending intent mutated inventory");
+        ensure!(crate::dao::mining_ledger::list(&f.db, f.owner, i64::MIN, i64::MAX).await? == baseline, "pending intent recorded a fact");
         while let Ok((event, _)) = rx.try_recv() { ensure!(event != "OnOreMined", "notice before contact"); }
         f.set(f.ship, ATTR_CAPACITY, 0.0).await;
         let mut idle = false;
@@ -141,6 +143,7 @@ async fn physical_drone_mining_and_laser_share_extraction() -> Result<()> {
             tick(&f).await?;
         }
         ensure!(idle && quantities(&f, rock, ore).await? == initial, "full hold did not reject intent unchanged: {}", state(&f, id, rock).await);
+        ensure!(crate::dao::mining_ledger::list(&f.db, f.owner, i64::MIN, i64::MAX).await? == baseline, "full hold recorded a fact");
         while let Ok((event, _)) = rx.try_recv() { ensure!(event != "OnOreMined", "full hold emitted ore notice"); }
         f.set(f.ship, ATTR_CAPACITY, volume * 100.0).await;
         command(&mut f, id, "CmdMineRepeatedly", Some(rock)).await?;
@@ -157,6 +160,9 @@ async fn physical_drone_mining_and_laser_share_extraction() -> Result<()> {
         ensure!(completed, "committed contact did not release the intent: {}", state(&f, id, rock).await);
         let after = quantities(&f, rock, ore).await?;
         ensure!(initial.0 - after.0 == second.units && after.1 - initial.1 == second.units, "delivery differs from pending units");
+        let first_logs = crate::dao::mining_ledger::list(&f.db, f.owner, i64::MIN, i64::MAX).await?;
+        ensure!(first_logs.len() == baseline.len() + 1, "contact did not record exactly one fact");
+        ensure!((first_logs[0].type_id, first_logs[0].solar_system_id, first_logs[0].quantity, first_logs[0].quantity_wasted) == (ore, f.system, second.units, 0), "contact fact differs from delivery");
         command(&mut f, id, "CmdReturnHome", None).await?;
         let mut notices = 0;
         for _ in 0..100 { while let Ok((event, _)) = rx.try_recv() { if event == "OnOreMined" { notices += 1; } } if notices > 0 { break; } tick(&f).await?; }
@@ -171,6 +177,7 @@ async fn physical_drone_mining_and_laser_share_extraction() -> Result<()> {
             tick(&f).await?;
         }
         ensure!(rejected && quantities(&f, rock, ore).await? == after, "failed bay return harvested ore or did not complete: {}", state(&f, id, rock).await);
+        ensure!(crate::dao::mining_ledger::list(&f.db, f.owner, i64::MIN, i64::MAX).await? == first_logs, "failed bay return recorded a fact");
         let row = f.db.query_one("SELECT location_id FROM game.items WHERE item_id=$1 AND owner_id=$2", &[&id, &f.owner]).await?;
         ensure!(row.get::<_, i64>("location_id") == f.system, "failed bay return moved drone");
         while let Ok((event, _)) = rx.try_recv() { ensure!(event != "OnOreMined", "failed bay return emitted ore notice"); }
@@ -187,6 +194,9 @@ async fn physical_drone_mining_and_laser_share_extraction() -> Result<()> {
         ensure!(bay, "pending return did not reach bay: {}", state(&f, id, rock).await);
         let returned = quantities(&f, rock, ore).await?;
         ensure!(after.0 - returned.0 == third.units && returned.1 - after.1 == third.units, "return did not join mining delivery with bay move");
+        let returned_logs = crate::dao::mining_ledger::list(&f.db, f.owner, i64::MIN, i64::MAX).await?;
+        ensure!(returned_logs.len() == first_logs.len() + 1, "bay return did not record exactly one fact");
+        ensure!((returned_logs[0].type_id, returned_logs[0].solar_system_id, returned_logs[0].quantity, returned_logs[0].quantity_wasted) == (ore, f.system, third.units, 0), "bay fact differs from delivery");
         let mut return_notices = 0;
         for _ in 0..100 {
             while let Ok((event, _)) = rx.try_recv() { if event == "OnOreMined" { return_notices += 1; } }
@@ -204,6 +214,7 @@ async fn physical_drone_mining_and_laser_share_extraction() -> Result<()> {
         ensure!(f.world.with(f.system, move |s| s.drone(id).is_some_and(|d| d.controller.is_none() && d.pending.is_none())).await.context("system stopped")?, "control loss retained intent");
         for _ in 0..20 { tick(&f).await?; }
         ensure!(quantities(&f, rock, ore).await? == returned, "control loss harvested pending intent");
+        ensure!(crate::dao::mining_ledger::list(&f.db, f.owner, i64::MIN, i64::MAX).await? == returned_logs, "control loss recorded a fact");
         while let Ok((event, _)) = rx.try_recv() { ensure!(event != "OnOreMined", "control loss emitted ore notice"); }
         Ok(())
     }.await;

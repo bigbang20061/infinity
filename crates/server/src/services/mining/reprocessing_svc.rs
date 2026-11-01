@@ -89,8 +89,16 @@ async fn reprocessable(c: &Client, ids: &[i64]) -> Result<Vec<crate::dao::items:
     crate::services::items::load_items(&c.db, &c.sde, crate::dao::items::loading::ItemQuery::IdsOwnerLocations(ids, char_id, station, ship)).await.map_err(db_err)
 }
 
+pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
+    if call.bound {
+        Some(reprocessing(c, call).await)
+    } else {
+        None
+    }
+}
+
 /// Bound reprocessingSvc (Moniker('reprocessingSvc', stationID)).
-pub(super) async fn reprocessing(c: &mut Client, call: &Call<'_>) -> CallResult {
+async fn reprocessing(c: &mut Client, call: &Call<'_>) -> CallResult {
     let char_id = c.session.int("charid").unwrap_or(0);
     match call.method {
         // GetQuotes(itemIDs, activeShipID) -> (stationTax, {typeID|None: stationEfficiency}, {itemID: quote})
