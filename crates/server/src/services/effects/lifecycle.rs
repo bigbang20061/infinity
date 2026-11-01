@@ -152,6 +152,11 @@ pub(super) fn cycle_should_stop(finished: bool, stop: &AtomicBool) -> bool {
     finished || stop.load(Ordering::Relaxed)
 }
 
+/// Settled snapshots may repeat; a missing or canceled capture must retire.
+pub(super) fn boundary_continues(captured: bool, finished: bool, stop: &AtomicBool) -> bool {
+    captured && !cycle_should_stop(finished, stop)
+}
+
 pub(super) fn schedule_cycle_end(s: &mut System, start: i64, duration_ms: f64, f: impl FnOnce(&mut System, i64) + Send + 'static) {
     let end = cycle_deadline(start, duration_ms);
     s.schedule_at(end, move |s| f(s, end));
@@ -220,6 +225,7 @@ pub(super) fn cycle_start(s: &mut System, mut cycle: Cycle, nominal_start: i64) 
         return;
     }
     cycle.nominal_start = nominal_start;
+    super::heat::begin_cycle(s, &cycle);
     s.defer(async move { cycle_begin_work(cycle).await; });
 }
 
@@ -255,7 +261,7 @@ async fn refund_refused_charge(cx: &Ctx, amount: f64) -> Result<(), CallError> {
 pub(super) async fn cycle_begin_work(mut cycle: Cycle) {
     let cx = cycle.cx.clone();
     let master = cycle.modules[0].id;
-    if cycle.cycles == 0 && cycle.effect.kind == EffectKind::Propulsion {
+    if cycle.effect.kind == EffectKind::Propulsion {
         apply_propulsion(&cx, master, cycle.stop.clone(), true).await;
     }
     let result = async {
@@ -308,6 +314,10 @@ pub(super) async fn cycle_begin_work(mut cycle: Cycle) {
             }
             Err(e) => { warn!("module {master} cycle start failed: {}", match e { CallError::Internal(e) => format!("{e:#}"), CallError::User { msg, .. } => msg }); return Err("phase failed"); }
         }
+        if let Err(e) = super::heat::connect_cycle(&cx, &fit, &cycle).await {
+            warn!("module {master} heat connection failed: {}", match e { CallError::Internal(e) => format!("{e:#}"), CallError::User { msg, .. } => msg });
+            return Err("heat connection failed");
+        }
         if cycle.effect.kind == EffectKind::Smartbomb || cycle.cycles == 0 && matches!(cycle.effect.kind, EffectKind::Bomb | EffectKind::FueledLocalRepair { .. } | EffectKind::RemoteRepair { .. } | EffectKind::CapTransfer | EffectKind::Neutralizer | EffectKind::Nosferatu | EffectKind::CapBooster | EffectKind::Ecm | EffectKind::BurstJammer) {
             weapon_fx(&cx, &cycle.modules, &cycle.effect, cycle.target, cycle.charge_type, true, cycle.duration_ms, cycle.repeat);
         }
@@ -328,20 +338,43 @@ pub(super) async fn cycle_begin_work(mut cycle: Cycle) {
     }
 }
 
-pub(super) fn cycle_end(s: &mut System, mut cycle: Cycle, fit: Fit, end: i64) {
+pub(super) fn cycle_end(s: &mut System, cycle: Cycle, fit: Fit, end: i64) {
     if !cycle_valid(s, &cycle) { cycle_stop(s, cycle); return; }
     let final_cycle = cycle_is_final(cycle.stop.load(Ordering::Relaxed), cycle.effect.has(EffectFlag::DisallowAutoRepeat), cycle.repeat, cycle.cycles);
-    s.defer(async move {
-        let cx = cycle.cx.clone();
-        let finished = match on_cycle_end(&cx, &fit, &mut cycle).await {
+    let Some(receiver) = super::heat::finish_cycle(s, &cycle, end, final_cycle) else { cycle_stop(s, cycle); return };
+    s.defer(async move { cycle_end_work(cycle, fit, end, final_cycle, receiver).await; });
+}
+
+/// Family end, then heat damage, then one actor closure that completes heat
+/// immediately before the repeat or the retirement.
+async fn cycle_end_work(mut cycle: Cycle, fit: Fit, end: i64, final_cycle: bool, receiver: tokio::sync::oneshot::Receiver<Option<Vec<super::heat::SourceSnapshot>>>) {
+    let cx = cycle.cx.clone();
+    let captured = match receiver.await {
+        Ok(Some(sources)) => Some(sources),
+        Ok(None) | Err(_) => None,
+    };
+    let (sources, finished) = if let Some(sources) = captured {
+        let mut finished = match on_cycle_end(&cx, &fit, &mut cycle).await {
             Ok(CycleOutcome::Continue) => final_cycle,
             Ok(CycleOutcome::Stop(_)) => true,
             Err(e) => { warn!("module {} cycle end failed: {}", cycle.modules[0].id, match e { CallError::Internal(e) => format!("{e:#}"), CallError::User { msg, .. } => msg }); true }
         };
-        cx.world.post(cx.system_id, move |s| {
-            if cycle_should_stop(finished, &cycle.stop) { cycle_stop(s, cycle); }
-            else { cycle_start(s, cycle, end); }
-        });
+        if let Err(e) = super::heat::damage::apply(&cx, sources).await {
+            warn!("module {} heat damage failed: {}", cycle.modules[0].id, match e { CallError::Internal(e) => format!("{e:#}"), CallError::User { msg, .. } => msg });
+            finished = true;
+        }
+        (true, finished)
+    } else {
+        (false, true)
+    };
+    cx.world.post(cx.system_id, move |s| {
+        if boundary_continues(sources, finished, &cycle.stop) {
+            super::heat::complete_cycle(s, &cycle, false);
+            cycle_start(s, cycle, end);
+        } else {
+            super::heat::complete_cycle(s, &cycle, true);
+            cycle_stop(s, cycle);
+        }
     });
 }
 
@@ -349,6 +382,7 @@ pub(super) fn cycle_stop(s: &mut System, mut cycle: Cycle) {
     let master = cycle.modules[0].id;
     let cx = cycle.cx.clone();
     debug!("module {master} stopped after {} cycles", cycle.cycles);
+    super::heat::stop_cycle(s, &cycle);
     let mut st = state();
     let retired = retire_activation(&mut st.active, master, &cycle.stop, || {
         ship_effect(&cx, master, cycle.effect.id, cycle.target, cycle.other.clone(), false, cycle.started, cycle.duration_ms, cycle.repeat);
@@ -489,6 +523,7 @@ pub(crate) async fn activate(c: &mut Client, call: &Call<'_>) -> CallResult {
             modules.push(Module { id: m.item_id, type_id: m.type_id, flag: m.flag_id });
         }
     }
+    for module in &modules { super::heat::damage::validate(&fit, module.id)?; }
     let masters: Vec<i64> = state().active.iter().filter(|(_, active)| active.char_id == cx.char_id && !active.forced_inactive).map(|(&id, _)| id).collect();
     let mut active = Vec::new();
     for master in masters { active.extend(bank(&cx.db, cx.ship_id, master).await?); }

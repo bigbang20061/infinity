@@ -232,6 +232,7 @@ impl Fit {
         let mut character: Vec<_> = character.into_iter().collect();
         character.sort_by_key(|v| v.0);
         let active = super::combat::active_modules();
+        let overloaded = super::effects::heat::overloaded_modules();
         let mut nodes = HashMap::new();
         let node = |type_id, location, online, active, level, overrides| Node {
             type_id, data_position: sde.types.position(type_id), location, online, active,
@@ -247,7 +248,9 @@ impl Fit {
         let mut module_by_flag = HashMap::new();
         for r in &modules {
             module_by_flag.insert(r.flag_id, r.item_id);
-            nodes.insert(Key::Module(r.item_id), node(r.type_id, Location::Ship, r.online, r.online && active.contains(&r.item_id), None, overrides.remove(&r.item_id).unwrap_or_default()));
+            let mut module = node(r.type_id, Location::Ship, r.online, r.online && active.contains(&r.item_id), None, overrides.remove(&r.item_id).unwrap_or_default());
+            module.overloaded = r.online && overloaded.contains(&r.item_id);
+            nodes.insert(Key::Module(r.item_id), module);
         }
         for r in &charges {
             if let Some(m) = module_by_flag.get(&r.flag_id) {
@@ -325,7 +328,7 @@ impl Fit {
         let Some(node) = self.nodes.get_mut(&Key::Module(item)) else { return false };
         if node.online != online {
             node.online = online;
-            if !online { node.active = false; }
+            if !online { node.active = false; node.overloaded = false; }
             self.memo.get_mut().unwrap().clear();
         }
         true

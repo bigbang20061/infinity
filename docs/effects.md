@@ -99,6 +99,58 @@ follow to surface contact and restore the target's movement properties on stop.
 Bomb and micro-jump heading follows moving velocity; when stationary it uses
 the last GOTO direction, then the existing negative Z direction.
 
+## Overload and heat
+
+Overload uses the existing Fit category-5 modifier gate, not a separate bonus
+evaluator. A module must have an overload effect, be online and unburnt, meet
+its Thermodynamics requirement, and have an implemented underlying behaviour;
+unsupported families remain refused. Single-module `Overload` and
+`StopOverload` return `None` remotely. `OverloadRack` and `StopOverloadRack`
+return lists of affected module IDs, even though the local rack-stop wrapper
+returns `None`. Rack operations include weapon-bank members and validate the
+set before changing it.
+
+Starting overload on a running module takes effect at its next cycle start;
+stopping takes effect at the current cycle end, which still rolls overloaded
+damage. Starting an idle module primes it immediately, without a heat source,
+so its first cycle is overloaded. Each running overloaded bank member is an
+independent source. Effect and heat-source notifications occur at effective
+boundaries: `OnHeatAdded` and `OnHeatRemoved` connect and disconnect sources,
+not merely requested changes.
+
+The system actor advances each rack's heat curve on its existing tick, settling
+the old curve before source changes and at cycle ends. Connected sources add
+their fitted heat absorption rates; capacity, generation and dissipation also
+come from Fit. With incoming heat the curve approaches capacity exponentially;
+without it heat decays exponentially and is rounded to zero at the cooling
+cutoff. The HUD reports heat divided by capacity.
+
+For each completed overloaded source cycle, the server uses the published
+[EVE University master overheat damage formula](https://wiki.eveuniversity.org/Overheating)
+as its damage policy, not as a client-provided formula. It rolls once for
+each online recipient in the same rack:
+
+`chance = clamp(heat / capacity, 0, 1) * (online high + medium + low modules) / (high + medium + low + rig slots) * attenuation^distance`
+
+Slot counts and attenuation are fitted values. Distance is the absolute
+physical slot difference without wrapping; empty and offline slots still count
+in that distance, but offline modules cannot receive damage. A successful roll
+adds the source's fitted `heatDamage`, capped at the recipient's fitted hit
+points. Fit already applies Thermodynamics to `heatDamage`; no separate skill
+multiplier is applied.
+
+Module damage uses the existing item attribute 3 and is persisted transactionally
+without a schema change. Burnout offlines the module through the existing online
+and weapon-bank path; a burnt bank member stops the bank, without burning its
+healthy members. Notifications of persisted changes follow commit. Station
+repair handles this damage, after which the module may be brought online under
+the ordinary fitting rules.
+
+Rack heat, priming and overload are runtime-only: they reset on docking, jump,
+logoff, leaving the ship or server restart, but persist through warp. Reset on
+docking is server policy, unlike the public wiki's docked cooling behaviour.
+NPC overload, paste repair, tether repair and structure repair are unsupported.
+
 ## Drones
 
 Drones share the sequential NPC/drone worker, effect registry and Fit evaluator.
@@ -212,8 +264,8 @@ once rather than doubled.
 Modifier evaluation covers item, location, group and required-skill domains,
 including character-location brain items and drones. Operation 8 applies
 unpenalized percent modifiers; special operation 9 derives skill level from
-skill points and rank. Overload modifier data is evaluated only when the
-snapshot marks a node overloaded; this does not add an overload RPC.
+skill points and rank. Category-5 overload modifiers are evaluated only when
+the snapshot marks a node overloaded.
 Ordinary numeric evaluation retains per-fit memoization, not a persistent
 keyed cache with invalidation. Client stacking penalties independently truncate
 the strongest upward and downward modifiers to eight each.

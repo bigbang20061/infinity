@@ -11,8 +11,8 @@
 //! Character brains compile passive skills and active implant and booster modifiers;
 //! structure effects remain unsupported.
 //! Brain versions are in-memory and reset when the server restarts.
-//! Ship priming reports the in-space capacitor's lazily recharged runtime level;
-//! ships not present in a running system use their fitted capacity.
+//! Ship priming reports settled runtime capacitor, rack heat and overload state;
+//! ships outside space use fitted values and no transient heat.
 pub(crate) mod brain;
 
 
@@ -22,7 +22,7 @@ use crate::client::{filetime_now, short, Client};
 use crate::dao::items::loading::{Item, ItemQuery};
 use super::items::load_items;
 use crate::dao::items::{charges, dogma as dogma_dao};
-use crate::consts::{dogma::ATTR_ARMOR_DAMAGE, dogma::ATTR_CAPACITOR_CAPACITY, dogma::ATTR_CAPACITY, dogma::ATTR_CHARGE, dogma::ATTR_HULL_DAMAGE, dogma::ATTR_IS_ONLINE, dogma::ATTR_MASS, dogma::ATTR_QUANTITY, dogma::ATTR_RADIUS, dogma::ATTR_SHIELD_CAPACITY, dogma::ATTR_SHIELD_CHARGE, dogma::ATTR_VOLUME, BLUEPRINT_COPY_QUANTITY, CATEGORY_OWNER, dogma::EFFECT_ONLINE, FLAG_HANGAR, FLAG_PILOT, SINGLETON_QUANTITY, TYPE_CHARACTER};
+use crate::consts::{dogma::ATTR_ARMOR_DAMAGE, dogma::ATTR_CAPACITOR_CAPACITY, dogma::ATTR_CAPACITY, dogma::ATTR_CHARGE, dogma::ATTR_HULL_DAMAGE, dogma::ATTR_IS_ONLINE, dogma::ATTR_MASS, dogma::ATTR_QUANTITY, dogma::ATTR_RADIUS, dogma::ATTR_SHIELD_CAPACITY, dogma::ATTR_SHIELD_CHARGE, dogma::ATTR_VOLUME, dogma::ATTR_HEAT_LOW, dogma::ATTR_HEAT_MED, dogma::ATTR_HEAT_HI, BLUEPRINT_COPY_QUANTITY, CATEGORY_OWNER, dogma::EFFECT_ONLINE, FLAG_HANGAR, FLAG_PILOT, SINGLETON_QUANTITY, TYPE_CHARACTER};
 use marshal::Value;
 use std::collections::BTreeMap;
 use tracing::warn;
@@ -30,12 +30,6 @@ use tracing::warn;
 /// SDE invGroups: Character.
 const GROUP_CHARACTER: i64 = 1;
 
-/// SDE dgmAttributeTypes: HUD defaults for attributes 1175 through 1177.
-const HUD_ATTRIBUTE_1175: i64 = 1175;
-/// SDE dgmAttributeTypes: HUD default attribute 1176.
-const HUD_ATTRIBUTE_1176: i64 = 1176;
-/// SDE dgmAttributeTypes: HUD default attribute 1177.
-const HUD_ATTRIBUTE_1177: i64 = 1177;
 /// Server online-effect duration wire choice for godma.py RefreshItemEffects' tuple.
 const ONLINE_EFFECT_DURATION: i64 = -1;
 /// Server online-effect repeat wire choice for godma.py RefreshItemEffects' tuple.
@@ -86,7 +80,7 @@ fn overlay_overrides(attrs: &mut BTreeMap<i64, f64>, overrides: impl IntoIterato
 /// godma's activeEffects for an online module: {effectID: (itemID, charID, shipID, targetID,
 /// otherID, area, effectID, startTime, duration, repeat)}. godma counts an effect as running
 /// only when it is listed here (RefreshItemEffects), so an empty dict shows every module offline.
-fn online_effect(item_id: i64, char_id: i64, ship_id: i64) -> Vec<(Value, Value)> {
+fn active_effect(item_id: i64, char_id: i64, ship_id: i64, effect_id: i64) -> (Value, Value) {
     let env = [
         Value::Int(item_id),
         Value::Int(char_id),
@@ -94,12 +88,23 @@ fn online_effect(item_id: i64, char_id: i64, ship_id: i64) -> Vec<(Value, Value)
         Value::None,
         Value::None,
         Value::list([]),
-        Value::Int(EFFECT_ONLINE),
+        Value::Int(effect_id),
         Value::Int(filetime_now()),
         Value::Int(ONLINE_EFFECT_DURATION),
         Value::Int(ONLINE_EFFECT_REPEAT),
     ];
-    vec![(Value::Int(EFFECT_ONLINE), Value::tuple(env))]
+    (Value::Int(effect_id), Value::tuple(env))
+}
+
+fn online_effect(item_id: i64, char_id: i64, ship_id: i64) -> Vec<(Value, Value)> {
+    vec![active_effect(item_id, char_id, ship_id, EFFECT_ONLINE)]
+}
+
+async fn heat_snapshot(c: &Client, ship: i64, fit: &fit::Fit) -> Vec<super::effects::heat::RackSnapshot> {
+    if let Some(system) = c.session.int("solarsystemid") {
+        if let Some(snapshot) = super::effects::heat::ship_state(&c.world, system, ship).await { return snapshot; }
+    }
+    super::effects::heat::empty_ship_state(fit, filetime_now())
 }
 
 fn info(item_row: Value, item_id: i64, attributes: BTreeMap<i64, f64>, active: Vec<(Value, Value)>) -> Value {
@@ -187,11 +192,17 @@ pub async fn ship_state(c: &Client, ship_id: i64) -> Result<Value, CallError> {
     super::effects::online::reconcile_ship(c, owner, ship_id).await?;
     let items = load_items(&c.db, &c.sde, ItemQuery::LocationExceptFlag(ship_id, FLAG_HANGAR)).await.map_err(db_err)?;
     let online = online_modules(c, ship_id).await?;
-    let instance = |key: Value, online: bool| {
+    let fit = if let Some(system) = c.session.int("solarsystemid") {
+        fit::Fit::load_in_space(&c.db, &c.world, system, owner, ship_id).await?
+    } else {
+        fit::Fit::load(&c.db, c.sde.clone(), owner, ship_id).await?
+    };
+    let heat = heat_snapshot(c, ship_id, &fit).await;
+    let instance = |key: Value, online: bool, damage: f64| {
         let row = [
             key.clone(),
             Value::Int(online as i64),
-            Value::Float(0.0),
+            Value::Float(damage),
             Value::Float(0.0),
             Value::Float(0.0),
             Value::Float(0.0),
@@ -200,12 +211,16 @@ pub async fn ship_state(c: &Client, ship_id: i64) -> Result<Value, CallError> {
         ];
         (key, Value::list(row))
     };
-    let mut instances: Vec<(Value, Value)> = items.iter().map(|i| instance(Value::Int(i.item_id), online.contains(&i.item_id))).collect();
+    let mut instances: Vec<(Value, Value)> = items.iter().map(|i| instance(Value::Int(i.item_id), online.contains(&i.item_id), fit.value(fit::Key::Module(i.item_id), ATTR_HULL_DAMAGE))).collect();
     // Loaded charges: sublocations (shipID, flagID, typeID) with their quantities.
     let (quantities, charges) = combat::flag_quantities(c, ship_id).await?;
-    instances.extend(charges.into_iter().map(|k| instance(k, false)));
+    instances.extend(charges.into_iter().map(|k| instance(k, false, 0.0)));
     let banks = combat::banks(&c.db, ship_id).await?;
-    Ok(Value::tuple([Value::Dict(instances), quantities, banks, Value::Dict(vec![])]))
+    let heat = heat.into_iter().map(|rack| (Value::Int(i64::from(rack.heat_id)), Value::tuple([
+        Value::Float(rack.heat), Value::Float(rack.capacity), Value::Float(rack.incoming),
+        Value::Float(rack.generation), Value::Float(rack.dissipation), Value::Int(rack.last_calc_time),
+    ]))).collect();
+    Ok(Value::tuple([Value::Dict(instances), quantities, banks, Value::Dict(heat)]))
 }
 
 /// The active ship and everything fitted in it.
@@ -224,6 +239,8 @@ async fn ship_info(c: &Client) -> Result<Vec<(Value, Value)>, CallError> {
     } else {
         fit::Fit::load(&c.db, c.sde.clone(), char_id, ship_id).await?
     };
+    let heat = heat_snapshot(c, ship_id, &fit).await;
+    let overloaded = super::effects::heat::overloaded_modules();
     let (cap_max, shield_max) = (fit.value(fit::Key::Ship, ATTR_CAPACITOR_CAPACITY), fit.value(fit::Key::Ship, ATTR_SHIELD_CAPACITY));
     let cap = if let Some(system) = system {
         combat::groups_health::capacitor_snapshot(&c.db, &c.world, system, ship_id).await?.map_or(cap_max, |snapshot| snapshot.level)
@@ -247,20 +264,28 @@ async fn ship_info(c: &Client) -> Result<Vec<(Value, Value)>, CallError> {
                 *value = fit.value(key, *attr as i32);
             }
         }
-        let active = if online.contains(&item.item_id) {
+        let mut active = if online.contains(&item.item_id) {
             attrs.insert(ATTR_IS_ONLINE as i64, 1.0);
             online_effect(item.item_id, char_id, ship_id)
         } else {
             vec![]
         };
+        if overloaded.contains(&item.item_id) {
+            for effect in c.sde.types.effects(item.type_id) {
+                if c.sde.dogma.effect(effect.effect_id).is_some_and(|row| row.effect_category == Some(super::effects::heat::rpc::OVERLOAD_CATEGORY)) {
+                    active.push(active_effect(item.item_id, char_id, ship_id, i64::from(effect.effect_id)));
+                }
+            }
+        }
         attrs.entry(ATTR_MASS as i64).or_insert(0.0); // mass is always present
         if item.item_id == ship_id {
             attrs.insert(ATTR_CHARGE as i64, cap);
             attrs.insert(ATTR_SHIELD_CHARGE as i64, shield);
             attrs.insert(ATTR_ARMOR_DAMAGE as i64, armor_damage);
             attrs.insert(ATTR_HULL_DAMAGE as i64, hull_damage);
+            for rack in &heat { attrs.insert(i64::from(rack.heat_id), rack.heat); }
         }
-        for k in [ATTR_HULL_DAMAGE as i64, ATTR_ARMOR_DAMAGE as i64, HUD_ATTRIBUTE_1175, HUD_ATTRIBUTE_1176, HUD_ATTRIBUTE_1177] {
+        for k in [ATTR_HULL_DAMAGE as i64, ATTR_ARMOR_DAMAGE as i64, i64::from(ATTR_HEAT_LOW), i64::from(ATTR_HEAT_MED), i64::from(ATTR_HEAT_HI)] {
             attrs.entry(k).or_insert(0.0);
         }
         out.push((Value::Int(item.item_id), info(item.row(), item.item_id, attrs, active)));
@@ -284,6 +309,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
     if let Some(r) = combat::dispatch(c, call).await {
         return r;
     }
+    if let Some(r) = super::effects::heat::rpc::dispatch(c, call).await { return r; }
     let flag = |i: usize| call.args.get(i).map(|v| !v.is_none() && v.as_int() != Some(0)).unwrap_or(false);
     match call.method {
         "ChangeDroneSettings" => {

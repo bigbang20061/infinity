@@ -11,7 +11,7 @@ use super::super::{db_err, notify_error, user_error, CallError, fit::{Fit, Key}}
 /// Client dogma effectSubSystem.
 const EFFECT_SUBSYSTEM: i32 = 3772;
 /// Client dogma rack effects and slot-count attributes (rigSlots is not upgradeSlotsLeft).
-const RACKS: [(i32, i32, i32); 5] = [(11, 12, FLAG_FITTING_FIRST), (13, 13, FLAG_MED_SLOT_FIRST), (12, 14, FLAG_HI_SLOT_FIRST), (EFFECT_RIG_SLOT, 1137, FLAG_RIG_FIRST), (EFFECT_SUBSYSTEM, 1367, FLAG_SUBSYSTEM_FIRST)];
+const RACKS: [(i32, i32, i32); 5] = [(11, ATTR_LOW_SLOTS, FLAG_FITTING_FIRST), (13, ATTR_MED_SLOTS, FLAG_MED_SLOT_FIRST), (12, ATTR_HI_SLOTS, FLAG_HI_SLOT_FIRST), (EFFECT_RIG_SLOT, ATTR_RIG_SLOTS, FLAG_RIG_FIRST), (EFFECT_SUBSYSTEM, 1367, FLAG_SUBSYSTEM_FIRST)];
 /// Client inventory rack width.
 const RACK_WIDTH: i32 = 8;
 /// Client visible subsystem slots.

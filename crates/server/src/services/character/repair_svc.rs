@@ -5,7 +5,7 @@
 //! The client requires one row per item; aggregating ship armor and hull health
 //! and applying the same repair fraction to both is a server inference.
 //! Payment and full-quote comparison use wallet-cent precision; zero-cent charges are refused.
-//! Structure facilities and heat generation are not modelled.
+//! Structure facilities and in-space paste repair are not modelled.
 use super::*;
 use crate::consts::{dogma::ATTR_ARMOR_DAMAGE, dogma::ATTR_ARMOR_HP, dogma::ATTR_HULL_DAMAGE, CARGO_CONTAINER_GROUPS, CATEGORY_DRONE, CATEGORY_MODULE, CATEGORY_SHIP, FLAG_HANGAR};
 use crate::dao::items::{dogma, repair};

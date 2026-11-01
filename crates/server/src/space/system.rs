@@ -24,6 +24,7 @@
 //! removal preserves that state.
 //! Live compressor ranges use actor-owned module generations and static type lists.
 //! Taking a ball also ends its in-memory ECM lockout before its pilot leaves.
+//! Rack heat and overload membership are transient and are cleared when a ship leaves.
 use super::*;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::future::Future;
@@ -101,6 +102,7 @@ pub struct System {
     pub(super) drone_launch_acks: Vec<tokio::sync::oneshot::Sender<()>>,
     pub(super) snapshot_context: Option<snapshot::Context>,
     pub(super) projection_sde: Option<Arc<Sde>>,
+    pub(crate) heat: crate::services::effects::heat::HeatState,
     pub(super) projections: HashMap<i64, Vec<crate::services::effects::projection::Projection>>,
     pub(super) projection_targets: HashMap<i64, i64>,
     pub(super) projection_revisions: HashMap<i64, u64>,
@@ -227,6 +229,7 @@ impl System {
             crate::services::combat::jamming::clear(self, id);
         }
         let ball = self.balls.remove(&id)?;
+        crate::services::effects::heat::remove_ship(self, id);
         self.compressors.remove(&id);
         self.module_cloaks.remove(&id);
         self.cloak_targeting.remove(&id);
@@ -268,7 +271,8 @@ impl System {
     pub(super) fn is_cold(&self) -> bool {
         self.actions.is_empty()
             && !self.timers.first_key_value().is_some_and(|(&(due, _), _)| due <= self.ms)
-            && self.module_cloaks.is_empty() && self.brains.is_empty() && self.drones.is_empty() && self.observers.is_empty() && !self.balls.values().any(|b|
+            && self.module_cloaks.is_empty() && self.brains.is_empty() && self.drones.is_empty() && self.observers.is_empty()
+            && !crate::services::effects::heat::active(&self.heat) && !self.balls.values().any(|b|
             (b.free && (b.mode != MODE_STOP || b.vel != [0.0; 3]))
             || (b.cloak != 0 && b.cloak_until > 0))
             && !collision::stationary_contact(&self.balls)
@@ -356,6 +360,7 @@ impl System {
             let (_, timer) = self.timers.pop_first().unwrap();
             timer(self);
         }
+        crate::services::effects::heat::tick(self);
         self.think_npcs();
         self.think_drones();
         if let Some(pending) = self.pending.take() {

@@ -5,6 +5,7 @@ use std::sync::Mutex;
 mod refund_db;
 mod forced_retire;
 mod banks_db;
+mod boundary;
 
 #[test]
 fn blocker_uses_target_modifier_source_not_scramble_identity() {
@@ -219,7 +220,7 @@ fn online_dispatch_stops_current_cycle_after_commit() {
         st.activation_generation.insert(module, stop.clone());
     }
     let mut outbox = Outbox::default();
-    outbox.operation(OnlineChanged { bank_stops: crate::services::combat::banks::capture_stop(module).into_iter().collect() });
+    outbox.operation(OnlineChanged { bank_stops: crate::services::combat::banks::capture_stop(module).into_iter().collect(), ship: 0, clear_heat: vec![] });
     assert!(!stop.load(Ordering::Relaxed));
     for entry in outbox.into_entries() {
         if let OutboxEffect::Operation(change) = entry { apply_online_changed(change); }

@@ -146,16 +146,37 @@ pub(crate) fn fire_fx_with_info(stamp: i64, shooter: i64, module: Option<(i64, i
 
 /// One `OnModuleAttributeChanges` entry.
 pub(crate) fn attribute_change(owner: i64, item: Value, attribute: i32, new: Value, old: Value) -> Value {
+    attribute_change_at(owner, item, attribute, new, old, filetime_now())
+}
+
+fn attribute_change_at(owner: i64, item: Value, attribute: i32, new: Value, old: Value, time: i64) -> Value {
     Value::tuple([
         Value::str("OnModuleAttributeChange"),
         Value::Int(owner),
         item,
         Value::Int(attribute as i64),
-        Value::Int(filetime_now()),
+        Value::Int(time),
         new,
         old,
         Value::None,
     ])
+}
+
+/// Client dogma heat-source modifier connection event.
+pub(crate) fn heat_connection(heat_id: i32, module: i64, start: bool) -> (&'static str, Vec<Value>) {
+    (if start { "OnHeatAdded" } else { "OnHeatRemoved" }, vec![Value::Int(i64::from(heat_id)), Value::Int(module)])
+}
+
+/// Attribute change for an actor-owned rack.
+pub(crate) fn heat_attribute(owner: i64, ship: i64, attribute: i32, old: f64, new: f64, time: i64) -> (&'static str, Vec<Value>) {
+    ("OnModuleAttributeChanges", vec![Value::list([attribute_change_at(owner, Value::Int(ship), attribute, Value::Float(new), Value::Float(old), time)])])
+}
+
+/// Category-5 effect notification without a live service context.
+pub(crate) fn overload_effect(owner: i64, ship: i64, module: i64, effect: i32, start: bool) -> (&'static str, Vec<Value>) {
+    let now = filetime_now();
+    let environment = environment::build(module, owner, ship, None, None, i64::from(effect));
+    ("OnGodmaShipEffect", ship_effect_args(module, i64::from(effect), environment, start, now, -1.0, -1, now))
 }
 
 #[cfg(test)] mod tests;

@@ -277,7 +277,6 @@ pub(super) fn social(call: &Call<'_>) -> Option<CallResult> {
         ("charMgr", "GetPaperdollState") => Value::Int(PAPERDOLL_NO_RECUSTOMIZATION),
         ("charMgr", "SetActivityStatus") => Value::None,
         ("charMgr", "GetCharacterDescription") => Value::unicode(""),
-        ("repairSvc", "RepairItemsInStation" | "RepairItemsInStructure") => Value::None,
         ("structureAssetSafety", "GetItemsInSafetyForCharacter" | "GetItemsInSafetyForCorp") => Value::list([]),
         ("bannedwords", "check_words_allowed") => Value::None,
         ("corpRegistry", "GetAggressionSettings") | ("accessGroupBookmarkMgr", "AddFolder") | ("corpStationMgr", "DoStandingCheckForStationService") | ("shipAdaptionMgr", "fetch_user_data") => Value::None,

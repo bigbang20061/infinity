@@ -12,6 +12,7 @@ pub(crate) mod effects;
 pub(crate) mod dynamic_items;
 pub(crate) mod fitting;
 pub(crate) mod gm;
+pub(crate) mod heat;
 pub(crate) mod industry;
 pub(crate) mod mining;
 pub(crate) mod repair;

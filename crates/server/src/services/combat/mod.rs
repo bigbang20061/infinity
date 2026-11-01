@@ -187,6 +187,7 @@ pub(super) fn attr(sde: &Sde, type_id: i32, id: i32, default: f64) -> f64 {
 /// Stop everything a character was doing in space (docking, jumping, logging off).
 pub fn reset(c: &Client) {
     let Some(char_id) = c.session.int("charid") else { return };
+    super::effects::heat::clear_character(char_id);
     clear_character_locks(&c.world, char_id);
     state().reset_character(char_id);
     if let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) {
