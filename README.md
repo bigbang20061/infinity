@@ -32,7 +32,7 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
 - **Economy.**
   - Regional market: seeded NPC orders, escrow, taxes and fees, history.
   - Contracts: item exchange, auction and courier.
-  - Industry: manufacturing, research, copying and invention.
+  - Industry: manufacturing, research, copying and invention at NPC stations, for pilots and for corporations. A corporation job takes its blueprint and materials from office divisions the installer may take from, delivers into the chosen division, and is paid from the installer's wallet or from a corporation division they may spend from. A job becomes ready at its end time, including after a restart, and is delivered when the pilot asks; until then its blueprint cannot be moved, trashed, sold or traded. Station taxes and the system cost index come from the industry configuration, the station's tax settings are read-only, and a job whose quoted cost or tax no longer matches is refused.
 - **Agents.** Kill missions, epic arcs, NPC standings, loyalty points and LP stores. LP store offers come from a catalogue the operator imports from ESI with `lp-import` (see [LP offer import](docs/lp-import.md)); the server itself never contacts ESI. While the catalogue is empty, every NPC corporation offers its race's faction items, priced from retail values, and the server logs a warning at start. You can buy an offer for yourself or, with withdrawal access to the chosen wallet division, for your corporation, which then pays the LP and ISK; the required items always come from your hangar in the station.
 - **Exploration.** Anomalies and signatures, probe and directional scanning, wormholes, the data and relic hacking minigame, and belt rats.
 - **Mining.** Asteroid belts, ore, ice and gas, mining modules, and belt regrowth.
@@ -51,13 +51,15 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
 - Not supported:
   - wars, sovereignty, and alliance capital systems and prime time
   - corporation shares and wallet journals
-  - corporation contracts and corporation industry jobs
+  - corporation contracts
+  - reactions and industry at player structures; NPC stations offer no reaction facility in the client
   - fleet warps, boosts and the fleet finder
   - shared bookmark folders
   - clone-grade and clone-implant restrictions and planetary colony extraction rules: every character is treated as Omega, and implants stay with the character rather than a jump clone
   - modules whose effect is not implemented yet, among them mutadaptive remote armor repairers. Activating one is refused with a message, and `/effects unsupported` lists the effects tried since the server started.
   - in direct trades: items from cargo, from inside a container or from a corporation hangar, the active ship, fitted modules and charges, and PLEX; types that cannot be traded are refused anywhere in an offered container or ship
   - the GM bounty reimbursement and bounty cache calls
+- An industry job installed before this version whose blueprint has since been moved or destroyed is refused at delivery.
   - labels for personal contacts
   - LP store offers that cost Analysis Kredits: they are listed, but buying one is refused
   - module heat damage from overheating, and repairs at structures
