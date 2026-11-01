@@ -144,25 +144,27 @@ pub(crate) async fn move_item(c: &mut Client, container: &Container, item_id: i6
                 let leaving_fit = departure && (item.location_id != location || !is_fitting_flag(flag) || item.owner_id != owner);
                 let online = leaving_fit && item.category_id == i64::from(crate::consts::CATEGORY_MODULE)
                     && crate::dao::items::dogma::online(tx, item.location_id).await.map_err(db_err)?.iter().any(|entry| entry.item_id == item.item_id);
+                let bank_departure = if departure {
+                    let before = super::super::combat::banks::snapshot(tx, item.location_id, &[item.item_id]).await?;
+                    let master = super::super::combat::targeting_charges::master_for_member(tx, item.location_id, item.item_id).await?;
+                    if !online {
+                        let mut modules = super::super::combat::targeting_charges::bank(tx, item.location_id, master).await?;
+                        if !modules.contains(&item.item_id) { modules.push(item.item_id); }
+                        outbox.operation(MoveEffect::ClearHeat(item.location_id, modules));
+                    }
+                    let changed = super::super::combat::banks::remove_member(tx, item.location_id, item.item_id, master, false).await?;
+                    Some((before, changed))
+                } else { None };
                 if online {
                     super::super::effects::online::set_online_core(tx, &sde, &policy, outbox, item.location_id, item.item_id, false).await?;
-                }
-                let before = if departure && !online { Some(super::super::combat::banks::snapshot(tx, item.location_id, &[item.item_id]).await?) } else { None };
-                let master = if departure && !online { super::super::combat::targeting_charges::master_for_member(tx, item.location_id, item.item_id).await? } else { item.item_id };
-                if departure && !online {
-                    let mut modules = super::super::combat::targeting_charges::bank(tx, item.location_id, master).await?;
-                    if !modules.contains(&item.item_id) { modules.push(item.item_id); }
-                    outbox.operation(MoveEffect::ClearHeat(item.location_id, modules));
                 }
                 let moved_id = move_core(tx, &sde, outbox, &item, owner, location, flag, take).await?;
                 if is_fitting_flag(flag) {
                     super::super::effects::fitting::validate_fit(tx, sde.clone(), owner, location, moved_id).await?;
                 }
-                if let Some(before) = before {
-                    if super::super::combat::banks::remove_member(tx, item.location_id, item.item_id, master, false).await? {
-                        for stop in super::super::combat::banks::changes(tx, item.location_id, before).await? { outbox.operation(MoveEffect::Bank(stop)); }
-                        outbox.notify_client("OnWeaponBanksChanged", vec![Value::Int(item.location_id), super::super::combat::banks(tx, item.location_id).await?]);
-                    }
+                if let Some((before, true)) = bank_departure {
+                    for stop in super::super::combat::banks::changes(tx, item.location_id, before).await? { outbox.operation(MoveEffect::Bank(stop)); }
+                    outbox.notify_client("OnWeaponBanksChanged", vec![Value::Int(item.location_id), super::super::combat::banks(tx, item.location_id).await?]);
                 }
                 if departure { super::super::effects::online::reconcile_core(tx, &sde, outbox, item.owner_id, item.location_id).await?; }
                 if is_fitting_flag(flag) { super::super::effects::online::reconcile_core(tx, &sde, outbox, owner, location).await?; }

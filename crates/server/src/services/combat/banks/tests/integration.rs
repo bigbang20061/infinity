@@ -30,6 +30,12 @@ fn direct_bank_pushes(client: &mut Client) -> Vec<Vec<Value>> {
     }).collect()
 }
 
+fn all_bank_pushes(client: &mut Client, rx: &mut UnboundedReceiver<(String, Vec<Value>)>) -> Vec<Vec<Value>> {
+    let mut pushes = bank_pushes(rx);
+    pushes.extend(direct_bank_pushes(client));
+    pushes
+}
+
 pub(super) async fn exercise(db: &Db, client: &mut Client, ship: i64, owner: i64, guns: &[i64], rx: &mut UnboundedReceiver<(String, Vec<Value>)>) {
     db.execute("DELETE FROM game.weapon_banks WHERE ship_id=$1", &[&ship]).await.unwrap();
     db.execute("DELETE FROM game.module_charges WHERE ship_id=$1", &[&ship]).await.unwrap();
@@ -103,25 +109,26 @@ pub(super) async fn exercise(db: &Db, client: &mut Client, ship: i64, owner: i64
     assert!(db.query_one("SELECT online FROM game.items WHERE item_id=$1", &[&b]).await.unwrap().get::<_, bool>("online"));
     assert!(!stopped(&replacement));
     assert!(bank_pushes(rx).is_empty());
+    assert!(direct_bank_pushes(client).is_empty());
 
     // Docked clients still receive the bank map through their own sender.
     client.world.unregister_pilot(owner);
-    assert!(online::set_online(client, ship, b, false).await.is_ok());
+    online::set_online(client, ship, b, false).await.expect("offline slave");
     assert!(stopped(&replacement));
     assert!(rows(db, ship).await.is_empty());
     assert!(!db.query_one("SELECT online FROM game.items WHERE item_id=$1", &[&b]).await.unwrap().get::<_, bool>("online"));
     assert_eq!(bank_pushes(rx), vec![vec![Value::Int(ship), Value::Dict(vec![])]]);
-    assert!(online::set_online(client, ship, b, false).await.is_ok());
+    online::set_online(client, ship, b, false).await.expect("repeat offline slave");
     assert!(bank_pushes(rx).is_empty());
-    assert!(online::set_online(client, ship, b, true).await.is_ok());
+    online::set_online(client, ship, b, true).await.expect("online slave");
     assert!(rpc(client, "LinkWeapons", ship, a, b).await.is_ok());
     assert!(rpc(client, "LinkWeapons", ship, a, c).await.is_ok());
     let master = active(a, owner);
-    assert!(online::set_online(client, ship, a, false).await.is_ok());
+    online::set_online(client, ship, a, false).await.expect("offline master");
     assert!(stopped(&master));
     assert!(rows(db, ship).await.is_empty());
     assert_eq!(bank_pushes(rx), vec![vec![Value::Int(ship), Value::Dict(vec![])]]);
-    assert!(online::set_online(client, ship, a, true).await.is_ok());
+    online::set_online(client, ship, a, true).await.expect("online master");
 
     assert!(rpc(client, "LinkWeapons", ship, a, b).await.is_ok());
     assert!(rpc(client, "LinkWeapons", ship, a, c).await.is_ok());
@@ -132,18 +139,18 @@ pub(super) async fn exercise(db: &Db, client: &mut Client, ship: i64, owner: i64
     assert!(!stopped(&master));
     assert!(bank_pushes(rx).is_empty());
     assert!(direct_bank_pushes(client).is_empty());
-    assert!(inventory::movement::move_item(client, &cargo, b, Some(ship), Some(28), None).await.is_ok());
+    inventory::movement::move_item(client, &cargo, b, Some(ship), Some(28), None).await.expect("move slave to same slot");
     assert!(!stopped(&master));
     assert!(bank_pushes(rx).is_empty());
     assert!(direct_bank_pushes(client).is_empty());
-    assert!(inventory::movement::move_item(client, &cargo, b, Some(ship), Some(crate::consts::FLAG_CARGO), None).await.is_ok());
+    inventory::movement::move_item(client, &cargo, b, Some(ship), Some(crate::consts::FLAG_CARGO), None).await.expect("move slave to cargo");
     assert_eq!(rows(db, ship).await, vec![(a, c)]);
     assert!(stopped(&master));
-    assert_eq!(direct_bank_pushes(client), vec![vec![Value::Int(ship), Value::Dict(vec![(Value::Int(a), Value::List(vec![Value::Int(c)]))])]]);
+    assert_eq!(all_bank_pushes(client, rx), vec![vec![Value::Int(ship), Value::Dict(vec![(Value::Int(a), Value::List(vec![Value::Int(c)]))])]]);
     let master = active(a, owner);
-    assert!(inventory::movement::move_item(client, &cargo, a, Some(ship), Some(crate::consts::FLAG_CARGO), None).await.is_ok());
+    inventory::movement::move_item(client, &cargo, a, Some(ship), Some(crate::consts::FLAG_CARGO), None).await.expect("move master to cargo");
     assert!(stopped(&master));
     assert!(rows(db, ship).await.is_empty());
-    assert_eq!(direct_bank_pushes(client), vec![vec![Value::Int(ship), Value::Dict(vec![])]]);
+    assert_eq!(all_bank_pushes(client, rx), vec![vec![Value::Int(ship), Value::Dict(vec![])]]);
     for id in guns { state().active.remove(id); }
 }
