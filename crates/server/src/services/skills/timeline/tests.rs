@@ -82,7 +82,7 @@ async fn training_booster_expiry_banks_only_until_expiry() {
     let baseline: i64 = existing.iter().map(|skill| skill.skill_points).sum();
     let mut exercised = false;
     'types: for data in c.sde.types.iter() {
-        if data.attribute(crate::consts::ATTR_BOOSTERNESS).is_none() { continue; }
+        if data.attribute(crate::consts::dogma::ATTR_BOOSTERNESS).is_none() { continue; }
         for entry in data.effects() {
             let Some(effect) = c.sde.dogma.effect(entry.effect_id) else { continue };
             if effect.effect_category.unwrap_or(0) != 0 { continue; }
@@ -97,7 +97,7 @@ async fn training_booster_expiry_banks_only_until_expiry() {
                 let old: HashMap<_, _> = CHAR_ATTRIBUTES.iter().map(|&id| (id, before.value(Key::Char, id as i32))).collect();
                 let new: HashMap<_, _> = CHAR_ATTRIBUTES.iter().map(|&id| (id, after.value(Key::Char, id as i32))).collect();
                 if old != new {
-                    for skill in c.sde.types.iter().filter(|skill| skill.attribute(crate::consts::ATTR_SKILL_TIME_CONSTANT).is_some() && !existing.iter().any(|row| row.type_id == skill.type_id)) {
+                    for skill in c.sde.types.iter().filter(|skill| skill.attribute(crate::consts::dogma::ATTR_SKILL_TIME_CONSTANT).is_some() && !existing.iter().any(|row| row.type_id == skill.type_id)) {
                         let mut old_row = QueueEntry { position: 0, type_id: skill.type_id, to_level: 1, start_sp: 0, dest_sp: 100_000, start_time: None, end_time: None };
                         let mut new_row = old_row.clone();
                         let Ok(old_end) = training::schedule(&c.sde, &mut old_row, &old, start) else { continue };
@@ -145,7 +145,7 @@ async fn completion_precedes_equal_expiry_and_harmless_expiries_preserve_queue()
     let f = fixture::create(&db).await.unwrap();
     let (c, _peer) = client(db.clone(), f.character).await;
     let existing = crate::dao::skills::training::current(&db, f.character).await.unwrap();
-    let skill = c.sde.types.iter().find(|s| s.attribute(crate::consts::ATTR_SKILL_TIME_CONSTANT).is_some() && !existing.iter().any(|r| r.type_id == s.type_id)).unwrap();
+    let skill = c.sde.types.iter().find(|s| s.attribute(crate::consts::dogma::ATTR_SKILL_TIME_CONSTANT).is_some() && !existing.iter().any(|r| r.type_id == s.type_id)).unwrap();
     crate::dao::skills::training::starting_skill(&db, f.character, skill.type_id, 0, 0).await.unwrap();
     let first = QueueEntry { position: 0, type_id: skill.type_id, to_level: 1, start_sp: 0, dest_sp: 100, start_time: Some(1), end_time: Some(100) };
     let second = QueueEntry { position: 1, type_id: skill.type_id, to_level: 2, start_sp: 100, dest_sp: 200, start_time: Some(100), end_time: Some(300) };
@@ -205,7 +205,7 @@ async fn supplied_skill_points_change_an_applicable_modifier() {
     let (c, _peer) = client(db.clone(), f.character).await;
     let mut found = false;
     'skills: for data in c.sde.types.iter() {
-        let Some(rank) = data.attribute(crate::consts::ATTR_SKILL_TIME_CONSTANT) else { continue };
+        let Some(rank) = data.attribute(crate::consts::dogma::ATTR_SKILL_TIME_CONSTANT) else { continue };
         if rank <= 0.0 { continue; }
         for entry in data.effects() {
             let Some(effect) = c.sde.dogma.effect(entry.effect_id) else { continue };

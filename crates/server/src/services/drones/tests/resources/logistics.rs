@@ -1,6 +1,6 @@
 use anyhow::{anyhow, ensure, Result};
 use marshal::Value;
-use crate::{consts::*, services::{Call, CallError, combat::{self, groups_health}, drones::worker,
+use crate::{consts::{*, dogma::*}, services::{Call, CallError, combat::{self, groups_health}, drones::worker,
     effects::{registry::{self, EffectAttribute}, EffectKind}, fit::{Fit, Key}}};
 use super::{fleet::form_fleet, super::fixture::Fixture};
 

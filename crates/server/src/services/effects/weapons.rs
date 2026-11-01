@@ -5,7 +5,7 @@ use super::lifecycle::Module;
 use crate::services::combat::{groups_health::damage, quantity_change, Ctx, ATTR_DAMAGE};
 use crate::services::fit::{Fit, Key};
 use crate::services::{db_err, rand01, CallError};
-use crate::consts::{ATTR_AOE_CLOUD_SIZE, ATTR_AOE_DAMAGE_REDUCTION_FACTOR, ATTR_AOE_VELOCITY, ATTR_DAMAGE_MULTIPLIER, ATTR_EXPLOSION_DELAY, ATTR_FALLOFF, ATTR_MAX_RANGE, ATTR_MAX_VELOCITY, ATTR_MISSILE_DAMAGE_MULTIPLIER, ATTR_OPTIMAL_SIG_RADIUS, ATTR_SIGNATURE_RADIUS, ATTR_TRACKING_SPEED};
+use crate::consts::{dogma::ATTR_AOE_CLOUD_SIZE, dogma::ATTR_AOE_DAMAGE_REDUCTION_FACTOR, dogma::ATTR_AOE_VELOCITY, dogma::ATTR_DAMAGE_MULTIPLIER, dogma::ATTR_EXPLOSION_DELAY, dogma::ATTR_FALLOFF, dogma::ATTR_MAX_RANGE, dogma::ATTR_MAX_VELOCITY, dogma::ATTR_MISSILE_DAMAGE_MULTIPLIER, dogma::ATTR_OPTIMAL_SIG_RADIUS, dogma::ATTR_SIGNATURE_RADIUS, dogma::ATTR_TRACKING_SPEED};
 use crate::db::Db;
 use crate::db::outbox::{dispatch_world, Outbox};
 use crate::sde::Sde;
@@ -377,7 +377,7 @@ pub(crate) async fn fire_source(cx: &super::space_source::SourceContext<'_>) -> 
     };
     let Some((from, victim)) = sample().await else { return Ok(()) };
     if matches!(cx.effect.kind, super::EffectKind::Missile) {
-        let charge = cx.fit.value(cx.key, crate::consts::ATTR_ENTITY_MISSILE_TYPE) as i32;
+        let charge = cx.fit.value(cx.key, crate::consts::dogma::ATTR_ENTITY_MISSILE_TYPE) as i32;
         if charge <= 0 || cx.world.sde().types.get(charge).is_none() {
             let id = cx.effect.id as i32;
             let name = cx.world.sde().dogma.effect(id).and_then(|row| row.name.as_deref()).unwrap_or("unknown");
@@ -393,18 +393,18 @@ pub(crate) async fn fire_source(cx: &super::space_source::SourceContext<'_>) -> 
                 (fit.value(key, ATTR_MAX_RANGE), fit.value(key, ATTR_FALLOFF), fit.value(key, ATTR_TRACKING_SPEED), fit.value(key, ATTR_OPTIMAL_SIG_RADIUS)), raw, Some(cx.guard)).await
         }
         super::EffectKind::Missile => {
-            let charge = fit.value(key, crate::consts::ATTR_ENTITY_MISSILE_TYPE) as i32;
+            let charge = fit.value(key, crate::consts::dogma::ATTR_ENTITY_MISSILE_TYPE) as i32;
             let sde = cx.world.sde();
             let attr = |id| sde.types.attribute(charge, id).or_else(|| sde.dogma.attribute(id).and_then(|a| a.default_value)).unwrap_or(0.0);
-            let velocity = (attr(ATTR_MAX_VELOCITY) * fit.value(key, crate::consts::ATTR_MISSILE_ENTITY_VELOCITY_MULTIPLIER)).max(1.0);
+            let velocity = (attr(ATTR_MAX_VELOCITY) * fit.value(key, crate::consts::dogma::ATTR_MISSILE_ENTITY_VELOCITY_MULTIPLIER)).max(1.0);
             let missile = Missile {
                 charge,
                 raw: ATTR_DAMAGE.map(|id| attr(id) * fit.value(key, ATTR_MISSILE_DAMAGE_MULTIPLIER)),
-                aoe_cloud: attr(ATTR_AOE_CLOUD_SIZE) * fit.value(key, crate::consts::ATTR_MISSILE_ENTITY_AOE_CLOUD_SIZE_MULTIPLIER),
-                aoe_velocity: attr(ATTR_AOE_VELOCITY) * fit.value(key, crate::consts::ATTR_MISSILE_ENTITY_AOE_VELOCITY_MULTIPLIER),
+                aoe_cloud: attr(ATTR_AOE_CLOUD_SIZE) * fit.value(key, crate::consts::dogma::ATTR_MISSILE_ENTITY_AOE_CLOUD_SIZE_MULTIPLIER),
+                aoe_velocity: attr(ATTR_AOE_VELOCITY) * fit.value(key, crate::consts::dogma::ATTR_MISSILE_ENTITY_AOE_VELOCITY_MULTIPLIER),
                 drf: attr(ATTR_AOE_DAMAGE_REDUCTION_FACTOR),
                 velocity,
-                flight_range: velocity * ms_to_seconds(attr(ATTR_EXPLOSION_DELAY) * fit.value(key, crate::consts::ATTR_MISSILE_ENTITY_FLIGHT_TIME_MULTIPLIER)),
+                flight_range: velocity * ms_to_seconds(attr(ATTR_EXPLOSION_DELAY) * fit.value(key, crate::consts::dogma::ATTR_MISSILE_ENTITY_FLIGHT_TIME_MULTIPLIER)),
                 weapon: from.type_id,
                 attacker: cx.attacker,
             };

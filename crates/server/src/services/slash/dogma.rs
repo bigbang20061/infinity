@@ -264,7 +264,7 @@ pub(super) async fn command(c: &mut Client, args: &[String]) -> Result<String, C
     let mut result = messages::gm::gm_dogma_result(id, attr_name, attr, old_base, new_base, old_effective.zip(new_effective), overridden);
     if key.is_none() { result.push_str("\n"); result.push_str(messages::gm::GM_DOGMA_BASE_ONLY); }
     let hull_foreign = item.category_id == i64::from(crate::consts::CATEGORY_SHIP)
-        && attr != crate::consts::ATTR_CAPACITY
+        && attr != crate::consts::dogma::ATTR_CAPACITY
         && c.sde.types.get(item.type_id).is_none_or(|data| data.attribute(attr).is_none());
     if item.category_id == i64::from(CATEGORY_MODULE) || hull_foreign {
         result.push_str("\n"); result.push_str(messages::gm::GM_DOGMA_VISIBILITY);

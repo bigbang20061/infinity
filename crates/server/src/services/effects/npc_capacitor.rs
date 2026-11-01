@@ -1,7 +1,7 @@
 //! Capacitor effects for NPC and drone sources.
 use super::{capacitor::nos_allowed, range::range_multiplier, registry::{EffectAttribute, EffectFlag},
     space_source::{SourceContext, SourceGuard}, EffectKind};
-use crate::consts::{ATTR_ENERGY_NEUTRALIZER_AMOUNT, ATTR_NOS_OVERRIDE, ATTR_POWER_TRANSFER_AMOUNT};
+use crate::consts::{dogma::ATTR_ENERGY_NEUTRALIZER_AMOUNT, dogma::ATTR_NOS_OVERRIDE, dogma::ATTR_POWER_TRANSFER_AMOUNT};
 use crate::services::{combat::groups_health::{capacitor_snapshot, drain_exact_guarded, inject_guarded, npc_capacitor_fraction, NpcCapacitorGuard}, CallError};
 use crate::space::{dist, drone::DronePhase};
 

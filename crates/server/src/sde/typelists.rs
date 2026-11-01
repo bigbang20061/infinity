@@ -2,7 +2,7 @@
 //! Membership follows `evetypes/__init__.py:GetTypeIDsFromTypeList`; other lists are not loaded.
 //! Startup fails if any requested trade or compressor list is missing.
 use std::collections::{HashMap, HashSet};
-use crate::{consts::ATTR_COMPRESSIBLE_ITEMS_TYPE_LIST, dao::sde::typelists as dao, db::Db};
+use crate::{consts::dogma::ATTR_COMPRESSIBLE_ITEMS_TYPE_LIST, dao::sde::typelists as dao, db::Db};
 use super::types::Types;
 
 /// inventoryrestrictions/common/checks.py: non-tradable type list.

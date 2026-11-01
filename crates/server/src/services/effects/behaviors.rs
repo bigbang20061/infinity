@@ -12,7 +12,7 @@ use crate::services::combat::{state, Ctx};
 use crate::services::combat::targeting_charges::{loaded, targets_of};
 use crate::services::fit::{Fit, Key};
 use crate::services::{user_error, CallError};
-use crate::consts::{ATTR_ACTIVATION_BLOCKED, CATEGORY_SHIP, EFFECT_MICROWARPDRIVE};
+use crate::consts::{dogma::ATTR_ACTIVATION_BLOCKED, CATEGORY_SHIP, dogma::EFFECT_MICROWARPDRIVE};
 use crate::messages;
 use crate::space::{System, MODE_WARP};
 use marshal::Value;

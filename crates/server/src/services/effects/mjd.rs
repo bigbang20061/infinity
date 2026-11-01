@@ -4,7 +4,7 @@
 //! values come from fitted dogma. Actor state and the spool are transient.
 use std::sync::{Arc, atomic::Ordering};
 use super::{lifecycle::{Cycle, CycleOutcome, Module}, registry::Effect};
-use crate::consts::{ATTR_ACTIVATION_BLOCKED, ATTR_WARP_SCRAMBLE_STATUS};
+use crate::consts::{dogma::ATTR_ACTIVATION_BLOCKED, dogma::ATTR_WARP_SCRAMBLE_STATUS};
 use crate::messages;
 use crate::services::{combat::{self, Ctx}, fit::{Fit, Key}, notify_error, CallError};
 use crate::space::{add, scale, MODE_WARP};

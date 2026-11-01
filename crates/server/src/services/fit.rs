@@ -11,14 +11,14 @@
 //! Mining and salvage drones have no mass or agility in the static data; the server gives them the common light-drone values (3000 kg, agility 100).
 
 use super::{db_err, CallError};
-use crate::consts::{ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_REQUIRED_SKILLS, ATTR_SPEED_FACTOR, CATEGORY_CHARGE, CATEGORY_SHIP, CATEGORY_SKILL, CATEGORY_SUBSYSTEM, EFFECT_AFTERBURNER, EFFECT_MICROWARPDRIVE, EFFECT_ONLINE, EFFECT_SKILL, TYPE_CHARACTER};
+use crate::consts::{dogma::ATTR_MASS, dogma::ATTR_MAX_VELOCITY, dogma::ATTR_REQUIRED_SKILLS, dogma::ATTR_SPEED_FACTOR, CATEGORY_CHARGE, CATEGORY_SHIP, CATEGORY_SKILL, CATEGORY_SUBSYSTEM, dogma::EFFECT_AFTERBURNER, dogma::EFFECT_MICROWARPDRIVE, dogma::EFFECT_ONLINE, dogma::EFFECT_SKILL, TYPE_CHARACTER};
 use crate::dao::items::fit as fit_dao;
 use crate::db::Db;
 use crate::sde::{dogma::{Attribute, Modifier}, types::TypeData, Sde};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use crate::consts::{ATTR_AGILITY, ATTR_SKILL_LEVEL, ATTR_SKILL_POINTS, ATTR_SKILL_TIME_CONSTANT, CATEGORY_DRONE, CATEGORY_IMPLANT, DRONE_FALLBACK_AGILITY, DRONE_FALLBACK_MASS, FLAG_IMPLANT};
+use crate::consts::{dogma::ATTR_AGILITY, dogma::ATTR_SKILL_LEVEL, dogma::ATTR_SKILL_POINTS, dogma::ATTR_SKILL_TIME_CONSTANT, CATEGORY_DRONE, CATEGORY_IMPLANT, DRONE_FALLBACK_AGILITY, DRONE_FALLBACK_MASS, FLAG_IMPLANT};
 /// SDE dogma effect category: passive.
 const EFFECT_CATEGORY_PASSIVE: i32 = 0;
 /// SDE dogma effect category: active.
@@ -412,7 +412,7 @@ impl Fit {
 
     pub(crate) fn type_has_attribute(&self, key: Key, attr: i32) -> bool {
         self.nodes.get(&key).and_then(|node| node.data_position)
-            .is_some_and(|position| attr == crate::consts::ATTR_CAPACITY || self.sde.types.at_position(position).attribute(attr).is_some())
+            .is_some_and(|position| attr == crate::consts::dogma::ATTR_CAPACITY || self.sde.types.at_position(position).attribute(attr).is_some())
     }
 
 

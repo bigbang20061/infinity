@@ -1,7 +1,7 @@
 //! Database-backed ancillary remote repair cycles through the dogma activation path.
 //! Uses published SDE modules and charges, game items and module charges; no UI is involved.
 use super::*;
-use crate::consts::{ATTR_CAPACITOR_NEED, ATTR_CHARGED_ARMOR_DAMAGE_MULTIPLIER, ATTR_RELOAD_TIME, CATEGORY_CHARGE, EFFECT_ANCILLARY_REMOTE_ARMOR_REPAIRER, EFFECT_ANCILLARY_REMOTE_SHIELD_BOOSTER, FLAG_CARGO};
+use crate::consts::{dogma::ATTR_CAPACITOR_NEED, dogma::ATTR_CHARGED_ARMOR_DAMAGE_MULTIPLIER, dogma::ATTR_RELOAD_TIME, CATEGORY_CHARGE, dogma::EFFECT_ANCILLARY_REMOTE_ARMOR_REPAIRER, dogma::EFFECT_ANCILLARY_REMOTE_SHIELD_BOOSTER, FLAG_CARGO};
 
 const RELOAD_MS: f64 = 1_000.0;
 const CARGO_QUANTITY: i32 = 100_000;
@@ -14,7 +14,7 @@ async fn ancillary(effect_id: i32, layer: usize, charged: bool, reload: bool) {
     let effect = registry::resolve(&sde, effect_id).expect("ancillary remote effect");
     let name = sde.dogma.effect(effect_id).unwrap().name.clone().unwrap();
     let size_id = sde.dogma.attributes_by_name("chargeSize").next().map(|a| a.attribute_id);
-    let amount_attr = [crate::consts::ATTR_SHIELD_BONUS, crate::consts::ATTR_ARMOR_DAMAGE_AMOUNT][layer];
+    let amount_attr = [crate::consts::dogma::ATTR_SHIELD_BONUS, crate::consts::dogma::ATTR_ARMOR_DAMAGE_AMOUNT][layer];
     let (module_type, charge_type, other_type) = sde.types.iter().filter(|m| m.published == Some(true)
         && m.category_id == Some(CATEGORY_MODULE) && m.effects().iter().any(|e| e.effect_id == effect_id)
         && effect.attribute(EffectAttribute::Duration).and_then(|a| m.attribute(a)).is_some_and(|v| (3000.0..=10000.0).contains(&v))

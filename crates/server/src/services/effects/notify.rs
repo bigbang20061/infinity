@@ -34,7 +34,7 @@ pub(crate) fn ewar_slot(effect: &super::registry::Effect) -> Option<&'static str
 
 /// Client dogma/effects/BUFF_SLOTS_BY_EFFECT_ID for the supported effects.
 fn ewar_slot_by_id(id: i32) -> Option<&'static str> {
-    use crate::consts::*;
+    use crate::consts::dogma::*;
     Some(match id {
         EFFECT_REMOTE_ECM_FALLOFF | EFFECT_ENTITY_ECM_FALLOFF | EFFECT_NPC_BEHAVIOR_ECM => "electronic",
         EFFECT_REMOTE_WEBIFIER_FALLOFF | EFFECT_REMOTE_WEBIFIER_ENTITY | EFFECT_NPC_BEHAVIOR_WEB => "webify",

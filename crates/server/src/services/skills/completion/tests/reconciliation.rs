@@ -2,7 +2,7 @@
 use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use crate::{
-    consts::{ATTR_BOOSTER_DURATION, ATTR_BOOSTERNESS, ATTR_CPU, ATTR_CPU_LOAD, ATTR_CPU_OUTPUT, ATTR_POWER, ATTR_POWER_LOAD, ATTR_POWER_OUTPUT, CATEGORY_IMPLANT, CATEGORY_MODULE, CATEGORY_SHIP, EFFECT_ONLINE, FLAG_HANGAR, FLAG_HI_SLOT_FIRST, GROUP_BOOSTER},
+    consts::{dogma::ATTR_BOOSTER_DURATION, dogma::ATTR_BOOSTERNESS, dogma::ATTR_CPU, dogma::ATTR_CPU_LOAD, dogma::ATTR_CPU_OUTPUT, dogma::ATTR_POWER, dogma::ATTR_POWER_LOAD, dogma::ATTR_POWER_OUTPUT, CATEGORY_IMPLANT, CATEGORY_MODULE, CATEGORY_SHIP, dogma::EFFECT_ONLINE, FLAG_HANGAR, FLAG_HI_SLOT_FIRST, GROUP_BOOSTER},
     dao::items::dogma,
     db::outbox::Outbox,
     services::{effects::online::{self, OnlineChanged, OnlinePolicy}, fit::{Fit, Key}, skills::{brain_items, requirements::requirements}},
@@ -37,7 +37,7 @@ async fn scheduled_booster_expiry_reconciles_online_fit_after_commit() {
             && t.effects().iter().any(|e| e.effect_id == 12)
             && t.effects().iter().any(|e| i64::from(e.effect_id) == EFFECT_ONLINE)
             && t.attribute(ATTR_CPU).is_some_and(|v| v > 0.0)
-            && !t.effects().iter().any(|e| e.effect_id == crate::consts::EFFECT_TURRET_FITTED || e.effect_id == crate::consts::EFFECT_LAUNCHER_FITTED)).expect("high-slot module").type_id;
+            && !t.effects().iter().any(|e| e.effect_id == crate::consts::dogma::EFFECT_TURRET_FITTED || e.effect_id == crate::consts::dogma::EFFECT_LAUNCHER_FITTED)).expect("high-slot module").type_id;
         for (skill, level) in requirements(&sde, booster).chain(requirements(&sde, module_type)) {
             let points = crate::services::skills::formulas::sp_for_level(crate::services::skills::training::skill_type(&sde, skill).rank, i64::from(level));
             training::set_level(&db, f.character, skill, level, points).await.unwrap();

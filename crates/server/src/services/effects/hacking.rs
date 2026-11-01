@@ -5,7 +5,7 @@
 //! Accepted analyzer activation cancels arrival jump cloak after validation.
 
 use crate::client::{filetime_now, Client};
-use crate::consts::EFFECT_HACKING;
+use crate::consts::dogma::EFFECT_HACKING;
 use crate::messages;
 use crate::services::{combat, notify_error, CallResult};
 use crate::space::{ms_to_seconds, seconds_to_ms};

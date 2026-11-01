@@ -1,7 +1,7 @@
 //! Sequential actor callbacks for drone work.
 use std::sync::{Arc, Weak};
 use tracing::warn;
-use crate::consts::{ATTR_DRONE_BANDWIDTH_USED, ATTR_DRONE_CONTROL_DISTANCE, ATTR_ENTITY_FLY_RANGE, ATTR_MAX_RANGE, ATTR_MAX_TARGET_RANGE, ATTR_RATE_OF_FIRE, ATTR_SCAN_RESOLUTION};
+use crate::consts::{dogma::ATTR_DRONE_BANDWIDTH_USED, dogma::ATTR_DRONE_CONTROL_DISTANCE, dogma::ATTR_ENTITY_FLY_RANGE, dogma::ATTR_MAX_RANGE, dogma::ATTR_MAX_TARGET_RANGE, dogma::ATTR_RATE_OF_FIRE, dogma::ATTR_SCAN_RESOLUTION};
 use crate::db::Db;
 use crate::services::{CallError, fit::{Fit, Key}, effects::{self, EffectKind, JammingType, registry::{self, EffectAttribute}, space_source::{SourceContext, SourceGuard}}};
 use crate::space::{World, drone::{DroneAction, DroneEffects, DroneOrder, DroneRecord, DronePhase, DroneSpec}};

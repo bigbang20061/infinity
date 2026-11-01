@@ -3,7 +3,7 @@
 //! rows supply notification classification and modifiers. Projections do not survive system shutdown.
 use super::*;
 use crate::services::{effects::{notify, projection::Projection, propulsion, registry, EffectKind}, fit::Fit};
-use crate::consts::{ATTR_MAX_TARGET_RANGE, ATTR_SCAN_RESOLUTION};
+use crate::consts::{dogma::ATTR_MAX_TARGET_RANGE, dogma::ATTR_SCAN_RESOLUTION};
 use crate::services::fit::Key;
 
 impl System {

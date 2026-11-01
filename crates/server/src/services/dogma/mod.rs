@@ -22,7 +22,7 @@ use crate::client::{filetime_now, short, Client};
 use crate::dao::items::loading::{Item, ItemQuery};
 use super::items::load_items;
 use crate::dao::items::{charges, dogma as dogma_dao};
-use crate::consts::{ATTR_ARMOR_DAMAGE, ATTR_CAPACITOR_CAPACITY, ATTR_CAPACITY, ATTR_CHARGE, ATTR_HULL_DAMAGE, ATTR_IS_ONLINE, ATTR_MASS, ATTR_QUANTITY, ATTR_RADIUS, ATTR_SHIELD_CAPACITY, ATTR_SHIELD_CHARGE, ATTR_VOLUME, BLUEPRINT_COPY_QUANTITY, CATEGORY_OWNER, EFFECT_ONLINE, FLAG_HANGAR, FLAG_PILOT, SINGLETON_QUANTITY, TYPE_CHARACTER};
+use crate::consts::{dogma::ATTR_ARMOR_DAMAGE, dogma::ATTR_CAPACITOR_CAPACITY, dogma::ATTR_CAPACITY, dogma::ATTR_CHARGE, dogma::ATTR_HULL_DAMAGE, dogma::ATTR_IS_ONLINE, dogma::ATTR_MASS, dogma::ATTR_QUANTITY, dogma::ATTR_RADIUS, dogma::ATTR_SHIELD_CAPACITY, dogma::ATTR_SHIELD_CHARGE, dogma::ATTR_VOLUME, BLUEPRINT_COPY_QUANTITY, CATEGORY_OWNER, dogma::EFFECT_ONLINE, FLAG_HANGAR, FLAG_PILOT, SINGLETON_QUANTITY, TYPE_CHARACTER};
 use marshal::Value;
 use std::collections::BTreeMap;
 use tracing::warn;

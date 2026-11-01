@@ -1,6 +1,6 @@
 //! Database-backed cloak, micro jump and compression actor regressions.
 use super::fixture;
-use crate::{consts::{ATTR_MAX_RANGE, ATTR_WARP_SCRAMBLE_STATUS, ATTR_MAX_TARGET_RANGE, ATTR_SCAN_RESOLUTION, CATEGORY_MODULE, CATEGORY_SHIP, EFFECT_CLOAKING, EFFECT_MICRO_JUMP_DRIVE, EFFECT_INDUSTRIAL_ITEM_COMPRESSION, FLAG_HI_SLOT_FIRST}, dao::items::dogma, services::{combat::{self, ActiveModule, Ctx, targeting_charges}, effects::{cloak, compression, mjd, EffectKind, lifecycle::{ActivationOwner, Cycle, Module}, registry}, fit::Fit}, space::World};
+use crate::{consts::{dogma::ATTR_MAX_RANGE, dogma::ATTR_WARP_SCRAMBLE_STATUS, dogma::ATTR_MAX_TARGET_RANGE, dogma::ATTR_SCAN_RESOLUTION, CATEGORY_MODULE, CATEGORY_SHIP, dogma::EFFECT_CLOAKING, dogma::EFFECT_MICRO_JUMP_DRIVE, dogma::EFFECT_INDUSTRIAL_ITEM_COMPRESSION, FLAG_HI_SLOT_FIRST}, dao::items::dogma, services::{combat::{self, ActiveModule, Ctx, targeting_charges}, effects::{cloak, compression, mjd, EffectKind, lifecycle::{ActivationOwner, Cycle, Module}, registry}, fit::Fit}, space::World};
 use marshal::Value;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 

@@ -5,7 +5,7 @@
 //! Planetary colonies, clone implant custody and clone-grade restrictions are not
 //! modelled; all characters follow the existing Omega policy.
 use super::{db_err, CallError};
-use crate::{consts::{ATTR_NON_DIMINISHING_SKILL_INJECTOR_USES, FLAG_CARGO, FLAG_HANGAR, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD}, dao::items::{loading::{Item, ItemQuery}, quantities::{self, QuantityChange}, transfers}, db::{executor::Executor, outbox::Outbox}, messages, sde::Sde, services::{items::load_items, notify_error}};
+use crate::{consts::{dogma::ATTR_NON_DIMINISHING_SKILL_INJECTOR_USES, FLAG_CARGO, FLAG_HANGAR, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD}, dao::items::{loading::{Item, ItemQuery}, quantities::{self, QuantityChange}, transfers}, db::{executor::Executor, outbox::Outbox}, messages, sde::Sde, services::{items::load_items, notify_error}};
 use marshal::Value;
 use std::sync::Arc;
 use crate::services::effects::online::{self, OnlineChanged};
@@ -231,7 +231,7 @@ async fn extract_tx(tx: &(impl Executor + ?Sized), outbox: &mut Outbox<OnlineCha
                 let removed = selected.get(&skill.type_id).copied().unwrap_or(0);
                 if removed > skill.skill_points || (removed > 0 && queued.iter().any(|q| q.type_id == skill.type_id)) { return Err(refusal()); }
                 if removed > 0 && !sde.types.get(skill.type_id).is_some_and(|t| t.category_id == Some(crate::consts::CATEGORY_SKILL) && t.published == Some(true)) { return Err(refusal()); }
-                if removed > 0 && skill.skill_points > super::formulas::sp_for_level(super::training::skill_type(&sde, skill.type_id).rank, i64::from(crate::consts::MAX_SKILL_LEVEL)) { return Err(refusal()); }
+                if removed > 0 && skill.skill_points > super::formulas::sp_for_level(super::training::skill_type(&sde, skill.type_id).rank, i64::from(crate::consts::dogma::MAX_SKILL_LEVEL)) { return Err(refusal()); }
                 let remaining = skill.skill_points - removed;
                 levels.insert(skill.type_id, super::formulas::level_from_points(remaining, super::training::skill_type(&sde, skill.type_id).rank));
             }

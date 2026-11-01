@@ -76,7 +76,7 @@ fn check_error(result: Result<(), crate::services::CallError>, expected: &str, c
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn refused_saves_roll_back_completion_history_jobs_and_effects() {
     use super::super::{save_queue, save_queue_tx, MAX_QUEUE_ENTRIES, UE_TYPEID};
-    use crate::{consts::{CATEGORY_SKILL, MAX_SKILL_LEVEL}, db::outbox::Outbox, messages as m, services::CallError};
+    use crate::{consts::{CATEGORY_SKILL, dogma::MAX_SKILL_LEVEL}, db::outbox::Outbox, messages as m, services::CallError};
     use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
@@ -164,7 +164,7 @@ async fn refused_saves_roll_back_completion_history_jobs_and_effects() {
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn saves_150_real_skill_levels_and_refuses_151_without_mutation() {
     use super::super::{save_queue, MAX_QUEUE_ENTRIES};
-    use crate::{consts::{CATEGORY_SKILL, MAX_SKILL_LEVEL}, messages as m};
+    use crate::{consts::{CATEGORY_SKILL, dogma::MAX_SKILL_LEVEL}, messages as m};
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let f = fixture::create(&db).await.unwrap();

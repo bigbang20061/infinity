@@ -4,7 +4,7 @@
 //! and do not model native propulsion physics beyond the fitted attributes.
 use std::sync::{Arc, atomic::AtomicBool};
 
-use crate::consts::{ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_SIGNATURE_RADIUS};
+use crate::consts::{dogma::ATTR_MASS, dogma::ATTR_MAX_VELOCITY, dogma::ATTR_SIGNATURE_RADIUS};
 use crate::services::{combat::{self, Ctx}, fit::{Fit, Key}};
 use crate::space::{event, Ball, System};
 use marshal::Value;
@@ -14,7 +14,7 @@ pub(crate) struct Kinematics { speed: f64, mass: f64, agility: f64, signature: f
 
 pub(crate) fn kinematics(fit: &Fit, key: Key) -> Kinematics {
     Kinematics { speed: fit.value(key, ATTR_MAX_VELOCITY), mass: fit.value(key, ATTR_MASS),
-        agility: fit.value(key, crate::consts::ATTR_AGILITY), signature: fit.value(key, ATTR_SIGNATURE_RADIUS) }
+        agility: fit.value(key, crate::consts::dogma::ATTR_AGILITY), signature: fit.value(key, ATTR_SIGNATURE_RADIUS) }
 }
 
 pub(crate) fn queue_kinematics(system: &mut System, ship: i64, values: Kinematics) {

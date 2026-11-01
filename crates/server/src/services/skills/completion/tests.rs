@@ -180,10 +180,10 @@ async fn harmless_expiries_preserve_queue_and_notify_once() {
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let f = fixture::create(&db).await.unwrap();
     let (c, _peer) = client(db.clone(), f.character).await;
-    let skill_type = c.sde.types.iter().find(|t| t.attribute(crate::consts::ATTR_SKILL_TIME_CONSTANT).is_some()).expect("test SDE has no skill").type_id;
+    let skill_type = c.sde.types.iter().find(|t| t.attribute(crate::consts::dogma::ATTR_SKILL_TIME_CONSTANT).is_some()).expect("test SDE has no skill").type_id;
     training::starting_skill(&db, f.character, skill_type, 0, 0).await.unwrap();
     let mut harmless = None;
-    for data in c.sde.types.iter().filter(|t| t.attribute(crate::consts::ATTR_BOOSTERNESS).is_some()) {
+    for data in c.sde.types.iter().filter(|t| t.attribute(crate::consts::dogma::ATTR_BOOSTERNESS).is_some()) {
         let first = booster(&db, f.character, data.type_id, 100).await;
         let second = booster(&db, f.character, data.type_id, 200).await;
         let before = super::super::attributes::character_attributes_at(&db, &c.sde, f.character, 99).await.unwrap_or_else(|_| panic!("loading active boosters"));
@@ -221,8 +221,8 @@ async fn live_deadlines_match_delayed_application() {
     let live = fixture::create(&db).await.unwrap();
     let late = fixture::create(&db).await.unwrap();
     let (c, _peer) = client(db.clone(), live.character).await;
-    let booster_type = c.sde.types.iter().find(|t| t.attribute(crate::consts::ATTR_BOOSTERNESS).is_some()).expect("test SDE has no booster").type_id;
-    let skill_type = c.sde.types.iter().find(|t| t.attribute(crate::consts::ATTR_SKILL_TIME_CONSTANT).is_some()).expect("test SDE has no skill").type_id;
+    let booster_type = c.sde.types.iter().find(|t| t.attribute(crate::consts::dogma::ATTR_BOOSTERNESS).is_some()).expect("test SDE has no booster").type_id;
+    let skill_type = c.sde.types.iter().find(|t| t.attribute(crate::consts::dogma::ATTR_SKILL_TIME_CONSTANT).is_some()).expect("test SDE has no skill").type_id;
     for character in [live.character, late.character] {
         training::starting_skill(&db, character, skill_type, 0, 0).await.unwrap();
         queue::insert(&db, character, &queue::QueueEntry { position: 0, type_id: skill_type, to_level: 1, start_sp: 0, dest_sp: 100, start_time: Some(1), end_time: Some(200) }).await.unwrap();
@@ -254,7 +254,7 @@ async fn manual_attribute_changes_retime_only_when_effective_values_change() {
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let f = fixture::create(&db).await.unwrap();
     let (c, _peer) = client(db.clone(), f.character).await;
-    let skill = c.sde.types.iter().find(|t| t.attribute(crate::consts::ATTR_SKILL_TIME_CONSTANT).is_some()).expect("test SDE has no skill").type_id;
+    let skill = c.sde.types.iter().find(|t| t.attribute(crate::consts::dogma::ATTR_SKILL_TIME_CONSTANT).is_some()).expect("test SDE has no skill").type_id;
     training::starting_skill(&db, f.character, skill, 0, 0).await.unwrap();
     let row = queue::QueueEntry { position: 0, type_id: skill, to_level: 1, start_sp: 0, dest_sp: 1000, start_time: Some(100), end_time: Some(1100) };
     queue::insert(&db, f.character, &row).await.unwrap();
@@ -293,12 +293,12 @@ async fn database_failure_after_completion_rolls_back_skill_queue_and_item_chang
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let f = fixture::create(&db).await.unwrap();
     let (c, _peer) = client(db.clone(), f.character).await;
-    let booster_type = c.sde.types.iter().find(|t| t.attribute(crate::consts::ATTR_BOOSTERNESS).is_some()).expect("test SDE has no booster").type_id;
-    let skill = c.sde.types.iter().find(|t| t.attribute(crate::consts::ATTR_SKILL_TIME_CONSTANT).is_some()).expect("test SDE has no skill").type_id;
+    let booster_type = c.sde.types.iter().find(|t| t.attribute(crate::consts::dogma::ATTR_BOOSTERNESS).is_some()).expect("test SDE has no booster").type_id;
+    let skill = c.sde.types.iter().find(|t| t.attribute(crate::consts::dogma::ATTR_SKILL_TIME_CONSTANT).is_some()).expect("test SDE has no skill").type_id;
     training::starting_skill(&db, f.character, skill, 0, 0).await.unwrap();
     queue::insert(&db, f.character, &queue::QueueEntry { position: 0, type_id: skill, to_level: 1, start_sp: 0, dest_sp: 100, start_time: Some(1), end_time: Some(200) }).await.unwrap();
     let item = booster(&db, f.character, booster_type, 250).await;
-    db.execute("INSERT INTO game.item_attributes (item_id,attribute_id,value) VALUES ($1,$2,$3)", &[&item, &crate::consts::ATTR_BOOSTERNESS, &1.0f64]).await.unwrap();
+    db.execute("INSERT INTO game.item_attributes (item_id,attribute_id,value) VALUES ($1,$2,$3)", &[&item, &crate::consts::dogma::ATTR_BOOSTERNESS, &1.0f64]).await.unwrap();
     reschedule(&db, f.character).await.unwrap_or_else(|_| panic!("scheduling fixture"));
     let before = state(&db, f.character).await;
     let dispatched = Arc::new(AtomicBool::new(false));
@@ -344,7 +344,7 @@ async fn runner_delivers_idle_booster_expiry_after_restart_seed() {
     assert!(crate::dao::jobs::next_due(&db, &[]).await.unwrap().is_none());
     let f = fixture::create(&db).await.unwrap();
     let (c, _peer) = client(db.clone(), f.character).await;
-    let booster_type = c.sde.types.iter().find(|t| t.attribute(crate::consts::ATTR_BOOSTERNESS).is_some()).expect("test SDE has no booster").type_id;
+    let booster_type = c.sde.types.iter().find(|t| t.attribute(crate::consts::dogma::ATTR_BOOSTERNESS).is_some()).expect("test SDE has no booster").type_id;
     let due = filetime_now() + crate::client::filetime_ticks_from_seconds(5);
     let item = booster(&db, f.character, booster_type, due).await;
     let (sender, mut receiver) = mpsc::unbounded_channel();
@@ -412,7 +412,7 @@ async fn training_booster_expiry_banks_old_rate_and_matches_live_processing() {
     let start = crate::consts::FILETIME_SECOND;
     let expiry = 10 * crate::consts::FILETIME_MINUTE;
     let mut exercised = false;
-    'candidate: for data in c.sde.types.iter().filter(|t| t.attribute(crate::consts::ATTR_BOOSTERNESS).is_some()) {
+    'candidate: for data in c.sde.types.iter().filter(|t| t.attribute(crate::consts::dogma::ATTR_BOOSTERNESS).is_some()) {
         for entry in data.effects() {
             let Some(effect) = c.sde.dogma.effect(entry.effect_id) else { continue };
             if effect.effect_category.unwrap_or(0) != 0 { continue; }
@@ -429,7 +429,7 @@ async fn training_booster_expiry_banks_old_rate_and_matches_live_processing() {
                 let old: HashMap<_, _> = CHAR_ATTRIBUTES.iter().map(|&id| (id, old_fit.value(Key::Char, id as i32))).collect();
                 let new: HashMap<_, _> = CHAR_ATTRIBUTES.iter().map(|&id| (id, new_fit.value(Key::Char, id as i32))).collect();
                 if old != new {
-                    for skill in c.sde.types.iter().filter(|s| s.attribute(crate::consts::ATTR_SKILL_TIME_CONSTANT).is_some()) {
+                    for skill in c.sde.types.iter().filter(|s| s.attribute(crate::consts::dogma::ATTR_SKILL_TIME_CONSTANT).is_some()) {
                         let mut row = queue::QueueEntry { position: 0, type_id: skill.type_id, to_level: 1, start_sp: 0, dest_sp: 100_000, start_time: None, end_time: None };
                         let mut slower = row.clone();
                         let Ok(old_end) = super::super::training::schedule(&c.sde, &mut row, &old, start) else { continue };
@@ -487,14 +487,14 @@ async fn training_booster_expiry_banks_old_rate_and_matches_live_processing() {
 async fn committed_effects_follow_timeline() {
     use crate::db::outbox::{Effect, Notification};
     use crate::lua::events::GameEvent;
-    use crate::consts::ATTR_NON_DIMINISHING_SKILL_INJECTOR_USES;
+    use crate::consts::dogma::ATTR_NON_DIMINISHING_SKILL_INJECTOR_USES;
     crate::tests::init_config();
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
     for completion_at in [50_i64, 150, 100] {
         let f = fixture::create(&db).await.unwrap();
         let (c, _peer) = client(db.clone(), f.character).await;
         let credit_type = c.sde.types.iter().find(|t| t.attribute(ATTR_NON_DIMINISHING_SKILL_INJECTOR_USES).is_some_and(|v| v >= 1.0 && v.fract() == 0.0)).expect("credit type in SDE").type_id;
-        let skill_type = c.sde.types.iter().find(|t| t.attribute(crate::consts::ATTR_SKILL_TIME_CONSTANT).is_some()).expect("skill in SDE").type_id;
+        let skill_type = c.sde.types.iter().find(|t| t.attribute(crate::consts::dogma::ATTR_SKILL_TIME_CONSTANT).is_some()).expect("skill in SDE").type_id;
         training::starting_skill(&db, f.character, skill_type, 0, 0).await.unwrap();
         queue::insert(&db, f.character, &queue::QueueEntry { position: 0, type_id: skill_type, to_level: 1, start_sp: 0, dest_sp: 100, start_time: Some(1), end_time: Some(completion_at) }).await.unwrap();
         let later = booster(&db, f.character, credit_type, 200).await;

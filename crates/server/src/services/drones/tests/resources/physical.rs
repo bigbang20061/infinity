@@ -1,6 +1,6 @@
 use anyhow::{anyhow, ensure, Context, Result};
 use marshal::Value;
-use crate::{consts::*, services::{Call, effects::{registry, EffectKind, registry::EffectAttribute}, fit::{Fit, Key}, mining::{self, Field}}, space::{dist, drone::{DroneOrder, PendingMining}}};
+use crate::{consts::{*, dogma::*}, services::{Call, effects::{registry, EffectKind, registry::EffectAttribute}, fit::{Fit, Key}, mining::{self, Field}}, space::{dist, drone::{DroneOrder, PendingMining}}};
 use super::super::fixture::Fixture;
 
 // SDE dgmAttributeTypes used by the shared mining calculation.

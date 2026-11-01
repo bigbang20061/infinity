@@ -1,7 +1,7 @@
 //! SDE skill prerequisites used by skill queue validation.
 //! Mirrors dogma/const.py requiredSkill attributes; reads startup SDE type data.
 //! Entitlement and recursive prerequisite policy are caller concerns.
-use crate::{consts::{ATTR_REQUIRED_SKILLS, ATTR_REQUIRED_SKILL_LEVELS}, sde::Sde};
+use crate::{consts::{dogma::ATTR_REQUIRED_SKILLS, dogma::ATTR_REQUIRED_SKILL_LEVELS}, sde::Sde};
 
 /// Required type and level pairs for a type, in SDE attribute slot order.
 pub(crate) fn requirements(sde: &Sde, type_id: i32) -> impl Iterator<Item = (i32, i32)> + '_ {

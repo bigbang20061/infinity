@@ -5,7 +5,7 @@ use super::aoe;
 use super::lifecycle::{Cycle, CycleOutcome, Module};
 use super::registry::Effect;
 use super::weapons::{consume_charge, next_missile_id};
-use crate::consts::{ATTR_EMP_FIELD_RANGE, ATTR_EXPLOSION_DELAY, ATTR_MAX_VELOCITY};
+use crate::consts::{dogma::ATTR_EMP_FIELD_RANGE, dogma::ATTR_EXPLOSION_DELAY, dogma::ATTR_MAX_VELOCITY};
 use crate::services::combat::{self, Ctx, ATTR_DAMAGE};
 use crate::services::fit::{Fit, Key};
 use crate::services::CallError;

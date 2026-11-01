@@ -5,7 +5,7 @@
 
 use std::{collections::HashSet, sync::Arc};
 use marshal::Value;
-use crate::{consts::*, dao::items::fit::{self as fit_dao, Module}, db::executor::Executor, messages, sde::Sde};
+use crate::{consts::{*, dogma::*}, dao::items::fit::{self as fit_dao, Module}, db::executor::Executor, messages, sde::Sde};
 use super::super::{db_err, notify_error, user_error, CallError, fit::{Fit, Key}};
 
 /// Client dogma effectSubSystem.

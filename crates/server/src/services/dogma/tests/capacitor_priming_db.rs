@@ -1,7 +1,7 @@
 //! Opt-in database regression for the ShipGetInfo capacitor priming path.
 use super::*;
 use std::sync::Arc;
-use crate::{client::filetime_now, consts::{ATTR_RECHARGE_RATE, CATEGORY_SHIP, FILETIME_SECOND}, space::{Ball, WarpState, MODE_STOP, World}};
+use crate::{client::filetime_now, consts::{dogma::ATTR_RECHARGE_RATE, CATEGORY_SHIP, FILETIME_SECOND}, space::{Ball, WarpState, MODE_STOP, World}};
 
 fn ball(id: i64, type_id: i32, pilot: i64) -> Ball {
     Ball {

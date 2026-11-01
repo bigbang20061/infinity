@@ -25,7 +25,7 @@
 
 use super::{db_err, Call, CallError, CallResult};
 use crate::client::{short, Client};
-use crate::consts::{ATTR_AGILITY, ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_SIGNATURE_RADIUS, FILETIME_SECOND, FLAG_HANGAR, TYPE_CAPSULE};
+use crate::consts::{dogma::ATTR_AGILITY, dogma::ATTR_MASS, dogma::ATTR_MAX_VELOCITY, dogma::ATTR_SIGNATURE_RADIUS, FILETIME_SECOND, FLAG_HANGAR, TYPE_CAPSULE};
 use crate::db::outbox::{dispatch_client, Effect, Outbox};
 use crate::lua::events::GameEvent;
 use crate::dao::{characters::{ship as character_dao, selection}, items::{ship as item_dao, creation}};
@@ -494,7 +494,7 @@ pub(super) async fn warp_to(c: &mut Client, object: Option<(V3, f64)>, point: V3
     loop {
         let fit = super::fit::Fit::load_in_space(&c.db, &c.world, system, char_id, ship).await?;
         let Some(revision) = fit.projection_revision() else { return Ok(Value::None) };
-        let scrambled = fit.value(super::fit::Key::Ship, crate::consts::ATTR_WARP_SCRAMBLE_STATUS) > 0.0;
+        let scrambled = fit.value(super::fit::Key::Ship, crate::consts::dogma::ATTR_WARP_SCRAMBLE_STATUS) > 0.0;
         let result = c.world.with(system, move |s| {
             commit_warp(s, ship, revision, scrambled, object, point, min_range, on_exit)
         }).await;

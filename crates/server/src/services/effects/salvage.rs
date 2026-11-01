@@ -4,7 +4,7 @@
 //! are a configured random selection of published Salvaged Materials types.
 //! Loose wreck contents are retained in a positioned cargo container.
 use super::{lifecycle::{Cycle, CycleOutcome, Module, subject_valid}, notify::fire_fx, registry::{Effect, EffectAttribute, EffectFlag}};
-use crate::consts::{ATTR_CAPACITY, ATTR_MAX_RANGE, FLAG_CARGO, GROUP_CARGO_CONTAINER, GROUP_WRECK, IX_LOCATION_ID};
+use crate::consts::{dogma::ATTR_CAPACITY, dogma::ATTR_MAX_RANGE, FLAG_CARGO, GROUP_CARGO_CONTAINER, GROUP_WRECK, IX_LOCATION_ID};
 use crate::dao::items::{creation, inventory, loading::{self, ItemQuery}, salvage, ship};
 use crate::db::outbox::{Effect as OutboxEffect, Outbox};
 use crate::messages;

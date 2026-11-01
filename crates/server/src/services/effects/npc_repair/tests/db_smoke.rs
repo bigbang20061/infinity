@@ -1,8 +1,8 @@
 use super::*;
 use std::sync::Arc;
-use crate::{consts::{ATTR_ARMOR_HP, ATTR_SHIELD_CAPACITY, ATTR_STRUCTURE_HP,
-    ATTR_SHIELD_EM_DAMAGE_RESONANCE, ATTR_ARMOR_EM_DAMAGE_RESONANCE,
-    ATTR_STRUCTURE_EM_DAMAGE_RESONANCE, CATEGORY_ENTITY},
+use crate::{consts::{dogma::ATTR_ARMOR_HP, dogma::ATTR_SHIELD_CAPACITY, dogma::ATTR_STRUCTURE_HP,
+    dogma::ATTR_SHIELD_EM_DAMAGE_RESONANCE, dogma::ATTR_ARMOR_EM_DAMAGE_RESONANCE,
+    dogma::ATTR_STRUCTURE_EM_DAMAGE_RESONANCE, CATEGORY_ENTITY},
     services::combat::groups_health::damage,
     space::{NpcBrain, NpcConfig, WarpState, MODE_STOP}};
 

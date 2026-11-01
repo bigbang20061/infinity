@@ -31,7 +31,7 @@ mod reprocessing_svc;
 use super::fit::{Fit, Key};
 use super::{db_err, keyval, notify_error, rand01, rand_dir, value_id_list, Call, CallError, CallResult};
 use crate::client::{filetime_now, unix_ms_from_filetime_ceil, Client};
-use crate::consts::{ATTR_CAPACITY, ATTR_MAX_RANGE, FILETIME_SECOND, FLAG_CARGO, FLAG_HANGAR, GROUP_ASTEROID_BELT, IX_FLAG, IX_LOCATION_ID, IX_STACK_SIZE};
+use crate::consts::{dogma::ATTR_CAPACITY, dogma::ATTR_MAX_RANGE, FILETIME_SECOND, FLAG_CARGO, FLAG_HANGAR, GROUP_ASTEROID_BELT, IX_FLAG, IX_LOCATION_ID, IX_STACK_SIZE};
 use crate::db::Db;
 use crate::messages;
 use crate::space::{dist, now_ms, Ball, NotifyTx, World, MODE_RIGID, V3};

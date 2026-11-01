@@ -6,7 +6,7 @@
 //! CharSettingBool with SDE attribute defaults and sends individual changes.
 use std::{collections::HashMap, sync::{Mutex, MutexGuard, OnceLock}};
 use marshal::Value;
-use crate::{consts::{ATTR_DRONE_FOCUS_FIRE, ATTR_DRONE_IS_AGGRESSIVE}, sde::Sde, services::{CallError, notify_error}};
+use crate::{consts::{dogma::ATTR_DRONE_FOCUS_FIRE, dogma::ATTR_DRONE_IS_AGGRESSIVE}, sde::Sde, services::{CallError, notify_error}};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct DroneSettings {

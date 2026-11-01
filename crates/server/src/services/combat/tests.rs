@@ -20,8 +20,8 @@ fn npc_zero_falloff_hits_inside_optimal() {
 #[tokio::test]
 #[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE"]
 async fn npc_projected_weapon_attributes_change_application() {
-    use crate::consts::{ATTR_TRACKING_SPEED, ATTR_MISSILE_ENTITY_AOE_VELOCITY_MULTIPLIER,
-        ATTR_MISSILE_ENTITY_AOE_CLOUD_SIZE_MULTIPLIER, CATEGORY_ENTITY};
+    use crate::consts::{dogma::ATTR_TRACKING_SPEED, dogma::ATTR_MISSILE_ENTITY_AOE_VELOCITY_MULTIPLIER,
+        dogma::ATTR_MISSILE_ENTITY_AOE_CLOUD_SIZE_MULTIPLIER, CATEGORY_ENTITY};
     use crate::services::effects::{projection::Projection, weapons::{missile_applied, turret_chance, Missile}, EffectKind, JammingType};
 
     crate::tests::init_config();
@@ -71,7 +71,7 @@ async fn npc_projected_weapon_attributes_change_application() {
     // Non-free balls retain velocity, so impact-time application is deterministic.
     let charge = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_CHARGE)
         && t.attribute(ATTR_AOE_CLOUD_SIZE).is_some_and(|v| v > 0.0)
-        && t.attribute(crate::consts::ATTR_AOE_VELOCITY).is_some_and(|v| v > 0.0)
+        && t.attribute(crate::consts::dogma::ATTR_AOE_VELOCITY).is_some_and(|v| v > 0.0)
         && ATTR_DAMAGE.iter().any(|&a| t.attribute(a).is_some_and(|v| v > 0.0)))
         .expect("damaging missile charge").type_id;
     let system = -481_000;

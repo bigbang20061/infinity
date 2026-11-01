@@ -3,7 +3,7 @@
 //! rows from `game.dynamic_item_modifiers`, and item overrides; uses SDE ranges for
 //! creation only. Renewal, erase and roguelike variants are unsupported; deployed
 //! inputs require World removal and are refused.
-use crate::{client::Client, consts::ATTR_HULL_DAMAGE, dao::{dynamic_items, items::{dogma, loading::ItemQuery}}, db::{executor::Executor, outbox::{dispatch_client, Outbox}}, messages::dynamic_items as msg, sde::Sde, services::{db_err, items::load_items, keyval, market, notify_error, rand01, Call, CallError, CallResult}};
+use crate::{client::Client, consts::dogma::ATTR_HULL_DAMAGE, dao::{dynamic_items, items::{dogma, loading::ItemQuery}}, db::{executor::Executor, outbox::{dispatch_client, Outbox}}, messages::dynamic_items as msg, sde::Sde, services::{db_err, items::load_items, keyval, market, notify_error, rand01, Call, CallError, CallResult}};
 use marshal::Value;
 use super::mutation::{self, Context};
 

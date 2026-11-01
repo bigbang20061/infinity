@@ -1,6 +1,6 @@
 //! Mutation regressions using the loaded SDE and a dedicated disposable database.
 use std::{collections::BTreeMap, sync::{Arc, atomic::{AtomicBool, Ordering}}};
-use crate::{consts::{ATTR_HULL_DAMAGE, CATEGORY_SHIP, FLAG_CARGO, FLAG_DRONE_BAY, FLAG_FITTING_FIRST, FLAG_HANGAR, CARGO_CONTAINER_GROUPS}, dao::{dynamic_items, items::dogma}, db::{Db, outbox::Outbox}, sde::Sde, services::{CallError, fit::base_attribute, keyval, market}};
+use crate::{consts::{dogma::ATTR_HULL_DAMAGE, CATEGORY_SHIP, FLAG_CARGO, FLAG_DRONE_BAY, FLAG_FITTING_FIRST, FLAG_HANGAR, CARGO_CONTAINER_GROUPS}, dao::{dynamic_items, items::dogma}, db::{Db, outbox::Outbox}, sde::Sde, services::{CallError, fit::base_attribute, keyval, market}};
 use marshal::Value;
 use super::{dynamic_item_service, mutation::{self, Context}};
 

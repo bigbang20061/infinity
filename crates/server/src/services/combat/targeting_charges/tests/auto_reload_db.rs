@@ -3,7 +3,7 @@ use super::*;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::Duration;
 use crate::{
-    consts::{CATEGORY_CHARGE, CATEGORY_MODULE, CATEGORY_SHIP, EFFECT_FUELED_SHIELD_BOOSTING, FLAG_FITTING_FIRST},
+    consts::{CATEGORY_CHARGE, CATEGORY_MODULE, CATEGORY_SHIP, dogma::EFFECT_FUELED_SHIELD_BOOSTING, FLAG_FITTING_FIRST},
     db::{Db, Error},
     space::{Ball, World, WarpState, MODE_STOP},
 };

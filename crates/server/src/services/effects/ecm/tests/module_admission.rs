@@ -3,7 +3,7 @@ use super::*;
 use std::{future::Future, sync::atomic::AtomicBool, task::Poll};
 use anyhow::{anyhow, ensure, Result};
 use marshal::Value;
-use crate::{consts::*, services::{combat::{ActiveModule, targeting_charges}, drones::{settings, tests::{fixture::Fixture, resources::fleet::form_fleet}}, effects::{lifecycle::ActivationOwner, registry}}, space::drone::DroneOrder};
+use crate::{consts::{*, dogma::*}, services::{combat::{ActiveModule, targeting_charges}, drones::{settings, tests::{fixture::Fixture, resources::fleet::form_fleet}}, effects::{lifecycle::ActivationOwner, registry}}, space::drone::DroneOrder};
 
 async fn catch_scenario(future: impl Future<Output = Result<()>>) -> std::thread::Result<Result<()>> {
     let mut future = std::pin::pin!(future);

@@ -1,7 +1,7 @@
 //! Database-backed slash oracle against sampled actor state and real SDE types.
 use std::sync::Arc;
 use crate::{
-    config::Config, conn::Conn, consts::{ATTR_FALLOFF, ATTR_MAX_RANGE, ATTR_OPTIMAL_SIG_RADIUS, ATTR_TRACKING_SPEED, CATEGORY_MODULE, CATEGORY_SHIP, FLAG_FITTING_FIRST, GM_ROLES},
+    config::Config, conn::Conn, consts::{dogma::ATTR_FALLOFF, dogma::ATTR_MAX_RANGE, dogma::ATTR_OPTIMAL_SIG_RADIUS, dogma::ATTR_TRACKING_SPEED, CATEGORY_MODULE, CATEGORY_SHIP, FLAG_FITTING_FIRST, GM_ROLES},
     db::Db, handshake::Login, sde::Sde, services::effects::{registry, EffectKind},
     space::{Ball, WarpState, World, MODE_STOP},
 };

@@ -2,7 +2,7 @@
 use super::*;
 use crate::services::effects::online::set_online;
 use crate::{
-    consts::{ATTR_CAPACITOR_CAPACITY, ATTR_RECHARGE_RATE, ATTR_SCAN_RESOLUTION, CATEGORY_CHARGE, CATEGORY_MODULE, CATEGORY_SHIP, FLAG_HI_SLOT_FIRST, GROUPABLE_GROUP_IDS},
+    consts::{dogma::ATTR_CAPACITOR_CAPACITY, dogma::ATTR_RECHARGE_RATE, dogma::ATTR_SCAN_RESOLUTION, CATEGORY_CHARGE, CATEGORY_MODULE, CATEGORY_SHIP, FLAG_HI_SLOT_FIRST, GROUPABLE_GROUP_IDS},
     dao::items::{charges, combat as item_combat, dogma},
     services::combat,
     space::{Ball, WarpState, World, MODE_STOP},
@@ -49,7 +49,7 @@ async fn slave_activation_fires_bank_and_offline_stops_actor_cycle() {
             let groups: Vec<_> = ["chargeGroup1", "chargeGroup2", "chargeGroup3", "chargeGroup4", "chargeGroup5"].iter()
                 .flat_map(|name| sde.dogma.attributes_by_name(name)).filter_map(|a| m.attribute(a.attribute_id)).collect();
             let module_size = size.and_then(|id| m.attribute(id));
-            let capacity = m.capacity.or_else(|| m.attribute(crate::consts::ATTR_CAPACITY))?;
+            let capacity = m.capacity.or_else(|| m.attribute(crate::consts::dogma::ATTR_CAPACITY))?;
             let c = sde.types.iter().find(|c| c.published == Some(true) && c.category_id == Some(CATEGORY_CHARGE)
                 && c.group_id.is_some_and(|g| groups.contains(&f64::from(g)))
                 && (module_size.is_none_or(|v| v <= 0.0) || size.and_then(|id| c.attribute(id)) == module_size)

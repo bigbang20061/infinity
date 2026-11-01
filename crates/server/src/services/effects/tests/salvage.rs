@@ -1,6 +1,6 @@
 //! Transactional salvage through the fitted effect, persistent inventory and system actor.
 use super::fixture;
-use crate::{consts::{ATTR_CAPACITY, ATTR_MAX_RANGE, ATTR_SCAN_RESOLUTION, CATEGORY_MODULE, CATEGORY_SHIP, EFFECT_SALVAGING, FLAG_CARGO, FLAG_HI_SLOT_FIRST, GROUP_CARGO_CONTAINER, GROUP_WRECK}, dao::items::{creation, dogma, loading::{self, ItemQuery}}, services::{combat::{self, ActiveModule, Ctx, targeting_charges}, effects::{lifecycle::{ActivationOwner, Cycle, CycleOutcome, Module}, registry, salvage}, fit::{Fit, Key}}, space::World};
+use crate::{consts::{dogma::ATTR_CAPACITY, dogma::ATTR_MAX_RANGE, dogma::ATTR_SCAN_RESOLUTION, CATEGORY_MODULE, CATEGORY_SHIP, dogma::EFFECT_SALVAGING, FLAG_CARGO, FLAG_HI_SLOT_FIRST, GROUP_CARGO_CONTAINER, GROUP_WRECK}, dao::items::{creation, dogma, loading::{self, ItemQuery}}, services::{combat::{self, ActiveModule, Ctx, targeting_charges}, effects::{lifecycle::{ActivationOwner, Cycle, CycleOutcome, Module}, registry, salvage}, fit::{Fit, Key}}, space::World};
 use std::{sync::{Arc, atomic::{AtomicBool, AtomicI64, Ordering}}, time::Duration};
 
 // SDE dogma accessDifficulty and accessDifficultyBonus; invGroups Salvaged Materials.

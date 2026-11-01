@@ -4,7 +4,7 @@ mod delegation;
 pub(in crate::services) mod fleet;
 
 use anyhow::{anyhow, ensure, Result};
-use crate::{consts::*, services::{effects::{registry, EffectKind}, fit::{Fit, Key}, mining::{self, Field}}};
+use crate::{consts::{*, dogma::*}, services::{effects::{registry, EffectKind}, fit::{Fit, Key}, mining::{self, Field}}};
 use super::fixture::Fixture;
 
 #[tokio::test]

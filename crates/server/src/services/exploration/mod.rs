@@ -47,7 +47,7 @@ use sites::*;
 
 use super::{db_err, keyval, notify_error, off_surface, rand01, rand_dir, value_ids, Call, CallError, CallResult};
 use crate::client::{filetime_now, filetime_ticks_from_seconds, Client};
-use crate::consts::{ATTR_EXPLOSION_DELAY, ATTR_REQUIRED_SKILL_1, AU, FACTION_AMARR, FACTION_ANGEL_CARTEL, FACTION_CALDARI, FACTION_GALLENTE, FACTION_GURISTAS, FACTION_MINMATAR, FILETIME_SECOND, FLAG_CARGO, GROUP_ASTEROID_BELT, GROUP_PLANET, SKILL_ARCHAEOLOGY, SKILL_HACKING};
+use crate::consts::{dogma::ATTR_EXPLOSION_DELAY, dogma::ATTR_REQUIRED_SKILL_1, AU, FACTION_AMARR, FACTION_ANGEL_CARTEL, FACTION_CALDARI, FACTION_GALLENTE, FACTION_GURISTAS, FACTION_MINMATAR, FILETIME_SECOND, FLAG_CARGO, GROUP_ASTEROID_BELT, GROUP_PLANET, SKILL_ARCHAEOLOGY, SKILL_HACKING};
 use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::{dispatch_client, Effect, Outbox};

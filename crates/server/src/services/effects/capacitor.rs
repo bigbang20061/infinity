@@ -5,7 +5,7 @@
 use super::lifecycle::{Cycle, CycleOutcome, Module};
 use super::registry::{Effect, EffectAttribute, EffectFlag};
 use super::{range::range_multiplier, weapons::consume_charge, EffectKind};
-use crate::consts::{ATTR_CAPACITOR_BONUS, ATTR_ENERGY_NEUTRALIZER_AMOUNT, ATTR_NOS_OVERRIDE, ATTR_POWER_TRANSFER_AMOUNT, CATEGORY_DRONE, CATEGORY_ENTITY, CATEGORY_SHIP};
+use crate::consts::{dogma::ATTR_CAPACITOR_BONUS, dogma::ATTR_ENERGY_NEUTRALIZER_AMOUNT, dogma::ATTR_NOS_OVERRIDE, dogma::ATTR_POWER_TRANSFER_AMOUNT, CATEGORY_DRONE, CATEGORY_ENTITY, CATEGORY_SHIP};
 use crate::messages;
 use crate::services::combat::{Ctx, groups_health::{capacitor_snapshot, drain_exact_guarded, inject, NpcCapacitorGuard}, targeting_charges::{loaded, targets_of}};
 use crate::services::fit::{Fit, Key};

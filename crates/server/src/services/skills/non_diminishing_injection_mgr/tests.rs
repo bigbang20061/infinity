@@ -1,6 +1,6 @@
 //! Read-only injector credit RPC regressions.
 use super::*;
-use crate::{consts::{ATTR_NON_DIMINISHING_SKILL_INJECTOR_USES, FLAG_BOOSTER, FILETIME_MINUTE}, services::tests::{client, fixture}};
+use crate::{consts::{dogma::ATTR_NON_DIMINISHING_SKILL_INJECTOR_USES, FLAG_BOOSTER, FILETIME_MINUTE}, services::tests::{client, fixture}};
 
 async fn fingerprint(db: &crate::db::Db, character: i64) -> String {
     let job = format!("skills.complete:{character}");

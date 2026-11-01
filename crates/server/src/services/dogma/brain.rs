@@ -7,7 +7,7 @@
 //! training-completion updates follow scheduled and mutation-time completions.
 
 use super::super::{fit::{Fit, Key, OP_PRE_ASSIGN, OP_PRE_MUL, OP_PRE_DIV, OP_MOD_ADD, OP_MOD_SUB, OP_POST_MUL, OP_POST_DIV, OP_POST_PERCENT, OP_POST_PERCENT_UNNERFED, OP_POST_ASSIGN, PERCENT_SCALE}, keyval, CallError};
-use crate::{client::Client, consts::ATTR_SKILL_LEVEL};
+use crate::{client::Client, consts::dogma::ATTR_SKILL_LEVEL};
 use marshal::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock};

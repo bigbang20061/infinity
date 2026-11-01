@@ -1,6 +1,6 @@
 use anyhow::{ensure, Context, Result};
 use marshal::Value;
-use crate::{consts::*, services::fit::{Fit, Key}};
+use crate::{consts::{*, dogma::*}, services::fit::{Fit, Key}};
 use super::fixture::Fixture;
 
 #[tokio::test]
