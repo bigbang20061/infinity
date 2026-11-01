@@ -6,28 +6,24 @@
 //! Charges, characters, structures, NPCs and stacked items are not supported.
 use super::{slash_error, Client, CallError};
 use crate::{dao::items::{dogma as dao, fit as fit_dao, loading::{Item, ItemQuery}}, messages};
-use crate::consts::{CATEGORY_CHARGE, CATEGORY_DRONE, CATEGORY_ENTITY, CATEGORY_MODULE, CATEGORY_OWNER};
+use crate::consts::{CATEGORY_CHARGE, CATEGORY_DRONE, CATEGORY_ENTITY, CATEGORY_MODULE, CATEGORY_OWNER, CATEGORY_STARBASE, CATEGORY_STRUCTURE};
 use crate::consts::dogma::CHAR_ATTRIBUTES;
 use crate::services::{combat, db_err, fit::{self, Fit, Key}, items::load_items, effects::{notify, propulsion}};
 use crate::db::outbox::Outbox;
 use crate::services::effects::online::{self, OnlineChanged};
 use marshal::Value;
 
-/// SDE invCategories: Starbase.
-const CATEGORY_STARBASE: i64 = 23;
 /// SDE invCategories: Infrastructure Upgrade.
 const CATEGORY_INFRASTRUCTURE_UPGRADE: i64 = 39;
 /// SDE invCategories: Sovereignty Structures.
 const CATEGORY_SOVEREIGNTY_STRUCTURES: i64 = 40;
-/// SDE invCategories: Structure.
-const CATEGORY_STRUCTURE: i64 = 65;
 /// SDE invCategories: Structure Module.
 const CATEGORY_STRUCTURE_MODULE: i64 = 66;
 /// Categories that are not override targets.
 const EXCLUDED_CATEGORIES: [i64; 8] = [
     CATEGORY_OWNER as i64, CATEGORY_CHARGE as i64, CATEGORY_ENTITY as i64,
-    CATEGORY_STARBASE, CATEGORY_INFRASTRUCTURE_UPGRADE, CATEGORY_SOVEREIGNTY_STRUCTURES,
-    CATEGORY_STRUCTURE, CATEGORY_STRUCTURE_MODULE,
+    CATEGORY_STARBASE as i64, CATEGORY_INFRASTRUCTURE_UPGRADE, CATEGORY_SOVEREIGNTY_STRUCTURES,
+    CATEGORY_STRUCTURE as i64, CATEGORY_STRUCTURE_MODULE,
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq)]

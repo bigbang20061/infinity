@@ -1,9 +1,9 @@
 //! Crimewatch: combat timers, criminal flags, engagements, security status, CONCORD and
 //! killmails (eve/client/script/ui/services/crimewatchSvc.py, crimewatch.const).
 //!
-//! Activating a weapon on another pilot's ship is legal against criminals or suspects, configured
-//! outlaws, pilots you are engaged with, and anywhere outside empire space. Otherwise it is a criminal
-//! act: the aggressor loses security status and is flagged criminal; in configured high-sec
+//! Activating a weapon on another pilot's ship is legal against opponents in an active war,
+//! criminals or suspects, configured outlaws, pilots you are engaged with, and anywhere outside empire space.
+//! Otherwise it is a criminal act: the aggressor loses security status and is flagged criminal; in high-sec
 //! CONCORD destroys their ship after a response time that grows as security falls, unless
 //! CONCORD responses are disabled. Aggression starts weapons and PvP timers and a mutual
 //! engagement regardless; their durations are operator policies.
@@ -20,9 +20,11 @@
 //! System security comes from the startup SDE map; character security is persisted in game data.
 mod corp_registry;
 mod crimewatch;
+pub(crate) mod killmails;
 mod war_statistic_mgr;
 
 use super::{db_err, keyval, Call, CallError, CallResult};
+use killmails::killmails;
 use crate::client::{filetime_now, ms_from_filetime_ticks, Client};
 use crate::consts::FILETIME_SECOND;
 use crate::db::Db;
@@ -178,10 +180,12 @@ pub async fn aggress(db: &Db, world: &Arc<World>, system: i64, attacker: i64, at
     let policy = &crate::config::game().crimewatch;
     let system_sec = system_security(world, system);
     let victim_sec = security_status(db, victim).await?;
+    let engaged = state().engagements.get(&(attacker, victim)).is_some_and(|until| *until > now);
     let legal = system_sec <= 0.0
         || is_criminal(victim, now)
         || victim_sec <= policy.outlaw_threshold
-        || state().engagements.get(&(attacker, victim)).is_some_and(|until| *until > now);
+        || engaged
+        || super::wars::classification::legal(db, attacker, victim, now).await?;
     let (weapons, pvp) = (
         now.saturating_add(policy.weapons_timer_secs.saturating_mul(FILETIME_SECOND)),
         now.saturating_add(policy.pvp_timer_secs.saturating_mul(FILETIME_SECOND)),
@@ -397,8 +401,15 @@ async fn write_killmail<X: Send>(
 ) -> Result<(i64, f64), CallError> {
     let final_blow = attackers.iter().max_by_key(|(_, c)| c.last).cloned();
     let mut blob = String::from("<doc><attackers>");
+    let mut affiliations = Vec::with_capacity(attackers.len());
     for (char_id, c) in attackers.iter() {
-        let corp = crate::dao::characters::crimewatch::corporation(db, *char_id).await.map_err(db_err)?.unwrap_or(0);
+        let info = crate::dao::corporations::roles::info(db, *char_id).await.map_err(db_err)?;
+        let corp = info.as_ref().map(|info| info.corporation_id).unwrap_or(0);
+        if let Some(info) = info {
+            affiliations.push(super::wars::classification::Affiliation {
+                character: *char_id, corporation: info.corporation_id, alliance: info.alliance_id,
+            });
+        }
         let sec = security_status(db, *char_id).await?;
         blob += &format!("<a c={char_id} r={corp} s={} w={} d={} t={sec:.1} />", c.ship_type, c.weapon_type, c.damage.round() as i64);
     }
@@ -417,20 +428,20 @@ async fn write_killmail<X: Send>(
         Some((ch, c)) => (Some(*ch), c.clone()),
         None => (None, Contribution::default()),
     };
-    let final_corp: Option<i64> = match final_char {
-        Some(ch) => crate::dao::characters::crimewatch::corporation(db, ch).await.map_err(db_err)?,
-        None => None,
-    };
+    let final_corp = affiliations.iter().find(|a| Some(a.character) == final_char).map(|a| a.corporation);
+    let final_alliance = affiliations.iter().find(|a| Some(a.character) == final_char).and_then(|a| a.alliance);
+    let victim_alliance = crate::dao::alliances::corporation_membership(db, victim_corp).await.map_err(db_err)?.map(|membership| membership.alliance);
     let final_sec = match final_char {
         Some(ch) => security_status(db, ch).await?,
         None => 0.0,
     };
     let involved: Vec<i64> = attackers.iter().map(|(ch, _)| *ch).collect();
     let kill_id = crate::dao::killmails::insert(db, &crate::dao::killmails::NewKillmail {
-        now, system, victim, victim_corp, ship_type, damage_taken, final_char, final_corp,
+        now, system, victim, victim_corp, victim_alliance, ship_type, damage_taken, final_char, final_corp, final_alliance,
         final_ship_type: final_c.ship_type, final_weapon_type: final_c.weapon_type, final_damage: final_c.damage,
         final_sec, isk_lost, involved: &involved, blob: &blob,
     }).await.map_err(db_err)?;
+    super::wars::classification::index(db, kill_id, victim_corp, victim_alliance, &affiliations, now).await?;
     super::bounty::kill_rights::consume(db, outbox, victim, now).await?;
     if let Some(final_char) = final_char {
         super::bounty::payout::schedule(db, super::bounty::payout::Payload {
@@ -463,41 +474,6 @@ pub async fn npc_killed(db: &Db, world: &World, char_id: i64) -> Result<(), Call
 
 
 
-/// Killmails the character was involved in (`kills`) or the victim of, newest first.
-async fn killmails(c: &Client, kills: Option<bool>, key: i64, num: i64, before: Option<i64>) -> CallResult {
-    let filter = match kills {
-        Some(true) => crate::dao::killmails::Filter::Kills,
-        Some(false) => crate::dao::killmails::Filter::Losses,
-        None => crate::dao::killmails::Filter::Id,
-    };
-    let rows = crate::dao::killmails::list(&c.db, filter, key, before, num.clamp(1, 500)).await.map_err(db_err)?;
-    let opt = |v: Option<i64>| v.map(Value::Int).unwrap_or(Value::None);
-    Ok(Value::list(rows.into_iter().map(|r| {
-        keyval([
-            ("killID", Value::Int(r.kill_id)),
-            ("killTime", Value::Int(r.kill_time)),
-            ("solarSystemID", Value::Int(r.solar_system_id)),
-            ("moonID", Value::None),
-            ("victimCharacterID", Value::Int(r.victim_id)),
-            ("victimCorporationID", Value::Int(r.victim_corp_id)),
-            ("victimAllianceID", Value::None),
-            ("victimFactionID", Value::None),
-            ("victimShipTypeID", Value::Int(r.victim_ship_type as i64)),
-            ("victimDamageTaken", Value::Int(r.damage_taken.round() as i64)),
-            ("finalCharacterID", opt(r.final_char_id)),
-            ("finalCorporationID", opt(r.final_corp_id)),
-            ("finalAllianceID", Value::None),
-            ("finalFactionID", Value::None),
-            ("finalShipTypeID", Value::Int(r.final_ship_type as i64)),
-            ("finalWeaponTypeID", Value::Int(r.final_weapon_type as i64)),
-            ("finalDamageDone", Value::Int(r.final_damage.round() as i64)),
-            ("finalSecurityStatus", Value::Float(r.final_sec_status)),
-            ("iskLost", Value::Float(r.isk_lost)),
-            ("warID", Value::None),
-            ("killBlob", Value::unicode(r.blob)),
-        ])
-    })))
-}
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     match call.service {

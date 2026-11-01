@@ -1,6 +1,6 @@
-//! Individual kill reports for `warStatisticMgr`.
-//! Answers the client's `GetKillMail` call using `game.killmails`.
-//! Alliance, faction and war fields not stored by the server are returned empty.
+//! Individual kill reports and bound war statistics for `warStatisticMgr`.
+//! Mirrors `warReport.py` and `killReportUtil.py`, using game killmails and wars.
+//! Historical alliance snapshots may be absent; unsupported war features have no report.
 
 use super::*;
 
@@ -12,6 +12,8 @@ pub(super) async fn dispatch(c: &Client, call: &Call<'_>) -> Option<CallResult> 
                 v.items().and_then(|k| k.first().cloned()).unwrap_or(Value::None)
             }))
         }
+        "GetBaseInfo" | "GetKills" | "GetKillsByGroup" =>
+            Some(crate::services::wars::statistics::query(c, call).await),
         _ => None,
     }
 }

@@ -44,6 +44,7 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
   - Player corporations: founding, applications and invitations, roles and titles, a bounty tax paid into the corporation wallet, and bulletins, contacts and labels.
   - Seven wallet divisions with ISK transfers between characters and corporations. Offices rented per station, with corporation hangars and rent bills that can be paid automatically. Directors, the CEO, accountants, junior accountants and traders can see each station's Deliveries hangar, and all of them except junior accountants can take items from it; nothing can be put into it.
   - Alliances: founding, applications, member removal, executor support, and bulletins and contacts.
+  - Mutual wars: a director or the CEO of a corporation outside an alliance, or of an alliance's executor corporation for the alliance, can invite another such corporation or alliance to a war. An invitation lasts seven days and can be accepted, declined or withdrawn, and an owner can block invitations. An accepted war costs nothing and starts 24 hours later. Either side can retract it; the two stay at war for a 24-hour cooldown, and then the war ends. Between owners at war, attacks are legal and bring no criminal flag, security loss or kill right; a pilot fights as their alliance, or as their corporation outside one. Each kill report records the wars it counts for and the alliances of the victim and the final blow at that moment, so a war's report and kill statistics stay the same when pilots or corporations change affiliation. Invitations, wars and their deadlines survive a restart.
 - **Store.** New Eden Store catalogue, PLEX vault, redeeming queue and seasonal login rewards.
 - **Lua scripts.** Scripts in `crates/server/lua/` can answer remote calls and add GM commands without changes to the server's routing. A script can also intercept one exact remote call before the server answers it, for example to refuse a buy order with a message, and react to game events such as a character being selected, a ship being lost, a market order being filled or a mission being accepted. Events reach scripts in order, after the change that caused them has been saved. The bundled scripts keep a message of the day that a GM sets, sent when a character is selected, and answer five client calls that only need fixed answers. See [Lua scripts](docs/lua.md).
 - **GM slash commands** (see [GM commands](#gm-commands)).
@@ -52,7 +53,7 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
 
 - The new player tutorial (AIR NPE) cannot run. Its dungeon layouts and behaviour trees never shipped with the client, so new characters start in their school's station.
 - Not supported:
-  - wars, sovereignty, and alliance capital systems and prime time
+  - wars declared by one side, which need a war headquarters structure; war allies and surrender; sovereignty, and alliance capital systems and prime time
   - corporation shares and wallet journals
   - reactions and industry at player structures; NPC stations offer no reaction facility in the client
   - fleet warps, boosts and the fleet finder
@@ -77,6 +78,9 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
 - An industry job installed before this version whose blueprint has since been moved or destroyed is refused at delivery.
 - Mining and salvage drones have no mass or agility in the static data; the server gives them the common light-drone values (3000 kg, agility 100). Drones with no targeting range or scan resolution in the static data lock at once within control range.
 - The personal mining ledger starts with mining done after this version is installed.
+- A corporation at war that joins an alliance keeps its war, but the war no longer applies to its pilots, who now fight as the alliance, as the client also shows. The corporation's own CEO or directors can still retract it.
+- Kill reports written before this version have no alliance recorded for the victim and the final blow, and these stay empty.
+- In a war report the client lists a kill under a side only if the final blow came from that side, so a kill whose final blow came from a third party counts in the war's totals but appears in neither side's list.
 - Some runtime state lives only in memory and is lost when the server restarts:
   - fleets, combat and Crimewatch timers, ECM jams, tractor pulls, and in-progress hacking; a suspect flag from an activated kill right is the exception and is restored with its original deadline;
   - everything spawned into space except ships (NPCs, wrecks, scheduled effects);
