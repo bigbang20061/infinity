@@ -74,6 +74,25 @@ fn queued_warp_blocks_position_commit() {
 }
 
 #[test]
+fn compressor_range_uses_live_matching_modules() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let mut s = System::new(0, Arc::default(), 1_000);
+    s.insert(ball(1, Some(100), 0.0));
+    let stopped = Arc::new(AtomicBool::new(false));
+    s.set_compressor(1, 10, stopped.clone(), 7, 80.0);
+    s.set_compressor(1, 11, Arc::new(AtomicBool::new(false)), 7, 20.0);
+    s.set_compressor(1, 12, Arc::new(AtomicBool::new(false)), 8, 30.0);
+    s.set_compressor(1, 13, Arc::new(AtomicBool::new(false)), 9, 100.0);
+    stopped.store(true, Ordering::Release);
+
+    assert_eq!(s.compressor_range_matching(1, |list| list == 7 || list == 8), Some(30.0));
+    assert_eq!(s.compressor_range_matching(1, |list| list == 7), Some(20.0));
+    assert_eq!(s.compressor_range_matching(1, |list| list == 10), None);
+    assert_eq!(s.compressor_range_matching(2, |_| true), None);
+}
+
+#[test]
 fn compression_combines_ranges_and_removes_only_matching_generation() {
     use std::sync::atomic::AtomicBool;
     let mut s = System::new(0, Arc::default(), 1000);

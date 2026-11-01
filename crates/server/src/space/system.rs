@@ -22,6 +22,7 @@
 //! sphere collisions do not emit bumps. Taking, replacing or destroying an NPC
 //! releases its in-memory combat health and capacitor state; temporary player
 //! removal preserves that state.
+//! Live compressor ranges use actor-owned module generations and static type lists.
 //! Taking a ball also ends its in-memory ECM lockout before its pilot leaves.
 use super::*;
 use std::collections::{BTreeMap, HashSet, VecDeque};
@@ -457,6 +458,18 @@ impl System {
         b.health = health;
         let update = event(self.current_time, "OnDamageStateChange", vec![Value::Int(id), b.damage_state()]);
         self.broadcast(id, vec![update]);
+    }
+    /// Return the largest active compressor range supporting this type.
+    pub(crate) fn compressor_range(&self, ship: i64, type_id: i32, sde: &crate::sde::Sde) -> Option<f64> {
+        let ty = sde.types.get(type_id)?;
+        self.compressor_range_matching(ship, |list| sde.typelists.contains(list, type_id, ty.group_id, ty.category_id))
+    }
+    pub(super) fn compressor_range_matching(&self, ship: i64, matches: impl Fn(i64) -> bool) -> Option<f64> {
+        self.ball(ship)?;
+        self.compressors.get(&ship)?.values()
+            .filter(|entry| !entry.generation.load(std::sync::atomic::Ordering::Acquire) && matches(entry.list))
+            .map(|entry| entry.range)
+            .reduce(f64::max)
     }
     /// Advertise the union of active compressor lists on the ship's slim item.
     pub(crate) fn set_compressor(&mut self, ship: i64, module: i64, generation: Arc<std::sync::atomic::AtomicBool>, list: i64, range: f64) {

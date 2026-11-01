@@ -39,16 +39,12 @@ async fn staging_rejects_restricted_and_foreign_descendants_atomically() {
     let world = World::new(db.clone(), sde.clone(), 1);
     let station = sde.map.stations().next().expect("station required").station_id;
     let normal = sde.types.iter().find(|t| sde.is_tradable(t.type_id)).expect("tradable type required").type_id;
-    let lists = crate::dao::sde::typelists::load(&db).await.unwrap();
+    let lists = crate::dao::sde::typelists::load(&db, &["36".to_string(), "142".to_string()]).await.unwrap();
     assert_eq!(lists.len(), 2);
     let mut restricted = Vec::new();
     for list in lists {
-        let ty = sde.types.iter().find(|t| {
-            let cat = t.category_id.is_some_and(|v| list.included_categories.contains(&v) && !list.excluded_categories.contains(&v));
-            let group = t.group_id.is_some_and(|v| list.included_groups.contains(&v));
-            let excluded = t.group_id.is_some_and(|v| list.excluded_groups.contains(&v));
-            ((cat || group) && !excluded || list.included_types.contains(&t.type_id)) && !list.excluded_types.contains(&t.type_id)
-        }).expect("each restriction list must include an SDE type").type_id;
+        let ty = sde.types.iter().find(|t| sde.typelists.contains(list.id, t.type_id, t.group_id, t.category_id))
+            .expect("each restriction list must include an SDE type").type_id;
         restricted.push(ty);
     }
     let account: i64 = db.query_one("INSERT INTO game.accounts (user_name, password_hash, role) VALUES (nextval('game.accounts_user_id_seq')::text, ''::bytea, 0) RETURNING user_id", &[]).await.unwrap().get("user_id");
