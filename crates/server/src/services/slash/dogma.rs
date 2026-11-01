@@ -7,6 +7,7 @@
 use super::{slash_error, Client, CallError};
 use crate::{dao::items::{dogma as dao, fit as fit_dao, loading::{Item, ItemQuery}}, messages};
 use crate::consts::{CATEGORY_CHARGE, CATEGORY_DRONE, CATEGORY_ENTITY, CATEGORY_MODULE, CATEGORY_OWNER};
+use crate::consts::dogma::CHAR_ATTRIBUTES;
 use crate::services::{combat, db_err, fit::{self, Fit, Key}, items::load_items, effects::{notify, propulsion}};
 use crate::db::outbox::Outbox;
 use crate::services::effects::online::{self, OnlineChanged};
@@ -28,8 +29,6 @@ const EXCLUDED_CATEGORIES: [i64; 8] = [
     CATEGORY_STARBASE, CATEGORY_INFRASTRUCTURE_UPGRADE, CATEGORY_SOVEREIGNTY_STRUCTURES,
     CATEGORY_STRUCTURE, CATEGORY_STRUCTURE_MODULE,
 ];
-/// SDE dgmAttributeTypes: the five primary character attributes.
-const CHARACTER_ATTRIBUTES: std::ops::RangeInclusive<i32> = 164..=168;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum Target { Ship, Item(i64), Flag(i32) }
@@ -69,7 +68,7 @@ fn attribute(c: &Client, name: &str) -> Result<i32, CallError> {
 }
 
 pub(super) fn denied(id: i32, matches_runtime: impl Fn(&str, i32) -> bool) -> Option<&'static str> {
-    if CHARACTER_ATTRIBUTES.contains(&id) { return Some(messages::gm::GM_DOGMA_CHARACTER); }
+    if CHAR_ATTRIBUTES.contains(&i64::from(id)) { return Some(messages::gm::GM_DOGMA_CHARACTER); }
     let runtime = ["isOnline", "damage", "charge", "skillPoints", "skillLevel", "armorDamage", "shieldCharge", "isIncapacitated", "quantity"];
     runtime.iter().any(|name| matches_runtime(name, id)).then_some(messages::gm::GM_DOGMA_RUNTIME)
 }

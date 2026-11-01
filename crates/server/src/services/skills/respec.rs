@@ -1,8 +1,9 @@
 //! Attribute remapping for eve/client/script/ui/shared/neocom/attributes.py.
 //! Uses game.character_respec, skills, skill_queue, skill_history and jobs;
 //! timed and bonus entitlements serialize with skill queue mutations.
-use super::{attributes::CHAR_ATTRIBUTES, completion, db_err, keyval, training, CallError};
+use super::{completion, db_err, keyval, training, CallError};
 use crate::{client::{filetime_now, Client}, consts::FILETIME_DAY, dao::{characters::attributes, skills::{queue, training as skill_dao}}, db::{executor::Executor, outbox::{dispatch_client, Outbox}}, services::{effects::online::{self, OnlineChanged}, notify_error}};
+use crate::consts::dogma::CHAR_ATTRIBUTES;
 use marshal::Value;
 
 /// Client eve/common/lib/appConst.py:1582-1585 remap interval and bounds.

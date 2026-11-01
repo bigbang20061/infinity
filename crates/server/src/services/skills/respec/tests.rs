@@ -32,6 +32,18 @@ fn exact_integer_attributes_and_total_are_required() {
     }
 }
 
+#[test]
+fn shuffled_wire_attributes_follow_remap_order() {
+    let value = Value::Dict(vec![
+        (Value::Int(168), Value::Int(25)),
+        (Value::Int(165), Value::Int(18)),
+        (Value::Int(167), Value::Int(20)),
+        (Value::Int(164), Value::Int(17)),
+        (Value::Int(166), Value::Int(19)),
+    ]);
+    assert_eq!(parse(&value), Ok([17, 18, 19, 20, 25]));
+}
+
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn entitlement_persists_and_paused_queue_remains_paused() {
