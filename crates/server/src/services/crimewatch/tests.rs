@@ -208,6 +208,8 @@ async fn killmail_writer_indexes_war_and_rolls_back_with_reports() {
     let rows = save.query("SELECT kill_id FROM game.killmails WHERE victim_id=$1", &[&characters[0]]).await.unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get::<_, i64>("kill_id"), kill_id);
+    let event = save.query_one("SELECT solar_system_id, event_time, kind FROM game.map_events WHERE source=$1 AND source_id=$2", &[&(crate::dao::map_telemetry::EventSource::Killmail as i16), &kill_id]).await.unwrap();
+    assert_eq!((event.get::<_, i64>("solar_system_id"), event.get::<_, i64>("event_time"), event.get::<_, i16>("kind")), (1, 4, crate::dao::map_telemetry::EventKind::Ship as i16));
     let projections = crate::dao::killmails::wars::by_kills(&save, &[kill_id]).await.unwrap();
     assert_eq!(projections.len(), 1);
     let projection = &projections[0];
@@ -239,7 +241,12 @@ async fn killmail_writer_indexes_war_and_rolls_back_with_reports() {
     assert_eq!(fields.get("finalCorporationID"), Some(&Value::Int(corps[2])));
     assert_eq!(fields.get("finalAllianceID"), Some(&Value::None));
     assert_eq!(fields.get("warID"), Some(&Value::Int(war.war_id)));
+    let (pod_id, _) = write_killmail(&save, &mut outbox, 1, characters[0], corps[0], crate::consts::TYPE_CAPSULE, &Lost::new(), &mut [], 5).await.unwrap();
+    let pod = save.query_one("SELECT solar_system_id, event_time, kind FROM game.map_events WHERE source=$1 AND source_id=$2", &[&(crate::dao::map_telemetry::EventSource::Killmail as i16), &pod_id]).await.unwrap();
+    assert_eq!((pod.get::<_, i64>("solar_system_id"), pod.get::<_, i64>("event_time"), pod.get::<_, i16>("kind")), (1, 5, crate::dao::map_telemetry::EventKind::Pod as i16));
+    assert_eq!(save.query("SELECT source_id FROM game.map_events WHERE source=$1 AND source_id=ANY($2)", &[&(crate::dao::map_telemetry::EventSource::Killmail as i16), &&[kill_id, pod_id][..]]).await.unwrap().len(), 2);
     save.rollback().await.unwrap();
+    assert!(tx.query("SELECT source_id FROM game.map_events WHERE source=$1 AND source_id=ANY($2)", &[&(crate::dao::map_telemetry::EventSource::Killmail as i16), &&[kill_id, pod_id][..]]).await.unwrap().is_empty());
     assert!(tx.query("SELECT kill_id FROM game.killmails WHERE victim_id=$1", &[&characters[0]]).await.unwrap().is_empty());
     assert!(crate::dao::killmails::wars::by_kills(&tx, &[kill_id]).await.unwrap().is_empty());
     assert!(crate::dao::killmails::wars::killmails(&tx, war.war_id).await.unwrap().is_empty());

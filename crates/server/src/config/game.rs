@@ -60,6 +60,8 @@ impl SalvageConfig {
 pub struct GameConfig {
     /// Bounty and kill-right policy.
     pub bounty: super::bounty::BountyConfig,
+    /// Map history retention and maintenance policy.
+    pub map: super::map::MapConfig,
     /// Accounts policy.
     pub accounts: economy::AccountsConfig,
     /// Characters policy.
@@ -109,6 +111,7 @@ pub struct GameConfig {
 impl GameConfig {
     pub fn validate(&self) -> Result<()> {
         self.bounty.validate()?;
+        self.map.validate()?;
         self.accounts.validate()?;
         self.characters.validate()?;
         self.market.validate()?;

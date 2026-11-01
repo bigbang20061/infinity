@@ -391,6 +391,7 @@ pub(super) async fn damage_npc(db: &Db, world: &World, system: i64, target: i64,
 
 async fn finish_npc_kill(db: &Db, world: &World, system: i64, target: i64, ball: Ball, attacker: Option<i64>) -> Result<(), CallError> {
     info!("ball {target} (type {}) destroyed", ball.type_id);
+    super::super::map::events::npc_lost(db, system, filetime_now()).await;
     if let Some(char_id) = attacker {
         let mut outbox = Outbox::default();
         outbox.event(crate::lua::events::GameEvent::NpcKilled { char_id, npc_id: target, type_id: ball.type_id, system_id: system });

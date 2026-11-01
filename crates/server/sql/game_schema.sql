@@ -2,6 +2,29 @@
 -- the server at startup. Static data lives in schema `sde` (sde_typed.sql).
 
 CREATE SCHEMA IF NOT EXISTS game;
+-- dao/map_telemetry: immutable typed event receipts and cumulative arrival visits.
+-- Event kinds: 1 jump, 2 ship, 3 NPC, 4 pod. Sources: 1 jump occurrence,
+-- 2 killmail, 3 NPC occurrence, 4 unpiloted ship.
+CREATE SEQUENCE IF NOT EXISTS game.map_occurrence_id_seq;
+CREATE TABLE IF NOT EXISTS game.map_events (
+    source smallint NOT NULL CHECK (source IN (1, 2, 3, 4)),
+    source_id bigint NOT NULL,
+    solar_system_id bigint NOT NULL,
+    event_time bigint NOT NULL,
+    kind smallint NOT NULL CHECK (kind IN (1, 2, 3, 4)),
+    PRIMARY KEY (source, source_id),
+    CHECK ((source = 1 AND kind = 1) OR (source = 2 AND kind IN (2, 4))
+        OR (source = 3 AND kind = 3) OR (source = 4 AND kind = 2))
+);
+CREATE INDEX IF NOT EXISTS map_events_event_time_idx ON game.map_events (event_time);
+CREATE TABLE IF NOT EXISTS game.map_visits (
+    character_id bigint NOT NULL,
+    solar_system_id bigint NOT NULL,
+    last_date_time bigint NOT NULL,
+    visits bigint NOT NULL CHECK (visits > 0),
+    PRIMARY KEY (character_id, solar_system_id)
+);
+
 
 CREATE TABLE IF NOT EXISTS game.accounts (
     user_id       bigserial PRIMARY KEY,

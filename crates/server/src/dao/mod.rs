@@ -29,6 +29,7 @@ pub(crate) mod killmails;
 pub(crate) mod lua_store;
 pub(crate) mod lp_offers;
 pub(crate) mod mail;
+pub(crate) mod map_telemetry;
 pub(crate) mod market;
 pub(crate) mod mining_ledger;
 pub(crate) mod missions;

@@ -5,6 +5,7 @@
 pub mod deployment;
 pub mod bounty;
 pub mod game;
+pub mod map;
 pub mod scheduler;
 pub mod lua;
 
@@ -30,6 +31,7 @@ pub struct Config {
     pub scheduler: scheduler::SchedulerConfig,
     pub lua: lua::LuaConfig,
     pub bounty: bounty::BountyConfig,
+    pub map: map::MapConfig,
     pub accounts: game::economy::AccountsConfig,
     pub characters: game::economy::CharactersConfig,
     pub market: game::economy::MarketConfig,
@@ -70,6 +72,7 @@ impl PartialEq for Config {
             && self.scheduler == other.scheduler
             && self.lua == other.lua
             && self.bounty == other.bounty
+            && self.map == other.map
             && self.accounts == other.accounts
             && self.characters == other.characters
             && self.market == other.market
@@ -211,6 +214,7 @@ impl Config {
     pub fn game_config(&self) -> GameConfig {
         GameConfig {
             bounty: self.bounty.clone(),
+            map: self.map.clone(),
             accounts: self.accounts.clone(),
             characters: self.characters.clone(),
             market: self.market.clone(),

@@ -189,3 +189,96 @@ async fn capacitor_db_smoke() {
     flush.unwrap();
     result.unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
+async fn npc_deaths_record_distinct_occurrences_and_exclude_other_balls() {
+    use crate::dao::map_telemetry::{self, EventKind, EventSource, HistoryStat};
+    use crate::space::{NpcBrain, NpcConfig};
+    use crate::services::drones::tests::fixture::Fixture;
+
+    let f = Fixture::new().await;
+    let system = f.system;
+    let owner = f.owner;
+    let npc = -f.ship;
+    let other = npc - 1;
+    let npc_type = f.sde.types.iter().find(|t| t.category_id == Some(CATEGORY_ENTITY)
+        && t.attribute(ATTR_ENTITY_KILL_BOUNTY).is_some_and(|v| v > 0.0)
+        && t.attribute(ATTR_STRUCTURE_HP).is_some_and(|v| v > 0.0)
+        && t.group_id.and_then(|group| f.sde.wrecks.get(group, t.race_id.unwrap_or(0))).is_some())
+        .expect("bounty-bearing NPC with wreck").type_id;
+    let drone_type = f.sde.types.iter().find(|t| t.published == Some(true)
+        && t.category_id == Some(crate::consts::CATEGORY_DRONE)
+        && t.attribute(ATTR_STRUCTURE_HP).is_some_and(|v| v > 0.0))
+        .expect("published drone with structure").type_id;
+    let drone = f.drone(drone_type, 1, true).await;
+    let marker = map_telemetry::next_occurrence(&f.db).await.unwrap();
+    let start = filetime_now();
+    let world2 = World::new(f.db.clone(), f.sde.clone(), 1);
+    let (db, world, second) = (f.db.clone(), f.world.clone(), world2.clone());
+    let result = tokio::spawn(async move {
+        let add_npc = |world: Arc<World>, id| async move {
+            let mut b = ball(id, npc_type, None);
+            b.owner_id = owner;
+            world.add_ship(system, b).await.unwrap();
+            assert!(world.with(system, move |s| s.add_npc(id, NpcBrain::new(None, NpcConfig {
+                fly_range: 1.0, aggro_range: 1.0, rate_of_fire_ms: 1.0,
+                scan_resolution: 1.0, repairs: (0.0, 0.0, 1.0),
+            }, Arc::new(|_| Box::pin(async {}))))).await.unwrap());
+        };
+        let events = || async {
+            db.query("SELECT source_id, solar_system_id, kind FROM game.map_events WHERE source=$1 AND source_id>$2 AND solar_system_id=$3 ORDER BY source_id",
+                &[&(EventSource::NpcOccurrence as i16), &marker, &system]).await.unwrap()
+        };
+        add_npc(world.clone(), npc).await;
+        damage(&db, &world, system, npc, [1e30; 4], None).await.ok().unwrap();
+        assert!(world.ball(system, npc).await.is_none());
+        assert_eq!(events().await.len(), 1);
+        assert_eq!(damage(&db, &world, system, npc, [1e30, 0.0, 0.0, 0.0], None).await.ok().unwrap(), 0.0);
+        assert_eq!(events().await.len(), 1);
+
+        let balance = crate::dao::wallets::characters::balance(&db, owner).await.unwrap();
+        add_npc(second.clone(), npc).await;
+        damage(&db, &second, system, npc, [1e30; 4], Some(owner)).await.ok().unwrap();
+        assert!(second.ball(system, npc).await.is_none());
+        assert!(crate::dao::wallets::characters::balance(&db, owner).await.unwrap() > balance);
+        assert!(db.query_one("SELECT count(*) FROM game.items WHERE owner_id=$1 AND location_id=$2 AND item_id<>$3",
+            &[&owner, &system, &drone]).await.unwrap().get::<_, i64>("count") >= 2);
+        let rows = events().await;
+        assert_eq!(rows.len(), 2);
+        assert_ne!(rows[0].get::<_, i64>("source_id"), rows[1].get::<_, i64>("source_id"));
+        assert!(rows.iter().all(|row| row.get::<_, i64>("solar_system_id") == system
+            && row.get::<_, i16>("kind") == EventKind::Npc as i16));
+        let history = map_telemetry::history(&db, HistoryStat::Kills, start, filetime_now()).await.unwrap();
+        let row = history.iter().find(|row| row.solar_system_id == system).unwrap();
+        assert_eq!((row.value1, row.value2, row.value3), (2, 2, 0));
+
+        let mut b = ball(other, npc_type, None);
+        b.owner_id = owner;
+        world.add_ship(system, b).await.unwrap();
+        assert!(!world.with(system, move |s| s.is_npc(other)).await.unwrap());
+        damage(&db, &world, system, other, [1e30; 4], None).await.ok().unwrap();
+        assert!(world.ball(system, other).await.is_none());
+        assert_eq!(events().await.len(), 2);
+
+        db.execute("UPDATE game.items SET location_id=$2, flag_id=0, x=0, y=0, z=0 WHERE item_id=$1 AND owner_id=$3", &[&drone, &system, &owner]).await.unwrap();
+        let spec = crate::space::drone::DroneSpec { type_id: drone_type, bandwidth: 1.0, scan_resolution: 1.0,
+            control_range: 1.0, max_target_range: 1.0, optimal_range: 1.0, orbit_range: 1.0,
+            duration_ms: 1.0, effect_id: None };
+        let mut b = ball(drone, drone_type, None);
+        b.owner_id = owner;
+        world.with(system, move |s| s.restore_drone(b, spec, Arc::new(|_| Box::pin(async {})))).await.unwrap();
+        damage(&db, &world, system, drone, [1e30, 1e30, 1e30, 1e30], None).await.ok().unwrap();
+        assert!(world.ball(system, drone).await.is_none());
+        assert!(db.query_opt("SELECT item_id FROM game.items WHERE item_id=$1", &[&drone]).await.unwrap().is_none());
+        assert_eq!(events().await.len(), 2);
+    }).await;
+    if let Some(ids) = world2.with(system, |s| s.balls().map(|b| b.id).collect::<Vec<_>>()).await {
+        for id in ids { world2.remove_ball(system, id).await; forget_ship(id); }
+    }
+    world2.flush_positions().await.unwrap();
+    f.db.execute("DELETE FROM game.map_events WHERE source=$1 AND source_id>$2 AND solar_system_id=$3",
+        &[&(EventSource::NpcOccurrence as i16), &marker, &system]).await.unwrap();
+    f.cleanup().await;
+    result.unwrap();
+}

@@ -1,6 +1,7 @@
 //! Durable health and destruction of persistent unpiloted ship balls.
 //! Uses fitted ship condition from game.item_attributes and the system's persistent identity.
 //! Client damage state is published after commit; free hull losses do not create rewards or wrecks.
+//! A destroyed hull's map loss commits with its claimed deletion.
 use super::*;
 use crate::consts::CATEGORY_SHIP;
 
@@ -57,7 +58,10 @@ pub(crate) async fn damage(db: &Db, world: &World, system: i64, ship: i64, raw: 
         let cond = cond.clone();
         Box::pin(async move {
             if !crate::dao::items::space_ships::claim_unpiloted(tx, ship, type_id, owner, system).await.map_err(db_err)? { return Ok(false); }
-            if lethal { delete_in(tx, ship).await?; }
+            if lethal {
+                delete_in(tx, ship).await?;
+                super::super::map::events::unpiloted_lost(tx, ship, system, now).await?;
+            }
             else { persist_condition_in(tx, ship, &cond).await?; }
             Ok::<bool, CallError>(true)
         })

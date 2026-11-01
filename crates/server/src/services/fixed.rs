@@ -54,8 +54,6 @@ const ANTI_ADDICTION_PASS_CODE: i64 = 201;
 pub(super) fn universe(call: &Call<'_>) -> Option<CallResult> {
     let history_header = ["solarSystemID", "value1", "value2", "value3"];
     Some(Ok(match (call.service, call.method) {
-        ("map", "GetHistory") => rowset(&history_header, vec![]),
-        ("map", "GetSolarSystemVisits") => Value::list([]),
         ("map", "GetMyExtraMapInfo") => Value::None,
         ("map", "GetMyExtraMapInfoAgents") => rowset(&["fromID", "rank"], vec![]),
         ("map", "GetDeadspaceComplexMap") | ("map", "GetDeadspaceAgentsMap") => Value::None,

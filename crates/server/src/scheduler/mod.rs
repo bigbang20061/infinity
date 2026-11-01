@@ -24,7 +24,8 @@ pub(crate) const MARKET: &str = "periodic:market.expire";
 pub(crate) const CONTRACTS: &str = "periodic:contracts.settle_auctions";
 pub(crate) const BILLS: &str = "periodic:bills.run";
 pub(crate) const MINING_LEDGER: &str = "periodic:mining.ledger_retention";
-pub(crate) const PERIODIC_KINDS: [&str; 4] = [MARKET, CONTRACTS, BILLS, MINING_LEDGER];
+pub(crate) const MAP_HISTORY: &str = "periodic:map.history_retention";
+pub(crate) const PERIODIC_KINDS: [&str; 5] = [MARKET, CONTRACTS, BILLS, MINING_LEDGER, MAP_HISTORY];
 pub(crate) async fn seed(db: &Db) -> Result<(), Error> {
     let now = filetime_now();
     for kind in PERIODIC_KINDS {
