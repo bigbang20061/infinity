@@ -8,8 +8,7 @@
 //! and overload activation are not managed here; callers provide a fit snapshot.
 //! Skill effects with fittingUsageChance require loading and filtering
 //! that attribute if such a skill appears in the SDE.
-//! Owner-fit drone queries do not include incoming drone projections;
-//! add a receiving drone fit when the in-space drone runtime exists.
+//! Mining and salvage drones have no mass or agility in the static data; the server gives them the common light-drone values (3000 kg, agility 100).
 
 use super::{db_err, CallError};
 use crate::consts::{ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_REQUIRED_SKILLS, ATTR_SPEED_FACTOR, CATEGORY_CHARGE, CATEGORY_SHIP, CATEGORY_SKILL, CATEGORY_SUBSYSTEM, EFFECT_AFTERBURNER, EFFECT_MICROWARPDRIVE, EFFECT_ONLINE, EFFECT_SKILL, TYPE_CHARACTER};
@@ -19,7 +18,7 @@ use crate::sde::{dogma::{Attribute, Modifier}, types::TypeData, Sde};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use crate::consts::{ATTR_SKILL_LEVEL, ATTR_SKILL_POINTS, ATTR_SKILL_TIME_CONSTANT, CATEGORY_DRONE, CATEGORY_IMPLANT, FLAG_IMPLANT};
+use crate::consts::{ATTR_AGILITY, ATTR_SKILL_LEVEL, ATTR_SKILL_POINTS, ATTR_SKILL_TIME_CONSTANT, CATEGORY_DRONE, CATEGORY_IMPLANT, DRONE_FALLBACK_AGILITY, DRONE_FALLBACK_MASS, FLAG_IMPLANT};
 /// SDE dogma effect category: passive.
 const EFFECT_CATEGORY_PASSIVE: i32 = 0;
 /// SDE dogma effect category: active.
@@ -90,14 +89,26 @@ struct Node {
     active: bool,
     overloaded: bool,
     projected_effect: Option<i32>,
+    receiver: Option<Key>,
     charge_type: Option<i32>,
     level: Option<i32>,
     overrides: Vec<(i32, f64)>,
     charge_values: Vec<(i32, f64)>,
 }
 
+fn physical_base(category: Option<i32>, attr: i32, value: Option<f64>) -> Option<f64> {
+    if category == Some(CATEGORY_DRONE) && !value.is_some_and(|v| v > 0.0) {
+        match attr {
+            ATTR_MASS => return Some(DRONE_FALLBACK_MASS),
+            ATTR_AGILITY => return Some(DRONE_FALLBACK_AGILITY),
+            _ => {}
+        }
+    }
+    value
+}
+
 pub(crate) fn base_attribute(data: Option<&TypeData>, meta: Option<&Attribute>, attr: i32) -> f64 {
-    data.and_then(|t| t.fit_attribute(attr))
+    physical_base(data.and_then(|t| t.category_id), attr, data.and_then(|t| t.fit_attribute(attr)))
         .unwrap_or_else(|| meta.and_then(|m| m.default_value).unwrap_or(0.0))
 }
 
@@ -130,9 +141,12 @@ pub struct Fit {
     sde: Arc<Sde>,
     memo: Mutex<HashMap<(Key, i32), f64>>,
     projection_revision: Option<u64>,
+    drone_projection_revision: Option<u64>,
 }
 
 impl Fit {
+    pub(crate) fn sde(&self) -> &Sde { &self.sde }
+
     /// Load a fit outside space, without incoming projections.
     pub async fn load(db: &(impl crate::db::executor::Executor + ?Sized), sde: Arc<Sde>, char_id: i64, ship: i64) -> Result<Fit, CallError> {
         Self::load_projected(db, sde, char_id, ship, Vec::new()).await
@@ -155,23 +169,25 @@ impl Fit {
         let mut nodes = HashMap::new();
         nodes.insert(Key::Ship, Node {
             type_id, data_position: sde.types.position(type_id), location: Location::Space,
-            online: true, active: false, overloaded: false, projected_effect: None,
+            online: true, active: false, overloaded: false, projected_effect: None, receiver: None,
             charge_type: None, level: None, overrides: Vec::new(), charge_values: Vec::new(),
         });
-        Self::insert_projections(&sde, &mut nodes, projections);
-        Fit { nodes, selected_effects: HashMap::new(), passive_modifiers: Vec::new(), passive_by_attribute: HashMap::new(), sde, memo: Mutex::new(HashMap::new()), projection_revision: None }
+        Self::insert_projections(&sde, &mut nodes, Key::Ship, projections);
+        Fit { nodes, selected_effects: HashMap::new(), passive_modifiers: Vec::new(), passive_by_attribute: HashMap::new(), sde, memo: Mutex::new(HashMap::new()), projection_revision: None, drone_projection_revision: None }
     }
 
-    fn insert_projections(sde: &Sde, nodes: &mut HashMap<Key, Node>, projections: Vec<super::effects::projection::Projection>) {
+    fn insert_projections(sde: &Sde, nodes: &mut HashMap<Key, Node>, receiver: Key, projections: Vec<super::effects::projection::Projection>) {
         for p in projections {
             let mut values = p.values;
             values.sort_by_key(|v| v.0);
             let mut charge_values = p.charge_values;
             charge_values.sort_by_key(|v| v.0);
-            nodes.insert(Key::Projected(p.source_module), Node {
+            let mut key = p.source_module;
+            while nodes.contains_key(&Key::Projected(key)) { key = key.wrapping_add(1); }
+            nodes.insert(Key::Projected(key), Node {
                 type_id: p.source_type, data_position: sde.types.position(p.source_type),
                 location: Location::Space, online: true, active: true, overloaded: false,
-                projected_effect: Some(p.effect_id), charge_type: p.charge_type, level: None, overrides: values, charge_values,
+                projected_effect: Some(p.effect_id), receiver: Some(receiver), charge_type: p.charge_type, level: None, overrides: values, charge_values,
             });
         }
     }
@@ -219,7 +235,7 @@ impl Fit {
         let mut nodes = HashMap::new();
         let node = |type_id, location, online, active, level, overrides| Node {
             type_id, data_position: sde.types.position(type_id), location, online, active,
-            overloaded: false, projected_effect: None, charge_type: None, level, overrides, charge_values: Vec::new(),
+            overloaded: false, projected_effect: None, receiver: None, charge_type: None, level, overrides, charge_values: Vec::new(),
         };
         nodes.insert(Key::Char, node(TYPE_CHARACTER, Location::Char, true, false, None, character));
         nodes.insert(Key::Ship, node(ship_type, Location::Space, true, false, None, overrides.remove(&ship).unwrap_or_default()));
@@ -252,7 +268,7 @@ impl Fit {
                 nodes.insert(Key::Drone(r.item_id), node(r.type_id, Location::Space, true, false, None, overrides.remove(&r.item_id).unwrap_or_default()));
             }
         }
-        Self::insert_projections(&sde, &mut nodes, projections);
+        Self::insert_projections(&sde, &mut nodes, Key::Ship, projections);
         let mut skill_effects = Vec::new();
         for r in skills {
             if nodes.get(&Key::Skill(r.type_id)).and_then(|n| n.level).unwrap_or(0) <= 0 { continue; }
@@ -275,7 +291,7 @@ impl Fit {
                 passive_modifiers.push((Key::Skill(id), effect_id, position));
             }
         }
-        Ok(Fit { nodes, selected_effects, passive_modifiers, passive_by_attribute, sde, memo: Mutex::new(HashMap::new()), projection_revision: None })
+        Ok(Fit { nodes, selected_effects, passive_modifiers, passive_by_attribute, sde, memo: Mutex::new(HashMap::new()), projection_revision: None, drone_projection_revision: None })
     }
 
     /// Include a prospective fitted item with its persisted dogma overrides.
@@ -286,11 +302,22 @@ impl Fit {
         overrides.sort_by_key(|v| v.0);
         self.nodes.insert(Key::Module(item), Node {
             type_id, data_position: self.sde.types.position(type_id), location: Location::Ship,
-            online: false, active: false, overloaded: false, projected_effect: None,
+            online: false, active: false, overloaded: false, projected_effect: None, receiver: None,
             charge_type: None, level: None, overrides, charge_values: Vec::new(),
         });
         self.memo.get_mut().unwrap().clear();
         Ok(())
+    }
+
+    /// Replace or add an owned drone, invalidating values that depended on its old state.
+    pub(crate) fn include_drone(&mut self, id: i64, type_id: i32, mut overrides: Vec<(i32, f64)>) {
+        overrides.sort_by_key(|v| v.0);
+        self.nodes.insert(Key::Drone(id), Node {
+            type_id, data_position: self.sde.types.position(type_id),
+            location: Location::Space, online: true, active: false, overloaded: false,
+            projected_effect: None, receiver: None, charge_type: None, level: None, overrides, charge_values: Vec::new(),
+        });
+        self.memo.get_mut().unwrap().clear();
     }
 
     /// Change a prospective module state and invalidate all dependent values.
@@ -306,21 +333,38 @@ impl Fit {
 
     /// Load the selected character ship and one owned drone, including launched drones.
     pub(crate) async fn drone(db: &Db, sde: Arc<Sde>, char_id: i64, drone_item: i64) -> Result<Fit, CallError> {
+        let ship = crate::dao::characters::selection::ship_id(db, char_id).await.map_err(db_err)?
+            .ok_or_else(|| CallError::Internal(anyhow::anyhow!("character has no selected ship")))?;
+        Self::load_drone(db, sde, char_id, ship, drone_item, Vec::new(), Vec::new()).await
+    }
+
+    /// Snapshot both receiving objects before loading their owner fit.
+    pub(crate) async fn drone_in_space(db: &Db, world: &crate::space::World, system: i64, char_id: i64, drone_item: i64) -> Result<Fit, CallError> {
+        let ship = crate::dao::characters::selection::ship_id(db, char_id).await.map_err(db_err)?
+            .ok_or_else(|| CallError::Internal(anyhow::anyhow!("character has no selected ship")))?;
+        let (ship_projections, ship_revision, drone_projections, drone_revision) = world.with(system, move |s|
+            (s.projections_on(ship), s.projection_revision(ship), s.projections_on(drone_item), s.projection_revision(drone_item)))
+            .await.ok_or_else(|| CallError::Internal(anyhow::anyhow!("system actor stopped")))?;
+        let mut fit = Self::load_drone(db, world.sde().clone(), char_id, ship, drone_item, ship_projections, drone_projections).await?;
+        fit.projection_revision = Some(ship_revision);
+        fit.drone_projection_revision = Some(drone_revision);
+        Ok(fit)
+    }
+
+    /// Revision of the drone projection snapshot, if present.
+    pub(crate) fn drone_projection_revision(&self) -> Option<u64> { self.drone_projection_revision }
+
+    pub(crate) async fn load_drone(db: &Db, sde: Arc<Sde>, char_id: i64, ship: i64, drone_item: i64,
+        ship_projections: Vec<super::effects::projection::Projection>, drone_projections: Vec<super::effects::projection::Projection>) -> Result<Fit, CallError> {
         use crate::dao::items::loading::{load_items, ItemQuery};
         let item = load_items(db, ItemQuery::Id(drone_item)).await.map_err(db_err)?
             .into_iter().find(|item| item.owner_id == char_id && sde.types.get(item.type_id).and_then(|d| d.category_id) == Some(CATEGORY_DRONE))
             .ok_or_else(|| CallError::Internal(anyhow::anyhow!("owned drone not found")))?;
-        let ship = crate::dao::characters::selection::ship_id(db, char_id).await.map_err(db_err)?
-            .ok_or_else(|| CallError::Internal(anyhow::anyhow!("character has no selected ship")))?;
-        let mut fit = Self::load(db, sde, char_id, ship).await?;
-        let mut overrides: Vec<_> = crate::dao::items::dogma::overrides_for(db, &[drone_item]).await.map_err(db_err)?
+        let mut fit = Self::load_projected(db, sde, char_id, ship, ship_projections).await?;
+        let overrides = crate::dao::items::dogma::overrides_for(db, &[drone_item]).await.map_err(db_err)?
             .into_iter().map(|r| (r.attribute_id, r.value)).collect();
-        overrides.sort_by_key(|v| v.0);
-        fit.nodes.insert(Key::Drone(drone_item), Node {
-            type_id: item.type_id, data_position: fit.sde.types.position(item.type_id),
-            location: Location::Space, online: true, active: false, overloaded: false,
-            projected_effect: None, charge_type: None, level: None, overrides, charge_values: Vec::new(),
-        });
+        fit.include_drone(drone_item, item.type_id, overrides);
+        Self::insert_projections(&fit.sde, &mut fit.nodes, Key::Drone(drone_item), drone_projections);
         fit.memo.get_mut().unwrap().clear();
         Ok(fit)
     }
@@ -383,7 +427,8 @@ impl Fit {
         // targetID denotes the receiving hull, including when the modified item
         // is a module located on it.
         if m.target_category.is_some() {
-            let category = self.nodes.get(&Key::Ship).and_then(|hull| hull.data_position)
+            let receiver = self.nodes.get(&source).and_then(|node| node.receiver).unwrap_or(Key::Ship);
+            let category = self.nodes.get(&receiver).and_then(|hull| hull.data_position)
                 .and_then(|i| self.sde.types.at_position(i).category_id);
             if !category_matches(m.target_category, category) { return false; }
         }
@@ -394,7 +439,7 @@ impl Fit {
                 let data = self.sde.types.at_position(i);
                 ATTR_REQUIRED_SKILLS.iter().filter_map(|a| data.fit_attribute(*a)).any(|v| v as i32 == s && s > 0) }))
         };
-        modifier_applies(source, m, target, t, group, required(m.skill))
+        modifier_applies(source, self.nodes.get(&source).and_then(|node| node.receiver), m, target, t, group, required(m.skill))
     }
 
     /// The effective value of `attr` on `key`.
@@ -506,12 +551,12 @@ fn category_matches(required: Option<i32>, actual: Option<i32>) -> bool {
     required.is_none() || required == actual
 }
 
-fn modifier_applies(source: Key, m: &Modifier, target: Key, node: &Node, group: Option<i32>, required: bool) -> bool {
+fn modifier_applies(source: Key, receiver: Option<Key>, m: &Modifier, target: Key, node: &Node, group: Option<i32>, required: bool) -> bool {
     let domain = match m.domain.as_str() {
         "itemID" => Some(source),
         "shipID" => Some(Key::Ship),
         "charID" => Some(Key::Char),
-        "targetID" if matches!(source, Key::Projected(_)) => Some(Key::Ship),
+        "targetID" if matches!(source, Key::Projected(_)) => receiver,
         "otherID" => match source {
             Key::Module(id) => Some(Key::Charge(id)),
             Key::Charge(id) => Some(Key::Module(id)),

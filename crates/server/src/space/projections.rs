@@ -95,6 +95,8 @@ impl System {
         let revision = self.projection_revisions.entry(target).or_default();
         *revision = revision.checked_add(1).expect("projection revision exhausted");
         let revision = *revision;
+        let drone = self.drone(target);
+        let incarnation = self.pilot_generation(target);
         let Some(ball) = self.ball(target) else { return };
         let character = ball.char_id;
         let type_id = ball.type_id;
@@ -103,6 +105,10 @@ impl System {
         let Some(context) = self.snapshot_context.clone() else { return };
         let has_target_range = sde.types.attribute(type_id, ATTR_MAX_TARGET_RANGE).is_some()
             || sde.dogma.attribute(ATTR_MAX_TARGET_RANGE).and_then(|a| a.default_value).is_some_and(|value| value > 0.0);
+        if let Some(drone) = drone.as_ref().filter(|d| d.owner != crate::consts::OWNER_UNOWNED) {
+            self.defer(refresh_owned_drone(context, sde, drone.clone(), revision, incarnation));
+            return;
+        }
         self.defer(async move {
             let fit = if let Some(character) = character {
                 match Fit::load_projected(&context.db, sde, character, target, projections).await {
@@ -111,12 +117,29 @@ impl System {
                     Err(crate::services::CallError::User { msg, .. }) => { tracing::warn!(%msg, target, "projected fit refresh failed"); return; }
                 }
             } else { Fit::for_space_type(sde, type_id, projections) };
-            let values = propulsion::kinematics(&fit);
+            let values = propulsion::kinematics(&fit, Key::Ship);
             let targeting = (fit.value(Key::Ship, ATTR_SCAN_RESOLUTION),
                 has_target_range.then(|| fit.value(Key::Ship, ATTR_MAX_TARGET_RANGE)));
+            let drone_spec = if drone.is_some() {
+                match crate::services::drones::worker::spec(&fit, Key::Ship, type_id) {
+                    Ok(spec) => Some(spec),
+                    Err(crate::services::CallError::Internal(error)) => { tracing::warn!(%error, target, "projected drone spec refresh failed"); return; }
+                    Err(crate::services::CallError::User { msg, .. }) => { tracing::warn!(%msg, target, "projected drone spec refresh failed"); return; }
+                }
+            } else { None };
             if let Some(tx) = context.tx.upgrade() {
                 let _ = tx.send(Box::new(move |system| {
-                    if system.contains(target) && system.projection_revisions.get(&target) == Some(&revision) {
+                    if !system.contains(target) || system.projection_revisions.get(&target) != Some(&revision)
+                        || system.pilot_generation(target) != incarnation { return; }
+                    if let Some(old) = &drone {
+                        if !system.drone(target).is_some_and(|d| d.generation == old.generation && d.owner == old.owner) {
+                            if system.drone(target).is_some() { system.refresh_projection_target(target); }
+                            return;
+                        }
+                    } else if system.drone(target).is_some() { return; }
+                    if let (Some(drone), Some(spec)) = (drone, drone_spec) {
+                        system.drone_refresh(target, drone.generation, spec, values, None);
+                    } else {
                         system.queue_projection_kinematics(target, revision, values);
                         system.refresh_npc_targeting(target, targeting.0, targeting.1);
                     }
@@ -125,3 +148,55 @@ impl System {
         });
     }
 }
+
+async fn refresh_owned_drone(context: snapshot::Context, sde: Arc<Sde>, drone: drone::DroneRecord, revision: u64, incarnation: Option<u64>) {
+    let target = drone.id;
+    let owner = drone.owner;
+    let generation = drone.generation;
+    let ship = match crate::dao::characters::selection::ship_id(&context.db, owner).await {
+        Ok(Some(ship)) => ship,
+        Ok(None) => { tracing::warn!(target, owner, "drone owner has no selected ship"); return; }
+        Err(error) => { tracing::warn!(%error, target, "drone owner ship lookup failed"); return; }
+    };
+    let Some(tx) = context.tx.upgrade() else { return };
+    let handle = actor::SystemHandle { tx, gate: context.gate.clone(), written: context.written.clone() };
+    let Some(snapshot) = handle.with(move |system| {
+        let current = system.drone(target)?;
+        if system.pilot_generation(target) != incarnation || system.projection_revision(target) != revision { return None; }
+        if current.owner != owner || current.generation != generation {
+            system.refresh_projection_target(target);
+            return None;
+        }
+        Some((system.projections_on(ship), system.projection_revision(ship), system.projections_on(target)))
+    }).await.flatten() else { return };
+    let (ship_projections, ship_revision, drone_projections) = snapshot;
+    let fit = match Fit::load_drone(&context.db, sde, owner, ship, target, ship_projections, drone_projections).await {
+        Ok(fit) => fit,
+        Err(crate::services::CallError::Internal(error)) => { tracing::warn!(%error, target, "projected drone fit refresh failed"); return; }
+        Err(crate::services::CallError::User { msg, .. }) => { tracing::warn!(%msg, target, "projected drone fit refresh failed"); return; }
+    };
+    let selected = match crate::dao::characters::selection::ship_id(&context.db, owner).await {
+        Ok(selected) => selected,
+        Err(error) => { tracing::warn!(%error, target, "drone owner ship lookup failed"); return; }
+    };
+    let values = propulsion::kinematics(&fit, Key::Drone(target));
+    let spec = match crate::services::drones::worker::spec(&fit, Key::Drone(target), drone.spec.type_id) {
+        Ok(spec) => spec,
+        Err(crate::services::CallError::Internal(error)) => { tracing::warn!(%error, target, "projected drone spec refresh failed"); return; }
+        Err(crate::services::CallError::User { msg, .. }) => { tracing::warn!(%msg, target, "projected drone spec refresh failed"); return; }
+    };
+    let _ = handle.send(Box::new(move |system| {
+        if system.pilot_generation(target) != incarnation || system.projection_revision(target) != revision { return; }
+        if !system.drone(target).is_some_and(|d| d.owner == owner && d.generation == generation) {
+            if system.drone(target).is_some() { system.refresh_projection_target(target); }
+            return;
+        }
+        if selected != Some(ship) || system.projection_revision(ship) != ship_revision {
+            system.refresh_projection_target(target);
+            return;
+        }
+        system.drone_refresh(target, generation, spec, values, Some((ship, ship_revision)));
+    }));
+}
+
+#[cfg(test)] mod tests;

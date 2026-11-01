@@ -57,13 +57,29 @@ async fn npc_ecm_requires_current_target_generation() {
         }
     }).await.expect("NPC shot generation");
     assert!(world.with(1, move |s| s.npc_projection_valid(-101, -102, generation)).await.unwrap());
-    apply_npc(&db, &world, 1, -103, &source, &victim, &effect, 5000.0, generation).await.ok().unwrap();
+    let fit = Fit::for_space_type(world.sde().clone(), source.type_id, Vec::new());
+    let cx = SourceContext { db: &db, world: &world, system: 1, source: &source, target: &victim,
+        module: -103, effect: &effect, duration_ms: 5000.0, fit: &fit, key: Key::Ship,
+        guard: SourceGuard::Npc { source: -101, target: -102, generation }, attacker: None,
+        drone: None, phase: DronePhase::End };
+    apply_source(&cx).await.ok().unwrap();
+    assert!(!combat::jamming::is_jammed(victim.id, crate::space::now_ms()));
+    let cx = SourceContext { phase: DronePhase::Begin, ..cx };
+    let mut failure = super::super::source(&fit, Key::Ship, source.id, -103, &effect, 5000.0);
+    failure.strengths = [0.0; 4];
+    assert!(apply_one(&db, &world, 1, &failure, &victim, None, Some(cx.guard)).await.ok().unwrap().is_some());
+    assert!(!combat::jamming::is_jammed(victim.id, crate::space::now_ms()));
+    let mut invalid_range = failure.clone();
+    invalid_range.optimal = f64::NAN;
+    assert!(apply_one(&db, &world, 1, &invalid_range, &victim, None, Some(cx.guard)).await.ok().unwrap().is_none());
+    apply_source(&cx).await.ok().unwrap();
     assert!(combat::jamming::is_jammed(victim.id, crate::space::now_ms()));
     world.with(1, move |s| {
         combat::jamming::clear(s, -102);
         s.drop_npc_targets(-101);
         assert!(!s.npc_projection_valid(-101, -102, generation));
     }).await.unwrap();
-    apply_npc(&db, &world, 1, -103, &source, &victim, &effect, 5000.0, generation).await.ok().unwrap();
+    assert!(apply_one(&db, &world, 1, &failure, &victim, None, Some(cx.guard)).await.ok().unwrap().is_none());
+    apply_source(&cx).await.ok().unwrap();
     assert!(!combat::jamming::is_jammed(victim.id, crate::space::now_ms()));
 }

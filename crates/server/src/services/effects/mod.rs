@@ -6,6 +6,7 @@
 //! including projected effects and ECM, use the shared lifecycle and actor state;
 //! unsupported families remain visibly refused.
 pub(crate) mod registry;
+pub(crate) mod space_source;
 pub(crate) mod projection;
 pub(crate) mod projected;
 pub(crate) mod range;

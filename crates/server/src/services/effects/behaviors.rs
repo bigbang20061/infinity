@@ -61,7 +61,7 @@ async fn remote_repair(cx: &Ctx, fit: &Fit, cycle: &Cycle, layer: usize) -> Resu
 
 pub(super) async fn on_cycle_start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle, charged: bool) -> Result<CycleOutcome, CallError> {
     use EffectKind::*;
-    match cycle.effect.kind {
+    let outcome = match cycle.effect.kind {
         Turret | Missile => {
             let target = cycle.target.unwrap_or(0);
             if !targets_of(cx.char_id).contains(&target) { return Ok(CycleOutcome::Stop("target lost")); }
@@ -148,7 +148,8 @@ pub(super) async fn on_cycle_start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle, charg
         AutoTarget | PassiveTarget => targeting::start(cx, fit, cycle).await,
         Salvage => salvage::start(cx, fit, cycle).await,
         kind @ (ProbeLaunch | Hacking | Online) => Err(CallError::Internal(anyhow::anyhow!("unsupported cycle start kind: {kind:?}"))),
-    }
+    }?;
+    Ok(outcome)
 }
 
 pub(super) async fn on_cycle_end(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<CycleOutcome, CallError> {

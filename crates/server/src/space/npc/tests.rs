@@ -1,5 +1,6 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
+mod drone;
 
 fn ball(id: i64, pilot: Option<i64>, x: f64) -> Ball {
     Ball {
@@ -82,7 +83,11 @@ fn assistance_guard_rejects_hostile_confusion_and_stale_generation() {
     let generation = s.brains[&1000].target_generation;
     let guard = NpcCapacitorGuard::Assistance { source: 1000, hostile: 1, target: 2, generation, optimal: 20.0, falloff: 0.0 };
     assert!(guard.valid(&s));
-    assert!(!NpcCapacitorGuard::Hostile { source: 1000, target: 2, generation }.valid(&s));
+    assert!(!NpcCapacitorGuard::Attack {
+        source: 1000, target: 2,
+        source_guard: Some(crate::services::effects::space_source::SourceGuard::Npc { source: 1000, target: 2, generation }),
+        player: None, optimal: 100.0, falloff: 0.0, offensive: true,
+    }.valid(&s));
     assert!(!NpcCapacitorGuard::Assistance { source: 1000, hostile: 1, target: 1, generation, optimal: 100.0, falloff: 0.0 }.valid(&s));
     let mut brain = s.brains.remove(&1000).unwrap();
     s.lose_npc_target(1000, &mut brain);

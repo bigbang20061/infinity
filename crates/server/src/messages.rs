@@ -7,6 +7,7 @@
 pub(crate) mod bounty;
 pub(crate) mod combat;
 pub(crate) mod contacts;
+pub(crate) mod drones;
 pub(crate) mod effects;
 pub(crate) mod fitting;
 pub(crate) mod gm;

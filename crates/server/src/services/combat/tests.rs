@@ -317,7 +317,7 @@ async fn condition_persists_recharges_and_rollback_preserves_all_layers() {
     let ship = crate::dao::items::creation::rookie_ship(&db, ty, owner, station, FLAG_HANGAR).await.unwrap();
     let world = World::new(db.clone(), sde, 1);
     let fit = Fit::load(&db, world.sde().clone(), owner, ship).await.ok().unwrap();
-    let stats = ShipStats::from_fit(&fit);
+    let stats = ShipStats::from_fit(&fit, Key::Ship);
     let levels = [stats.max[0] * 0.25, stats.max[1] - 3.0, stats.max[2] - 2.0];
     state().condition.insert(ship, Condition { stats: stats.clone(), now: levels, shield_at: filetime_now() });
     assert_eq!(damage_player(&db, &world, -1, ship, owner, [100.0; 4], None).await.ok(), Some(0.0));

@@ -17,7 +17,7 @@ pub(super) struct Context {
 struct Position { id: i64, generation: u64, pos: V3 }
 
 fn candidates(s: &System) -> impl Iterator<Item = (i64, u64)> + '_ {
-    s.pilots().filter_map(|ball| {
+    s.persistent_balls().filter_map(|ball| {
         let &(generation, previous) = s.snapshot_positions.get(&ball.id)?;
         (ball.pos != previous).then_some((ball.id, generation))
     })
@@ -56,11 +56,13 @@ pub(super) async fn flush(handle: SystemHandle, db: Db) -> Result<u64> {
 }
 
 async fn write_conditions(handle: &SystemHandle, db: &Db) -> Result<()> {
-    let ids = handle.with(|s| s.pilots().map(|ball| ball.id).collect::<Vec<_>>()).await
+    let ids = handle.with(|s| s.persistent_balls().map(|ball| (ball.id, s.drone(ball.id).is_some())).collect::<Vec<_>>()).await
         .ok_or_else(|| anyhow::anyhow!("system actor stopped during condition snapshot"))?;
     let mut failure = None;
-    for ship in ids {
-        if let Err(error) = crate::services::combat::save_condition(db, ship).await {
+    for (ship, drone) in ids {
+        let result = if drone { crate::services::combat::drone_health::save_condition(db, ship).await }
+            else { crate::services::combat::save_condition(db, ship).await };
+        if let Err(error) = result {
             let error = match error {
                 crate::services::CallError::Internal(error) => error,
                 crate::services::CallError::User { msg, .. } => anyhow::anyhow!(msg),
@@ -81,7 +83,7 @@ async fn write_positions(handle: &SystemHandle, db: &Db) -> Result<u64> {
     if tokens.is_empty() { return Ok(0); }
     let candidates: HashMap<i64, u64> = candidates.into_iter().collect();
     let positions = handle.with(move |s| {
-        s.pilots().filter_map(|ball| {
+        s.persistent_balls().filter_map(|ball| {
             let &(generation, previous) = s.snapshot_positions.get(&ball.id)?;
             (ball.pos != previous && candidates.get(&ball.id) == Some(&generation))
                 .then(|| Position { id: ball.id, generation, pos: ball.pos })

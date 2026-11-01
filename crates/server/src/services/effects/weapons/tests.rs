@@ -153,12 +153,22 @@ async fn missile_uses_signature_and_speed_at_impact() {
     world.system(system).await.unwrap();
     let inserted = target.clone();
     world.with(system, move |s| { s.insert(inserted); }).await.unwrap();
+    let stale = Missile {
+        charge, raw: [shield, 0.0, 0.0, 0.0], aoe_cloud: 40.0, aoe_velocity: 170.0,
+        drf: 0.604, velocity: 1_000.0, flight_range: 10_000.0, weapon: charge, attacker: None,
+    };
+    let before = world.with(system, |s| s.balls().count()).await.unwrap();
+    let guard = crate::services::effects::space_source::SourceGuard::Npc {
+        source: source.id, target: target.id, generation: 0,
+    };
+    launch_missile(db.clone(), world.clone(), system, source.clone(), target.clone(), 1, None, stale, Some(guard)).await.ok().unwrap();
+    assert_eq!(world.with(system, |s| s.balls().count()).await.unwrap(), before);
     let missile = Missile {
         charge, raw: [shield * 0.25 / resonance, 0.0, 0.0, 0.0],
         aoe_cloud: 40.0, aoe_velocity: 170.0, drf: 0.604,
         velocity: 1_000.0, flight_range: 10_000.0, weapon: charge, attacker: None,
     };
-    launch_missile(db, world.clone(), system, source, target, 1, None, missile).await.ok().unwrap();
+    launch_missile(db, world.clone(), system, source, target, 1, None, missile, None).await.ok().unwrap();
     world.with(system, move |s| s.command(target_id, |ball, _, _| {
         ball.signature_radius = Some(35.0);
         ball.vel = [0.0, 400.0, 0.0];
@@ -172,4 +182,40 @@ async fn missile_uses_signature_and_speed_at_impact() {
     assert!((fraction - (1.0 - 0.25 * application)).abs() < 1e-9);
     crate::services::combat::forget_ship(target_id);
     world.remove_ball(system, target_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to a dedicated test database with SDE"]
+async fn npc_miss_reports_physical_source_to_drone_owner() {
+    use crate::space::drone::DroneSpec;
+    crate::tests::init_config();
+    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = Arc::new(Sde::load(&db).await.unwrap());
+    let world = World::new(db.clone(), sde, 1);
+    let system = -31_002;
+    let mut source = ball();
+    source.id = -31_003;
+    source.pos = [0.0; 3];
+    let mut target = ball();
+    target.id = -31_004;
+    target.owner_id = -31_005;
+    target.pos = source.pos;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    world.register_pilot(target.owner_id, tx);
+    world.system(system).await.unwrap();
+    let (a, b) = (source.clone(), target.clone());
+    world.with(system, move |s| {
+        s.insert(a);
+        s.restore_drone(b, DroneSpec { type_id: 1, bandwidth: 0.0, scan_resolution: 0.0,
+            control_range: 0.0, max_target_range: 0.0, optimal_range: 0.0, orbit_range: 0.0,
+            duration_ms: 0.0, effect_id: None }, Arc::new(|_| Box::pin(async {})));
+    }).await.unwrap();
+    assert_eq!(target.char_id, None);
+    turret_shot(&db, &world, system, &source, &target, None, 42, (1.0, 1.0, 1.0, 1.0), [1.0; 4], None).await.ok().unwrap();
+    let (event, args) = rx.try_recv().expect("drone owner receives NPC hit log");
+    assert_eq!(event, "OnDamageMessage");
+    assert_eq!(args[0], damage_message("source", source.id, 42, 0.0, HIT_MISS));
+    world.unregister_pilot(target.owner_id);
+    world.remove_ball(system, target.id).await;
+    world.remove_ball(system, source.id).await;
 }

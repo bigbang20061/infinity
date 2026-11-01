@@ -20,4 +20,11 @@ pub(crate) async fn grown(ex: &(impl Executor + ?Sized), field: i64, system: i64
              ON CONFLICT (field_id) DO UPDATE SET grown_at = EXCLUDED.grown_at, depleted_at = NULL", &[&field, &system, &now]).await }
 pub(crate) async fn delete(ex: &(impl Executor + ?Sized), id: i64) -> Result<u64, db::Error> { ex.execute("DELETE FROM game.asteroids WHERE asteroid_id = $1", &[&id]).await }
 pub(crate) async fn mark_depleted(ex: &(impl Executor + ?Sized), field: i64, now: i64) -> Result<u64, db::Error> { ex.execute("UPDATE game.asteroid_fields SET depleted_at = $2 WHERE field_id = $1", &[&field, &now]).await }
-pub(crate) async fn quantity(ex: &(impl Executor + ?Sized), id: i64, quantity: i64) -> Result<u64, db::Error> { ex.execute("UPDATE game.asteroids SET quantity = $2 WHERE asteroid_id = $1", &[&id, &quantity]).await }
+/// Lock a rock for an extraction in the caller's transaction.
+pub(crate) async fn lock(ex: &(impl Executor + ?Sized), system: i64, id: i64, type_id: i32) -> Result<Option<i64>, db::Error> {
+    Ok(ex.query_opt("SELECT quantity FROM game.asteroids WHERE system_id = $1 AND asteroid_id = $2 AND type_id = $3 FOR UPDATE", &[&system, &id, &type_id]).await?.map(|r| r.get("quantity")))
+}
+/// Decrement only the quantity observed under the lock.
+pub(crate) async fn take(ex: &(impl Executor + ?Sized), id: i64, old: i64, taken: i64) -> Result<bool, db::Error> {
+    Ok(ex.execute("UPDATE game.asteroids SET quantity = quantity - $3 WHERE asteroid_id = $1 AND quantity = $2 AND quantity >= $3", &[&id, &old, &taken]).await? == 1)
+}

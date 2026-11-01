@@ -55,6 +55,21 @@ pub const DAMAGE_LAYER_COUNT: usize = 3;
 // Distances.
 /// Server distance convention: the IAU astronomical unit, in metres.
 pub const AU: f64 = 149_597_870_700.0;
+/// Client menusvc.DEFAULT_INTERACTION_RANGE and server drone scoop policy, metres.
+pub const DRONE_SCOOP_RANGE: f64 = 2500.0;
+/// Neutral owner used by positioned exploration containers in dao/exploration.rs.
+pub const OWNER_UNOWNED: i64 = 1;
+
+/// Client entityConst: idle drone activity.
+pub const DRONE_STATE_IDLE: i32 = 0;
+/// Client entityConst: combat drone activity.
+pub const DRONE_STATE_COMBAT: i32 = 1;
+/// Client entityConst: mining drone activity.
+pub const DRONE_STATE_MINING: i32 = 2;
+/// Client entityConst: approaching drone activity.
+pub const DRONE_STATE_APPROACHING: i32 = 3;
+/// Client entityConst: departing drone activity.
+pub const DRONE_STATE_DEPARTING: i32 = 4;
 
 // SDE inventory type, group and category IDs.
 /// SDE invTypes: Character (Gallente), used for player owners.
@@ -93,6 +108,10 @@ pub const CATEGORY_ENTITY: i32 = 11;
 pub const CATEGORY_SKILL: i32 = 16;
 /// SDE invCategories: Drone.
 pub const CATEGORY_DRONE: i32 = 18;
+/// Mass of most published 5 m³ drones in the static data; used when a drone type has no positive mass.
+pub const DRONE_FALLBACK_MASS: f64 = 3000.0;
+/// Agility of nearly all published drones in the static data; used when a drone type has none.
+pub const DRONE_FALLBACK_AGILITY: f64 = 100.0;
 /// SDE invCategories: Subsystem.
 pub const CATEGORY_SUBSYSTEM: i32 = 32;
 /// SDE invTypes: Hacking skill.
@@ -121,6 +140,20 @@ pub const FACTION_GURISTAS: i64 = 500010;
 pub const FACTION_ANGEL_CARTEL: i64 = 500011;
 
 // SDE dogma attribute and effect IDs.
+/// SDE dgmAttributeTypes: maxActiveDrones.
+pub const ATTR_MAX_ACTIVE_DRONES: i32 = 352;
+/// SDE dgmAttributeTypes: droneControlDistance.
+pub const ATTR_DRONE_CONTROL_DISTANCE: i32 = 458;
+/// SDE dgmAttributeTypes: droneBandwidth.
+pub const ATTR_DRONE_BANDWIDTH: i32 = 1271;
+/// SDE dgmAttributeTypes: droneBandwidthUsed.
+pub const ATTR_DRONE_BANDWIDTH_USED: i32 = 1272;
+/// SDE dgmAttributeTypes: droneIsAggressive.
+pub const ATTR_DRONE_IS_AGGRESSIVE: i32 = 1275;
+/// SDE dgmAttributeTypes: droneFocusFire.
+pub const ATTR_DRONE_FOCUS_FIRE: i32 = 1297;
+/// SDE dgmAttributeTypes: droneCapacity.
+pub const ATTR_DRONE_CAPACITY: i32 = 283;
 /// Client dogma/const.py: attributeEmpFieldRange.
 pub const ATTR_EMP_FIELD_RANGE: i32 = 99;
 /// SDE dgmEffects: skillEffect, skill-point bookkeeping rather than a modifier.

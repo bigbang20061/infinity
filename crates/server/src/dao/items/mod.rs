@@ -12,6 +12,7 @@ pub(crate) mod clones;
 pub(crate) mod combat;
 pub(crate) mod creation;
 pub(crate) mod dogma;
+pub(crate) mod drones;
 pub(crate) mod fit;
 pub(crate) mod fitting;
 pub(crate) mod hacking;

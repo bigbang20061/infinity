@@ -203,6 +203,7 @@ use targeting_charges::*;
 pub(in crate::services) mod banks;
 use banks::weapon_groups;
 pub(crate) mod groups_health;
+pub(crate) mod drone_health;
 use groups_health::*;
 use super::effects::notify::attribute_change;
 use super::effects::lifecycle;
@@ -277,7 +278,7 @@ pub(crate) async fn load_docked_condition(db: &Db, world: &World, char_id: i64, 
 }
 
 pub(super) async fn load_condition_with_fit(db: &Db, ship: i64, fit: &Fit) -> Result<[f64; 3], CallError> {
-    let stats = ShipStats::from_fit(fit);
+    let stats = ShipStats::from_fit(fit, Key::Ship);
     let rows = crate::dao::items::dogma::overrides(db, ship).await.map_err(db_err)?;
     let at = rows.iter().find(|r| r.attribute_id == ATTR_SHIELD_CHARGE).map(|r| r.updated_at).unwrap_or(0);
     let value = |id| rows.iter().find(|r| r.attribute_id == id).map(|r| r.value);
@@ -365,29 +366,18 @@ pub async fn spawn_npc(db: Db, world: Arc<World>, system: i64, id: i64, type_id:
                     }
                     NpcAction::Effect { me, victim, effect_id, source_module, duration_ms, generation } => {
                         if let Some(effect) = super::effects::registry::resolve(world.sde(), effect_id) {
-                            let result = match effect.kind {
-                                super::effects::EffectKind::Projected { .. } =>
-                                    super::effects::projected::apply_npc(
-                                        &db, &world, system, source_module, &me, &victim, &effect, duration_ms, generation,
-                                    ).await,
-                                super::effects::EffectKind::Neutralizer | super::effects::EffectKind::Nosferatu | super::effects::EffectKind::CapTransfer =>
-                                    super::effects::npc_capacitor::apply_npc(
-                                        &db, &world, system, source_module, &me, &victim, &effect, duration_ms, generation,
-                                    ).await,
-                                super::effects::EffectKind::RemoteRepair { .. } =>
-                                    super::effects::npc_repair::apply_npc(
-                                        &db, &world, system, source_module, &me, &victim, &effect, duration_ms, generation,
-                                    ).await,
-                                super::effects::EffectKind::Ecm =>
-                                    super::effects::ecm::apply_npc(
-                                        &db, &world, system, source_module, &me, &victim, &effect, duration_ms, generation,
-                                    ).await,
-                                super::effects::EffectKind::Smartbomb =>
-                                    super::effects::aoe::apply_npc(
-                                        &db, &world, system, source_module, &me, &victim, &effect, duration_ms, generation,
-                                    ).await,
-                                _ => return,
+                            let source = me.id;
+                            let target = victim.id;
+                            let Some(Some(projections)) = world.with(system, move |s|
+                                s.npc_projection_valid(source, target, generation).then(|| s.projections_on(source))).await else { return };
+                            let fit = Fit::for_space_type(world.sde().clone(), me.type_id, projections);
+                            let cx = super::effects::space_source::SourceContext {
+                                db: &db, world: &world, system, source: &me, target: &victim,
+                                module: source_module, effect: &effect, duration_ms, fit: &fit, key: Key::Ship,
+                                guard: super::effects::space_source::SourceGuard::Npc { source, target, generation },
+                                attacker: None, drone: None, phase: crate::space::drone::DronePhase::Begin,
                             };
+                            let result = super::effects::space_source::apply(&cx).await;
                             match result {
                                 Err(CallError::Internal(error)) => warn!("npc {id} effect {effect_id}: {error:#}"),
                                 Err(CallError::User { msg, .. }) if !matches!(effect.kind, super::effects::EffectKind::Projected { .. }) =>

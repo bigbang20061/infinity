@@ -4,6 +4,12 @@ use crate::dao::items::creation;
 
 mod db_smoke;
 mod fixture;
+
+/// Drain up to the requested amount for capacitor integration tests.
+pub(in crate::services) async fn drain_exact(db: &Db, world: &World, system: i64, ship: i64, amount: f64) -> Result<f64, CallError> {
+    Ok(capacitor_operation(db, world, system, ship, Operation::Drain(amount), None).await?.map_or(0.0, |(_, amount, _)| amount))
+}
+
 #[test]
 fn recharge_uses_existing_curve_and_never_runs_backwards() {
     let level = recharge(25.0, 100.0, 1000.0, 1.0);
@@ -21,6 +27,16 @@ fn injection_and_capacity_are_clamped() {
     assert_eq!((result.after, result.amount), (50.0, 0.0));
     let result = mutate(&mut entries, 1, -1.0, 1000.0, 0, Operation::Snapshot);
     assert_eq!(result.after, 0.0);
+}
+
+#[test]
+fn drone_assistance_rejects_missing_or_self_source() {
+    let system = crate::space::System::new(1, std::sync::Arc::default(), 0);
+    for target in [1, 2] {
+        assert!(!NpcCapacitorGuard::DroneAssistance {
+            source: 1, target, generation: 3, optimal: 100.0, falloff: 0.0, owner: 4,
+        }.valid(&system));
+    }
 }
 
 #[test]
@@ -96,4 +112,24 @@ fn concurrent_npc_damage_does_not_overwrite_cached_updates() {
         }
     });
     assert_eq!(state().hp.remove(&target).unwrap().now[0], 800.0);
+}
+
+#[test]
+fn drone_hp_rollback_restores_absence_and_exact_previous_value() {
+    let target = i64::MIN + 206;
+    for damaged in [[80.0, 100.0, 100.0], [0.0; 3]] {
+        for existed in [false, true] {
+            let original = Hp { now: [90.0, 80.0, 70.0], max: [100.0; 3], resonance: [[0.5; 4]; 3] };
+            let previous = existed.then(|| original.clone());
+            state().hp.insert(target, Hp { now: damaged, max: [100.0; 3], resonance: [[1.0; 4]; 3] });
+            restore_drone_hp(target, previous);
+            let restored = state().hp.remove(&target);
+            if existed {
+                let restored = restored.unwrap();
+                assert_eq!((restored.now, restored.max, restored.resonance), (original.now, original.max, original.resonance));
+            } else {
+                assert!(restored.is_none());
+            }
+        }
+    }
 }

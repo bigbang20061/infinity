@@ -1,7 +1,7 @@
 //! Ship health and memory-only capacitor state; routing lives in the parent module.
 //! The client reads capacitor charge through clientDogmaLocation; player attributes come
 //! from fitted dogma and NPC attributes from the SDE. Capacitor state is not persisted;
-//! NPC projections are checked in the system actor before capacitor changes commit.
+//! Hostile capacitor mutations validate their source and range in the system actor.
 //! Confirmed NPC destruction emits a kill event for a known attacker before rewards are attempted.
 //! NPC repairs use the damage cache in the system actor and are not persisted; missing
 //! cache entries represent undamaged NPCs. Player repairs use fitted ship attributes
@@ -101,16 +101,43 @@ pub(crate) fn npc_capacitor_fraction(sde: &crate::sde::Sde, ball: &Ball) -> Opti
     Some(recharge(level, capacity, tau, dt) / capacity)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) enum NpcCapacitorGuard {
-    Hostile { source: i64, target: i64, generation: u64 },
     Assistance { source: i64, hostile: i64, target: i64, generation: u64, optimal: f64, falloff: f64 },
+    DroneAssistance { source: i64, target: i64, generation: u64, optimal: f64, falloff: f64, owner: i64 },
+    Attack { source: i64, target: i64, source_guard: Option<crate::services::effects::space_source::SourceGuard>, player: Option<(i64, i64, std::sync::Arc<std::sync::atomic::AtomicBool>)>, optimal: f64, falloff: f64, offensive: bool },
 }
 
 impl NpcCapacitorGuard {
-    pub(crate) fn valid(self, s: &crate::space::System) -> bool {
-        match self {
-            Self::Hostile { source, target, generation } => s.npc_projection_valid(source, target, generation),
+    pub(crate) fn valid(&self, s: &crate::space::System) -> bool {
+        match self.clone() {
+            Self::Attack { source, target, source_guard, player, optimal, falloff, .. } => {
+                if source_guard.is_some_and(|guard| !guard.valid(s)) { return false; }
+                if let Some((character, module, generation)) = player {
+                    if generation.load(std::sync::atomic::Ordering::Relaxed)
+                        || !s.pilot_ball(character).is_some_and(|ball| ball.id == source)
+                        || !crate::services::combat::targeting_charges::targets_of(character).contains(&target)
+                        || !state().active.get(&module).is_some_and(|active| std::sync::Arc::ptr_eq(&active.stop, &generation)) { return false; }
+                }
+                s.sampled_ball(source).zip(s.sampled_ball(target)).is_some_and(|(a, b)| {
+                    let distance = (crate::space::dist(a.pos, b.pos) - f64::from(a.radius) - f64::from(b.radius)).max(0.0);
+                    a.mode != crate::space::MODE_WARP && b.mode != crate::space::MODE_WARP
+                        && crate::services::effects::npc_capacitor::in_range(distance, optimal, falloff)
+                })
+            }
+            Self::DroneAssistance { source, target, generation, optimal, falloff, owner } => {
+                let guard = crate::services::effects::space_source::SourceGuard::Drone { source, target, generation };
+                source != target && guard.valid(s) && s.drone(source).is_some_and(|drone| drone.owner == owner)
+                    && s.sampled_ball(source).zip(s.sampled_ball(target)).is_some_and(|(me, other)| {
+                        let player = other.char_id.is_some_and(|pilot| s.pilot_ball(pilot).is_some_and(|ball| ball.id == target))
+                            && s.sde().and_then(|sde| sde.types.get(other.type_id))
+                                .is_some_and(|ty| ty.category_id == Some(crate::consts::CATEGORY_SHIP));
+                        let eligible = player || s.is_npc(target) || s.drone(target).is_some();
+                        let distance = (crate::space::dist(me.pos, other.pos) - f64::from(me.radius) - f64::from(other.radius)).max(0.0);
+                        eligible && me.mode != crate::space::MODE_WARP && other.mode != crate::space::MODE_WARP && other.cloak == 0
+                            && crate::services::effects::npc_capacitor::in_range(distance, optimal, falloff)
+                    })
+            }
             Self::Assistance { source, hostile, target, generation, optimal, falloff } =>
                 s.npc_projection_valid(source, hostile, generation) && s.npc_assist_eligible(source, target)
                 && s.sampled_ball(source).zip(s.sampled_ball(target)).is_some_and(|(me, other)| {
@@ -122,7 +149,7 @@ impl NpcCapacitorGuard {
 }
 
 
-async fn capacitor_operation(db: &Db, world: &World, system: i64, ship: i64, op: Operation, guard: Option<NpcCapacitorGuard>) -> Result<Option<(CapacitorSnapshot, f64)>, CallError> {
+async fn capacitor_operation(db: &Db, world: &World, system: i64, ship: i64, op: Operation, guard: Option<NpcCapacitorGuard>) -> Result<Option<(CapacitorSnapshot, f64, Option<i64>)>, CallError> {
     let Some((type_id, pilot)) = world.with(system, move |s| s.ball(ship).map(|b| (b.type_id, b.char_id))).await.flatten() else {
         return Ok(None);
     };
@@ -137,7 +164,7 @@ async fn capacitor_operation(db: &Db, world: &World, system: i64, ship: i64, op:
         let ball = s.ball(ship)?;
         if (ball.type_id, ball.char_id) != (type_id, pilot)
             || revision.is_some_and(|revision| s.projection_revision(ship) != revision)
-            || guard.is_some_and(|guard| !guard.valid(s))
+            || guard.as_ref().is_some_and(|guard| !guard.valid(s))
         {
             return None;
         }
@@ -149,33 +176,32 @@ async fn capacitor_operation(db: &Db, world: &World, system: i64, ship: i64, op:
             let change = attribute_change(pilot, Value::Int(ship), ATTR_CHARGE, Value::Float(result.after), Value::Float(result.before));
             s.notify_pilot(pilot, "OnModuleAttributeChanges", vec![Value::list([change])]);
         }
-        Some((CapacitorSnapshot { capacity, level: result.after }, result.amount))
+        if let Some(NpcCapacitorGuard::Attack { source, target, offensive: true, .. }) = &guard {
+            if ship == *target { s.drone_attack(*source, *target); }
+        }
+        Some((CapacitorSnapshot { capacity, level: result.after }, result.amount, s.combat_owner(ship)))
     }).await.flatten())
 }
 
 /// Return the current capacitor for a ship present in the system.
 pub(crate) async fn capacitor_snapshot(db: &Db, world: &World, system: i64, ship: i64) -> Result<Option<CapacitorSnapshot>, CallError> {
-    Ok(capacitor_operation(db, world, system, ship, Operation::Snapshot, None).await?.map(|(snapshot, _)| snapshot))
+    Ok(capacitor_operation(db, world, system, ship, Operation::Snapshot, None).await?.map(|(snapshot, _, _)| snapshot))
 }
 
 /// Inject energy, returning the amount accepted.
 pub(crate) async fn inject(db: &Db, world: &World, system: i64, ship: i64, amount: f64) -> Result<f64, CallError> {
-    Ok(capacitor_operation(db, world, system, ship, Operation::Inject(amount), None).await?.map_or(0.0, |(_, amount)| amount))
-}
-
-/// Drain up to the requested amount, returning the amount actually drained.
-pub(crate) async fn drain_exact(db: &Db, world: &World, system: i64, ship: i64, amount: f64) -> Result<f64, CallError> {
-    Ok(capacitor_operation(db, world, system, ship, Operation::Drain(amount), None).await?.map_or(0.0, |(_, amount)| amount))
+    Ok(capacitor_operation(db, world, system, ship, Operation::Inject(amount), None).await?.map_or(0.0, |(_, amount, _)| amount))
 }
 
 /// Inject energy only while the NPC projection remains valid.
 pub(crate) async fn inject_guarded(db: &Db, world: &World, system: i64, ship: i64, amount: f64, guard: NpcCapacitorGuard) -> Result<f64, CallError> {
-    Ok(capacitor_operation(db, world, system, ship, Operation::Inject(amount), Some(guard)).await?.map_or(0.0, |(_, amount)| amount))
+    Ok(capacitor_operation(db, world, system, ship, Operation::Inject(amount), Some(guard)).await?.map_or(0.0, |(_, amount, _)| amount))
 }
 
-/// Drain energy only while the NPC projection remains valid.
-pub(crate) async fn drain_exact_guarded(db: &Db, world: &World, system: i64, ship: i64, amount: f64, guard: NpcCapacitorGuard) -> Result<f64, CallError> {
-    Ok(capacitor_operation(db, world, system, ship, Operation::Drain(amount), Some(guard)).await?.map_or(0.0, |(_, amount)| amount))
+/// Drain only while the guarded attack remains valid. `None` means refused;
+/// an accepted drain can have a zero amount.
+pub(crate) async fn drain_exact_guarded(db: &Db, world: &World, system: i64, ship: i64, amount: f64, guard: NpcCapacitorGuard) -> Result<Option<(f64, Option<i64>)>, CallError> {
+    Ok(capacitor_operation(db, world, system, ship, Operation::Drain(amount), Some(guard)).await?.map(|(_, amount, owner)| (amount, owner)))
 }
 
 /// A ship's hit points and resistances, from its fit.
@@ -187,11 +213,11 @@ pub(super) struct ShipStats {
 }
 
 impl ShipStats {
-    pub(super) fn from_fit(fit: &Fit) -> Self {
+    pub(super) fn from_fit(fit: &Fit, key: Key) -> Self {
         Self {
-            max: ATTR_HP.map(|a| fit.value(Key::Ship, a)),
-            resonance: ATTR_RESONANCE.map(|layer| layer.map(|a| fit.value(Key::Ship, a))),
-            shield_tau_ms: fit.value(Key::Ship, ATTR_SHIELD_RECHARGE_RATE),
+            max: ATTR_HP.map(|a| fit.value(key, a)),
+            resonance: ATTR_RESONANCE.map(|layer| layer.map(|a| fit.value(key, a))),
+            shield_tau_ms: fit.value(key, ATTR_SHIELD_RECHARGE_RATE),
         }
     }
 }
@@ -206,7 +232,7 @@ pub(super) struct Condition {
 
 pub(super) async fn ship_stats(db: &Db, world: &World, system: i64, char_id: i64, ship: i64) -> Result<ShipStats, CallError> {
     let fit = Fit::load_in_space(db, world, system, char_id, ship).await?;
-    Ok(ShipStats::from_fit(&fit))
+    Ok(ShipStats::from_fit(&fit, Key::Ship))
 }
 
 /// (shieldCharge, armorDamage, damage) of a ship that has taken damage since it was last
@@ -255,9 +281,26 @@ fn damage_npc_cached(target: i64, initial: impl FnOnce() -> Hp, raw: [f64; 4]) -
     (dealt, destroyed, health)
 }
 
+fn restore_drone_hp(target: i64, previous: Option<Hp>) {
+    let mut st = state();
+    match previous {
+        Some(hp) => { st.hp.insert(target, hp); }
+        None => { st.hp.remove(&target); }
+    }
+}
+
 /// Damage an NPC (or any non-player ball); destroys it at zero structure.
 pub(super) async fn damage_npc(db: &Db, world: &World, system: i64, target: i64, raw: [f64; 4], attacker: Option<i64>) -> Result<f64, CallError> {
-    let Some(ball) = world.ball(system, target).await else { return Ok(0.0) };
+    let Some((ball, drone, npc)) = world.with(system, move |s| Some((s.ball(target)?.clone(), s.drone(target), s.is_npc(target)))).await.flatten() else { return Ok(0.0) };
+    let _lock = if drone.is_some() { Some(super::super::market::lock().await) } else { None };
+    if let Some(drone) = &drone {
+        let owner = drone.owner;
+        super::drone_health::refresh_locked(db, world, system, target, owner).await?;
+        if !world.with(system, move |s| s.drone(target).is_some_and(|d| d.owner == owner)).await.unwrap_or(false) {
+            return Ok(0.0);
+        }
+    }
+    let previous = if drone.is_some() { state().hp.get(&target).cloned() } else { None };
     if let Some(pilot) = attacker {
         world.post(system, move |s| {
             s.add_aggressor(target, pilot);
@@ -268,10 +311,30 @@ pub(super) async fn damage_npc(db: &Db, world: &World, system: i64, target: i64,
         Hp { now: max, max, resonance: ATTR_RESONANCE.map(|layer| layer.map(|id| attr(world.sde(), ball.type_id, id, 1.0))) }
     }, raw);
     if destroyed {
+        if let Some(drone) = &drone {
+            let owner = drone.owner;
+            let result = db.transaction(
+                |tx, _: &mut Outbox| Box::pin(async move {
+                    crate::dao::items::drones::destroy(tx, target, owner, system).await.map_err(db_err)
+                }),
+                |value, _| async move { Ok(value) },
+            ).await;
+            match result {
+                Ok(true) => {}
+                Ok(false) => {
+                    forget_ship(target);
+                    return Ok(0.0);
+                }
+                Err(error) => {
+                    restore_drone_hp(target, previous);
+                    return Err(error);
+                }
+            }
+        }
         let destroyed = world.destroy_ball(system, target).await;
         forget_ship(target);
         forget_target(world, target);
-        if let Some(ball) = destroyed {
+        if let Some(ball) = destroyed.filter(|_| npc) {
             info!("ball {target} (type {}) destroyed", ball.type_id);
             if let Some(char_id) = attacker {
                 let mut outbox = Outbox::default();
@@ -286,6 +349,12 @@ pub(super) async fn damage_npc(db: &Db, world: &World, system: i64, target: i64,
             }
         }
     } else {
+        if drone.is_some() {
+            if let Err(error) = super::drone_health::save_condition_in(db, target).await {
+                restore_drone_hp(target, previous);
+                return Err(error);
+            }
+        }
         world.set_health(system, target, health);
     }
     Ok(dealt)
@@ -376,7 +445,8 @@ pub(crate) fn repair_npc_in_system(s: &mut crate::space::System, sde: &crate::sd
     let category = sde.types.get(ball.type_id).and_then(|ty| ty.category_id);
     if ball.char_id.is_some()
         || !(category == Some(crate::consts::CATEGORY_SHIP)
-            || (category == Some(crate::consts::CATEGORY_ENTITY) && s.is_npc(target)))
+            || (category == Some(crate::consts::CATEGORY_ENTITY) && s.is_npc(target))
+            || (category == Some(crate::consts::CATEGORY_DRONE) && s.drone(target).is_some()))
     {
         return false;
     }
@@ -575,7 +645,7 @@ fn loot_category(published: Option<bool>, category: Option<i32>) -> Option<i32> 
 }
 
 #[cfg(test)] mod loot_tests;
-#[cfg(test)] mod tests;
+#[cfg(test)] pub(in crate::services) mod tests;
 
 
 

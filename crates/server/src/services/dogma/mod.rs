@@ -286,6 +286,13 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
     }
     let flag = |i: usize| call.args.get(i).map(|v| !v.is_none() && v.as_int() != Some(0)).unwrap_or(false);
     match call.method {
+        "ChangeDroneSettings" => {
+            let owner = c.session.int("charid").ok_or_else(|| super::notify_error(crate::messages::drones::NOT_AVAILABLE))?;
+            let patch = super::drones::settings::parse(call.args)?;
+            let defaults = super::drones::settings::defaults(&c.sde)?;
+            super::drones::settings::apply(owner, defaults, patch);
+            Ok(Value::None)
+        }
         // GetAllInfo(getCharInfo, getShipInfo, structureID)
         "GetAllInfo" => {
             let char_info = if flag(0) {

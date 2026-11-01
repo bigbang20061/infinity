@@ -1,19 +1,9 @@
-//! NPC-source neutralizers, nosferatu and capacitor transfers.
-//! Like player capacitor effects, these use SDE dogma effect range metadata and
-//! combat capacitor state; NPC source attributes come from the entity type's SDE.
-//! NPCs have no fitted-module capacitor cost; transfers assist eligible NPCs
-//! without Crimewatch flags, and do nothing if no recipient needs energy.
-//! If a target is lost between nosferatu's drain and injection, the transfer
-//! ends with that target generation; transient NPC capacitor is not persisted.
-use super::capacitor::nos_allowed;
-use super::range::range_multiplier;
-use super::registry::{Effect, EffectAttribute};
-use super::EffectKind;
+//! Capacitor effects for NPC and drone sources.
+use super::{capacitor::nos_allowed, range::range_multiplier, registry::{EffectAttribute, EffectFlag},
+    space_source::{SourceContext, SourceGuard}, EffectKind};
 use crate::consts::{ATTR_ENERGY_NEUTRALIZER_AMOUNT, ATTR_NOS_OVERRIDE, ATTR_POWER_TRANSFER_AMOUNT};
-use crate::db::Db;
-use crate::services::combat::{attr, groups_health::{capacitor_snapshot, drain_exact_guarded, inject_guarded, npc_capacitor_fraction, NpcCapacitorGuard}};
-use crate::services::CallError;
-use crate::space::{dist, Ball, World};
+use crate::services::{combat::groups_health::{capacitor_snapshot, drain_exact_guarded, inject_guarded, npc_capacitor_fraction, NpcCapacitorGuard}, CallError};
+use crate::space::{dist, drone::DronePhase};
 
 fn scaled_amount(amount: f64, distance: f64, optimal: f64, falloff: f64) -> f64 {
     if !amount.is_finite() { return 0.0; }
@@ -23,50 +13,63 @@ pub(crate) fn in_range(distance: f64, optimal: f64, falloff: f64) -> bool {
     range_multiplier(distance, optimal, falloff) > 0.0
 }
 
-
-pub(crate) async fn apply_npc(
-    db: &Db, world: &World, system: i64, _source_module: i64, me: &Ball, victim: &Ball,
-    effect: &Effect, _duration_ms: f64, generation: u64,
-) -> Result<(), CallError> {
-    let sde = world.sde();
-    let value = |id| attr(sde, me.type_id, id, 0.0);
-    let optimal = effect.attribute(EffectAttribute::Range).map(value).unwrap_or(0.0);
-    let falloff = effect.attribute(EffectAttribute::Falloff).map(value).unwrap_or(0.0);
-    let distance = (dist(me.pos, victim.pos) - f64::from(me.radius) - f64::from(victim.radius)).max(0.0);
-    let guard = NpcCapacitorGuard::Hostile { source: me.id, target: victim.id, generation };
-    match effect.kind {
+pub(crate) async fn apply_source(cx: &SourceContext<'_>) -> Result<(), CallError> {
+    if !matches!(cx.phase, DronePhase::Begin) { return Ok(()); }
+    let value = |id| cx.fit.value(cx.key, id);
+    let optimal = cx.effect.attribute(EffectAttribute::Range).map(value).unwrap_or(0.0);
+    let falloff = cx.effect.attribute(EffectAttribute::Falloff).map(value).unwrap_or(0.0);
+    let distance = (dist(cx.source.pos, cx.target.pos) - f64::from(cx.source.radius) - f64::from(cx.target.radius)).max(0.0);
+    let guard = NpcCapacitorGuard::Attack {
+        source: cx.source.id, target: cx.target.id, source_guard: Some(cx.guard), player: None,
+        optimal, falloff, offensive: cx.effect.has(EffectFlag::Offensive),
+    };
+    let mut admitted_owner = None;
+    match cx.effect.kind {
         EffectKind::Neutralizer => {
             let amount = scaled_amount(value(ATTR_ENERGY_NEUTRALIZER_AMOUNT), distance, optimal, falloff);
-            drain_exact_guarded(db, world, system, victim.id, amount, guard).await?;
+            admitted_owner = drain_exact_guarded(cx.db, cx.world, cx.system, cx.target.id, amount, guard).await?;
         }
         EffectKind::Nosferatu => {
-            let Some(source) = capacitor_snapshot(db, world, system, me.id).await? else { return Ok(()) };
-            let Some(target) = capacitor_snapshot(db, world, system, victim.id).await? else { return Ok(()) };
+            let Some(source) = capacitor_snapshot(cx.db, cx.world, cx.system, cx.source.id).await? else { return Ok(()) };
+            let Some(target) = capacitor_snapshot(cx.db, cx.world, cx.system, cx.target.id).await? else { return Ok(()) };
             if nos_allowed(source.level, source.capacity, target.level, target.capacity, value(ATTR_NOS_OVERRIDE) > 0.0) {
                 let amount = scaled_amount(value(ATTR_POWER_TRANSFER_AMOUNT), distance, optimal, falloff);
-                let drained = drain_exact_guarded(db, world, system, victim.id, amount, guard).await?;
-                inject_guarded(db, world, system, me.id, drained, guard).await?;
+                if let Some((drained, owner)) = drain_exact_guarded(cx.db, cx.world, cx.system, cx.target.id, amount, guard.clone()).await? {
+                    admitted_owner = Some((drained, owner));
+                    inject_guarded(cx.db, cx.world, cx.system, cx.source.id, drained, guard).await?;
+                }
             }
         }
         EffectKind::CapTransfer => {
-            let source = me.id;
-            let hostile = victim.id;
-            let sde = sde.clone();
-            let Some((source_ball, target)) = world.with(system, move |s| {
-                if !s.npc_projection_valid(source, hostile, generation) { return None; }
-                let target = s.assist_target(source, |me, candidate| {
-                    let distance = (dist(me.pos, candidate.pos) - f64::from(me.radius) - f64::from(candidate.radius)).max(0.0);
-                    if !in_range(distance, optimal, falloff) { return None; }
-                    npc_capacitor_fraction(&sde, candidate).filter(|fraction| *fraction < 1.0)
-                })?;
-                Some((s.sampled_ball(source)?, target))
-            }).await.flatten() else { return Ok(()) };
-            let distance = (dist(source_ball.pos, target.pos) - f64::from(source_ball.radius) - f64::from(target.radius)).max(0.0);
+            let (target, distance, guard) = match cx.guard {
+                SourceGuard::Npc { source, target: hostile, generation } => {
+                    let sde = cx.world.sde().clone();
+                    let Some((source_ball, target)) = cx.world.with(cx.system, move |s| {
+                        if !s.npc_projection_valid(source, hostile, generation) { return None; }
+                        let target = s.assist_target(source, |me, candidate| {
+                            let distance = (dist(me.pos, candidate.pos) - f64::from(me.radius) - f64::from(candidate.radius)).max(0.0);
+                            if !in_range(distance, optimal, falloff) { return None; }
+                            npc_capacitor_fraction(&sde, candidate).filter(|fraction| *fraction < 1.0)
+                        })?;
+                        Some((s.sampled_ball(source)?, target))
+                    }).await.flatten() else { return Ok(()) };
+                    let distance = (dist(source_ball.pos, target.pos) - f64::from(source_ball.radius) - f64::from(target.radius)).max(0.0);
+                    (target.id, distance, NpcCapacitorGuard::Assistance { source, hostile, target: target.id, generation, optimal, falloff })
+                }
+                SourceGuard::Drone { source, target, generation } => {
+                    let Some(owner) = cx.attacker else { return Ok(()) };
+                    (target, distance, NpcCapacitorGuard::DroneAssistance { source, target, generation, optimal, falloff, owner })
+                }
+            };
             let amount = scaled_amount(value(ATTR_POWER_TRANSFER_AMOUNT), distance, optimal, falloff);
-            let guard = NpcCapacitorGuard::Assistance { source, hostile, target: target.id, generation, optimal, falloff };
-            inject_guarded(db, world, system, target.id, amount, guard).await?;
+            inject_guarded(cx.db, cx.world, cx.system, target, amount, guard).await?;
         }
-        _ => unreachable!("not an NPC capacitor effect"),
+        _ => unreachable!("not a capacitor effect"),
+    }
+    if cx.effect.has(EffectFlag::Offensive) {
+        if let (Some(attacker), Some((_, Some(victim)))) = (cx.attacker, admitted_owner) {
+            crate::services::crimewatch::aggress(cx.db, cx.world, cx.system, attacker, cx.source.type_id, cx.source.type_id, victim, cx.target.id).await?;
+        }
     }
     Ok(())
 }
