@@ -25,7 +25,7 @@ pub(crate) mod combat;
 mod charsel;
 mod config;
 mod contracts;
-mod corps;
+pub(crate) mod corps;
 mod corpwallet;
 pub(crate) mod crimewatch;
 pub(crate) mod dogma;
@@ -81,6 +81,7 @@ pub(crate) fn scheduler_registrations() -> Vec<crate::scheduler::Registration> {
         crate::scheduler::register(industry::completion::KIND, industry::completion::handle),
         crate::scheduler::register(chat::expiry::KIND, chat::expiry::handle),
         crate::scheduler::register(wars::deadlines::KIND, wars::deadlines::handle),
+        crate::scheduler::register(corps::vote_close::KIND, corps::vote_close::handle),
     ]
 }
 

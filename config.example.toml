@@ -207,7 +207,7 @@ history_days = 90                   # server completed-job history retention
 
 [corporations]
 min_management_skill_level = 1      # existing minimum Corporation Management skill level
-initial_shares = 1000               # existing initial corporation shares
+initial_shares = 1000               # founding and one-time NULL-total startup backfill; later changes do not alter issued totals
 max_bulletins = 10                  # existing corporation/alliance bulletin limit
 office_slots_per_station = 24       # server office capacity policy; capacity was not shipped
 office_rent_base_isk = 100000       # server minimum office rent

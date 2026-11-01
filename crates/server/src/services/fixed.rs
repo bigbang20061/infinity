@@ -99,8 +99,6 @@ pub(super) fn universe(call: &Call<'_>) -> Option<CallResult> {
         // A player character's corporation, or an NPC's (agents) from the SDE.
         ("corpRegistry", "GetOldApplications") | ("corpRegistry", "GetAllianceApplications") => Value::Dict(vec![]),
         ("corpRegistry", "GetPendingAutoKicks") => Value::list([]),
-        ("corpRegistry", "GetShareholders") => rowset(&["shareholderID", "shares", "shareholderCorporationID"], vec![]),
-        ("corpRegistry", "GetSharesByShareholder") => rowset(&["shareholderID", "shares", "corporationID"], vec![]),
         ("corpRegistry", "GetStructureReinforceDefault") => Value::None,
         ("corpRegistry", "DoesMyCorpAcceptStructures") | ("corpRegistry", "DoesCorpRestrictCorpMails") => Value::Bool(false),
         ("allianceRegistry", "GetDaysInAlliance") => Value::Int(0),
@@ -137,8 +135,6 @@ pub(super) fn universe(call: &Call<'_>) -> Option<CallResult> {
         ("corporationSvc", "GetMedalsReceived") => Value::tuple([Value::list([]), Value::list([])]),
         // An NPC corporation's market supply and demand (typeID, sellPrice, buyPrice...): none traded.
         ("corporationSvc", "GetCorpInfo") => Value::list([]),
-        // NPC corporations hold no shareholder votes.
-        ("voteManager", "CanViewVotes") => Value::Bool(false),
         // No shared bookmark folders exist (accessGroupBookmarkMgr.AddFolder keeps none).
         ("accessGroupBookmarkMgr", "SearchFoldersWithAdminAccess") => Value::list([]),
         ("repairableShipMgr", "GetServiceLifeDamage") => Value::Float(0.0),
