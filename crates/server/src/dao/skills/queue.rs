@@ -4,16 +4,13 @@
 use crate::db::{executor::Executor, Error};
 use tokio_postgres::Row;
 
-pub(crate) struct Finished { pub type_id: i32, pub to_level: i32, pub dest_sp: i64 }
-impl Finished { fn from_row(r: &Row) -> Self { Self { type_id: r.get("type_id"), to_level: r.get("to_level"), dest_sp: r.get("dest_sp") } } }
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct QueueEntry { pub position: i32, pub type_id: i32, pub to_level: i32, pub start_sp: i64, pub dest_sp: i64, pub start_time: Option<i64>, pub end_time: Option<i64> }
 impl QueueEntry { fn from_row(r: &Row) -> Self { Self { position: r.get("position"), type_id: r.get("type_id"), to_level: r.get("to_level"), start_sp: r.get("start_sp"), dest_sp: r.get("dest_sp"), start_time: r.get("start_time"), end_time: r.get("end_time") } } }
 pub(crate) struct Active { pub type_id: i32, pub start_sp: i64, pub dest_sp: i64, pub start_time: Option<i64>, pub end_time: Option<i64> }
 impl Active { fn from_row(r: &Row) -> Self { Self { type_id: r.get("type_id"), start_sp: r.get("start_sp"), dest_sp: r.get("dest_sp"), start_time: r.get("start_time"), end_time: r.get("end_time") } } }
-pub(crate) async fn collect_finished(ex: &(impl Executor + ?Sized), char_id: i64, now: i64) -> Result<Vec<Finished>, Error> {
-    let done: Vec<_> = ex.query("DELETE FROM game.skill_queue WHERE character_id = $1 AND end_time IS NOT NULL AND end_time <= $2\n             RETURNING type_id, to_level, dest_sp", &[&char_id, &now]).await?.iter().map(Finished::from_row).collect();
-    if !done.is_empty() { ex.execute("UPDATE game.skill_queue q SET position = n.rn - 1 FROM\n                    (SELECT position, row_number() OVER (ORDER BY position) rn FROM game.skill_queue WHERE character_id = $1) n\n                 WHERE q.character_id = $1 AND q.position = n.position", &[&char_id]).await?; }
-    Ok(done)
+pub(crate) async fn active_characters(ex: &(impl Executor + ?Sized)) -> Result<Vec<i64>, Error> {
+    Ok(ex.query("SELECT character_id FROM game.skill_queue WHERE position = 0 AND end_time IS NOT NULL ORDER BY character_id", &[]).await?.iter().map(|r| r.get("character_id")).collect())
 }
 pub(crate) async fn active(ex: &(impl Executor + ?Sized), char_id: i64) -> Result<Option<Active>, Error> {
     Ok(ex.query_opt("SELECT type_id, start_sp, dest_sp, start_time, end_time FROM game.skill_queue WHERE character_id = $1 AND position = 0", &[&char_id]).await?.as_ref().map(Active::from_row))

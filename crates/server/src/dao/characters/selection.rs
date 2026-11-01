@@ -51,8 +51,8 @@ pub(crate) async fn space_ship(ex: &(impl Executor + ?Sized), character_id: i64)
     Ok(ex.query_opt("SELECT i.item_id, i.x, i.y, i.z FROM game.characters ch JOIN game.items i ON i.item_id = ch.ship_id
              WHERE ch.character_id = $1 AND i.location_id = ch.solar_system_id AND i.x IS NOT NULL", &[&character_id]).await?.as_ref().map(SpaceShip::from_row))
 }
-/// Serialize first ship grants on the character row within the caller's transaction.
-pub(crate) async fn lock_for_ship_grant(ex: &(impl Executor + ?Sized), character_id: i64) -> Result<(), db::Error> {
+/// Lock the character row FOR UPDATE to serialize per-character mutations.
+pub(crate) async fn lock_character(ex: &(impl Executor + ?Sized), character_id: i64) -> Result<(), db::Error> {
     ex.query_one("SELECT character_id FROM game.characters WHERE character_id = $1 FOR UPDATE", &[&character_id]).await?;
     Ok(())
 }

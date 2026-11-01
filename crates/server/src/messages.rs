@@ -16,6 +16,7 @@ pub(crate) mod lua;
 pub(crate) mod loyalty;
 pub(crate) mod standings;
 pub(crate) mod trade;
+pub(crate) mod skills;
 
 // Client fitting and online UserError catalogue keys.
 pub(crate) const MSG_FITTING_HAS_SKILL_PREREQUISITES: &str = "FittingHasSkillPrerequisites";
@@ -636,6 +637,10 @@ pub(crate) const MSG_CHARACTER_NOT_FOUND: &str = "CharacterNotFound";
 pub(crate) const MSG_CHARACTER_NOT_READY_FOR_DELETION: &str = "CharacterNotReadyForDeletion";
 /// Client message `CharNameInvalid`.
 pub(crate) const MSG_CHAR_NAME_INVALID: &str = "CharNameInvalid";
+/// Client `eve/client/script/ui/services/skillsvc.py:1028-1029` combine validation.
+pub(crate) const MSG_COMBINE_SKILL_INJECTOR_TOO_FEW_INJECTORS: &str = "CombineSkillInjectorTooFewInjectors";
+/// Client `eve/client/script/ui/services/skillsvc.py:774-776` skillbook validation.
+pub(crate) const MSG_ITEM_NOT_A_SKILL: &str = "ItemNotASkill";
 /// Client message `ConContractNotFound`.
 pub(crate) const MSG_CON_CONTRACT_NOT_FOUND: &str = "ConContractNotFound";
 /// Client message `ConContractNotOutstanding`.
@@ -690,8 +695,32 @@ pub(crate) const MSG_NOT_CLOSE_ENOUGH_TO_JUMP: &str = "NotCloseEnoughToJump";
 pub(crate) const MSG_NOT_ENOUGH_MONEY: &str = "NotEnoughMoney";
 /// Client message `OnlyCEOCanResign`.
 pub(crate) const MSG_ONLY_CEO_CAN_RESIGN: &str = "OnlyCEOCanResign";
+/// Client `eve/client/script/ui/shared/neocom/attributes.py:241` validation.
+pub(crate) const MSG_RESPEC_ATTRIBUTES_TOO_LOW: &str = "RespecAttributesTooLow";
+/// Client `eve/client/script/ui/shared/neocom/attributes.py:243` validation.
+pub(crate) const MSG_RESPEC_ATTRIBUTES_TOO_HIGH: &str = "RespecAttributesTooHigh";
+/// Client `eve/client/script/ui/shared/neocom/attributes.py:250` validation.
+pub(crate) const MSG_RESPEC_ATTRIBUTES_MISALLOCATED: &str = "RespecAttributesMisallocated";
+/// Client `eve/client/script/ui/shared/neocom/attributes.py:267` entitlement refusal.
+pub(crate) const MSG_RESPEC_TOO_SOON: &str = "RespecTooSoon";
+/// Client skillQueueSvc.py queue validation refusals.
+pub(crate) const MSG_QUEUE_INVALID_POSITION: &str = "QueueInvalidPosition";
+pub(crate) const MSG_QUEUE_SKILL_NOT_UPLOADED: &str = "QueueSkillNotUploaded";
+pub(crate) const MSG_QUEUE_PREVIOUSLY_TRAINED: &str = "QueueCannotTrainPreviouslyTrainedSkills";
+pub(crate) const MSG_QUEUE_PAST_MAXIMUM: &str = "QueueCannotTrainPastMaximumLevel";
+pub(crate) const MSG_QUEUE_LEVELS_OUT_OF_ORDER: &str = "QueueCannotPlaceSkillLevelsOutOfOrder";
+pub(crate) const MSG_QUEUE_BEFORE_REQUIREMENTS: &str = "QueueCannotPlaceSkillBeforeRequirements";
+pub(crate) const MSG_QUEUE_AFTER_DEPENDENTS: &str = "QueueCannotPlaceSkillAfterDependentSkills";
+pub(crate) const MSG_QUEUE_ALREADY_PRESENT: &str = "QueueSkillAlreadyPresent";
+pub(crate) const MSG_QUEUE_TOO_MANY: &str = "QueueTooManySkills";
 /// Client message `RepackageBeforeSelling`.
 pub(crate) const MSG_REPACKAGE_BEFORE_SELLING: &str = "RepackageBeforeSelling";
+/// Client `eve/client/script/ui/services/skillsvc.py:1004-1005` extraction validation.
+pub(crate) const MSG_SKILL_EXTRACTION_NOT_ENOUGH_SP: &str = "SkillExtractionNotEnoughSP";
+/// Client `eve/client/script/ui/services/skillsvc.py:1006-1009` extraction token validation.
+pub(crate) const MSG_TOKEN_REQUIRED_FOR_SKILL_EXTRACTION: &str = "TokenRequiredForSkillExtraction";
+/// Client `eve/client/script/ui/services/skillsvc.py:1000-1001` docking validation.
+pub(crate) const MSG_SKILL_EXTRACTOR_NOT_DOCKED_IN_STATION: &str = "SkillExtractorNotDockedInStation";
 /// Client message `ShipNotFound`.
 pub(crate) const MSG_SHIP_NOT_FOUND: &str = "ShipNotFound";
 /// Client message `SlashError`.

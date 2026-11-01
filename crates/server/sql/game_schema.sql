@@ -65,6 +65,13 @@ CREATE TABLE IF NOT EXISTS game.items (
 );
 CREATE INDEX IF NOT EXISTS items_location_idx ON game.items (location_id, flag_id);
 CREATE INDEX IF NOT EXISTS items_owner_idx ON game.items (owner_id);
+-- dao/items/brain: durable augmentation metadata on installed item rows.
+ALTER TABLE game.items ADD COLUMN IF NOT EXISTS brain_slot integer;
+ALTER TABLE game.items ADD COLUMN IF NOT EXISTS brain_activated_at bigint;
+ALTER TABLE game.items ADD COLUMN IF NOT EXISTS brain_expires_at bigint;
+ALTER TABLE game.items ADD COLUMN IF NOT EXISTS brain_effect_ids integer[];
+CREATE UNIQUE INDEX IF NOT EXISTS items_brain_slot_idx ON game.items (owner_id, flag_id, brain_slot)
+    WHERE location_id = owner_id AND brain_slot IS NOT NULL;
 -- dao/items/dogma: per-item dogma base overrides.
 CREATE TABLE IF NOT EXISTS game.item_attributes (
     item_id bigint NOT NULL REFERENCES game.items(item_id) ON DELETE CASCADE,
@@ -116,6 +123,24 @@ CREATE TABLE IF NOT EXISTS game.skills (
     level        integer NOT NULL,
     skill_points bigint NOT NULL,
     PRIMARY KEY (character_id, type_id)
+);
+
+-- Skill history and authoritative character remaps (dao/skills/history, dao/characters/attributes).
+CREATE TABLE IF NOT EXISTS game.skill_history (
+    history_id bigserial PRIMARY KEY,
+    character_id bigint NOT NULL REFERENCES game.characters ON DELETE CASCADE,
+    skill_type_id integer NOT NULL,
+    event_type_id integer NOT NULL,
+    absolute_points bigint NOT NULL,
+    log_date bigint NOT NULL
+);
+CREATE INDEX IF NOT EXISTS skill_history_character_date_idx ON game.skill_history (character_id, log_date DESC, history_id DESC);
+CREATE TABLE IF NOT EXISTS game.character_respec (
+    character_id bigint PRIMARY KEY REFERENCES game.characters ON DELETE CASCADE,
+    bases integer[],
+    free_respecs bigint NOT NULL,
+    last_respec_date bigint,
+    next_timed_respec bigint
 );
 
 -- Active training queue; times are FILETIME (100ns since 1601) like the client's.

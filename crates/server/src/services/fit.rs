@@ -2,8 +2,10 @@
 //! brain items, drones and explicitly supplied incoming projections. Modifier
 //! rows and defaults come from the SDE; owned items and overrides come from the
 //! game database. Mirrors `dogma/effects/modifiers.py`, `dogma/const.py`, and
-//! `dogma/attributes/skillLevelAttribute.py`. Projection lifetime and overload
-//! activation are not managed here; callers provide a fit snapshot.
+//! `dogma/attributes/skillLevelAttribute.py`. Brain snapshots filter boosters
+//! at the evaluation time and apply only selected chance effects; historical
+//! snapshots cover rows still present, not removed items. Projection lifetime
+//! and overload activation are not managed here; callers provide a fit snapshot.
 //! Skill effects with fittingUsageChance require loading and filtering
 //! that attribute if such a skill appears in the SDE.
 //! Owner-fit drone queries do not include incoming drone projections;
@@ -17,9 +19,7 @@ use crate::sde::{dogma::{Attribute, Modifier}, types::TypeData, Sde};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use crate::consts::{ATTR_SKILL_LEVEL, ATTR_SKILL_POINTS, ATTR_SKILL_TIME_CONSTANT, CATEGORY_DRONE, FLAG_IMPLANT};
-/// SDE invCategories: Implant, exempt from stacking penalties.
-const CATEGORY_IMPLANT: i32 = 20;
+use crate::consts::{ATTR_SKILL_LEVEL, ATTR_SKILL_POINTS, ATTR_SKILL_TIME_CONSTANT, CATEGORY_DRONE, CATEGORY_IMPLANT, FLAG_IMPLANT};
 /// SDE dogma effect category: passive.
 const EFFECT_CATEGORY_PASSIVE: i32 = 0;
 /// SDE dogma effect category: active.
@@ -125,6 +125,7 @@ impl Node {
 pub struct Fit {
     nodes: HashMap<Key, Node>,
     passive_modifiers: Vec<(Key, i32, usize)>,
+    selected_effects: HashMap<i64, Vec<i32>>,
     passive_by_attribute: HashMap<i32, Vec<usize>>,
     sde: Arc<Sde>,
     memo: Mutex<HashMap<(Key, i32), f64>>,
@@ -158,7 +159,7 @@ impl Fit {
             charge_type: None, level: None, overrides: Vec::new(), charge_values: Vec::new(),
         });
         Self::insert_projections(&sde, &mut nodes, projections);
-        Fit { nodes, passive_modifiers: Vec::new(), passive_by_attribute: HashMap::new(), sde, memo: Mutex::new(HashMap::new()), projection_revision: None }
+        Fit { nodes, selected_effects: HashMap::new(), passive_modifiers: Vec::new(), passive_by_attribute: HashMap::new(), sde, memo: Mutex::new(HashMap::new()), projection_revision: None }
     }
 
     fn insert_projections(sde: &Sde, nodes: &mut HashMap<Key, Node>, projections: Vec<super::effects::projection::Projection>) {
@@ -177,11 +178,30 @@ impl Fit {
 
     /// Load the fit and explicit source-effective incoming projected effects.
     pub(crate) async fn load_projected(db: &(impl crate::db::executor::Executor + ?Sized), sde: Arc<Sde>, char_id: i64, ship: i64, projections: Vec<super::effects::projection::Projection>) -> Result<Fit, CallError> {
+        Self::load_at(db, sde, char_id, ship, projections, crate::client::filetime_now(), None).await
+    }
+
+    /// Load a character-only snapshot at an explicit FILETIME.
+    pub async fn load_character_at(db: &(impl crate::db::executor::Executor + ?Sized), sde: Arc<Sde>, char_id: i64, at: i64) -> Result<Fit, CallError> {
+        Self::load_at(db, sde, char_id, 0, Vec::new(), at, None).await
+    }
+
+    /// Evaluate the same character fit using a borrowed skill snapshot instead
+    /// of persisted skills. Levels are still derived from skill points.
+    pub(crate) async fn load_character_with_skills_at(db: &(impl crate::db::executor::Executor + ?Sized), sde: Arc<Sde>, char_id: i64, at: i64, skills: &[crate::dao::skills::training::Skill]) -> Result<Fit, CallError> {
+        Self::load_at(db, sde, char_id, 0, Vec::new(), at, Some(skills)).await
+    }
+
+    async fn load_at(db: &(impl crate::db::executor::Executor + ?Sized), sde: Arc<Sde>, char_id: i64, ship: i64, projections: Vec<super::effects::projection::Projection>, at: i64, supplied_skills: Option<&[crate::dao::skills::training::Skill]>) -> Result<Fit, CallError> {
         let ship_type = crate::dao::items::inventory::type_id(db, ship).await.map_err(db_err)?.unwrap_or(0);
-        let skills = crate::dao::skills::training::current(db, char_id).await.map_err(db_err)?;
+        let loaded_skills;
+        let skills = if let Some(skills) = supplied_skills { skills } else {
+            loaded_skills = crate::dao::skills::training::current(db, char_id).await.map_err(db_err)?;
+            &loaded_skills
+        };
         let modules = fit_dao::modules(db, ship).await.map_err(db_err)?;
         let charges = fit_dao::charges(db, ship).await.map_err(db_err)?;
-        let brain = fit_dao::brain_items(db, char_id).await.map_err(db_err)?;
+        let brain = fit_dao::brain_items(db, char_id, at).await.map_err(db_err)?;
         let drones = fit_dao::drones(db, char_id, ship).await.map_err(db_err)?;
         let ids: Vec<i64> = [ship, char_id].into_iter().chain(modules.iter().map(|m| m.item_id))
             .chain(brain.iter().map(|m| m.item_id)).chain(drones.iter().map(|m| m.item_id)).collect();
@@ -203,7 +223,7 @@ impl Fit {
         };
         nodes.insert(Key::Char, node(TYPE_CHARACTER, Location::Char, true, false, None, character));
         nodes.insert(Key::Ship, node(ship_type, Location::Space, true, false, None, overrides.remove(&ship).unwrap_or_default()));
-        for r in &skills {
+        for r in skills {
             let rank = sde.types.get(r.type_id).and_then(|d| d.fit_attribute(ATTR_SKILL_TIME_CONSTANT)).unwrap_or(0.0);
             let level = super::skills::formulas::level_from_points(r.skill_points, rank);
             nodes.insert(Key::Skill(r.type_id), node(r.type_id, Location::Char, true, false, Some(level), vec![(ATTR_SKILL_POINTS, r.skill_points as f64)]));
@@ -218,9 +238,14 @@ impl Fit {
                 nodes.insert(Key::Charge(*m), node(r.type_id, Location::Ship, true, false, None, Vec::new()));
             }
         }
-        for r in &brain {
+        let mut selected_effects = HashMap::new();
+        for r in brain {
             let key = if r.flag_id == FLAG_IMPLANT { Key::Implant(r.item_id) } else { Key::Booster(r.item_id) };
             nodes.insert(key, node(r.type_id, Location::Char, true, false, None, overrides.remove(&r.item_id).unwrap_or_default()));
+            if let Some(mut ids) = r.effect_ids {
+                ids.sort_unstable();
+                selected_effects.insert(r.item_id, ids);
+            }
         }
         for r in &drones {
             if sde.types.get(r.type_id).and_then(|d| d.category_id) == Some(CATEGORY_DRONE) {
@@ -229,12 +254,12 @@ impl Fit {
         }
         Self::insert_projections(&sde, &mut nodes, projections);
         let mut skill_effects = Vec::new();
-        for r in &skills {
+        for r in skills {
             if nodes.get(&Key::Skill(r.type_id)).and_then(|n| n.level).unwrap_or(0) <= 0 { continue; }
             if let Some(data) = sde.types.get(r.type_id) {
                 for entry in data.effects() {
                     if entry.effect_id == EFFECT_SKILL { continue; }
-                    if sde.dogma.effect(entry.effect_id).is_some_and(|effect| effect.effect_category.unwrap_or(0) == EFFECT_CATEGORY_PASSIVE) {
+                    if sde.dogma.effect(entry.effect_id).is_some_and(|effect| effect.effect_category.unwrap_or(0) == EFFECT_CATEGORY_PASSIVE && chance_enabled(&selected_effects, Key::Skill(r.type_id), data, effect)) {
                         skill_effects.push((r.type_id, entry.effect_id));
                     }
                 }
@@ -250,7 +275,7 @@ impl Fit {
                 passive_modifiers.push((Key::Skill(id), effect_id, position));
             }
         }
-        Ok(Fit { nodes, passive_modifiers, passive_by_attribute, sde, memo: Mutex::new(HashMap::new()), projection_revision: None })
+        Ok(Fit { nodes, selected_effects, passive_modifiers, passive_by_attribute, sde, memo: Mutex::new(HashMap::new()), projection_revision: None })
     }
 
     /// Include a prospective fitted item with its persisted dogma overrides.
@@ -310,7 +335,7 @@ impl Fit {
             if let Some(data) = node.data_position.map(|i| self.sde.types.at_position(i)) {
                 for entry in data.effects() {
                     if let Some(effect) = self.sde.dogma.effect(entry.effect_id) {
-                        if effect.effect_category.unwrap_or(0) == EFFECT_CATEGORY_PASSIVE {
+                        if effect.effect_category.unwrap_or(0) == EFFECT_CATEGORY_PASSIVE && chance_enabled(&self.selected_effects, key, data, effect) {
                             for modifier in effect.modifiers() { visit(key, modifier); }
                         }
                     }
@@ -416,7 +441,7 @@ impl Fit {
                     }
                 } else {
                     for (effect, m) in data.modifiers(&self.sde.dogma, attr) {
-                        if !effect_running(source, node, effect.effect_id, effect.effect_category.unwrap_or(0), &m.domain) { continue; }
+                        if !chance_enabled(&self.selected_effects, source, data, effect) || !effect_running(source, node, effect.effect_id, effect.effect_category.unwrap_or(0), &m.domain) { continue; }
                         if !self.applies(source, m, key) { continue; }
                         let value = self.value_guarded(source, m.modifying, visiting);
                         mods.push((m.op, value, !stackable && !stacking_exempt(data.category_id.unwrap_or(0))));
@@ -438,6 +463,15 @@ impl Fit {
         let value = apply(base, &mods);
         self.memo.lock().unwrap().insert((key, attr), value);
         value
+    }
+}
+
+fn chance_enabled(selected: &HashMap<i64, Vec<i32>>, source: Key, data: &TypeData, effect: &crate::sde::dogma::Effect) -> bool {
+    if !effect.fitting_usage_chance_attribute_id.is_some_and(|id| data.attribute(id).is_some()) { return true; }
+    match source {
+        Key::Booster(id) => selected.get(&id).is_some_and(|ids| ids.binary_search(&effect.effect_id).is_ok()),
+        Key::Skill(_) | Key::Implant(_) => false,
+        _ => true,
     }
 }
 

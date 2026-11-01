@@ -1,12 +1,14 @@
-//! Bound skillHandler calls; no specific client module path is established.
-//! Uses game.skills, game.skill_queue, game.characters and startup SDE data
-//! through the training and attribute helpers.
-//! History, boosters, implants, penalties and several other calls use fixed answers.
-//! The reported free respec count is an operator policy.
+//! Bound skillHandler calls used by `eve/client/script/ui/services/skillsvc.py`.
+//! Uses game.skills, game.skill_queue, game.characters, game.items and startup
+//! SDE data through the training, augmentation and attribute helpers.
+//! History, remaps and augmentations are persisted; penalties remain fixed answers.
+//! `CharStartTrainingSkill` accepts an accessible unlearned book item and its
+//! location (`skillsvc.py:763-767`); learned skills have no item identity here.
+//! Injector diminishing and rounding are server policy, not a native algorithm.
 use super::*;
 use super::attributes::character_attributes;
 use super::training::{skills_dict, queue_list, save_queue};
-use crate::client::{filetime_now, short};
+use crate::client::short;
 use marshal::Value;
 use tracing::warn;
 
@@ -39,6 +41,8 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
                 Err(e) => Err(db_err(e)),
             }
         }
+        (SKILL_HANDLER, "ApplyFreeSkillPoints") => super::free_points::apply(c, me, call.args).await,
+        (SKILL_HANDLER, "CharStartTrainingSkill") => super::books::start_training(c, me, call.args).await,
         (SKILL_HANDLER, "GetSkillPoints") => match crate::dao::skills::training::total(&c.db, me).await
         {
             Ok(points) => Ok(Value::Int(points)),
@@ -47,14 +51,18 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         (SKILL_HANDLER, "GetAttributes") => character_attributes(c, me)
             .await
             .map(|a| Value::Dict(a.into_iter().map(|(k, v)| (Value::Int(k), Value::Float(v))).collect())),
-        (SKILL_HANDLER, "GetBoosters") | (SKILL_HANDLER, "GetImplants") => Ok(Value::Dict(vec![])),
-        (SKILL_HANDLER, "GetSkillHistory") => Ok(Value::list([])),
-        (SKILL_HANDLER, "GetPenaltySkillPoints") | (SKILL_HANDLER, "GetDiminishedSpFromInjectors") => Ok(Value::Int(0)),
-        (SKILL_HANDLER, "GetRespecInfo") => Ok(keyval([
-            ("freeRespecs", Value::Int(crate::config::game().characters.free_respecs)),
-            ("lastRespecDate", Value::None),
-            ("nextTimedRespec", Value::Int(filetime_now())),
-        ])),
+        (SKILL_HANDLER, "GetBoosters") => super::brain_reads::get_boosters(c, me).await,
+        (SKILL_HANDLER, "GetImplants") => super::brain_reads::get_implants(c, me).await,
+        (SKILL_HANDLER, "GetSkillHistory") => super::history::get(c, me, call.kwargs.get("maxresults").or_else(|| call.args.first())).await,
+        (SKILL_HANDLER, "GetPenaltySkillPoints") => Ok(Value::Int(0)),
+        (SKILL_HANDLER, "GetDiminishedSpFromInjectors") => super::trading::quote(c, me, call.args).await,
+        (SKILL_HANDLER, "CheckInjectionConstraints") => super::trading::inject(c, me, call.args, true).await,
+        (SKILL_HANDLER, "InjectSkillpoints") => super::trading::inject(c, me, call.args, false).await,
+        (SKILL_HANDLER, "SplitSkillInjector") => super::trading::convert(c, me, call.args, true).await,
+        (SKILL_HANDLER, "CombineSkillInjector") => super::trading::convert(c, me, call.args, false).await,
+        (SKILL_HANDLER, "ExtractSkills") => super::trading::extract(c, me, call.args).await,
+        (SKILL_HANDLER, "GetRespecInfo") => super::respec::get(c, me).await,
+        (SKILL_HANDLER, "RespecCharacter") => super::respec::apply(c, me, call.args.first().unwrap_or(&Value::None)).await,
         (SKILL_HANDLER, m) => {
             warn!(
                 user = c.login.user_id,

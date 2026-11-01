@@ -314,3 +314,74 @@ fn node_override_precedence_and_modifier() {
 }
 
 
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
+async fn brain_snapshot_respects_activation_and_expiry() {
+    use crate::consts::{FLAG_BOOSTER, FLAG_IMPLANT};
+    use crate::dao::items::fit::brain_items;
+    use crate::services::tests::fixture;
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let f = fixture::create(&db).await.unwrap();
+    let row = db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,singleton,brain_activated_at,brain_expires_at,brain_effect_ids) VALUES (1,$1,$1,$2,true,10,20,ARRAY[7,3]) RETURNING item_id", &[&f.character, &FLAG_BOOSTER]).await.unwrap();
+    let booster: i64 = row.get("item_id");
+    let row = db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,singleton,brain_activated_at,brain_expires_at) VALUES (1,$1,$1,$2,true,10,20) RETURNING item_id", &[&f.character, &FLAG_IMPLANT]).await.unwrap();
+    let implant: i64 = row.get("item_id");
+    for (time, present) in [(9, false), (10, true), (19, true), (20, false)] {
+        let items = brain_items(&db, f.character, time).await.unwrap();
+        assert_eq!(items.iter().any(|item| item.item_id == booster), present);
+        assert!(items.iter().any(|item| item.item_id == implant));
+    }
+    db.execute("UPDATE game.items SET brain_activated_at=NULL,brain_expires_at=NULL WHERE item_id=$1", &[&booster]).await.unwrap();
+    assert!(brain_items(&db, f.character, 100).await.unwrap().iter().any(|item| item.item_id == booster));
+    fixture::cleanup(&db, f).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
+async fn selected_booster_effect_changes_fit_and_wire_brain() {
+    use crate::consts::FLAG_BOOSTER;
+    use crate::services::tests::{client, fixture};
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let f = fixture::create(&db).await.unwrap();
+    let (c, _peer) = client(db.clone(), f.character).await;
+    let mut exercised = false;
+    'types: for data in c.sde.types.iter() {
+        if data.attribute(crate::consts::ATTR_BOOSTERNESS).is_none() { continue; }
+        for entry in data.effects() {
+            let Some(effect) = c.sde.dogma.effect(entry.effect_id) else { continue };
+            if effect.effect_category.unwrap_or(0) != 0 || !effect.fitting_usage_chance_attribute_id.is_some_and(|id| data.attribute(id).is_some()) { continue; }
+            for modifier in effect.modifiers() {
+                if modifier.modified == modifier.modifying || !matches!(modifier.op, 2 | 3 | 4 | 6) { continue; }
+                let row = db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,singleton,brain_effect_ids) VALUES ($1,$2,$2,$3,true,ARRAY[]::integer[]) RETURNING item_id", &[&data.type_id, &f.character, &FLAG_BOOSTER]).await.unwrap();
+                let item: i64 = row.get("item_id");
+                db.execute("INSERT INTO game.item_attributes (item_id,attribute_id,value) VALUES ($1,$2,10)", &[&item, &modifier.modifying]).await.unwrap();
+                let before = super::Fit::load_character_at(&db, c.sde.clone(), f.character, 10).await.unwrap_or_else(|_| panic!("loading unselected fit"));
+                let source = super::Key::Booster(item);
+                let mut absent = true;
+                before.brain_modifiers(|key, m| {
+                    if key == source && std::ptr::eq(m, modifier) { absent = false; }
+                });
+                db.execute("UPDATE game.items SET brain_effect_ids=ARRAY[$2::integer] WHERE item_id=$1", &[&item, &effect.effect_id]).await.unwrap();
+                let after = super::Fit::load_character_at(&db, c.sde.clone(), f.character, 10).await.unwrap_or_else(|_| panic!("loading selected fit"));
+                let mut present = false;
+                after.brain_modifiers(|key, m| {
+                    if key == source && std::ptr::eq(m, modifier) { present = true; }
+                });
+                for target in [super::Key::Char, super::Key::Ship, source] {
+                    if before.value(target, modifier.modified) != after.value(target, modifier.modified) {
+                        assert!(absent && present);
+                        exercised = true;
+                        break;
+                    }
+                }
+                db.execute("DELETE FROM game.items WHERE item_id=$1", &[&item]).await.unwrap();
+                if exercised { break 'types; }
+            }
+        }
+    }
+    fixture::cleanup(&db, f).await.unwrap();
+    assert!(exercised, "no effective chance modifier was found in the test SDE");
+}

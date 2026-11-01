@@ -1,4 +1,5 @@
 use super::*;
+use crate::client::BRAIN_REFRESH;
 
 fn entry(position: i32, type_id: i32, start: Option<i64>, end: Option<i64>) -> queue::QueueEntry {
     queue::QueueEntry { position, type_id, to_level: 1, start_sp: 0, dest_sp: 100, start_time: start, end_time: end }
@@ -19,7 +20,7 @@ fn removing_paused_entry_preserves_unrelated_paused_entry() {
     assert_eq!((kept[0].position, kept[0].type_id, kept[0].start_time), (0, 2, None));
 }
 
-fn assert_changed_batch(outbox: Outbox, character: i64, expected: &[i32]) {
+fn assert_changed_batch(outbox: Outbox<crate::services::effects::online::OnlineChanged>, character: i64, expected: &[i32]) {
     use crate::db::outbox::{Effect, Notification};
     let mut batches = Vec::new();
     let mut queues = 0;
@@ -71,9 +72,10 @@ async fn database_gm_mutations_materialize_overdue_training_before_queue_changes
     let mut config = crate::config::tests::test_database();
     config.schema_on_start = false;
     let db = crate::db::Db::connect(&config).await.expect("database pool");
-    let sde = Sde::load(&db).await.expect("loaded SDE");
+    let sde = std::sync::Arc::new(Sde::load(&db).await.expect("loaded SDE"));
     let (mut client, connection) = tokio_postgres::connect(&config.url, tokio_postgres::NoTls).await.expect("connect");
     tokio::spawn(async move { connection.await.expect("connection"); });
+    let _market = crate::services::market::lock().await;
     let tx = client.transaction().await.expect("transaction");
     let rows = tx.query("SELECT character_id, type_id FROM game.skills WHERE character_id = (SELECT s.character_id FROM game.skills s JOIN game.characters c ON c.character_id = s.character_id WHERE NOT c.deleted GROUP BY s.character_id HAVING count(*) >= 2 ORDER BY s.character_id LIMIT 1) ORDER BY type_id LIMIT 2 FOR UPDATE", &[]).await.expect("existing skills");
     assert_eq!(rows.len(), 2);
@@ -90,10 +92,10 @@ async fn database_gm_mutations_materialize_overdue_training_before_queue_changes
     active.dest_sp = 250;
     let future = entry(2, other, Some(now + 1_000_000_000), Some(now + 2_000_000_000));
     for row in [&done, &active, &future] { queue::insert(&tx, character, row).await.expect("insert queue"); }
-    let mut outbox = Outbox::default();
-    assert!(set_levels(&tx, &mut outbox, &sde, character, &[(target, 0)]).await.is_ok());
+    let mut outbox: Outbox<crate::services::effects::online::OnlineChanged> = Outbox::default();
+    assert!(set_levels(&tx, &mut outbox, &sde, character, &[(target, 0)], filetime_now()).await.is_ok());
     assert_changed_batch(outbox, character, &[other, target]);
-    let mut outbox: Outbox = Outbox::default();
+    let mut outbox: Outbox<crate::services::effects::online::OnlineChanged> = Outbox::default();
     let skills = training::current(&tx, character).await.expect("read skills");
     let completed = skills.iter().find(|s| s.type_id == other).expect("completed skill");
     assert_eq!((completed.level, completed.skill_points), (1, 250));
@@ -108,14 +110,32 @@ async fn database_gm_mutations_materialize_overdue_training_before_queue_changes
     queue::insert(&tx, character, &done).await.expect("insert completed target");
     active.position = 1;
     queue::insert(&tx, character, &active).await.expect("insert future target");
-    assert!(remove(&tx, &mut outbox, &sde, character, &[target]).await.is_ok());
+    assert!(remove(&tx, &mut outbox, &sde, character, &[target], filetime_now()).await.is_ok());
+    let effects = outbox.into_entries();
+    let mut removed_notices = 0;
+    let mut changed_notices = 0;
+    let mut brains = 0;
+    let mut trained = 0;
+    for effect in effects {
+        match effect {
+            crate::db::outbox::Effect::Notification(crate::db::outbox::Notification::Pilot { event, .. }) => {
+                if event == "OnServerSkillsRemoved" { removed_notices += 1; }
+                if event == "OnServerSkillsChanged" { changed_notices += 1; }
+                if event == BRAIN_REFRESH { brains += 1; }
+            }
+            crate::db::outbox::Effect::Event(crate::lua::events::GameEvent::SkillTrained { char_id, type_id, level }) if char_id == character && type_id == target && level == 1 => trained += 1,
+            _ => {}
+        }
+    }
+    assert_eq!((removed_notices, changed_notices, brains, trained), (1, 0, 1, 1));
+    let mut outbox: Outbox<crate::services::effects::online::OnlineChanged> = Outbox::default();
     assert!(queue::list(&tx, character).await.expect("read queue").is_empty());
-    assert!(super::super::training::advance_training(&tx, character, filetime_now()).await.is_ok());
+    assert!(completion::advance_tx(&tx, &mut outbox, &sde, character, filetime_now()).await.is_ok());
     assert!(training::current(&tx, character).await.expect("read skills").iter().all(|s| s.type_id != target));
     training::set_level(&tx, character, other, 0, 0).await.expect("reset skill");
     done.type_id = other;
     queue::insert(&tx, character, &done).await.expect("insert unrelated completed skill");
-    assert!(set_levels(&tx, &mut outbox, &sde, character, &[(target, 0)]).await.is_ok());
+    assert!(set_levels(&tx, &mut outbox, &sde, character, &[(target, 0)], filetime_now()).await.is_ok());
     let skills = training::current(&tx, character).await.expect("read skills");
     let completed = skills.iter().find(|s| s.type_id == other).expect("completed skill");
     assert_eq!((completed.level, completed.skill_points), (1, 250));
@@ -125,12 +145,16 @@ async fn database_gm_mutations_materialize_overdue_training_before_queue_changes
     training::set_level(&tx, character, other, 0, 0).await.expect("reset skill");
     queue::clear(&tx, character).await.expect("clear queue");
     queue::insert(&tx, character, &done).await.expect("insert completed skill");
-    let mut starters_outbox = Outbox::default();
-    assert!(grant_starters(&tx, &mut starters_outbox, &sde, character).await.is_ok());
+    let mut starters_outbox: Outbox<crate::services::effects::online::OnlineChanged> = Outbox::default();
+    assert!(grant_starters(&tx, &mut starters_outbox, &sde, character, filetime_now()).await.is_ok());
     assert_changed_batch(starters_outbox, character, &[other, seed]);
     let skills = training::current(&tx, character).await.expect("read skills");
     let completed = skills.iter().find(|s| s.type_id == other).expect("completed skill");
     assert_eq!((completed.level, completed.skill_points), (1, 250));
+    let history = crate::dao::skills::history::list(&tx, character, 1000).await.expect("history");
+    assert!(history.iter().any(|row| row.skill_type_id == target && row.event_type_id == super::super::history::REMOVED && row.absolute_points == 250));
+    assert!(history.iter().any(|row| row.skill_type_id == target && row.event_type_id == super::super::history::GM_GIVE && row.absolute_points == 0));
+    assert!(history.iter().any(|row| row.skill_type_id == other && row.event_type_id == super::super::history::TRAINING_COMPLETE && row.absolute_points == 250));
     tx.rollback().await.expect("rollback");
 }
 
@@ -143,9 +167,10 @@ async fn database_gm_set_queues_only_completed_training_event_once() {
     let mut config = crate::config::tests::test_database();
     config.schema_on_start = false;
     let db = crate::db::Db::connect(&config).await.expect("database pool");
-    let sde = Sde::load(&db).await.expect("loaded SDE");
+    let sde = std::sync::Arc::new(Sde::load(&db).await.expect("loaded SDE"));
     let (mut client, connection) = tokio_postgres::connect(&config.url, tokio_postgres::NoTls).await.expect("connect");
     tokio::spawn(async move { connection.await.expect("connection"); });
+    let _market = crate::services::market::lock().await;
     let tx = client.transaction().await.expect("transaction");
     let rows = tx.query("SELECT character_id, type_id FROM game.skills WHERE character_id = (SELECT s.character_id FROM game.skills s JOIN game.characters c ON c.character_id = s.character_id WHERE NOT c.deleted GROUP BY s.character_id HAVING count(*) >= 2 ORDER BY s.character_id LIMIT 1) ORDER BY type_id LIMIT 2 FOR UPDATE", &[]).await.expect("existing skills");
     assert_eq!(rows.len(), 2);
@@ -160,9 +185,9 @@ async fn database_gm_set_queues_only_completed_training_event_once() {
     done.dest_sp = 1415;
     queue::insert(&tx, character, &done).await.expect("insert completed training");
 
-    let mut outbox: Outbox = Outbox::default();
-    assert!(set_levels(&tx, &mut outbox, &sde, character, &[(granted, 3)]).await.is_ok(), "grant level");
-    assert!(set_levels(&tx, &mut outbox, &sde, character, &[(granted, 3)]).await.is_ok(), "repeat grant");
+    let mut outbox: Outbox<crate::services::effects::online::OnlineChanged> = Outbox::default();
+    assert!(set_levels(&tx, &mut outbox, &sde, character, &[(granted, 3)], filetime_now()).await.is_ok(), "grant level");
+    assert!(set_levels(&tx, &mut outbox, &sde, character, &[(granted, 3)], filetime_now()).await.is_ok(), "repeat grant");
     tx.rollback().await.expect("rollback without dispatch");
     let events: Vec<_> = outbox.into_entries().into_iter().filter_map(|effect| match effect {
         Effect::Event(event) => Some(event),

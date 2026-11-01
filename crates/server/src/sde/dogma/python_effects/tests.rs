@@ -4,6 +4,7 @@ fn effect(name: &str) -> Effect {
     Effect {
         effect_id: 1, name: Some(name.into()), guid: None, effect_category: None,
         duration_attribute_id: None, is_offensive: false, is_assistance: false,
+        fitting_usage_chance_attribute_id: None,
         disallow_auto_repeat: false, electronic_chance: false, propulsion_chance: false,
         discharge_attribute_id: None, range_attribute_id: None, falloff_attribute_id: None,
         tracking_attribute_id: None, modifiers: Vec::new(),

@@ -30,7 +30,7 @@ impl PublicInfo {
         }
     }
 }
-pub(crate) async fn public_info(ex: &impl Executor, id: i64, second: i64, epoch: i64) -> Result<Option<PublicInfo>, Error> {
+pub(crate) async fn public_info(ex: &(impl Executor + ?Sized), id: i64, second: i64, epoch: i64) -> Result<Option<PublicInfo>, Error> {
     let row = ex.query_opt(
         "SELECT name, corporation_id, race_id, bloodline_id, ancestry_id, school_id, gender_id,\n                    (extract(epoch FROM created_at) * $2::bigint)::bigint + $3::bigint AS created\n             FROM game.characters WHERE character_id = $1",
         &[&id, &second, &epoch],

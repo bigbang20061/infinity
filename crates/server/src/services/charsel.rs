@@ -176,7 +176,7 @@ async fn ensure_ship(c: &Client, char_id: i64, race_id: i32, station_id: i64) ->
     let ship_type = c.sde.characters.race(race_id as i64).and_then(|race| race.ship_type_id).unwrap_or(FALLBACK_ROOKIE_SHIP);
     let ship_id = c.db.transaction(
         |tx, _: &mut Outbox| Box::pin(async move {
-            characters::selection::lock_for_ship_grant(tx, char_id).await?;
+            characters::selection::lock_character(tx, char_id).await?;
             if let Some(ship_id) = characters::selection::ship_id(tx, char_id).await? {
                 return Ok::<i64, CallError>(ship_id);
             }

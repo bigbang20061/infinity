@@ -4,8 +4,7 @@
 use super::{args::{self, Args}, slash_error, CallError, Client};
 use crate::{messages, services::skills::gm::{self, Change}};
 
-/// characterskills/util.py maximum trained skill level.
-const MAX_LEVEL: i32 = 5;
+use crate::consts::MAX_SKILL_LEVEL as MAX_LEVEL;
 
 fn level(text: Option<&str>) -> Result<i32, CallError> {
     match text {

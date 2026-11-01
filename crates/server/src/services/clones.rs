@@ -10,15 +10,13 @@
 
 use super::{crowset, db_err, notify_error, value_text, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
-use crate::consts::{FILETIME_HOUR, FLAG_HANGAR, TYPE_CAPSULE};
+use crate::consts::{FILETIME_HOUR, FLAG_HANGAR, TYPE_CAPSULE, SKILL_INFOMORPH_PSYCHOLOGY, SKILL_ADVANCED_INFOMORPH_PSYCHOLOGY};
 use crate::dao::{characters::clones as clone_dao, items::{clones as item_dao, creation}, skills::levels as skill_dao};
 use crate::db::outbox::{Effect, Outbox};
 use crate::messages;
 use marshal::{DbRowDescriptor, DbType, Value};
 use tracing::info;
 
-const SKILL_INFOMORPH_PSYCHOLOGY: i32 = 24242;
-const SKILL_ADVANCED_INFOMORPH_PSYCHOLOGY: i32 = 33407;
 const SKILL_INFOMORPH_SYNCHRONIZING: i32 = 33399;
 /// Existing server policy: maximum jump clone name characters.
 const MAX_CLONE_NAME_LENGTH: usize = 100;
