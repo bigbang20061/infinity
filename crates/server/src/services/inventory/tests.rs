@@ -3,6 +3,7 @@ use super::movement::{move_core, move_item};
 use crate::consts::FLAG_CORP_SAG1;
 use crate::consts::ROLE_HANGAR_CAN_TAKE_1;
 mod deliveries;
+mod reachability;
 
 fn item(id: i64, quantity: i32) -> Item {
     Item { item_id: id, type_id: 1, owner_id: 1, location_id: 1, flag_id: 1, quantity, singleton: false, group_id: 1, category_id: 1, custom_info: None }
@@ -187,7 +188,7 @@ async fn reserved_shared_move_rolls_back_prior_writes_and_notifications() {
 async fn move_fingerprint(db: &crate::db::Db) -> Vec<String> {
     let mut result = Vec::new();
     for table in ["items", "module_charges", "weapon_banks", "pending_reloads"] {
-        let query = format!("SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY row_to_json(t)::text), '')) AS fingerprint FROM game.{table} t");
+        let query = format!("SELECT count(*)::text || ':' || md5(COALESCE(string_agg(md5(row_to_json(t)::text), '' ORDER BY md5(row_to_json(t)::text)), '')) AS fingerprint FROM game.{table} t");
         result.push(db.query_one(&query, &[]).await.unwrap().get("fingerprint"));
     }
     result
@@ -200,10 +201,10 @@ async fn move_item_authorizes_sources_and_destinations() {
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let sde = Arc::new(Sde::load(&db).await.unwrap());
-    let type_id = sde.types.iter().find(|t| t.category_id != Some(crate::consts::CATEGORY_MODULE) && t.category_id != Some(crate::consts::CATEGORY_SUBSYSTEM)).unwrap().type_id;
+    let type_id = sde.types.iter().find(|t| t.category_id == Some(crate::consts::CATEGORY_CHARGE) && t.published == Some(true)).unwrap().type_id;
     let ship_type = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_SHIP)).unwrap().type_id;
-    let wreck_type = sde.types.iter().find(|t| t.group_id == Some(crate::consts::GROUP_WRECK)).unwrap().type_id;
-    let container_type = sde.types.iter().find(|t| t.group_id == Some(crate::consts::GROUP_CARGO_CONTAINER)).unwrap().type_id;
+    let wreck_type = sde.types.iter().find(|t| t.group_id == Some(crate::consts::GROUP_WRECK) && t.attribute(715).is_none()).unwrap().type_id;
+    let container_type = sde.types.iter().find(|t| t.group_id == Some(crate::consts::GROUP_CARGO_CONTAINER) && t.attribute(715).is_none()).unwrap().type_id;
     let account: i64 = db.query_one("INSERT INTO game.accounts (user_name, password_hash, role) VALUES ('inventory-auth-' || nextval('game.accounts_user_id_seq')::text, $1, 0) RETURNING user_id", &[&&b"fixture"[..]]).await.unwrap().get("user_id");
     let mut chars = Vec::new();
     for _ in 0..2 {
@@ -211,7 +212,15 @@ async fn move_item_authorizes_sources_and_destinations() {
         chars.push(row.get::<_, i64>("character_id"));
     }
     let (me, other) = (chars[0], chars[1]);
-    let station = -100_i64;
+    let mut station = None;
+    for candidate in sde.map.stations() {
+        if crate::dao::offices::at(&db, 1, candidate.station_id).await.unwrap().is_none()
+            && crate::dao::offices::at(&db, 2, candidate.station_id).await.unwrap().is_none() {
+            station = Some(candidate.station_id);
+            break;
+        }
+    }
+    let station = station.expect("SDE must contain a station without either fixture corporation's office");
     let system = -101_i64;
     let insert = |type_id, owner, location, flag| {
         let db = &db;
@@ -227,6 +236,7 @@ async fn move_item_authorizes_sources_and_destinations() {
     crate::dao::offices::insert(&db, foreign_office, 2, station, 1).await.unwrap();
     let wreck = insert(wreck_type, other, system, FLAG_HANGAR).await;
     let can = insert(container_type, other, system, FLAG_HANGAR).await;
+    db.execute("UPDATE game.items SET singleton = true WHERE item_id = ANY($1)", &[&&[own_ship, foreign_ship, own_container, foreign_container, wreck, can][..]]).await.unwrap();
     db.execute("UPDATE game.items SET location_id = $2, x = 0, y = 0, z = 0 WHERE item_id = ANY($1)", &[&&[wreck, can, foreign_ship][..], &system]).await.unwrap();
     let mut foreign = Vec::new();
     for (location, flag) in [(foreign_ship, FLAG_CARGO), (foreign_ship, FLAG_FITTING_FIRST), (foreign_ship, crate::consts::FLAG_DRONE_BAY), (foreign_container, FLAG_HANGAR), (station, FLAG_HANGAR)] {
@@ -292,9 +302,10 @@ async fn move_item_authorizes_sources_and_destinations() {
     assert!(move_item(&mut client, &Container::Item(own_ship), own, None, Some(FLAG_FITTING_FIRST), None).await.is_err());
     assert_eq!(move_fingerprint(&db).await, before);
     assert!(client.outbox.is_empty());
+    db.execute("UPDATE game.items SET location_id = $2 WHERE item_id = $1", &[&own_ship, &system]).await.unwrap();
     client.session.apply(vec![("stationid", Value::None), ("solarsystemid", Value::Int(system))]);
     let ball = |id, x| crate::space::Ball {
-        id, type_id: 1, owner_id: me, corp_id: 1, alliance_id: 0, char_id: None,
+        id, type_id: 1, owner_id: me, corp_id: 1, alliance_id: 0, char_id: (id == own_ship).then_some(me),
         mode: crate::space::MODE_STOP, radius: 50.0, signature_radius: None, mass: 1.0, max_vel: 0.0, agility: 1.0, speed_fraction: 0.0,
         pos: [x, 0.0, 0.0], vel: [0.0; 3], old_pos: [x, 0.0, 0.0], old_vel: [0.0; 3], segment_acceleration: None,
         goto: [0.0; 3], follow_id: 0, follow_range: 0.0, free: true, global: false, massive: false, interactive: false,

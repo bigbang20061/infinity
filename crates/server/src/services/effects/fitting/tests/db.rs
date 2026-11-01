@@ -31,6 +31,7 @@ async fn fitting_online_priming_and_slash() {
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let sde = Arc::new(Sde::load(&db).await.unwrap());
+    let station = sde.map.stations().next().expect("station in SDE").station_id;
     let ship_type = sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_SHIP)
         && t.attribute(14).is_some_and(|v| v >= 2.0)).expect("published ship with two high slots").type_id;
     let module_type = sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_MODULE)
@@ -44,6 +45,7 @@ async fn fitting_online_priming_and_slash() {
     let required: Vec<_> = ATTR_REQUIRED_SKILLS.iter().filter_map(|a| sde.types.get(module_type).and_then(|t| t.attribute(*a)).filter(|v| *v > 0.0).map(|v| (v as i32, 5))).collect();
     let before = fixture::fingerprint(&db).await.unwrap();
     let f = fixture::create(&db, ship_type, module_type).await.unwrap();
+    db.execute("UPDATE game.items SET location_id=$2, flag_id=$3 WHERE item_id=$1", &[&f.ship, &station, &crate::consts::FLAG_HANGAR]).await.unwrap();
     let world = World::new(db.clone(), sde.clone(), 1);
     let test_db = db.clone();
     let test_world = world.clone();
@@ -53,7 +55,7 @@ async fn fitting_online_priming_and_slash() {
         let (stream, address) = listener.accept().await.unwrap();
         let mut client = Client::new(crate::conn::Conn::new(stream, address), Arc::new(crate::config::Config::default()), test_db.clone(), sde.clone(),
             crate::chat::Hub::new("localhost"), test_world.clone(), crate::handshake::Login { user_id: f.account, user_name: "fitting-fixture".into(), role: GM_ROLES, client_id: 1, session_id: 1, language_id: "EN".into() });
-        client.session.apply(vec![("charid", Value::Int(f.owner)), ("shipid", Value::Int(f.ship))]);
+        client.session.apply(vec![("charid", Value::Int(f.owner)), ("shipid", Value::Int(f.ship)), ("stationid", Value::Int(station))]);
         let (notify, mut events) = tokio::sync::mpsc::unbounded_channel();
         client.notify_tx = notify;
         let drone = sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(crate::consts::CATEGORY_DRONE)
