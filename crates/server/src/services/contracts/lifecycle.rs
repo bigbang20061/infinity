@@ -1,5 +1,6 @@
 //! Contract lifecycle mechanics for contractProxy, mirroring eve/client/script/ui/shared/neocom/contracts.
 //! Uses game contracts and items through database access and immutable SDE types and stations; corporation contracts are unsupported.
+//! Requested exchange items retain their identity, state and contents when handed over.
 //! Expiry, courier duration, item counts and text lengths use the configured contracts policy.
 
 use super::*;
@@ -53,19 +54,26 @@ pub(super) async fn create(c: &Client, info: &Value) -> CallResult {
             _ => None,
         })
         .collect();
-    let requested: Vec<(i32, i32)> = if kind == TYPE_ITEM_EXCHANGE {
-        field(info, "requestItemTypeList")
-            .and_then(|v| v.items())
-            .unwrap_or(&[])
-            .iter()
-            .filter_map(|e| match e.items()? {
-                [t, qty, ..] => Some((t.as_int()? as i32, qty.as_int().unwrap_or(1).clamp(1, i32::MAX as i64) as i32)),
-                _ => None,
-            })
-            .collect()
-    } else {
-        vec![]
-    };
+    let mut requested = Vec::new();
+    if kind == TYPE_ITEM_EXCHANGE {
+        if let Some(value) = field(info, "requestItemTypeList") {
+            let entries = value.items().ok_or_else(|| notify_error(messages::CONTRACT_REQUIRED_ITEMS_MISSING))?;
+            for entry in entries {
+                let (type_id, qty) = match entry.items() {
+                    Some([t, q, ..]) => (t.as_int(), q.as_int()),
+                    _ => (None, None),
+                };
+                let type_id = type_id.and_then(|v| i32::try_from(v).ok()).filter(|v| *v > 0)
+                    .ok_or_else(|| notify_error(messages::CONTRACT_REQUIRED_ITEMS_MISSING))?;
+                let qty = qty.and_then(|v| i32::try_from(v).ok()).filter(|v| *v > 0)
+                    .ok_or_else(|| notify_error(messages::CONTRACT_REQUIRED_ITEMS_MISSING))?;
+                if sde.types.get(type_id).is_none() || requested.iter().any(|(t, _)| *t == type_id) {
+                    return Err(notify_error(messages::CONTRACT_REQUIRED_ITEMS_MISSING));
+                }
+                requested.push((type_id, qty));
+            }
+        }
+    }
     match kind {
         TYPE_AUCTION if items.is_empty() => return Err(notify_error(messages::AUCTION_REQUIRES_ITEMS)),
         TYPE_AUCTION if collateral > 0.0 && collateral < price => return Err(notify_error(messages::BUYOUT_BELOW_START_PRICE)),
@@ -186,27 +194,61 @@ pub(super) async fn accept(c: &Client, id: i64) -> CallResult {
                     // The requested items must all be in the acceptor's hangar at the start station.
                     let wanted = contract_dao::requested_items(db, id).await.map_err(db_err)?;
                     let mut takes = vec![];
+                    let mut types = std::collections::HashSet::new();
                     for w in &wanted {
                         let (type_id, qty) = (w.type_id, w.quantity);
-                        let stacks = load_items(db, &sde, ItemQuery::OwnerLocationFlagTypeDescending(me, k.start, FLAG_HANGAR, type_id)).await.map_err(db_err)?;
-                        let have: i64 = stacks.iter().map(|s| if s.singleton { 1 } else { s.quantity as i64 }).sum();
-                        if have < qty as i64 {
+                        if type_id <= 0 || qty <= 0 || !types.insert(type_id) || sde.types.get(type_id).is_none() {
                             return Err(notify_error(messages::CONTRACT_REQUIRED_ITEMS_MISSING));
                         }
-                        takes.push((type_id, qty, stacks));
+                        let stacks = load_items(db, &sde, ItemQuery::OwnerLocationFlagTypeDescending(me, k.start, FLAG_HANGAR, type_id)).await.map_err(db_err)?;
+                        let have: i64 = stacks.iter().map(|s| if s.singleton { 1 } else { i64::from(s.quantity.max(0)) }).sum();
+                        if have < i64::from(qty) {
+                            return Err(notify_error(messages::CONTRACT_REQUIRED_ITEMS_MISSING));
+                        }
+                        let mut left = qty;
+                        for item in stacks {
+                            if left == 0 { break; }
+                            let n = if item.singleton { 1 } else { item.quantity.min(left) };
+                            if n <= 0 { continue; }
+                            left -= n;
+                            takes.push((item, n));
+                        }
+                    }
+                    takes.sort_unstable_by_key(|(item, _)| item.item_id);
+                    let ids: Vec<_> = takes.iter().map(|(item, _)| item.item_id).collect();
+                    let tree = crate::dao::trades::descendants(db, &ids).await.map_err(db_err)?;
+                    if !crate::dao::trades::reserved(db, &tree).await.map_err(db_err)?.is_empty() {
+                        return Err(notify_error(messages::trade::TRADE_ITEM_RESERVED));
                     }
                     debit(db, outbox, me, k.price).await?;
-                    for (type_id, qty, stacks) in takes {
-                        let mut left = qty;
-                        for s in stacks {
-                            if left == 0 {
-                                break;
+                    let mut plan = Vec::new();
+                    let mut full_ids = std::collections::HashSet::new();
+                    for (item, quantity) in takes {
+                        let item_id = if !item.singleton && quantity < item.quantity {
+                            let id = super::super::inventory::split_stack(db, &item, quantity, me, k.start, FLAG_HANGAR, false).await?;
+                            let remaining = Item { quantity: item.quantity - quantity, ..item.clone() };
+                            outbox.notify_pilot(me, "OnItemChange", vec![remaining.row(), Value::Dict(vec![(Value::Int(IX_STACK_SIZE), Value::Int(i64::from(item.quantity)))]), Value::None]);
+                            id
+                        } else {
+                            if !crate::dao::items::inventory::move_item(db, &item, item.location_id, item.flag_id, item.owner_id, item.singleton).await.map_err(db_err)? {
+                                return Err(notify_error(messages::CONTRACT_REQUIRED_ITEMS_MISSING));
                             }
-                            let n = if s.singleton { 1 } else { s.quantity.min(left) };
-                            take_items(db, outbox, s, n).await?;
-                            left -= n;
+                            full_ids.insert(item.item_id);
+                            item.item_id
+                        };
+                        plan.push(transfers::Transfer { item_id, owner: k.issuer, location: k.start, flag: FLAG_HANGAR });
+                    }
+                    transfers::hand_over(db, &plan).await.map_err(db_err)?;
+                    let ids: Vec<_> = plan.iter().map(|transfer| transfer.item_id).collect();
+                    let docked = transfers::docked(db, k.issuer).await.map_err(db_err)? == Some(k.start);
+                    for item in load_items(db, &sde, ItemQuery::Ids(&ids)).await.map_err(db_err)? {
+                        let change = Value::Dict(vec![(Value::Int(IX_OWNER_ID), Value::Int(me))]);
+                        if full_ids.contains(&item.item_id) {
+                            outbox.notify_pilot(me, "OnItemChange", vec![item.row(), change.clone(), Value::None]);
                         }
-                        deliver(db, &sde, outbox, k.issuer, k.start, type_id, qty).await?;
+                        if docked {
+                            outbox.notify_pilot(k.issuer, "OnItemChange", vec![item.row(), change, Value::None]);
+                        }
                     }
                     credit(db, outbox, k.issuer, k.price).await?;
                     credit(db, outbox, me, k.reward).await?;

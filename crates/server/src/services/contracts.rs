@@ -31,13 +31,13 @@ use lists::{bidding_on, escrow, in_progress, items_in, list_for_owner, login_inf
 
 use crate::dao::contracts::{Contract, query::{self, Filter}, shared};
 use crate::dao::items::loading::{Item, ItemQuery};
-use super::items::{deliver, load_items, take_items};
+use super::items::{load_items, take_items};
 use super::market::{lock, round2, station};
 use super::wallets::{credit, debit};
 use crate::dao::items::transfers;
 use super::{db_err, keyval, notify_error, user_error, value_id_list, value_text, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
-use crate::consts::{ACCOUNT_CASH, FILETIME_DAY, FILETIME_MINUTE, FLAG_HANGAR, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD};
+use crate::consts::{ACCOUNT_CASH, FILETIME_DAY, FILETIME_MINUTE, FLAG_HANGAR, IX_LOCATION_ID, IX_OWNER_ID, IX_STACK_SIZE, LOCATION_JUNKYARD};
 use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::{dispatch_world, Outbox};
