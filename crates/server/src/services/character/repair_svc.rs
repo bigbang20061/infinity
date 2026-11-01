@@ -7,7 +7,7 @@
 //! Payment and full-quote comparison use wallet-cent precision; zero-cent charges are refused.
 //! Structure facilities and in-space paste repair are not modelled.
 use super::*;
-use crate::consts::{dogma::ATTR_ARMOR_DAMAGE, dogma::ATTR_ARMOR_HP, dogma::ATTR_HULL_DAMAGE, CARGO_CONTAINER_GROUPS, CATEGORY_DRONE, CATEGORY_MODULE, CATEGORY_SHIP, FLAG_HANGAR};
+use crate::consts::{dogma::ATTR_ARMOR_DAMAGE, dogma::ATTR_ARMOR_HP, dogma::ATTR_HULL_DAMAGE, CARGO_CONTAINER_GROUPS, CATEGORY_DRONE, CATEGORY_MODULE, CATEGORY_SHIP, CATEGORY_STARBASE, FLAG_HANGAR};
 use crate::dao::items::{dogma, repair};
 use crate::db::{executor::Executor, outbox::{dispatch_world, Outbox}};
 use crate::services::{combat, effects::notify::attribute_change, fit::{Fit, Key}, inventory::is_fitting_flag, market, notify_error, wallets};
@@ -17,8 +17,6 @@ use std::sync::Arc;
 const CATEGORY_STRUCTURE_MODULE: i32 = 66;
 /// Client inventorycommon.const.categoryDeployable.
 const CATEGORY_DEPLOYABLE: i32 = 22;
-/// Client inventorycommon.const.categoryStarbase.
-const CATEGORY_STARBASE: i32 = 23;
 /// Client inventorycommon.const.groupTool.
 const GROUP_TOOL: i32 = 332;
 

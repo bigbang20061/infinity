@@ -98,6 +98,10 @@ pub const CATEGORY_MODULE: i32 = 7;
 pub const CATEGORY_CHARGE: i32 = 8;
 /// SDE invCategories: Entity.
 pub const CATEGORY_ENTITY: i32 = 11;
+/// Client `inventorycommon.const.categoryStarbase`; SDE invCategories: Starbase.
+pub const CATEGORY_STARBASE: i32 = 23;
+/// Client `inventorycommon.const.categoryStructure`; SDE invCategories: Structure.
+pub const CATEGORY_STRUCTURE: i32 = 65;
 /// SDE invCategories: Skill.
 pub const CATEGORY_SKILL: i32 = 16;
 /// SDE invCategories: Drone.
@@ -196,6 +200,11 @@ pub const ORG_NAME_MAX_LENGTH: usize = 50;
 pub const ORG_SHORT_NAME_MIN_LENGTH: usize = 2;
 /// Maximum corporation or alliance short name length.
 pub const ORG_SHORT_NAME_MAX_LENGTH: usize = 5;
+
+/// SDE invTypes: Corporation.
+pub const TYPE_CORPORATION: i64 = 2;
+/// SDE invTypes: Alliance.
+pub const TYPE_ALLIANCE: i64 = 16159;
 
 // Client corporation public row conventions.
 /// Client corporation row: hangar and wallet division name count.
