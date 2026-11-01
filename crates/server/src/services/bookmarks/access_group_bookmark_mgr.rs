@@ -1,9 +1,122 @@
-//! accessGroupBookmarkMgr for `eve/client/script/ui/shared/bookmarks/bookmarkSvc.py`.
-//! Uses personal bookmark tables and SDE locations; shared access-group folders are unsupported.
+//! `accessGroupBookmarkMgr` folder reads and known subscriptions for `bookmarkSvc.py`.
+//! Uses bookmark folders and known rows; affiliation changes are checked on each request.
 use super::*;
 
-/// `BookmarkStaticLocation(itemID, folderID, name, comment, expiry, subfolderID=)`: a region,
-/// constellation, solar system or station.
+
+fn unavailable() -> CallError {
+    CallError::User { msg: messages::MSG_BOOKMARK_FOLDER_NO_LONGER_THERE.into(), dict: vec![] }
+}
+
+async fn contents(ex: &(impl Executor + ?Sized), ids: &[i64]) -> Result<(Value, Value), CallError> {
+    let bookmarks = dao::bookmarks(ex, ids, filetime_now()).await.map_err(db_err)?;
+    let subfolders = dao::subfolders(ex, ids).await.map_err(db_err)?;
+    Ok((Value::list(bookmarks.iter().map(bookmark_row)), Value::list(subfolders.iter().map(subfolder_row))))
+}
+
+async fn collection(c: &Client, me: i64, gated: bool) -> Result<Option<Value>, CallError> {
+    c.db.transaction(|tx, _: &mut Outbox| Box::pin(async move {
+        let known = dao::known::known(tx, me).await.map_err(db_err)?;
+        let mut folders = Vec::new();
+        let mut active = Vec::new();
+        for row in known {
+            let Some(folder) = dao::folder(tx, row.folder_id).await.map_err(db_err)? else { continue };
+            if !folder.is_personal && !gated { return Ok(None); }
+            let tier = access::tier(tx, me, &folder).await?;
+            if tier == access::NONE {
+                if gated { dao::known::remove_known(tx, me, row.folder_id).await.map_err(db_err)?; }
+                continue;
+            }
+            if row.is_active { active.push(folder.folder_id); }
+            folders.push(folder_row(&folder, row.is_active, tier));
+        }
+        let (bookmarks, subfolders) = contents(tx, &active).await?;
+        Ok(Some(Value::tuple([Value::list(folders), bookmarks, subfolders])))
+    }), |value, _| async move { Ok(value) }).await
+}
+
+async fn get_collection(c: &Client, me: i64) -> CallResult {
+    if let Some(value) = collection(c, me, false).await? { return Ok(value); }
+    let _guard = crate::services::access_groups::lock().await;
+    collection(c, me, true).await?.ok_or_else(unavailable)
+}
+
+async fn info(c: &Client, me: i64, id: i64) -> CallResult {
+    let folder = dao::folder(&c.db, id).await.map_err(db_err)?.ok_or_else(unavailable)?;
+    let _guard = if folder.is_personal { None } else { Some(crate::services::access_groups::lock().await) };
+    c.db.transaction(|tx, _: &mut Outbox| Box::pin(async move {
+        let Some(folder) = dao::folder(tx, id).await.map_err(db_err)? else { return Ok::<_, CallError>(None) };
+        let tier = access::tier(tx, me, &folder).await?;
+        if tier == access::NONE {
+            if !folder.is_personal { dao::known::remove_known(tx, me, id).await.map_err(db_err)?; }
+            return Ok(None);
+        }
+        let active = dao::known::known(tx, me).await.map_err(db_err)?.iter().any(|row| row.folder_id == id && row.is_active);
+        Ok(Some(folder_row(&folder, active, tier)))
+    }), |value, _| async move { Ok(value) }).await?.ok_or_else(unavailable)
+}
+
+async fn search(c: &Client, me: i64) -> CallResult {
+    let _guard = crate::services::access_groups::lock().await;
+    c.db.transaction(|tx, _: &mut Outbox| Box::pin(async move {
+        let known = dao::known::known(tx, me).await.map_err(db_err)?;
+        let mut rows = Vec::new();
+        for folder in dao::all_folders(tx).await.map_err(db_err)? {
+            if !folder.is_personal {
+                let tier = access::tier(tx, me, &folder).await?;
+                if tier == access::NONE && known.iter().any(|row| row.folder_id == folder.folder_id) {
+                    dao::known::remove_known(tx, me, folder.folder_id).await.map_err(db_err)?;
+                } else if tier == access::ADMIN {
+                    let active = known.iter().any(|row| row.folder_id == folder.folder_id && row.is_active);
+                    rows.push(folder_row(&folder, active, access::ADMIN));
+                }
+            }
+        }
+        Ok(Value::list(rows))
+    }), |value, _| async move { Ok(value) }).await
+}
+
+async fn set_known(c: &Client, me: i64, id: i64, active: bool) -> CallResult {
+    let _guard = crate::services::access_groups::lock().await;
+    c.db.transaction(|tx, _: &mut Outbox| Box::pin(async move {
+        let Some(folder) = dao::folder(tx, id).await.map_err(db_err)? else { return Ok(None) };
+        let tier = access::tier(tx, me, &folder).await?;
+        if tier == access::NONE {
+            dao::known::remove_known(tx, me, id).await.map_err(db_err)?;
+            return Ok(None);
+        }
+        let known = dao::known::known(tx, me).await.map_err(db_err)?;
+        let mut known_count = 0;
+        let mut already_known = false;
+        let mut active_count = 0;
+        for row in &known {
+            if let Some(other) = dao::folder(tx, row.folder_id).await.map_err(db_err)? {
+                if access::tier(tx, me, &other).await? == access::NONE {
+                    dao::known::remove_known(tx, me, row.folder_id).await.map_err(db_err)?;
+                    continue;
+                }
+                known_count += 1;
+                if row.folder_id == id { already_known = true; }
+                else if row.is_active && other.is_personal == folder.is_personal { active_count += 1; }
+            }
+        }
+        if !already_known && known_count >= MAX_KNOWN { return Err(notify_error(messages::bookmarks::BOOKMARK_LIMIT_REACHED)); }
+        if active && active_count >= if folder.is_personal { MAX_ACTIVE_PERSONAL } else { MAX_ACTIVE_SHARED } {
+            return Err(notify_error(messages::bookmarks::BOOKMARK_LIMIT_REACHED));
+        }
+        dao::known::set_known(tx, me, id, active).await.map_err(db_err)?;
+        let (bookmarks, subfolders) = if active { contents(tx, &[id]).await? } else { (Value::list([]), Value::list([])) };
+        Ok(Some(Value::tuple([folder_row(&folder, active, tier), bookmarks, subfolders])))
+    }), |value, outbox| async move { crate::db::outbox::dispatch_world(value, outbox, &c.world) }).await?.ok_or_else(unavailable)
+}
+
+async fn remove_known(c: &Client, me: i64, id: i64) -> CallResult {
+    let _guard = crate::services::access_groups::lock().await;
+    c.db.transaction(|tx, _: &mut Outbox| Box::pin(async move {
+        dao::known::remove_known(tx, me, id).await.map_err(db_err)?;
+        Ok(Value::None)
+    }), |value, outbox| async move { crate::db::outbox::dispatch_world(value, outbox, &c.world) }).await
+}
+
 async fn static_location(c: &Client, call: &Call<'_>) -> CallResult {
     let me = c.session.int("charid").unwrap_or(0);
     let item = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
@@ -12,11 +125,7 @@ async fn static_location(c: &Client, call: &Call<'_>) -> CallResult {
         map.celestial(item).map(|celestial| (
             station.solar_system_id.expect("station solar_system_id is NULL"),
             station.type_id.expect("station type_id is NULL") as i32,
-            [
-                celestial.x.expect("celestial x is NULL"),
-                celestial.y.expect("celestial y is NULL"),
-                celestial.z.expect("celestial z is NULL"),
-            ],
+            [celestial.x.expect("celestial x is NULL"), celestial.y.expect("celestial y is NULL"), celestial.z.expect("celestial z is NULL")],
         ))
     }).or_else(|| map.system(item).map(|system| (system.solar_system_id, TYPE_SOLAR_SYSTEM, [0.0; 3])));
     // Regions and constellations bookmark the solar system the pilot is in.
@@ -25,143 +134,22 @@ async fn static_location(c: &Client, call: &Call<'_>) -> CallResult {
         None => (c.session.int("solarsystemid2").unwrap_or(0), Some(TYPE_SOLAR_SYSTEM), [0.0; 3]),
     };
     let folder = call.args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-    add(&c.db, me, folder, subfolder_arg(call, 5), Some(item), type_id, system, pos, &value_text(call.args.get(2), MAX_NAME), &value_text(call.args.get(3), MAX_DESCRIPTION), expiry(call, 4)).await
+    mutations::add(c, me, folder, subfolder_arg(call, 5), Some(item), type_id, system, pos, &value_text(call.args.get(2), MAX_NAME), &value_text(call.args.get(3), MAX_DESCRIPTION), expiry(call, 4)?).await
 }
+
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     let me = c.session.int("charid").unwrap_or(0);
-    let int = |i: usize| call.args.get(i).and_then(|v| v.as_int()).unwrap_or(0);
-    let db = &c.db;
+    let id = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
     Some(match call.method {
-        // -> (folders, bookmarks, subfolders)
-        "GetMyActiveBookmarks" => {
-            let folders = match dao::folders(db, me).await {
-                Ok(r) => r,
-                Err(e) => return Some(Err(db_err(e))),
-            };
-            let now = filetime_now();
-            let bookmarks = match dao::bookmarks(db, me, now).await {
-                Ok(r) => r,
-                Err(e) => return Some(Err(db_err(e))),
-            };
-            let subfolders = match dao::subfolders(db, me).await {
-                Ok(r) => r,
-                Err(e) => return Some(Err(db_err(e))),
-            };
-            Ok(Value::tuple([
-                Value::list(folders.iter().map(|r| folder_row(r, me))),
-                Value::list(bookmarks.iter().map(bookmark_row)),
-                Value::list(subfolders.iter().map(|r| subfolder_row(r, me))),
-            ]))
+        "GetMyActiveBookmarks" => get_collection(c, me).await,
+        "GetFolderInfo" => info(c, me, id).await,
+        "SearchFoldersWithAdminAccess" => search(c, me).await,
+        "AddToKnownFolders" | "UpdateKnownFolderState" => {
+            let active = call.args.get(1).is_some_and(|v| matches!(v, Value::Bool(true)) || v.as_int() == Some(1));
+            set_known(c, me, id, active).await
         }
-        // AddFolder(isPersonal, name, description, adminGroupID, manageGroupID, useGroupID, viewGroupID)
-        "AddFolder" => match dao::add_folder(db, me, &value_text(call.args.get(1), MAX_NAME), &value_text(call.args.get(2), MAX_DESCRIPTION)).await {
-            Ok(r) => Ok(folder_row(&r, me)),
-            Err(e) => Err(db_err(e)),
-        },
-        // UpdateFolder(folderID, name, description, ...) -> access level
-        "UpdateFolder" => dao::update_folder(db, int(0), me, &value_text(call.args.get(1), MAX_NAME), &value_text(call.args.get(2), MAX_DESCRIPTION)).await
-            .map(|_| Value::Int(ACCESS_PERSONAL))
-            .map_err(db_err),
-        "DeleteFolder" => {
-            let folder = int(0);
-            db.transaction(
-                |tx, _: &mut Outbox| Box::pin(async move {
-                    own_folder(tx, me, folder).await?;
-                    dao::delete_folder(tx, folder).await.map_err(db_err)?;
-                    Ok(Value::None)
-                }),
-                |value, _| async move { Ok(value) },
-            ).await
-        }
-        "GetFolderInfo" => match dao::folder(db, int(0), me).await {
-            Ok(r) => Ok(r.map(|r| folder_row(&r, me)).unwrap_or(Value::None)),
-            Err(e) => Err(db_err(e)),
-        },
-        // CreateSubfolder(folderID, name)
-        "CreateSubfolder" => {
-            let folder = int(0);
-            if let Err(e) = own_folder(db, me, folder).await {
-                return Some(Err(e));
-            }
-            match dao::add_subfolder(db, folder, &value_text(call.args.get(1), MAX_NAME)).await {
-                Ok(r) => Ok(subfolder_row(&r, me)),
-                Err(e) => Err(db_err(e)),
-            }
-        }
-        // UpdateSubfolder(folderID, subfolderID, name) -> success
-        "UpdateSubfolder" => {
-            if let Err(e) = own_folder(db, me, int(0)).await {
-                return Some(Err(e));
-            }
-            dao::update_subfolder(db, int(0), int(1), &value_text(call.args.get(2), MAX_NAME)).await
-                .map(|n| Value::Bool(n > 0))
-                .map_err(db_err)
-        }
-        // DeleteSubfolder(folderID, subfolderID) -> the bookmark IDs deleted with it
-        "DeleteSubfolder" => {
-            let folder = int(0);
-            let subfolder = int(1);
-            db.transaction(
-                |tx, _: &mut Outbox| Box::pin(async move {
-                    own_folder(tx, me, folder).await?;
-                    let deleted = dao::delete_subfolder_bookmarks(tx, folder, subfolder).await.map_err(db_err)?;
-                    dao::delete_subfolder(tx, folder, subfolder).await.map_err(db_err)?;
-                    Ok(Value::list(deleted.iter().map(|&id| Value::Int(id))))
-                }),
-                |value, _| async move { Ok(value) },
-            ).await
-        }
+        "RemoveFromKnownFolders" => remove_known(c, me, id).await,
         "BookmarkStaticLocation" => static_location(c, call).await,
-        // UpdateBookmark(bookmarkID, folderID, name, note, subfolderID, newFolderID, expiryCancel)
-        "UpdateBookmark" => {
-            let new_folder = call.args.get(5).and_then(|v| v.as_int()).unwrap_or(int(1));
-            if let Err(e) = own_folder(db, me, new_folder).await {
-                return Some(Err(e));
-            }
-            let cancel = call.args.get(6).is_some_and(|v| matches!(v, Value::Bool(true)) || v.as_int() == Some(1));
-            dao::update_bookmark(db, &dao::UpdateBookmark { id: int(0), folder: int(1), memo: &value_text(call.args.get(2), MAX_NAME), note: &value_text(call.args.get(3), MAX_DESCRIPTION), subfolder: call.args.get(4).and_then(|v| v.as_int()), new_folder, cancel, me }).await
-                .map(|_| Value::None)
-                .map_err(db_err)
-        }
-        // DeleteBookmarks(folderID, {bookmarkID}) -> deleted IDs
-        "DeleteBookmarks" => {
-            let wanted = value_id_list(call.args.get(1));
-            match dao::delete_bookmarks(db, int(0), &wanted, me).await {
-                Ok(r) => Ok(Value::list(r.iter().map(|&id| Value::Int(id)))),
-                Err(e) => Err(db_err(e)),
-            }
-        }
-        // MoveBookmarksToFolderAndSubfolder(oldFolderID, folderID, subfolderID, bookmarkIDs) -> (rows, message)
-        "MoveBookmarksToFolderAndSubfolder" => {
-            let (to, sub, wanted) = (int(1), call.args.get(2).and_then(|v| v.as_int()), value_id_list(call.args.get(3)));
-            if let Err(e) = own_folder(db, me, to).await {
-                return Some(Err(e));
-            }
-            match dao::move_bookmarks(db, int(0), to, sub, &wanted, me).await {
-                Ok(rows) => Ok(Value::tuple([
-                    Value::list(rows.iter().map(|r| {
-                        keyval([
-                            ("bookmarkID", Value::Int(r.bookmark_id)),
-                            ("folderID", Value::Int(r.folder_id)),
-                            ("subfolderID", r.subfolder_id.map(Value::Int).unwrap_or(Value::None)),
-                        ])
-                    })),
-                    Value::None,
-                ])),
-                Err(e) => Err(db_err(e)),
-            }
-        }
-        // CopyBookmarksToFolderAndSubfolder(oldFolderID, folderID, subfolderID, bookmarkIDs) -> ({id: bookmark}, message)
-        "CopyBookmarksToFolderAndSubfolder" => {
-            let (to, sub, wanted) = (int(1), call.args.get(2).and_then(|v| v.as_int()), value_id_list(call.args.get(3)));
-            if let Err(e) = own_folder(db, me, to).await {
-                return Some(Err(e));
-            }
-            match dao::copy_bookmarks(db, int(0), to, sub, me, &wanted).await {
-                Ok(rows) => Ok(Value::tuple([Value::Dict(rows.iter().map(|r| (Value::Int(r.bookmark_id), bookmark_row(r))).collect()), Value::None])),
-                Err(e) => Err(db_err(e)),
-            }
-        }
-        _ => return None,
+        _ => return mutations::dispatch(c, call).await,
     })
 }

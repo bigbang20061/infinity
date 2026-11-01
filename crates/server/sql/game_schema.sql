@@ -797,6 +797,56 @@ CREATE TABLE IF NOT EXISTS game.bookmarks (
 );
 CREATE INDEX IF NOT EXISTS bookmarks_folder_idx ON game.bookmarks (folder_id);
 
+-- Shared bookmark access groups and per-character folder subscriptions (dao/bookmarks).
+CREATE TABLE IF NOT EXISTS game.access_groups (
+    group_id bigserial PRIMARY KEY,
+    creator_id bigint NOT NULL,
+    name text NOT NULL,
+    description text NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS game.access_group_members (
+    group_id bigint NOT NULL REFERENCES game.access_groups(group_id) ON DELETE CASCADE,
+    member_id bigint NOT NULL,
+    membership_type integer NOT NULL CHECK (membership_type BETWEEN 0 AND 3),
+    PRIMARY KEY (group_id, member_id)
+);
+CREATE TABLE IF NOT EXISTS game.access_group_logs (
+    log_id bigserial PRIMARY KEY,
+    group_id bigint NOT NULL,
+    log_date bigint NOT NULL,
+    character_id bigint NOT NULL,
+    action_id integer NOT NULL,
+    owner_id bigint,
+    old_text text,
+    new_text text,
+    old_membership_type integer,
+    new_membership_type integer
+);
+CREATE INDEX IF NOT EXISTS access_group_logs_group_idx ON game.access_group_logs (group_id, log_id);
+ALTER TABLE game.bookmark_folders ADD COLUMN IF NOT EXISTS is_personal boolean NOT NULL DEFAULT true;
+ALTER TABLE game.bookmark_folders ADD COLUMN IF NOT EXISTS admin_group_id bigint;
+ALTER TABLE game.bookmark_folders ADD COLUMN IF NOT EXISTS manage_group_id bigint;
+ALTER TABLE game.bookmark_folders ADD COLUMN IF NOT EXISTS use_group_id bigint;
+ALTER TABLE game.bookmark_folders ADD COLUMN IF NOT EXISTS view_group_id bigint;
+ALTER TABLE game.bookmark_subfolders ADD COLUMN IF NOT EXISTS creator_id bigint;
+UPDATE game.bookmark_subfolders AS s SET creator_id = f.owner_id
+    FROM game.bookmark_folders AS f WHERE s.folder_id = f.folder_id AND s.creator_id IS NULL;
+CREATE TABLE IF NOT EXISTS game.bookmark_known_folders (
+    character_id bigint NOT NULL,
+    folder_id bigint NOT NULL REFERENCES game.bookmark_folders(folder_id) ON DELETE CASCADE,
+    is_active boolean NOT NULL,
+    PRIMARY KEY (character_id, folder_id)
+);
+CREATE TABLE IF NOT EXISTS game.bookmark_migrations (name text PRIMARY KEY);
+WITH migration AS (
+    INSERT INTO game.bookmark_migrations (name) VALUES ('personal_known_folders')
+    ON CONFLICT DO NOTHING RETURNING name
+)
+INSERT INTO game.bookmark_known_folders (character_id, folder_id, is_active)
+SELECT f.owner_id, f.folder_id, true FROM game.bookmark_folders AS f CROSS JOIN migration
+WHERE f.is_personal
+ON CONFLICT (character_id, folder_id) DO NOTHING;
+
 -- Calendar events (services/calendar.rs): owned by a character or a player corporation.
 CREATE TABLE IF NOT EXISTS game.calendar_events (
     event_id    bigserial PRIMARY KEY,

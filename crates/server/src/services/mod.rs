@@ -12,6 +12,7 @@
 //! deadlines and leases. Local active IDs are excluded from reclaim to prevent overlapping
 //! scans in one process; leases are not renewed.
 
+mod access_groups;
 mod agency;
 mod alliances;
 mod bills;
@@ -361,6 +362,9 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
                 return r;
             }
             if let Some(r) = bookmarks::dispatch(c, call).await {
+                return r;
+            }
+            if let Some(r) = access_groups::dispatch(c, call).await {
                 return r;
             }
             if matches!(call.service, "calendarMgr" | "accessGroupBookmarkMgr") {

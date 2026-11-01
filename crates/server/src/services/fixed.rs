@@ -135,8 +135,6 @@ pub(super) fn universe(call: &Call<'_>) -> Option<CallResult> {
         ("corporationSvc", "GetMedalsReceived") => Value::tuple([Value::list([]), Value::list([])]),
         // An NPC corporation's market supply and demand (typeID, sellPrice, buyPrice...): none traded.
         ("corporationSvc", "GetCorpInfo") => Value::list([]),
-        // No shared bookmark folders exist (accessGroupBookmarkMgr.AddFolder keeps none).
-        ("accessGroupBookmarkMgr", "SearchFoldersWithAdminAccess") => Value::list([]),
         ("repairableShipMgr", "GetServiceLifeDamage") => Value::Float(0.0),
         ("monolithTaskTrackerMgr", "UpdateClientAchievmentsAndCounters") => Value::None,
         // typeID -> expert system state; none installed.
@@ -255,10 +253,9 @@ pub(super) fn root(call: &Call<'_>) -> Option<CallResult> {
 /// Fixed replies at the calendar/bookmark position in the dispatch chain.
 pub(super) fn social_early(call: &Call<'_>) -> Option<CallResult> {
     Some(match (call.service, call.method) {
-        ("notificationMgr", "LogNotificationInteraction") | ("accessGroupBookmarkMgr", "RemoveFromKnownFolders") => Ok(Value::None),
+        ("notificationMgr", "LogNotificationInteraction") => Ok(Value::None),
         ("mailingListsMgr", "Create") => Err(notify_error(crate::messages::MAILING_LISTS_UNSUPPORTED)),
         ("calendarMgr", "CreateAllianceEvent" | "EditAllianceEvent") => Err(notify_error(crate::messages::ALLIANCE_EVENTS_UNSUPPORTED)),
-        ("accessGroupBookmarkMgr", "AddToKnownFolders" | "UpdateKnownFolderState") => Err(notify_error(crate::messages::SHARED_BOOKMARK_FOLDERS_UNSUPPORTED)),
         _ => return None,
     })
 }
@@ -271,7 +268,7 @@ pub(super) fn social(call: &Call<'_>) -> Option<CallResult> {
         ("charMgr", "GetCharacterDescription") => Value::unicode(""),
         ("structureAssetSafety", "GetItemsInSafetyForCharacter" | "GetItemsInSafetyForCorp") => Value::list([]),
         ("bannedwords", "check_words_allowed") => Value::None,
-        ("corpRegistry", "GetAggressionSettings") | ("accessGroupBookmarkMgr", "AddFolder") | ("corpStationMgr", "DoStandingCheckForStationService") | ("shipAdaptionMgr", "fetch_user_data") => Value::None,
+        ("corpRegistry", "GetAggressionSettings") | ("corpStationMgr", "DoStandingCheckForStationService") | ("shipAdaptionMgr", "fetch_user_data") => Value::None,
         ("RWManager", "solarsystem_contains_rw_instances") => Value::Bool(false),
         ("dynamicBountyMgr", "GetOutputForClientSolarSystem") => Value::tuple([Value::None, Value::Bool(false)]),
         _ => return None,

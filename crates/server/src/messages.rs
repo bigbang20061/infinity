@@ -4,6 +4,8 @@
 //! the client's slash service. This module reads no database and does not
 //! implement localisation, data-derived names, or protocol identifiers.
 
+pub(crate) mod access_groups;
+pub(crate) mod bookmarks;
 pub(crate) mod bounty;
 pub(crate) mod chat;
 pub(crate) mod combat;
@@ -98,8 +100,6 @@ pub(crate) const ACCOUNTANT_REQUIRED_FOR_AUTOPAY_SETTINGS: &str = "只有会计�
 pub(crate) const BOOKMARK_TARGET_MOVED_OR_MISSING: &str = "目标已不在原处。";
 /// Bookmarking requires a fully scanned signature.
 pub(crate) const BOOKMARK_REQUIRES_FULL_SCAN: &str = "请先将信号扫描到 100% 再保存位置。";
-/// Shared bookmark folders are unavailable.
-pub(crate) const SHARED_BOOKMARK_FOLDERS_UNSUPPORTED: &str = "暂不支持共享书签文件夹。";
 
 // Calendar (services/calendar.rs)
 /// Calendar event missing.
