@@ -14,6 +14,8 @@
 //! comes from the immutable typed SDE.
 //! NPC facility tax settings are read-only; submitted cost and tax quotes are checked against
 //! the same configured tax and system index used for settlement.
+//! Deadlines in game.jobs persist readiness across restarts; delivery remains explicit.
+//! Structures and reactions are not supported.
 //! Legacy jobs whose blueprint was already missing or moved before custody prevention
 //! are refused at delivery and may require operator repair.
 
@@ -25,7 +27,7 @@ use super::fit::{Fit, Key};
 use super::market::{jumps, lock};
 use super::{db_err, keyval, notify_error, rand01, user_error, value_id_list, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
-use crate::consts::{BLUEPRINT_COPY_QUANTITY, FILETIME_DAY, FILETIME_SECOND, INDUSTRY_JOB_STATUS_INSTALLED, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD};
+use crate::consts::{BLUEPRINT_COPY_QUANTITY, FILETIME_DAY, FILETIME_SECOND, INDUSTRY_JOB_STATUS_INSTALLED, INDUSTRY_JOB_STATUS_READY, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD};
 use crate::db::executor::Executor;
 use crate::db::outbox::{dispatch_client, Outbox};
 use crate::messages;
@@ -235,6 +237,7 @@ async fn tell_job<X>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, j: &
 }
 
 mod authorization;
+pub(crate) mod completion;
 mod facility_manager;
 mod industry_manager;
 mod industry_monitor;

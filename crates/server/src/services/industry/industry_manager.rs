@@ -64,6 +64,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
                     if industry_dao::cancel_job(tx, &j, me, INDUSTRY_JOB_STATUS_INSTALLED).await.map_err(db_err)? == 0 {
                         return Err(notify_error(messages::INDUSTRY_PROJECT_CANNOT_CANCEL));
                     }
+                    completion::cancel(tx, id).await?;
                     tell_job(tx, outbox, &j).await?;
                     Ok(Value::None)
                 }),

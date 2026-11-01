@@ -42,6 +42,13 @@ const ONLINE_JOIN_DELTA: i64 = 1;
 /// Server online population counter delta when a session leaves.
 const ONLINE_LEAVE_DELTA: i64 = -1;
 
+fn startup_call_error(error: services::CallError) -> anyhow::Error {
+    match error {
+        services::CallError::Internal(error) => error,
+        services::CallError::User { msg, .. } => anyhow::anyhow!(msg),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cfg = Arc::new(config::Config::load()?);
@@ -55,29 +62,18 @@ async fn main() -> Result<()> {
     let sde = Arc::new(sde::Sde::load(&db).await?);
     let types = sde.types.len();
     info!(target: "infinity_server::db", "database ready ({types} types in SDE)");
-    services::recover_pending_reloads(&db, &sde).await.map_err(|error| match error {
-        services::CallError::Internal(e) => e,
-        services::CallError::User { msg, .. } => anyhow::anyhow!(msg),
-    })?;
+    services::recover_pending_reloads(&db, &sde).await.map_err(startup_call_error)?;
     if let Err(services::CallError::Internal(e)) = services::unbury_sites(&db, &sde).await {
         tracing::warn!("moving sites out of planets failed: {e:#}");
     }
     let hub = chat::Hub::new(&cfg.chat.domain);
     let world = space::World::new(db.clone(), sde.clone(), cfg.server.system_capacity);
-    services::trade::recover(&db, &world, sde.clone()).await.map_err(|error| match error {
-        services::CallError::Internal(error) => error,
-        services::CallError::User { msg, .. } => anyhow::anyhow!(msg),
-    })?;
+    services::trade::recover(&db, &world, sde.clone()).await.map_err(startup_call_error)?;
     lua::start(&cfg, &db, &sde, &world).await?;
-    let restored = services::bounty::restore_activations(&db, &world).await.map_err(|error| match error {
-        services::CallError::Internal(e) => e,
-        services::CallError::User { msg, .. } => anyhow::anyhow!(msg),
-    })?;
+    let restored = services::bounty::restore_activations(&db, &world).await.map_err(startup_call_error)?;
     info!(restored, "restored active kill rights");
-    services::skills::completion::seed(&db).await.map_err(|error| match error {
-        services::CallError::Internal(error) => error,
-        services::CallError::User { msg, .. } => anyhow::anyhow!(msg),
-    })?;
+    services::skills::completion::seed(&db).await.map_err(startup_call_error)?;
+    services::industry::completion::seed(&db).await.map_err(startup_call_error)?;
     let (scheduler_stop, scheduler_shutdown) = tokio::sync::watch::channel(false);
     let mut scheduler_task = scheduler::runner::start(db.clone(), world.clone(), services::scheduler_registrations(), cfg.scheduler.clone(), scheduler_shutdown)?;
     scheduler::seed(&db).await?;

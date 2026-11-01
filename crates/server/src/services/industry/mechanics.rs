@@ -2,6 +2,8 @@
 //! Uses blueprint SDE data and game jobs, items and authorized wallets.
 //! Job durations include the configured industry time multiplier; NPC fees use the published
 //! facility policy and submitted cost and facility-tax quotes are checked before settlement.
+//! Installed deadlines persist in game.jobs and become ready before explicit delivery.
+//! Structures and reactions are unsupported; legacy displaced blueprints require repair.
 
 use super::*;
 use crate::sde::{Sde, industry::Activity};
@@ -411,11 +413,12 @@ pub(super) async fn install(c: &mut Client, request: &Value) -> CallResult {
                     wallet_owner, wallet_account_key, blueprint_location: bp.location, blueprint_flag: bp.flag,
                 };
                 j.id = industry_dao::insert_job(tx, &j).await.map_err(db_err)?;
+                completion::schedule(tx, &j).await?;
                 tell_job(tx, outbox, &j).await?;
                 Ok(j)
             })
         },
-        |j, outbox| async move { dispatch_client(j, outbox, c) },
+        |j, outbox| async move { let result = dispatch_client(j, outbox, c); crate::scheduler::wake(); result },
     ).await?;
     info!("industry: {me} installed job {} (activity {activity_id}, {runs} runs of {}) at {} for {} ISK, {}s", j.id, j.blueprint_type, j.facility, j.cost, j.time);
     Ok(Value::Int(j.id))
@@ -457,7 +460,7 @@ async fn deliver_job<X: Send>(db: &(impl Executor + ?Sized), sde: &Sde, outbox: 
     j.successful_runs = Some(successful);
     j.completed = Some(completed);
     j.completed_by = Some(by);
-    if industry_dao::deliver_job(db, j, INDUSTRY_JOB_STATUS_INSTALLED).await.map_err(db_err)? == 0 {
+    if industry_dao::deliver_job(db, j, INDUSTRY_JOB_STATUS_READY).await.map_err(db_err)? == 0 {
         return Err(notify_error(messages::INDUSTRY_PROJECT_ALREADY_DELIVERED));
     }
     let act = sde.industry.activity(j.blueprint_type, j.activity);
@@ -517,10 +520,10 @@ pub(super) async fn complete(c: &mut Client, id: i64) -> Result<(), CallError> {
     let _trading = lock().await;
     let j = job(&db, id).await?;
     authorization::owner(&db, me, j.owner, None).await?;
-    if j.status != INDUSTRY_JOB_STATUS_INSTALLED {
+    if j.status != INDUSTRY_JOB_STATUS_INSTALLED && j.status != INDUSTRY_JOB_STATUS_READY {
         return Err(notify_error(messages::INDUSTRY_PROJECT_ALREADY_DELIVERED));
     }
-    if j.end > filetime_now() {
+    if j.status == INDUSTRY_JOB_STATUS_INSTALLED && j.end > filetime_now() {
         return Err(notify_error(messages::INDUSTRY_PROJECT_NOT_COMPLETE));
     }
     let successful = if j.activity == INVENTION { (0..j.runs).filter(|_| rand01() < j.probability).count() as i32 } else { j.runs };
@@ -533,11 +536,18 @@ pub(super) async fn complete(c: &mut Client, id: i64) -> Result<(), CallError> {
             Box::pin(async move {
                 let mut j = job(tx, id).await?;
                 authorization::owner(tx, me, j.owner, None).await?;
-                if j.status != INDUSTRY_JOB_STATUS_INSTALLED || j.activity != expected.activity || j.runs != expected.runs || j.probability != expected.probability {
+                if (j.status != INDUSTRY_JOB_STATUS_INSTALLED && j.status != INDUSTRY_JOB_STATUS_READY) || j.activity != expected.activity || j.runs != expected.runs || j.probability != expected.probability {
                     return Err(notify_error(messages::INDUSTRY_PROJECT_ALREADY_DELIVERED));
                 }
-                if j.end > completed { return Err(notify_error(messages::INDUSTRY_PROJECT_NOT_COMPLETE)); }
+                if j.status == INDUSTRY_JOB_STATUS_INSTALLED {
+                    if j.end > completed { return Err(notify_error(messages::INDUSTRY_PROJECT_NOT_COMPLETE)); }
+                    if industry_dao::mark_ready(tx, id, completed).await.map_err(db_err)? == 0 {
+                        return Err(notify_error(messages::INDUSTRY_PROJECT_ALREADY_DELIVERED));
+                    }
+                    j.status = INDUSTRY_JOB_STATUS_READY;
+                }
                 deliver_job(tx, &sde, outbox, &mut j, me, successful, completed).await?;
+                completion::cancel(tx, id).await?;
                 Ok(j)
             })
         },

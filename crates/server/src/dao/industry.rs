@@ -2,7 +2,7 @@
 //! The owning services support `eve/client/script/industry`; this DAO has no wire contract.
 //! Uses `game.items`, `game.blueprints`, `game.industry_jobs`, `game.retail_prices`
 //! Custody and payer fields are persisted; policy, transactions and notifications remain with callers.
-//! Cancellation is guarded by installed status.
+//! Installed jobs transition to ready only when due; cancellation is installed-only.
 
 use std::collections::HashMap;
 use crate::consts::{BLUEPRINT_COPY_QUANTITY, BLUEPRINT_INFINITE_RUNS, INDUSTRY_JOB_STATUS_INSTALLED, INDUSTRY_JOB_STATUS_READY};
@@ -90,6 +90,15 @@ struct ItemIdRow { item_id: i64 }
 impl ItemIdRow { fn from_row(r: &Row) -> Self { Self { item_id: r.get("item_id") } } }
 struct JobIdRow { job_id: i64 }
 impl JobIdRow { fn from_row(r: &Row) -> Self { Self { job_id: r.get("job_id") } } }
+pub(crate) struct Deadline { pub(crate) id: i64, pub(crate) end: i64 }
+impl Deadline { fn from_row(r: &Row) -> Self { Self { id: r.get("job_id"), end: r.get("end_date") } } }
+
+pub(crate) async fn installed_deadlines(ex: &(impl Executor + ?Sized)) -> Result<Vec<Deadline>, db::Error> {
+    Ok(ex.query("SELECT job_id, end_date FROM game.industry_jobs WHERE status = $1 ORDER BY job_id", &[&INDUSTRY_JOB_STATUS_INSTALLED]).await?.iter().map(Deadline::from_row).collect())
+}
+pub(crate) async fn mark_ready(ex: &(impl Executor + ?Sized), id: i64, now: i64) -> Result<u64, db::Error> {
+    ex.execute("UPDATE game.industry_jobs SET status = $2 WHERE job_id = $1 AND status = $3 AND end_date <= $4", &[&id, &INDUSTRY_JOB_STATUS_READY, &INDUSTRY_JOB_STATUS_INSTALLED, &now]).await
+}
 
 pub(crate) async fn blueprint(ex: &(impl Executor + ?Sized), item_id: i64) -> Result<Option<Blueprint>, db::Error> {
     Ok(ex.query_opt(BLUEPRINT_SQL, &[&item_id, &BLUEPRINT_INFINITE_RUNS]).await?.as_ref().map(Blueprint::from_row))
@@ -101,10 +110,11 @@ pub(crate) async fn job(ex: &(impl Executor + ?Sized), id: i64) -> Result<Option
     Ok(ex.query_opt(&format!("{JOB_SELECT} WHERE job_id = $1"), &[&id]).await?.as_ref().map(Job::from_row))
 }
 pub(crate) async fn jobs_by_owner(ex: &(impl Executor + ?Sized), owner: i64, completed: bool, installed_status: i32, cutoff: i64) -> Result<Vec<Job>, db::Error> {
+    let statuses = [installed_status, INDUSTRY_JOB_STATUS_READY];
     let rows = if completed {
-        ex.query(&format!("{JOB_SELECT} WHERE owner_id = $1 AND (status = $2 OR completed_date >= $3) ORDER BY job_id"), &[&owner, &installed_status, &cutoff]).await?
+        ex.query(&format!("{JOB_SELECT} WHERE owner_id = $1 AND (status = ANY($2) OR completed_date >= $3) ORDER BY job_id"), &[&owner, &statuses.as_slice(), &cutoff]).await?
     } else {
-        ex.query(&format!("{JOB_SELECT} WHERE owner_id = $1 AND status = $2 ORDER BY job_id"), &[&owner, &installed_status]).await?
+        ex.query(&format!("{JOB_SELECT} WHERE owner_id = $1 AND status = ANY($2) ORDER BY job_id"), &[&owner, &statuses.as_slice()]).await?
     };
     Ok(rows.iter().map(Job::from_row).collect())
 }
@@ -131,8 +141,8 @@ pub(crate) async fn delete_blueprint_item(ex: &(impl Executor + ?Sized), item_id
 pub(crate) async fn insert_copy(ex: &(impl Executor + ?Sized), type_id: i32, owner: i64, station: i64, flag: i32, quantity: i64) -> Result<i64, db::Error> {
     Ok(ItemIdRow::from_row(&ex.query_one(INSERT_COPY_SQL, &[&type_id, &owner, &station, &flag, &quantity]).await?).item_id)
 }
-pub(crate) async fn deliver_job(ex: &(impl Executor + ?Sized), job: &Job, installed_status: i32) -> Result<u64, db::Error> {
-    ex.execute(DELIVER_SQL, &[&job.id, &job.status, &job.successful_runs, &job.completed, &job.completed_by, &installed_status]).await
+pub(crate) async fn deliver_job(ex: &(impl Executor + ?Sized), job: &Job, expected_status: i32) -> Result<u64, db::Error> {
+    ex.execute(DELIVER_SQL, &[&job.id, &job.status, &job.successful_runs, &job.completed, &job.completed_by, &expected_status]).await
 }
 pub(crate) async fn cancel_job(ex: &(impl Executor + ?Sized), job: &Job, completed_by: i64, installed_status: i32) -> Result<u64, db::Error> {
     ex.execute(CANCEL_SQL, &[&job.id, &job.status, &job.completed, &completed_by, &installed_status]).await

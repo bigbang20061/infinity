@@ -35,7 +35,7 @@ mod fixed;
 mod fleets;
 mod fitting;
 mod hacking;
-mod industry;
+pub(crate) mod industry;
 mod insurance;
 pub(crate) mod inventory;
 pub(crate) mod items;
@@ -73,6 +73,7 @@ pub(crate) fn scheduler_registrations() -> Vec<crate::scheduler::Registration> {
         crate::scheduler::register(bounty::kill_rights::EXPIRY_KIND, bounty::kill_rights::expire),
         crate::scheduler::register(bounty::payout::KIND, bounty::payout::handle),
         crate::scheduler::register(skills::completion::KIND, skills::completion::handle),
+        crate::scheduler::register(industry::completion::KIND, industry::completion::handle),
     ]
 }
 
