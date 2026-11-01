@@ -606,6 +606,7 @@ impl World {
         if systems.contains_key(&system_id) { return Ok(()); }
         let tick = now_ms();
         let mut system = System::new(system_id, self.pilots.clone(), tick);
+        system.world = self.weak.clone();
         system.projection_sde = Some(self.sde.clone());
         for r in self.sde.map.celestials(system_id) {
             let Some(type_id) = r.type_id.and_then(|id| i32::try_from(id).ok()) else { continue };

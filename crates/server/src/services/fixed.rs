@@ -6,7 +6,6 @@
 use super::{notify_error, rowset, Call, CallResult};
 use super::universe::{WARZONES, DYNAMIC_RESOURCE_MAX_OUTPUT};
 use marshal::Value;
-use super::fleets::MAX_MEMBERS;
 use crate::consts::FAR_FUTURE;
 /// Client paperdoll.State.no_recustomization.
 const PAPERDOLL_NO_RECUSTOMIZATION: i64 = 0;
@@ -285,11 +284,7 @@ pub(super) fn social(call: &Call<'_>) -> Option<CallResult> {
 
 pub(super) fn fleets(call: &Call<'_>) -> Option<CallResult> {
     Some(Ok(match (call.service, call.method) {
-        ("fleetProxy", "GetAvailableFleetAds") => Value::Dict(vec![]),
-        ("fleetMgr", "AddToWatchlist" | "RemoveFromWatchlist" | "RegisterForDamageUpdates" | "BroadcastToSystem" | "BroadcastToBubble") => Value::None,
-        ("fleetObjectHandler", "GetFleetMaxSize") => Value::Int(MAX_MEMBERS as i64),
-        ("fleetObjectHandler", "GetJoinRequests") => Value::Dict(vec![]),
-        ("fleetObjectHandler", "GetActiveBridgeForShip" | "UpdateMemberInfo" | "SetOptions" | "SetAutoJoinSquadID" | "SetTakesFleetWarp" | "SetAcceptsRegroupValue" | "SetAcceptsConduitJumpsValue" | "SetFleetMaxSize" | "FinishMove" | "LoadFleetSetup" | "RejectJoinRequest" | "MassMoveMembers" | "ArrangeMembersByShipType" | "ArrangeMembersByPreCount" | "ArrangeMembersByEvenlyDistribute" | "ArrangeMembersByAllToFirst") => Value::None,
+        ("fleetObjectHandler", "GetActiveBridgeForShip") => Value::None,
         _ => return None,
     }))
 }
