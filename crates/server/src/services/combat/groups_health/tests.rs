@@ -4,6 +4,7 @@ use crate::dao::items::creation;
 
 mod db_smoke;
 mod fixture;
+mod rewards;
 
 /// Drain up to the requested amount for capacitor integration tests.
 pub(in crate::services) async fn drain_exact(db: &Db, world: &World, system: i64, ship: i64, amount: f64) -> Result<f64, CallError> {

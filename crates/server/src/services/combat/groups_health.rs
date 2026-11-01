@@ -3,6 +3,7 @@
 //! from fitted dogma and NPC attributes from the SDE. Capacitor state is not persisted;
 //! Hostile capacitor mutations validate their source and range in the system actor.
 //! Confirmed NPC destruction emits a kill event for a known attacker before rewards are attempted.
+//! NPC bounty net and corporation tax commit together; wallet notices and events follow commit.
 //! NPC repairs use the damage cache in the system actor and are not persisted; missing
 //! cache entries represent undamaged NPCs. Player repairs use fitted ship attributes
 //! and remain in memory until the normal condition save.
@@ -553,22 +554,20 @@ pub(super) async fn reward_kill(db: &Db, world: &World, system: i64, npc: &Ball,
         let payout = bounty_payout(bounty, crate::config::game().combat.bounty_multiplier)
             .ok_or_else(|| CallError::Internal(anyhow::anyhow!("nonfinite bounty payout for NPC type {}", npc.type_id)))?;
         if payout > 0.0 {
-            // A player corporation takes its tax rate of the payout into its master wallet.
-            let corp_tax = crate::dao::characters::combat::corporation_tax(db, pilot).await.map_err(db_err)?
-                .map(|r| (r.corporation_id, r.tax_rate.clamp(0.0, 1.0)));
-            let tax = corp_tax.map(|(_, rate)| super::super::market::round2(payout * rate)).unwrap_or(0.0);
-            let balance = crate::dao::wallets::characters::credit(db, pilot, payout - tax).await.map_err(db_err)?;
-            world.notify_pilot(pilot, "OnAccountChange", vec![Value::str("cash"), Value::Int(pilot), Value::Float(balance)]);
-            if payout - tax != 0.0 {
-                let mut outbox = Outbox::default();
-                outbox.event(crate::lua::events::GameEvent::WalletChanged { owner_id: pilot, account_key: ACCOUNT_CASH, balance, delta: payout - tax });
-                dispatch_world((), outbox, world)?;
-            }
-            if let Some((corp, _)) = corp_tax.filter(|_| tax > 0.0) {
-                let mut outbox = Outbox::default();
-                super::super::wallets::corp_credit(db, &mut outbox, corp, ACCOUNT_CASH, tax).await?;
-                dispatch_world((), outbox, world)?;
-            }
+            let _lock = super::super::market::lock().await;
+            let tax = db.transaction(
+                |tx, outbox: &mut Outbox| Box::pin(async move {
+                    let corp_tax = crate::dao::characters::combat::corporation_tax(tx, pilot).await.map_err(db_err)?
+                        .map(|r| (r.corporation_id, r.tax_rate.clamp(0.0, 1.0)));
+                    let tax = corp_tax.map(|(_, rate)| super::super::market::round2(payout * rate)).unwrap_or(0.0);
+                    super::super::wallets::credit(tx, outbox, pilot, payout - tax).await?;
+                    if let Some((corp, _)) = corp_tax.filter(|_| tax > 0.0) {
+                        super::super::wallets::corp_credit(tx, outbox, corp, ACCOUNT_CASH, tax).await?;
+                    }
+                    Ok(tax)
+                }),
+                |value, outbox| async move { dispatch_world(value, outbox, world) },
+            ).await?;
             info!("{pilot} earned {payout:.0} ISK bounty for {} ({tax:.0} corporation tax)", npc.type_id);
         }
         super::super::crimewatch::npc_killed(db, world, pilot).await?;
