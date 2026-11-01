@@ -1,8 +1,7 @@
 //! GM per-item dogma base overrides. The slash role gate is owned by the parent service.
 //! Mirrors godma item attributes and the client brain's hull preAssignment effects;
 //! overrides live in game.item_attributes and follow singleton item identity.
-//! Owned drone queries evaluate the owner's fit; no drone gameplay RPC is provided.
-//! Incoming drone projections require the in-space drone runtime.
+//! Owned drone queries evaluate the owner's fit and live incoming projections.
 //! Hull and fitted-module overrides reconcile online resources atomically.
 //! Charges, characters, structures, NPCs and stacked items are not supported.
 use super::{slash_error, Client, CallError};
@@ -84,6 +83,11 @@ fn drone_query_key(item: &Item, action: Action<'_>, char_id: Option<i64>) -> Opt
     (matches!(action, Action::Query(_))
         && item.category_id == i64::from(CATEGORY_DRONE)
         && char_id == Some(item.owner_id)).then_some(Key::Drone(item.item_id))
+}
+
+fn drone_location(item: &Item) -> Option<i64> {
+    (item.singleton && item.flag_id == 0 && item.category_id == i64::from(CATEGORY_DRONE))
+        .then_some(item.location_id)
 }
 
 fn current_projection(s: &mut crate::space::System, ship: i64, revision: u64) -> bool {
@@ -178,7 +182,15 @@ pub(super) async fn command(c: &mut Client, args: &[String]) -> Result<String, C
     let fallback = fit::base_attribute(c.sde.types.get(item.type_id), c.sde.dogma.attribute(attr), attr);
     let char_id = c.session.int("charid").unwrap_or(0);
     let old_fit = if drone_key.is_some() {
-        Some(Fit::drone(&c.db, c.sde.clone(), char_id, id).await?)
+        let system = if let Some(location) = drone_location(&item) {
+            c.world.with(location, move |s| s.drone(id).is_some() && s.ball(id).is_some())
+                .await.filter(|live| *live).map(|_| location)
+        } else { None };
+        Some(if let Some(system) = system {
+            Fit::drone_in_space(&c.db, &c.world, system, char_id, id).await?
+        } else {
+            Fit::drone(&c.db, c.sde.clone(), char_id, id).await?
+        })
     } else if key.is_some() {
         Some(if let Some(system) = fit_system {
             Fit::load_in_space(&c.db, &c.world, system, fit_pilot, fit_ship.unwrap()).await?
@@ -232,8 +244,8 @@ pub(super) async fn command(c: &mut Client, args: &[String]) -> Result<String, C
     let new_effective = current_fit.zip(key).map(|(fit, key)| fit.value(key, attr));
     if changed {
         if let (Some(old), Some(new), Some(key)) = (old_fit.as_ref(), new_fit.as_ref(), key) {
-            let before = propulsion::kinematics(old);
-            let after = propulsion::kinematics(new);
+            let before = propulsion::kinematics(old, Key::Ship);
+            let after = propulsion::kinematics(new, Key::Ship);
             if before != after {
                 if let (Some(system), Some(ship), Some(revision)) = (fit_system, fit_ship, new.projection_revision()) {
                     c.world.post(system, move |s| {

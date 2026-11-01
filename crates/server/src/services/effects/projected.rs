@@ -1,13 +1,13 @@
-//! Snapshot and apply targeted dogma modifiers for ships and NPCs.
+//! Snapshot and apply targeted dogma modifiers for in-space sources.
 //! Mirrors the projected effects in dogma/pythonEffects and uses SDE modifier
 //! rows with effective source Fit values. Lifetime and notifications belong to
 //! the system actor; effects with no target modifier rows are not synthesized here.
-use super::{projection::Projection, range::range_multiplier, registry::{Effect, EffectAttribute}};
-use crate::db::Db;
+use super::{projection::Projection, range::range_multiplier, registry::{Effect, EffectAttribute, EffectFlag}};
+use super::space_source::{SourceContext, SourceGuard};
 use crate::messages;
 use crate::sde::{dogma::Modifier, Sde};
 use crate::services::{combat::Ctx, fit::{Fit, Key, OP_PRE_MUL, OP_PRE_DIV, OP_POST_MUL, OP_POST_DIV}, user_error, CallError};
-use crate::space::{dist, seconds_to_ms, Ball, World};
+use crate::space::{dist, seconds_to_ms, World, drone::DronePhase};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -50,20 +50,21 @@ fn missing_target() -> CallError {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn insert(world: &Arc<World>, system: i64, source: i64, target: i64, module: i64, source_type: i32, effect: &Effect, duration_ms: f64, charge_type: Option<i32>, snapshots: (Vec<(i32, f64, i32)>, Vec<(i32, f64, i32)>), optimal: f64, falloff: f64, npc_generation: Option<u64>, player: Option<(i64, Arc<AtomicBool>)>) -> Result<(), CallError> {
+async fn insert(world: &Arc<World>, system: i64, source: i64, target: i64, module: i64, source_type: i32, effect: &Effect, duration_ms: f64, charge_type: Option<i32>, snapshots: (Vec<(i32, f64, i32)>, Vec<(i32, f64, i32)>), optimal: f64, falloff: f64, guard: Option<SourceGuard>, player: Option<(i64, Arc<AtomicBool>)>) -> Result<(Option<i64>, bool, i32), CallError> {
     let kind = effect.kind;
     let effect_id = effect.id as i32;
+    let offensive = effect.has(EffectFlag::Offensive);
     let inserted = world.with(system, move |s| {
         if let Some((character, generation)) = &player {
-            if generation.load(Ordering::Relaxed) || !crate::services::combat::targeting_charges::targets_of(*character).contains(&target) { return false; }
+            if generation.load(Ordering::Relaxed) || !crate::services::combat::targeting_charges::targets_of(*character).contains(&target) { return None; }
             let state = crate::services::combat::state();
-            if !state.active.get(&module).is_some_and(|active| Arc::ptr_eq(&active.stop, generation)) { return false; }
+            if !state.active.get(&module).is_some_and(|active| Arc::ptr_eq(&active.stop, generation)) { return None; }
         }
-        if npc_generation.is_some_and(|generation| !s.npc_projection_valid(source, target, generation)) { return false; }
-        let Some((a, b)) = s.sampled_ball(source).zip(s.sampled_ball(target)) else { return false };
+        if guard.is_some_and(|guard| !guard.valid(s)) { return None; }
+        let Some((a, b)) = s.sampled_ball(source).zip(s.sampled_ball(target)) else { return None };
         let gap = (dist(a.pos, b.pos) - f64::from(a.radius) - f64::from(b.radius)).max(0.0);
         let strength = range_multiplier(gap, optimal, falloff);
-        if strength <= 0.0 { return false; }
+        if strength <= 0.0 { return None; }
         let scale = |entries: Vec<(i32, f64, i32)>| entries.into_iter().map(|(attr, value, op)| (attr, scaled(value, op, strength))).collect();
         let values = scale(snapshots.0);
         let charge_values = scale(snapshots.1);
@@ -71,9 +72,10 @@ async fn insert(world: &Arc<World>, system: i64, source: i64, target: i64, modul
             s.now_ms().saturating_add(duration_ms as i64).saturating_add(seconds_to_ms(1.0) as i64)
         };
         s.upsert_projection(target, Projection { source_ship: source, source_module: module, source_type, effect_id, kind, until_ms, values, charge_values, charge_type });
-        true
-    }).await.unwrap_or(false);
-    if inserted { Ok(()) } else { Err(missing_target()) }
+        if offensive { s.drone_attack(source, target); }
+        Some((s.combat_owner(target), s.drone(target).is_some(), a.type_id))
+    }).await.flatten();
+    inserted.ok_or_else(missing_target)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -83,26 +85,31 @@ pub(super) async fn apply(cx: &Ctx, fit: &Fit, source_module: i64, source_type: 
     let optimal = effect.attribute(EffectAttribute::Range).map_or(0.0, |attr| fit.value(key, attr));
     let falloff = effect.attribute(EffectAttribute::Falloff).map_or(0.0, |attr| fit.value(key, attr));
     let values = snapshot(cx.world.sde(), fit, key, effect, charge_type);
-    insert(&cx.world, cx.system_id, cx.ship_id, target, source_module, source_type, effect, duration_ms, charge_type, values, optimal, falloff, None, Some((cx.char_id, generation))).await?;
+    let (victim, drone, source_type_id) = insert(&cx.world, cx.system_id, cx.ship_id, target, source_module, source_type, effect, duration_ms, charge_type, values, optimal, falloff, None, Some((cx.char_id, generation))).await?;
+    if drone && effect.has(EffectFlag::Offensive) {
+        if let Some(victim) = victim {
+            crate::services::crimewatch::aggress(&cx.db, &cx.world, cx.system_id, cx.char_id, source_type_id, source_type, victim, target).await?;
+        }
+    }
     if matches!(effect.kind, super::EffectKind::Projected { jamming: super::JammingType::Scramble }) {
         super::lifecycle::stop_blocked_propulsion(&cx.db, &cx.world, cx.system_id, target).await;
     }
     Ok(())
 }
 
-/// NPC module identities are allocated by the caller and remain stable across cycles.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn apply_npc(db: &Db, world: &Arc<World>, system: i64, source_module: i64, source: &Ball, target: &Ball, effect: &Effect, duration_ms: f64, generation: u64) -> Result<(), CallError> {
-    let source_id = source.id;
-    let projections = world.with(system, move |s| s.projections_on(source_id)).await.ok_or_else(missing_target)?;
-    let fit = Fit::for_space_type(world.sde().clone(), source.type_id, projections);
-    let key = Key::Ship;
-    let optimal = effect.attribute(EffectAttribute::Range).map_or(0.0, |attr| fit.value(key, attr));
-    let falloff = effect.attribute(EffectAttribute::Falloff).map_or(0.0, |attr| fit.value(key, attr));
-    let values = snapshot(world.sde(), &fit, key, effect, None);
-    insert(world, system, source.id, target.id, source_module, source.type_id, effect, duration_ms, None, values, optimal, falloff, Some(generation), None).await?;
-    if matches!(effect.kind, super::EffectKind::Projected { jamming: super::JammingType::Scramble }) {
-        super::lifecycle::stop_blocked_propulsion(db, world, system, target.id).await;
+pub(crate) async fn apply_source(cx: &SourceContext<'_>) -> Result<(), CallError> {
+    if !matches!(cx.phase, DronePhase::Begin) { return Ok(()); }
+    let optimal = cx.effect.attribute(EffectAttribute::Range).map_or(0.0, |attr| cx.fit.value(cx.key, attr));
+    let falloff = cx.effect.attribute(EffectAttribute::Falloff).map_or(0.0, |attr| cx.fit.value(cx.key, attr));
+    let values = snapshot(cx.world.sde(), cx.fit, cx.key, cx.effect, None);
+    let (victim, _, _) = insert(cx.world, cx.system, cx.source.id, cx.target.id, cx.module, cx.source.type_id, cx.effect, cx.duration_ms, None, values, optimal, falloff, Some(cx.guard), None).await?;
+    if cx.effect.has(EffectFlag::Offensive) {
+        if let (Some(attacker), Some(victim)) = (cx.attacker, victim) {
+            crate::services::crimewatch::aggress(cx.db, cx.world, cx.system, attacker, cx.source.type_id, cx.source.type_id, victim, cx.target.id).await?;
+        }
+    }
+    if matches!(cx.effect.kind, super::EffectKind::Projected { jamming: super::JammingType::Scramble }) {
+        super::lifecycle::stop_blocked_propulsion(cx.db, cx.world, cx.system, cx.target.id).await;
     }
     Ok(())
 }

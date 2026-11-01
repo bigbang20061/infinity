@@ -1,5 +1,6 @@
 //! Real-database regression for capacitor booster charge consumption and injection.
 use super::*;
+use crate::services::combat::groups_health::tests::drain_exact;
 use std::sync::{Arc, atomic::AtomicBool};
 use crate::{
     consts::{ATTR_CAPACITOR_CAPACITY, ATTR_CHARGE, ATTR_QUANTITY, ATTR_RECHARGE_RATE, CATEGORY_CHARGE, CATEGORY_MODULE, CATEGORY_SHIP, EFFECT_POWER_BOOSTER, FLAG_FITTING_FIRST},
@@ -105,6 +106,23 @@ async fn cap_booster_db_smoke() {
         let capacity = fit.value(Key::Ship, ATTR_CAPACITOR_CAPACITY);
         let bonus = fit.value(Key::Charge(fixture.module), ATTR_CAPACITOR_BONUS);
         assert!(capacity.is_finite() && capacity > 0.0 && bonus.is_finite() && bonus > 0.0);
+        let empty_type = test_world.sde().types.iter().find(|ty| ty.attribute(ATTR_CAPACITOR_CAPACITY).unwrap_or(0.0) <= 0.0).expect("SDE type with no capacitor").type_id;
+        let mut empty = ball(-9_001_001, empty_type, fixture.character);
+        empty.char_id = None;
+        test_world.add_ship(system, empty).await.unwrap();
+        let admitted = NpcCapacitorGuard::Attack {
+            source: fixture.ship, target: -9_001_001, source_guard: None, player: None,
+            optimal: 100.0, falloff: 0.0, offensive: false,
+        };
+        assert_eq!(drain_exact_guarded(&test_db, &test_world, system, -9_001_001, 10.0, admitted).await.ok().unwrap().unwrap().0, 0.0);
+        test_world.remove_ball(system, -9_001_001).await;
+        combat::forget_ship(-9_001_001);
+        let stale = NpcCapacitorGuard::Attack {
+            source: fixture.ship, target: fixture.ship,
+            source_guard: Some(crate::services::effects::space_source::SourceGuard::Drone { source: fixture.ship, target: fixture.ship, generation: 0 }),
+            player: None, optimal: 100.0, falloff: 0.0, offensive: true,
+        };
+        assert!(drain_exact_guarded(&test_db, &test_world, system, fixture.ship, 0.0, stale).await.ok().unwrap().is_none());
         let cx = Ctx { db: test_db.clone(), world: test_world.clone(), notify: tx, char_id: fixture.character, ship_id: fixture.ship, system_id: system };
         let module = Module { id: fixture.module, type_id: module_type, flag: FLAG_FITTING_FIRST };
         let stop = Arc::new(AtomicBool::new(false));

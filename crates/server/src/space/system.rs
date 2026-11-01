@@ -85,11 +85,19 @@ pub struct System {
     tractors: HashMap<i64, Tractor>,
     tractor_epochs: HashMap<i64, Arc<()>>,
     pub(super) brains: HashMap<i64, NpcBrain>,
+    pub(super) drones: HashMap<i64, drone::DroneBrain>,
+    pub(super) drone_reservations: HashMap<u64, drone::Reservation>,
     pub(super) effect_jobs: Option<mpsc::UnboundedSender<npc::EffectJob>>,
     pub(super) deferred_jobs: Option<mpsc::UnboundedSender<npc::NpcFuture>>,
     pub(super) groups: HashMap<u64, npc::SpawnGroup>,
     pub(super) member_groups: HashMap<i64, std::collections::HashSet<u64>>,
     pub(super) due_brains: Vec<i64>,
+    pub(super) due_drones: Vec<i64>,
+    pub(super) drone_aggressors: HashMap<i64, drone::automatic::Aggressors>,
+    pub(super) automatic_drones: Vec<i64>,
+    pub(super) automatic_targets: Vec<i64>,
+    pub(super) drone_announcements: Vec<i64>,
+    pub(super) drone_launch_acks: Vec<tokio::sync::oneshot::Sender<()>>,
     pub(super) snapshot_context: Option<snapshot::Context>,
     pub(super) projection_sde: Option<Arc<Sde>>,
     pub(super) projections: HashMap<i64, Vec<crate::services::effects::projection::Projection>>,
@@ -100,6 +108,7 @@ pub struct System {
     pub(super) snapshot_due: i64,
 }
 impl System {
+    pub(crate) fn sde(&self) -> Option<&crate::sde::Sde> { self.projection_sde.as_deref() }
     pub fn new(id: i64, registry: Arc<Pilots>, unix_ms: i64) -> Self {
         let current_time = unix_ms.div_euclid(MILLISECONDS_PER_SECOND);
         Self { id, registry, ms: unix_ms, current_time,
@@ -149,6 +158,9 @@ impl System {
     pub fn ball(&self, id: i64) -> Option<&Ball> {
         self.balls.get(&id)
     }
+    pub(super) fn set_ball_owner(&mut self, id: i64, owner: i64) {
+        if let Some(ball) = self.balls.get_mut(&id) { ball.owner_id = owner; }
+    }
 
     /// Sample the completed segment at the actor's shared millisecond clock.
     pub fn sample_position(&self, id: i64) -> Option<V3> {
@@ -170,6 +182,9 @@ impl System {
 
     pub fn pilots(&self) -> impl Iterator<Item = &Ball> {
         self.pilots.values().filter_map(|id| self.ball(*id))
+    }
+    pub(crate) fn persistent_balls(&self) -> impl Iterator<Item = &Ball> {
+        self.snapshot_positions.keys().filter_map(|id| self.ball(*id))
     }
 
     pub fn pilot_ball(&self, char_id: i64) -> Option<&Ball> {
@@ -203,6 +218,8 @@ impl System {
     }
 
     pub fn take(&mut self, id: i64) -> Option<Ball> {
+        self.drone_controller_lost(id);
+        self.drone_removed(id);
         self.cleanup_tractors(id);
         self.warp_exits.remove(&id);
         if self.balls.contains_key(&id) {
@@ -250,7 +267,7 @@ impl System {
     pub(super) fn is_cold(&self) -> bool {
         self.actions.is_empty()
             && !self.timers.first_key_value().is_some_and(|(&(due, _), _)| due <= self.ms)
-            && self.module_cloaks.is_empty() && self.brains.is_empty() && self.observers.is_empty() && !self.balls.values().any(|b|
+            && self.module_cloaks.is_empty() && self.brains.is_empty() && self.drones.is_empty() && self.observers.is_empty() && !self.balls.values().any(|b|
             (b.free && (b.mode != MODE_STOP || b.vel != [0.0; 3]))
             || (b.cloak != 0 && b.cloak_until > 0))
             && !collision::stationary_contact(&self.balls)
@@ -297,7 +314,7 @@ impl System {
                     b.evolve_behavior_for_ball(logical_ms, anchor_ms, &self.target_states, self.current_time);
                     let activated = aligning && b.is_warping();
                     self.target_states.get_mut(&id).unwrap().vel = b.vel;
-                    if activated { self.stop_all_followers(id); }
+                    if activated { self.stop_all_followers(id); self.drone_controller_lost(id); }
                 }
                 collision::freeze(&mut self.collision_scratch, &self.balls);
                 collision::apply(&self.collision_scratch, &mut self.balls);
@@ -318,7 +335,7 @@ impl System {
             }
             self.current_time += 1;
         }
-        if self.pilots.is_empty() {
+        if self.snapshot_positions.is_empty() {
             self.snapshot_due = 0;
         } else if self.snapshot_due != 0 && ms >= self.snapshot_due {
             self.snapshot_due = ms.saturating_add(crate::config::game().space.position_snapshot_secs.saturating_mul(MILLISECONDS_PER_SECOND));
@@ -339,6 +356,7 @@ impl System {
             timer(self);
         }
         self.think_npcs();
+        self.think_drones();
         if let Some(pending) = self.pending.take() {
             for (client, events) in pending {
                 if let Some((_, tx)) = self.observers.get(&client) {
@@ -346,6 +364,13 @@ impl System {
                 }
             }
         }
+        let mut announcements = std::mem::take(&mut self.drone_announcements);
+        for id in announcements.iter().copied() { self.announce_drone(id); }
+        announcements.clear();
+        self.drone_announcements = announcements;
+        let mut acks = std::mem::take(&mut self.drone_launch_acks);
+        for ack in acks.drain(..) { let _ = ack.send(()); }
+        self.drone_launch_acks = acks;
     }
     fn deliver(&mut self, about: Option<(i64, u8)>, events: Vec<Value>) {
         self.observers.retain(|&client, (ego, tx)| {
@@ -360,6 +385,12 @@ impl System {
     pub fn broadcast(&mut self, about: i64, events: Vec<Value>) {
         let visibility = self.ball(about).map(|b| (b.id, b.cloak));
         self.deliver(visibility, events);
+    }
+    pub(super) fn queue_drone_announcement(&mut self, id: i64) {
+        self.actions.push_back((self.current_time, Box::new(move |s, _| s.drone_announcements.push(id))));
+    }
+    pub(super) fn queue_drone_launch_ack(&mut self, ack: tokio::sync::oneshot::Sender<()>) {
+        self.actions.push_back((self.current_time, Box::new(move |s, _| s.drone_launch_acks.push(ack))));
     }
     pub fn add_ship(&mut self, mut ball: Ball) {
         ball.last_ms = self.current_time * MILLISECONDS_PER_SECOND;
@@ -588,7 +619,7 @@ impl System {
                 ("damageState", Value::Dict(damage)),
                 ("effectStates", Value::list([])),
                 ("allianceBridges", Value::list([])),
-                ("droneState", Value::list([])),
+                ("droneState", Value::list(self.drone_state_rows(ego))),
                 ("solItem", sol),
                 ("industryLevel", Value::Int(0)),
                 ("researchLevel", Value::Int(0)),
@@ -605,6 +636,24 @@ impl System {
         let (stamp, action) = self.actions.pop_back().expect("kinematics queues one action");
         self.actions.push_back((stamp, Box::new(move |s, stamp| {
             if s.projection_revision(target) == revision { action(s, stamp); }
+        })));
+    }
+    pub(super) fn queue_drone_kinematics(&mut self, target: i64, generation: u64, revision: u64,
+        owner_projection: Option<(i64, u64)>, values: crate::services::effects::propulsion::Kinematics) {
+        crate::services::effects::propulsion::queue_kinematics(self, target, values);
+        let (stamp, action) = self.actions.pop_back().expect("kinematics queues one action");
+        self.actions.push_back((stamp, Box::new(move |s, stamp| {
+            if !s.drone_current(target, generation) {
+                if let Some(current) = s.drone(target) { s.invalidate_drone_kinematics(target, current.generation); }
+                return;
+            }
+            if s.projection_revision(target) == revision
+                && owner_projection.is_none_or(|(owner, revision)| s.projection_revision(owner) == revision) {
+                action(s, stamp);
+            } else {
+                s.invalidate_drone_kinematics(target, generation);
+                s.refresh_projection_target(target);
+            }
         })));
     }
     /// Queue a command for the next destiny boundary, retaining its enqueue stamp.

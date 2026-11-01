@@ -1,6 +1,7 @@
 use super::*;
 mod jamming;
 mod jump_cloak;
+mod drone;
 #[path = "../effects/tests.rs"]
 mod effect_actions;
 

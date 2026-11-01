@@ -18,6 +18,26 @@ fn drone_queries_select_only_the_session_owners_drone() {
 }
 
 #[test]
+fn live_drone_candidate_uses_item_location_and_rejects_bay_or_non_singletons() {
+    let mut item = Item {
+        item_id: 42, type_id: 1, owner_id: 7, location_id: 123, flag_id: 0,
+        quantity: 1, singleton: true, group_id: 1,
+        category_id: i64::from(CATEGORY_DRONE), custom_info: None,
+    };
+    assert_eq!(drone_location(&item), Some(123));
+    item.location_id = 456;
+    assert_eq!(drone_location(&item), Some(456));
+    item.flag_id = 1;
+    assert_eq!(drone_location(&item), None);
+    item.flag_id = 0;
+    item.singleton = false;
+    assert_eq!(drone_location(&item), None);
+    item.singleton = true;
+    item.category_id = i64::from(CATEGORY_MODULE);
+    assert_eq!(drone_location(&item), None);
+}
+
+#[test]
 fn late_gm_snapshot_requests_refresh_without_overwriting_newer_projection() {
     use crate::space::{Ball, System, WarpState, MODE_STOP};
     use std::sync::Arc;

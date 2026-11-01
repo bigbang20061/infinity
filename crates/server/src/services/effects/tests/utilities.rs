@@ -68,7 +68,7 @@ async fn scanner(effect_id: i32) {
         while rx.try_recv().is_ok() {}
         if effect_id == EFFECT_SHIP_SCAN {
             let cap = groups_health::capacitor_snapshot(&test_db, &test_world, 1, foreign.ship).await.ok().flatten().unwrap();
-            assert!(groups_health::drain_exact(&test_db, &test_world, 1, foreign.ship, cap.capacity / 2.0).await.ok().unwrap() > 0.0);
+            assert!(groups_health::tests::drain_exact(&test_db, &test_world, 1, foreign.ship, cap.capacity / 2.0).await.ok().unwrap() > 0.0);
         }
         assert_eq!(scan::end(&cx, &fit, &mut cycle).await.ok().unwrap(), CycleOutcome::Stop("scan complete"));
         let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();

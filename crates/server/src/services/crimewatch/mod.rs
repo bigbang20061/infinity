@@ -108,6 +108,14 @@ pub fn weapons_timer(char_id: i64) -> Option<i64> {
 fn is_criminal(char_id: i64, now: i64) -> bool {
     state().pilots.get(&char_id).is_some_and(|p| p.criminal_until > now || p.suspect_until > now)
 }
+/// Whether existing engagement or flags permit retaliation against a player.
+pub(crate) fn retaliation_allowed(owner: i64, aggressor: i64, now: i64) -> bool {
+    if owner == aggressor { return false; }
+    let st = state();
+    st.engagements.get(&(owner, aggressor)).is_some_and(|until| *until > now)
+        || st.pilots.get(&aggressor).is_some_and(|p| p.criminal_until > now || p.suspect_until > now)
+}
+
 
 pub async fn security_status(db: &(impl Executor + ?Sized), char_id: i64) -> Result<f64, CallError> {
     Ok(crate::dao::characters::crimewatch::security(db, char_id).await.map_err(db_err)?.unwrap_or(0.0))

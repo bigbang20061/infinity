@@ -47,6 +47,8 @@ mod actor;
 pub(crate) mod system;
 mod projections;
 mod npc;
+pub(crate) mod drone;
+mod targeting;
 mod warpin;
 mod snapshot;
 mod stop;
@@ -565,11 +567,12 @@ pub struct World {
     systems: Arc<Mutex<HashMap<i64, SystemHandle>>>,
     observers: Mutex<HashMap<i64, i64>>,
     pilots: Arc<Pilots>,
+    weak: std::sync::Weak<World>,
 }
 impl World {
     pub fn new(db: Db, sde: Arc<Sde>, capacity: usize) -> Arc<Self> {
-        Arc::new(Self { db, sde, systems: Default::default(),
-            observers: Default::default(), pilots: Arc::new(Pilots { capacity, ..Pilots::default() }) })
+        Arc::new_cyclic(|weak| Self { db, sde, systems: Default::default(),
+            observers: Default::default(), pilots: Arc::new(Pilots { capacity, ..Pilots::default() }), weak: weak.clone() })
     }
     pub fn sde(&self) -> &Arc<Sde> { &self.sde }
     pub fn register_pilot(&self, char_id: i64, tx: NotifyTx) { self.pilots.register_pilot(char_id, tx); }
@@ -580,6 +583,12 @@ impl World {
     /// Start the destination before removing a jumping ship from its source.
     /// Construction is serialized with the live-handle check.
     pub async fn system(&self, system_id: i64) -> Result<()> {
+        if self.running(system_id).is_some() { return Ok(()); }
+        let restored = crate::services::drones::inventory::restore_specs(&self.db, self.sde.clone(), system_id).await
+            .map_err(|error| match error {
+                crate::services::CallError::Internal(error) => error,
+                crate::services::CallError::User { msg, .. } => anyhow::anyhow!(msg),
+            })?;
         let mut systems = self.systems.lock().unwrap();
         if systems.get(&system_id).is_some_and(|h| h.is_closed()) { systems.remove(&system_id); }
         if systems.contains_key(&system_id) { return Ok(()); }
@@ -654,6 +663,8 @@ impl World {
                 },
             );
         }
+        let effects = crate::services::drones::worker::effects(self.db.clone(), self.weak.clone(), system_id);
+        for (ball, spec) in restored { system.restore_drone(ball, spec, effects.clone()); }
         info!("loaded solar system {system_id} with {} celestials", system.balls().count());
 
         let handle = actor::start(system, system_id, Arc::downgrade(&self.systems), self.db.clone());

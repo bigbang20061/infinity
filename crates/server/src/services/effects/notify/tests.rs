@@ -1,6 +1,17 @@
 use super::*;
 
 #[test]
+fn drone_notifications_preserve_client_arguments_and_none() {
+    assert_eq!(drone_state(10, Some(20), Some(30), 6, 40, Some(50), Some(60)),
+        vec![Value::Int(10), Value::Int(20), Value::Int(30), Value::Int(6), Value::Int(40), Value::Int(50), Value::Int(60)]);
+    assert_eq!(drone_state(10, Some(20), None, 0, 40, None, None),
+        vec![Value::Int(10), Value::Int(20), Value::None, Value::Int(0), Value::Int(40), Value::None, Value::None]);
+    assert_eq!(drone_activity(10, Some(20), Some("assist")), vec![Value::Int(10), Value::Int(20), Value::str("assist")]);
+    assert_eq!(drone_activity(10, None, None), vec![Value::Int(10), Value::None, Value::None]);
+    assert_eq!(drone_control_lost(10), vec![Value::Int(10)]);
+}
+
+#[test]
 fn ewar_notifications_use_client_string_slot_and_argument_order() {
     let args = vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::str("webify")];
     assert_eq!(ewar(1, 2, 3, "webify", true), ("OnEwarStart", args.clone()));

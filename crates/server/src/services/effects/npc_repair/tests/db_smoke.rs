@@ -40,11 +40,18 @@ fn brain(hostile: Option<i64>, shots: Option<tokio::sync::mpsc::UnboundedSender<
     }
     brain
 }
+async fn run_source(db: &crate::db::Db, world: &Arc<crate::space::World>, system: i64, me: &Ball, victim: &Ball, effect: &Effect, duration_ms: f64, generation: u64) -> Result<(), CallError> {
+    let fit = crate::services::fit::Fit::for_space_type(world.sde().clone(), me.type_id, vec![]);
+    apply_source(&SourceContext { db, world, system, source: me, target: victim, module: 0, effect, duration_ms, fit: &fit,
+        key: crate::services::fit::Key::Ship, guard: SourceGuard::Npc { source: me.id, target: victim.id, generation },
+        attacker: None, drone: None, phase: DronePhase::Begin }).await
+}
+
 
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn npc_repair_real_sde_phase_selection_and_guards() {
-    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
     let target_type = sde.types.iter().find(|ty| {
         ty.category_id == Some(CATEGORY_ENTITY)
@@ -56,7 +63,7 @@ async fn npc_repair_real_sde_phase_selection_and_guards() {
     let hp = [ATTR_SHIELD_CAPACITY, ATTR_ARMOR_HP, ATTR_STRUCTURE_HP].map(|id| sde.types.attribute(target_type, id).unwrap());
     let resonance = [ATTR_SHIELD_EM_DAMAGE_RESONANCE, ATTR_ARMOR_EM_DAMAGE_RESONANCE, ATTR_STRUCTURE_EM_DAMAGE_RESONANCE]
         .map(|id| sde.types.attribute(target_type, id).unwrap_or(1.0));
-    let world = World::new(db.clone(), sde.clone(), 1);
+    let world = crate::space::World::new(db.clone(), sde.clone(), 1);
     for (layer, effect_id) in [EFFECT_NPC_REMOTE_SHIELD_BOOSTER, EFFECT_NPC_REMOTE_ARMOR_REPAIRER, EFFECT_NPC_REMOTE_HULL_REPAIRER].into_iter().enumerate() {
         let effect = super::super::super::registry::resolve(&sde, effect_id).expect("NPC repair effect");
         let source_type = sde.types.iter().find(|ty| ty.effects().iter().any(|e| e.effect_id == effect_id)
@@ -86,7 +93,7 @@ async fn npc_repair_real_sde_phase_selection_and_guards() {
             .await.expect("NPC shot timed out").expect("NPC callback closed");
         let full_source = world.ball(system, source).await.unwrap();
         let full_victim = world.ball(system, hostile).await.unwrap();
-        apply_npc(&db, &world, system, 0, &full_source, &full_victim, &effect, CYCLE_MS, generation).await.ok().unwrap();
+        run_source(&db, &world, system, &full_source, &full_victim, &effect, CYCLE_MS, generation).await.ok().unwrap();
         let full = world.with(system, move |s| npc_health_fraction(s.ball(ally).unwrap(), layer).unwrap()).await.unwrap();
         assert_eq!(full, 1.0);
         let raw = (0..layer).map(|i| hp[i] / resonance[i]).sum::<f64>() + hp[layer] * 0.5 / resonance[layer];
@@ -103,11 +110,11 @@ async fn npc_repair_real_sde_phase_selection_and_guards() {
         let mut missing = me.clone();
         missing.type_id = missing_type;
         assert!(!supported_for_type(&sde, missing_type, &effect));
-        apply_npc(&db, &world, system, 0, &missing, &victim, &effect, CYCLE_MS, generation).await.ok().unwrap();
+        run_source(&db, &world, system, &missing, &victim, &effect, CYCLE_MS, generation).await.ok().unwrap();
         assert!(world.after(system, CYCLE_WAIT_MS).await);
         let unchanged = world.with(system, move |s| npc_health_fraction(s.ball(ally).unwrap(), layer).unwrap()).await.unwrap();
         assert_eq!(unchanged, before);
-        apply_npc(&db, &world, system, 0, &me, &victim, &effect, CYCLE_MS, generation).await.ok().unwrap();
+        run_source(&db, &world, system, &me, &victim, &effect, CYCLE_MS, generation).await.ok().unwrap();
         let (first, second) = world.with(system, move |s| (npc_health_fraction(s.ball(ally).unwrap(), layer).unwrap(), npc_health_fraction(s.ball(rival).unwrap(), layer).unwrap())).await.unwrap();
         if layer == 0 { assert!(first > before); } else { assert_eq!(first, before); }
         assert_eq!(second, before, "equal health ties choose the lower ID");
@@ -118,18 +125,18 @@ async fn npc_repair_real_sde_phase_selection_and_guards() {
             let after = world.with(system, move |s| npc_health_fraction(s.ball(ally).unwrap(), layer).unwrap()).await.unwrap();
             assert!(after > before, "armor and hull repair at cycle end");
             // The remaining damaged ally is selected, then made ineligible before the timer.
-            apply_npc(&db, &world, system, 0, &me, &victim, &effect, CYCLE_MS, generation).await.ok().unwrap();
+            run_source(&db, &world, system, &me, &victim, &effect, CYCLE_MS, generation).await.ok().unwrap();
             world.with(system, move |s| { s.spawn_group([source], |_| {}); }).await.unwrap();
             assert!(world.after(system, CYCLE_WAIT_MS).await);
             let unchanged = world.with(system, move |s| npc_health_fraction(s.ball(rival).unwrap(), layer).unwrap()).await.unwrap();
             assert_eq!(unchanged, before, "an ally leaving the support group cancels the repair");
-            apply_npc(&db, &world, system, 0, &me, &victim, &effect, CYCLE_MS, generation).await.ok().unwrap();
+            run_source(&db, &world, system, &me, &victim, &effect, CYCLE_MS, generation).await.ok().unwrap();
             assert!(world.after(system, CYCLE_WAIT_MS).await);
             let no_ally = world.with(system, move |s| npc_health_fraction(s.ball(rival).unwrap(), layer).unwrap()).await.unwrap();
             assert_eq!(no_ally, before, "no eligible ally starts no repair");
 
             world.with(system, move |s| { s.spawn_group([source, rival], |_| {}); }).await.unwrap();
-            apply_npc(&db, &world, system, 0, &me, &victim, &effect, MOVE_CYCLE_MS, generation).await.ok().unwrap();
+            run_source(&db, &world, system, &me, &victim, &effect, MOVE_CYCLE_MS, generation).await.ok().unwrap();
             world.with(system, move |s| {
                 s.command(rival, |ball, _, _| {
                     ball.pos = [1.0e12, 0.0, 0.0];
@@ -149,7 +156,7 @@ async fn npc_repair_real_sde_phase_selection_and_guards() {
                 });
             }).await.unwrap();
             assert!(world.after(system, 1_200).await);
-            apply_npc(&db, &world, system, 0, &me, &victim, &effect, 10_000.0, generation).await.ok().unwrap();
+            run_source(&db, &world, system, &me, &victim, &effect, 10_000.0, generation).await.ok().unwrap();
             world.with(system, move |s| { s.remove_ball(hostile); }).await.unwrap();
             assert!(world.after(system, 1_500).await);
             world.with(system, move |s| { s.insert(ball(hostile, target_type, 2, Some(1))); }).await.unwrap();

@@ -78,6 +78,11 @@ fn state() -> MutexGuard<'static, State> {
     STATE.get_or_init(Default::default).lock().unwrap()
 }
 
+pub(crate) fn same_fleet(a: i64, b: i64) -> bool {
+    let state = state();
+    state.of.get(&a).is_some_and(|fleet| state.of.get(&b) == Some(fleet))
+}
+
 fn next_id() -> i64 {
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
 }

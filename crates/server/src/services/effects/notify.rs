@@ -10,6 +10,20 @@ use marshal::Value;
 
 use super::environment;
 
+/// Michelle.OnDroneStateChange's authoritative seven positional arguments.
+pub(crate) fn drone_state(drone: i64, owner: Option<i64>, controller: Option<i64>, state: i32, type_id: i32, controller_owner: Option<i64>, target: Option<i64>) -> Vec<Value> {
+    vec![Value::Int(drone), owner.map_or(Value::None, Value::Int), controller.map_or(Value::None, Value::Int),
+        Value::Int(i64::from(state)), Value::Int(i64::from(type_id)), controller_owner.map_or(Value::None, Value::Int), target.map_or(Value::None, Value::Int)]
+}
+
+/// Michelle.OnDroneActivityChange carries assist/guard metadata.
+pub(crate) fn drone_activity(drone: i64, character: Option<i64>, activity: Option<&str>) -> Vec<Value> {
+    vec![Value::Int(drone), character.map_or(Value::None, Value::Int), activity.map_or(Value::None, Value::str)]
+}
+
+/// Client dogma.OnDroneControlLost unloads the drone's dogma item.
+pub(crate) fn drone_control_lost(drone: i64) -> Vec<Value> { vec![Value::Int(drone)] }
+
 /// Client dogma/effects/GetEwarTypeByEffectID, including chance-flag precedence.
 pub(crate) fn ewar_slot(effect: &super::registry::Effect) -> Option<&'static str> {
     use super::registry::EffectFlag;

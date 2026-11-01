@@ -3,11 +3,11 @@
 //! effect metadata determine amounts and falloff. Capacitor state and recharge are
 //! owned by combat; assistance Crimewatch propagation is not yet modelled.
 use super::lifecycle::{Cycle, CycleOutcome, Module};
-use super::registry::{Effect, EffectAttribute};
+use super::registry::{Effect, EffectAttribute, EffectFlag};
 use super::{range::range_multiplier, weapons::consume_charge, EffectKind};
-use crate::consts::{ATTR_CAPACITOR_BONUS, ATTR_ENERGY_NEUTRALIZER_AMOUNT, ATTR_NOS_OVERRIDE, ATTR_POWER_TRANSFER_AMOUNT, CATEGORY_ENTITY, CATEGORY_SHIP};
+use crate::consts::{ATTR_CAPACITOR_BONUS, ATTR_ENERGY_NEUTRALIZER_AMOUNT, ATTR_NOS_OVERRIDE, ATTR_POWER_TRANSFER_AMOUNT, CATEGORY_DRONE, CATEGORY_ENTITY, CATEGORY_SHIP};
 use crate::messages;
-use crate::services::combat::{Ctx, groups_health::{capacitor_snapshot, drain_exact, inject}, targeting_charges::{loaded, targets_of}};
+use crate::services::combat::{Ctx, groups_health::{capacitor_snapshot, drain_exact_guarded, inject, NpcCapacitorGuard}, targeting_charges::{loaded, targets_of}};
 use crate::services::fit::{Fit, Key};
 use crate::services::{user_error, CallError};
 use crate::space::{dist, MODE_WARP};
@@ -21,18 +21,18 @@ fn target_error() -> CallError {
 }
 
 /// Sample both balls together so the falloff uses one actor-time position.
-async fn target_distance(cx: &Ctx, target: Option<i64>) -> Result<f64, CallError> {
+async fn target_distance(cx: &Ctx, target: Option<i64>) -> Result<(f64, bool), CallError> {
     let target = target.filter(|&id| id != cx.ship_id && targets_of(cx.char_id).contains(&id)).ok_or_else(target_error)?;
     let source = cx.ship_id;
-    let Some((ship, victim, npc)) = cx.world.with(cx.system_id, move |s| Some((s.sampled_ball(source)?, s.sampled_ball(target)?, s.is_npc(target)))).await.flatten() else {
+    let Some((ship, victim, npc, drone)) = cx.world.with(cx.system_id, move |s| Some((s.sampled_ball(source)?, s.sampled_ball(target)?, s.is_npc(target), s.drone(target).is_some()))).await.flatten() else {
         return Err(target_error());
     };
     if ship.mode == MODE_WARP || victim.mode == MODE_WARP {
         return Err(user_error(messages::MSG_DENIED_ACTIVATE_IN_WARP, vec![]));
     }
     let category = cx.world.sde().types.get(victim.type_id).and_then(|t| t.category_id);
-    if category != Some(CATEGORY_SHIP) && !(category == Some(CATEGORY_ENTITY) && npc) { return Err(target_error()); }
-    Ok((dist(ship.pos, victim.pos) - f64::from(ship.radius) - f64::from(victim.radius)).max(0.0))
+    if category != Some(CATEGORY_SHIP) && category != Some(CATEGORY_DRONE) && !(category == Some(CATEGORY_ENTITY) && npc) { return Err(target_error()); }
+    Ok(((dist(ship.pos, victim.pos) - f64::from(ship.radius) - f64::from(victim.radius)).max(0.0), drone))
 }
 
 pub(super) async fn validate(cx: &Ctx, _fit: &Fit, module: &Module, effect: &Effect, target: Option<i64>) -> Result<(), CallError> {
@@ -66,7 +66,7 @@ pub(super) async fn start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<Cycl
         inject(&cx.db, &cx.world, cx.system_id, cx.ship_id, amount).await?;
         return Ok(CycleOutcome::Continue);
     }
-    let distance = match target_distance(cx, cycle.target).await {
+    let (distance, target_drone) = match target_distance(cx, cycle.target).await {
         Ok(distance) => distance,
         Err(CallError::User { .. }) => return Ok(CycleOutcome::Stop("target lost")),
         Err(error) => return Err(error),
@@ -76,18 +76,26 @@ pub(super) async fn start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<Cycl
     let optimal = cycle.effect.attribute(EffectAttribute::Range).map(|attr| fit.value(key, attr)).unwrap_or(0.0);
     let falloff = cycle.effect.attribute(EffectAttribute::Falloff).map(|attr| fit.value(key, attr)).unwrap_or(0.0);
     let scale = range_multiplier(distance, optimal, falloff);
+    let guard = NpcCapacitorGuard::Attack {
+        source: cx.ship_id, target, source_guard: None,
+        player: Some((cx.char_id, module.id, cycle.stop.clone())), optimal, falloff,
+        offensive: cycle.effect.has(EffectFlag::Offensive),
+    };
+    let mut victim_owner = None;
     match cycle.effect.kind {
         EffectKind::Neutralizer => {
             let amount = fit.value(key, ATTR_ENERGY_NEUTRALIZER_AMOUNT).max(0.0) * scale;
-            drain_exact(&cx.db, &cx.world, cx.system_id, target, amount).await?;
+            victim_owner = drain_exact_guarded(&cx.db, &cx.world, cx.system_id, target, amount, guard).await?.and_then(|(_, owner)| owner);
         }
         EffectKind::Nosferatu => {
             let Some(source) = capacitor_snapshot(&cx.db, &cx.world, cx.system_id, cx.ship_id).await? else { return Ok(CycleOutcome::Stop("source lost")); };
             let Some(victim) = capacitor_snapshot(&cx.db, &cx.world, cx.system_id, target).await? else { return Ok(CycleOutcome::Stop("target lost")); };
             if nos_allowed(source.level, source.capacity, victim.level, victim.capacity, fit.value(key, ATTR_NOS_OVERRIDE) > 0.0) {
                 let amount = fit.value(key, ATTR_POWER_TRANSFER_AMOUNT).max(0.0) * scale;
-                let drained = drain_exact(&cx.db, &cx.world, cx.system_id, target, amount).await?;
-                inject(&cx.db, &cx.world, cx.system_id, cx.ship_id, drained).await?;
+                if let Some((drained, owner)) = drain_exact_guarded(&cx.db, &cx.world, cx.system_id, target, amount, guard).await? {
+                    victim_owner = owner;
+                    inject(&cx.db, &cx.world, cx.system_id, cx.ship_id, drained).await?;
+                }
             }
         }
         EffectKind::CapTransfer => {
@@ -95,6 +103,11 @@ pub(super) async fn start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<Cycl
             inject(&cx.db, &cx.world, cx.system_id, target, amount).await?;
         }
         _ => unreachable!("not a capacitor effect"),
+    }
+    if target_drone && cycle.effect.has(EffectFlag::Offensive) {
+        if let (Some(victim), Some(ship_type)) = (victim_owner, fit.source_type(Key::Ship)) {
+            crate::services::crimewatch::aggress(&cx.db, &cx.world, cx.system_id, cx.char_id, ship_type, module.type_id, victim, target).await?;
+        }
     }
     Ok(CycleOutcome::Continue)
 }

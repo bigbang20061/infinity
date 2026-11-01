@@ -33,6 +33,8 @@ async fn undock(c: &mut Client) -> CallResult {
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     match call.method {
         "Undock" => Some(undock(c).await),
+        "LaunchDrones" => Some(crate::services::drones::inventory::launch::launch(c, call).await),
+        "ScoopDrone" => Some(crate::services::drones::inventory::returning::scoop(c, call).await),
         _ => None,
     }
 }

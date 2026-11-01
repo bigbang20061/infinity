@@ -19,12 +19,7 @@ static NEXT_GROUP: AtomicU64 = AtomicU64::new(1);
 /// Process-local NPC effect identities occupy the negative, non-item ID namespace.
 static NEXT_NPC_MODULE: AtomicI64 = AtomicI64::new(-1);
 
-static NEXT_NPC_TARGET_GENERATION: AtomicU64 = AtomicU64::new(1);
-
-fn next_npc_target_generation() -> u64 {
-    NEXT_NPC_TARGET_GENERATION.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-        .expect("NPC target generation exhausted")
-}
+use super::targeting::next_generation as next_npc_target_generation;
 
 /// Server NPC targeting policy: sentinel owner permitting targets among all pilots.
 pub const HOSTILE_TO_ALL: i64 = -1;
@@ -87,6 +82,7 @@ impl NpcBrain {
 
 pub(super) enum EffectJob {
     Npc { effects: NpcEffects, action: NpcAction },
+    Drone { effects: drone::DroneEffects, action: drone::DroneAction },
 }
 pub(super) fn start_worker(system: &mut System) {
     let (tx, mut rx) = mpsc::unbounded_channel::<EffectJob>();
@@ -94,8 +90,11 @@ pub(super) fn start_worker(system: &mut System) {
     system.effect_jobs = Some(tx);
     system.deferred_jobs = Some(deferred_tx);
     let worker = tokio::spawn(async move {
-        while let Some(EffectJob::Npc { effects, action }) = rx.recv().await {
-            effects(action).await;
+        while let Some(job) = rx.recv().await {
+            match job {
+                EffectJob::Npc { effects, action } => effects(action).await,
+                EffectJob::Drone { effects, action } => effects(action).await,
+            }
         }
     });
     tokio::spawn(async move {
@@ -226,6 +225,7 @@ impl System {
         brain.announced = false;
     }
     pub(crate) fn drop_npc_targets(&mut self, id: i64) {
+        self.drone_jammed(id);
         let Some(mut brain) = self.brains.remove(&id) else { return };
         self.lose_npc_target(id, &mut brain);
         self.brains.insert(id, brain);
@@ -245,7 +245,7 @@ impl System {
         let Some(me) = self.ball(id) else { return };
         let pos = me.position_at(self.ms);
         let current = brain.target.and_then(|(ship, _, _)| self.ball(ship))
-            .filter(|b| b.cloak == 0 && b.mode != MODE_WARP && b.signature_radius.is_some()
+            .filter(|b| targeting::target_visible(b) && b.signature_radius.is_some()
                 && len(sub(b.position_at(self.ms), pos)) < brain.config.aggro_range * crate::config::game().combat.npc_target_loss_range_factor
                 && brain.max_target_range.is_none_or(|range| len(sub(b.position_at(self.ms), pos)) <= range));
         let victim_id = current.map(|b| b.id);
@@ -260,13 +260,14 @@ impl System {
         }
         if victim_id.is_none() {
             self.lose_npc_target(id, brain);
-            let nearest = self.pilots().filter(|b| b.char_id.is_some_and(|pilot|
-                brain.owner == Some(HOSTILE_TO_ALL) || brain.owner == Some(pilot) || brain.aggressors.contains(&pilot))
-                && b.signature_radius.is_some() && b.cloak == 0 && b.mode != MODE_WARP)
-                .map(|b| (b, len(sub(b.position_at(self.ms), pos))))
-                .filter(|(_, distance)| *distance <= brain.config.aggro_range && brain.max_target_range.is_none_or(|range| *distance <= range))
-                .min_by(|(_, a), (_, b)| a.total_cmp(b))
-                .map(|(b, _)| (b.id, b.char_id.unwrap(), b.signature_radius.unwrap()));
+            let nearest = self.pilots().filter_map(|b| b.char_id.map(|owner| (b, owner)))
+                .chain(self.drones().filter_map(|d| self.ball(d.id).map(|b| (b, d.owner))))
+                .filter(|(b, pilot)| (brain.owner == Some(HOSTILE_TO_ALL) || brain.owner == Some(*pilot) || brain.aggressors.contains(pilot))
+                    && targeting::target_visible(b) && b.signature_radius.is_some())
+                .map(|(b, pilot)| (b, pilot, len(sub(b.position_at(self.ms), pos))))
+                .filter(|(_, _, distance)| *distance <= brain.config.aggro_range && brain.max_target_range.is_none_or(|range| *distance <= range))
+                .min_by(|(_, _, a), (_, _, b)| a.total_cmp(b))
+                .map(|(b, pilot, _)| (b.id, pilot, b.signature_radius.unwrap()));
             if let Some((ship, pilot, signature)) = nearest {
                 let orbit = brain.config.fly_range;
                 self.command(id, move |b, stamp, others| {
@@ -299,7 +300,7 @@ impl System {
             && brain.target_generation == generation && brain.announced
             && brain.target.is_some_and(|(ship, _, _)| ship == target)
             && self.ball(id).zip(self.ball(target)).is_some_and(|(me, victim)|
-                victim.cloak == 0 && victim.mode != MODE_WARP && victim.signature_radius.is_some()
+                targeting::target_visible(victim) && victim.signature_radius.is_some()
                     && len(sub(victim.position_at(self.ms), me.position_at(self.ms)))
                         < brain.config.aggro_range * crate::config::game().combat.npc_target_loss_range_factor
                     && brain.max_target_range.is_none_or(|range| len(sub(victim.position_at(self.ms), me.position_at(self.ms))) <= range))
@@ -325,8 +326,8 @@ impl System {
             && brain.target == Some((ship, pilot, deadline)) && !brain.announced;
         let valid = current && !crate::services::combat::jamming::is_jammed(id, self.now_ms())
             && self.ball(id).zip(self.ball(ship)).is_some_and(|(me, victim)|
-                victim.char_id == Some(pilot) && victim.signature_radius.is_some()
-                && victim.cloak == 0 && victim.mode != MODE_WARP
+                (victim.char_id == Some(pilot) || self.drone(ship).is_some_and(|d| d.owner == pilot))
+                && targeting::target_visible(victim) && victim.signature_radius.is_some()
                 && len(sub(victim.position_at(self.ms), me.position_at(self.ms))) < brain.config.aggro_range * crate::config::game().combat.npc_target_loss_range_factor
                 && brain.max_target_range.is_none_or(|range| len(sub(victim.position_at(self.ms), me.position_at(self.ms))) <= range));
         if valid {

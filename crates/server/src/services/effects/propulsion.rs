@@ -12,9 +12,9 @@ use marshal::Value;
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) struct Kinematics { speed: f64, mass: f64, agility: f64, signature: f64 }
 
-pub(crate) fn kinematics(fit: &Fit) -> Kinematics {
-    Kinematics { speed: fit.value(Key::Ship, ATTR_MAX_VELOCITY), mass: fit.value(Key::Ship, ATTR_MASS),
-        agility: fit.value(Key::Ship, crate::consts::ATTR_AGILITY), signature: fit.value(Key::Ship, ATTR_SIGNATURE_RADIUS) }
+pub(crate) fn kinematics(fit: &Fit, key: Key) -> Kinematics {
+    Kinematics { speed: fit.value(key, ATTR_MAX_VELOCITY), mass: fit.value(key, ATTR_MASS),
+        agility: fit.value(key, crate::consts::ATTR_AGILITY), signature: fit.value(key, ATTR_SIGNATURE_RADIUS) }
 }
 
 pub(crate) fn queue_kinematics(system: &mut System, ship: i64, values: Kinematics) {
@@ -30,7 +30,7 @@ pub(crate) fn queue_kinematics(system: &mut System, ship: i64, values: Kinematic
 pub(super) async fn apply_propulsion(cx: &Ctx, master: i64, generation: Arc<AtomicBool>, active: bool) {
     let Ok(fit) = Fit::load_in_space(&cx.db, &cx.world, cx.system_id, cx.char_id, cx.ship_id).await else { return };
     let Some(revision) = fit.projection_revision() else { return };
-    let values = kinematics(&fit);
+    let values = kinematics(&fit, Key::Ship);
     let ship = cx.ship_id;
     cx.world.post(cx.system_id, move |s| {
         let mut st = combat::state();

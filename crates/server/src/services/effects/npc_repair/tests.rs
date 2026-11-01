@@ -19,4 +19,14 @@ fn npc_repair_variants_exclude_unimplemented_families() {
     assert!(!supported(i64::from(crate::consts::EFFECT_MUTADAPTIVE_REMOTE_ARMOR_REPAIRER)));
 }
 
+#[test]
+fn remote_repair_phase_and_range_policy() {
+    for (layer, start) in [(0, true), (1, false), (2, false)] {
+        assert_eq!(repair::applies_at_start(layer), start);
+        assert_eq!(repair::scaled_amount(100.0, 10.0, 10.0, 20.0), 100.0);
+        assert_eq!(repair::scaled_amount(100.0, 30.0, 10.0, 20.0), 50.0);
+        assert_eq!(repair::scaled_amount(100.0, 11.0, 10.0, 0.0), 0.0);
+    }
+}
+
 mod db_smoke;

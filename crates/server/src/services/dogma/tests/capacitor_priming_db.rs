@@ -53,7 +53,7 @@ async fn ship_get_info_priming_does_not_refill_capacitor() {
         let tau = fit.value(fit::Key::Ship, ATTR_RECHARGE_RATE);
         assert!(capacity.is_finite() && capacity > 0.0 && tau.is_finite() && tau > 0.0);
         let start = filetime_now();
-        let drained = combat::groups_health::drain_exact(&test_db, &test_world, system, fixture.ship, capacity * 2.0).await.ok().expect("drain");
+        let drained = combat::groups_health::tests::drain_exact(&test_db, &test_world, system, fixture.ship, capacity * 2.0).await.ok().expect("drain");
         assert_eq!(drained, capacity);
         for _ in 0..2 {
             let primed = ship_info(&client).await.ok().expect("ShipGetInfo priming");

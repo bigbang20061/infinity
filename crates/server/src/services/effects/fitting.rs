@@ -59,8 +59,7 @@ fn free_rack_slot(first: i32, count: i32, used: impl Fn(i32) -> bool) -> Option<
     (first..first + count.clamp(0, RACK_WIDTH)).find(|&flag| !used(flag))
 }
 
-fn skills(fit: &Fit, sde: &Sde, item: i64, ty: i32, online: bool) -> Result<(), CallError> {
-    let key = Key::Module(item);
+pub(crate) fn required_skills(fit: &Fit, sde: &Sde, key: Key, ty: i32, online: bool) -> Result<(), CallError> {
     let missing: Vec<_> = ATTR_REQUIRED_SKILLS.iter().zip(ATTR_REQUIRED_SKILL_LEVELS).filter_map(|(&skill_attr, level_attr)| {
         let skill = fit.value(key, skill_attr) as i32;
         let level = fit.value(key, level_attr) as i32;
@@ -101,7 +100,7 @@ fn structural(fit: &Fit, sde: &Sde, modules: &[Module], item: i64, ty: i32, flag
         if value > 0 { restricted = true; allowed |= value == expected; }
     }
     if restricted && !allowed { return Err(refusal(messages::fitting::HULL)); }
-    skills(fit, sde, item, ty, online)?;
+    required_skills(fit, sde, Key::Module(item), ty, online)?;
     let Some((effect, slots_attr, first)) = rack(sde, ty) else {
         return Err(user_error(messages::MSG_MODULE_NOT_POWERED, vec![("type".into(), int(ty))]));
     };

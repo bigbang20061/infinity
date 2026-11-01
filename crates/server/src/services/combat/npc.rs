@@ -3,7 +3,7 @@
 //! Queued shots revalidate the actor's current target and ECM lockout.
 //! The client has no NPC server combat implementation to mirror.
 use super::*;
-use crate::services::effects::{notify::fire_fx, weapons::{hit_quality, launch_missile, report_hit, target_signature, turret_chance, turret_roll, Missile}};
+use crate::services::effects::{notify::fire_fx, weapons::{launch_missile, turret_shot, Missile}};
 use crate::consts::ATTR_AGILITY;
 use crate::consts::{ATTR_TRACKING_SPEED, ATTR_OPTIMAL_SIG_RADIUS, ATTR_AOE_VELOCITY, ATTR_AOE_DAMAGE_REDUCTION_FACTOR, ATTR_MISSILE_ENTITY_VELOCITY_MULTIPLIER, ATTR_MISSILE_ENTITY_FLIGHT_TIME_MULTIPLIER, ATTR_MISSILE_ENTITY_AOE_VELOCITY_MULTIPLIER, ATTR_MISSILE_ENTITY_AOE_CLOUD_SIZE_MULTIPLIER};
 use crate::sde::types::TypeData;
@@ -147,13 +147,7 @@ pub(super) async fn npc_shot(db: &Db, world: &Arc<World>, system: i64, id: i64, 
     let ship = victim.id;
     let gap = (dist(me.pos, victim.pos) - me.radius as f64 - victim.radius as f64).max(0.0);
     let owner_id = me.owner_id;
-    let attacker_char_id = me.char_id;
-    let victim_char_id = victim.char_id;
-    let chance = if stats.damage.iter().any(|d| *d > 0.0) && gap <= optimal + falloff * NPC_TURRET_REACH_FALLOFF_MULTIPLIER {
-        Some(turret_chance(&me, &victim, optimal, falloff, tracking, stats.opt_sig, target_signature(sde, &victim)))
-    } else {
-        None
-    };
+    let can_turret = stats.damage.iter().any(|d| *d > 0.0) && gap <= optimal + falloff * NPC_TURRET_REACH_FALLOFF_MULTIPLIER;
     if let Some((charge, multiplier)) = &stats.missile {
         let (charge, multiplier) = (*charge, *multiplier);
         let (velocity, flight) = npc_missile_kinematics(
@@ -161,7 +155,6 @@ pub(super) async fn npc_shot(db: &Db, world: &Arc<World>, system: i64, id: i64, 
             attr(world.sde(), charge, ATTR_EXPLOSION_DELAY, NPC_MISSILE_FLIGHT_MS),
             velocity_multiplier, flight_multiplier);
         if gap <= flight {
-            if world.with(system, move |s| s.npc_projection_valid(id, target, generation)).await != Some(true) { return Ok(()); }
             let missile = Missile {
                 charge,
                 raw: ATTR_DAMAGE.map(|a| attr(world.sde(), charge, a, 0.0) * multiplier),
@@ -175,19 +168,20 @@ pub(super) async fn npc_shot(db: &Db, world: &Arc<World>, system: i64, id: i64, 
                 weapon: type_id,
                 attacker: None,
             };
-            launch_missile(db.clone(), world.clone(), system, me, victim, owner_id, None, missile).await?;
+            launch_missile(db.clone(), world.clone(), system, me.clone(), victim.clone(), owner_id, None, missile,
+                Some(crate::services::effects::space_source::SourceGuard::Npc { source: id, target, generation })).await?;
         }
     }
-    if let Some(chance) = chance {
+    if can_turret {
         if world.with(system, move |s| s.npc_projection_valid(id, target, generation)).await != Some(true) { return Ok(()); }
         if let Some(guid) = stats.fx.as_deref() {
             let guid = guid.to_owned();
             let duration = stats.rate_of_fire_ms;
             world.broadcast(system, id, move |stamp| vec![fire_fx(stamp, id, None, &guid, Some(ship), None, true, true, duration, 1)]);
         }
-        let multiplier = turret_roll(chance);
-        let dealt = if multiplier > 0.0 { damage(db, world, system, ship, victim_char_id, stats.damage.map(|d| d * multiplier), None).await? } else { 0.0 };
-        report_hit(world, id, ship, attacker_char_id, victim_char_id, type_id, dealt, hit_quality(multiplier));
+        turret_shot(db, world, system, &me, &victim, None, type_id,
+            (optimal, falloff, tracking, stats.opt_sig), stats.damage,
+            Some(crate::services::effects::space_source::SourceGuard::Npc { source: id, target, generation })).await?;
     }
     Ok(())
 }

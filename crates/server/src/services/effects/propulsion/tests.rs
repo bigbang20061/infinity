@@ -47,4 +47,24 @@ fn propulsion_commands_wait_for_boundary_and_use_enqueue_stamp() {
     system.queue_projection_kinematics(1, old, Kinematics { speed: 100.0, mass: 100.0, agility: 1.0, signature: 100.0 });
     system.tick(15_000);
     assert_eq!(system.ball(1).unwrap().max_vel, 10.0);
+    system.remove_projection(3);
+    let restored = system.projection_revision(1);
+    assert_ne!(restored, current);
+    system.queue_projection_kinematics(1, current, Kinematics { speed: 10.0, mass: 30.0, agility: 0.25, signature: 40.0 });
+    system.queue_projection_kinematics(1, restored, Kinematics { speed: 20.0, mass: 30.0, agility: 0.25, signature: 40.0 });
+    system.tick(16_000);
+    assert_eq!(system.ball(1).unwrap().max_vel, 20.0);
+}
+
+#[tokio::test]
+#[ignore = "requires a dedicated database with the retail SDE"]
+async fn kinematics_reads_the_requested_fit_key() {
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
+    let mut fit = Fit::for_space_type(sde, 587, vec![]);
+    fit.include_drone(7, 2454, vec![(ATTR_MAX_VELOCITY, 123.0), (ATTR_MASS, 456.0),
+        (crate::consts::ATTR_AGILITY, 0.75), (ATTR_SIGNATURE_RADIUS, 9.0)]);
+    let drone = kinematics(&fit, Key::Drone(7));
+    assert_eq!((drone.speed, drone.mass, drone.agility, drone.signature), (123.0, 456.0, 0.75, 9.0));
+    assert_ne!(kinematics(&fit, Key::Ship).speed, drone.speed);
 }

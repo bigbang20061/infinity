@@ -56,6 +56,25 @@ async fn fitting_online_priming_and_slash() {
         client.session.apply(vec![("charid", Value::Int(f.owner)), ("shipid", Value::Int(f.ship))]);
         let (notify, mut events) = tokio::sync::mpsc::unbounded_channel();
         client.notify_tx = notify;
+        let drone = sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(crate::consts::CATEGORY_DRONE)
+            && ATTR_REQUIRED_SKILLS.iter().zip(crate::consts::ATTR_REQUIRED_SKILL_LEVELS).any(|(&skill, level)|
+                t.attribute(skill).unwrap_or(0.0) > 0.0 && t.attribute(level).unwrap_or(0.0) > 0.0))
+            .expect("published drone with skill prerequisites");
+        let drone_type = drone.type_id;
+        let drone_skills = ATTR_REQUIRED_SKILLS.iter().zip(crate::consts::ATTR_REQUIRED_SKILL_LEVELS)
+            .filter_map(|(&skill, level)| {
+                let skill = drone.attribute(skill).unwrap_or(0.0) as i32;
+                let level = drone.attribute(level).unwrap_or(0.0) as i32;
+                (skill > 0 && level > 0).then_some((skill, level))
+            }).collect();
+        let mut drone_fit = Fit::load(&test_db, sde.clone(), f.owner, f.ship).await.ok().unwrap();
+        drone_fit.include_drone(f.modules[0], drone_type, vec![]);
+        assert!(matches!(super::super::required_skills(&drone_fit, &sde, Key::Drone(f.modules[0]), drone_type, false),
+            Err(CallError::User { msg, .. }) if msg == crate::messages::MSG_FITTING_HAS_SKILL_PREREQUISITES));
+        services::skills::gm::apply(&mut client, f.owner, services::skills::gm::Change::Set(drone_skills)).await.ok().expect("seed drone prerequisites");
+        let mut drone_fit = Fit::load(&test_db, sde.clone(), f.owner, f.ship).await.ok().unwrap();
+        drone_fit.include_drone(f.modules[0], drone_type, vec![]);
+        assert!(super::super::required_skills(&drone_fit, &sde, Key::Drone(f.modules[0]), drone_type, false).is_ok());
         services::skills::gm::apply(&mut client, f.owner, services::skills::gm::Change::Set(required)).await.ok().expect("seed fitting prerequisites");
         while events.try_recv().is_ok() {}
         for (id, attr, value) in [(f.ship, ATTR_CPU_OUTPUT, 0.0), (f.ship, ATTR_POWER_OUTPUT, 1000.0), (f.modules[0], ATTR_CPU, 10.0), (f.modules[0], ATTR_POWER, 0.0)] {

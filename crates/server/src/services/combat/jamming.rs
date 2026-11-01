@@ -65,6 +65,7 @@ pub(crate) fn apply(s: &mut System, source: i64, module: i64, target: i64, durat
         (lost, notices, until)
     };
     s.drop_npc_targets(target);
+    s.drone_jammed(target);
     if let Some(pilot) = victim_pilot {
         for locked in lost {
             s.remove_projections_between(target, locked);

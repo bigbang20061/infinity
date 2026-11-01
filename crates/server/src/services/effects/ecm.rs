@@ -5,16 +5,17 @@
 //! The system actor owns jam lifetimes; jams and locks are not resumed after
 //! restart. Other burst projectors are not supported.
 //! The existing TargetingAttemptCancelled lock error is the server's choice:
-//! the client supplies no ECM-specific lock error. Offensive attempts are
-//! revalidated before Crimewatch and again before applying a jam.
+//! the client supplies no ECM-specific lock error. Attempts are revalidated
+//! in the system actor before a jam is applied.
 use std::sync::{Arc, atomic::Ordering};
-use super::{EffectKind, lifecycle::{Cycle, CycleOutcome, Module}, range::range_multiplier, registry::{Effect, EffectAttribute}};
+use super::{EffectKind, lifecycle::{Cycle, CycleOutcome, Module}, range::range_multiplier, registry::{Effect, EffectAttribute, EffectFlag}};
+use super::space_source::{SourceContext, SourceGuard};
 use crate::consts::{ATTR_SCAN_GRAVIMETRIC_STRENGTH, ATTR_SCAN_LADAR_STRENGTH, ATTR_SCAN_MAGNETOMETRIC_STRENGTH, ATTR_SCAN_RADAR_STRENGTH, CATEGORY_SHIP, CATEGORY_ENTITY, CATEGORY_DRONE};
 use crate::db::Db;
 use crate::messages;
 use crate::sde::Sde;
 use crate::services::{combat::{self, Ctx, targeting_charges::targets_of}, crimewatch, fit::{Fit, Key}, rand01, user_error, CallError};
-use crate::space::{dist, Ball, System, World, MODE_WARP};
+use crate::space::{dist, Ball, System, World, MODE_WARP, drone::DronePhase};
 
 /// Client dogma/const.py: racial ECM strengths in primary-sensor order.
 const JAM_STRENGTH: [i32; 4] = [238, 239, 240, 241];
@@ -73,19 +74,22 @@ pub(super) async fn validate(cx: &Ctx, fit: &Fit, module: &Module, effect: &Effe
 }
 
 #[derive(Clone)]
-struct Source { id: i64, type_id: Option<i32>, module: i64, optimal: f64, falloff: f64, strengths: [f64; 4], duration: f64, burst: bool, revision: Option<u64> }
+struct Source { id: i64, type_id: Option<i32>, module: i64, optimal: f64, falloff: f64, strengths: [f64; 4], duration: f64, burst: bool, offensive: bool, revision: Option<u64>, owner_revision: Option<(i64, u64)> }
 fn source(fit: &Fit, key: Key, id: i64, module: i64, effect: &Effect, cycle: f64) -> Source {
-    Source { id, type_id: fit.source_type(Key::Ship), module, optimal: effect.attribute(EffectAttribute::Range).map_or(0.0, |a| fit.value(key, a)), falloff: effect.attribute(EffectAttribute::Falloff).map_or(0.0, |a| fit.value(key, a)), strengths: JAM_STRENGTH.map(|a| fit.value(key, a)), duration: selected_duration(fit, key, cycle), burst: effect.kind == EffectKind::BurstJammer, revision: fit.projection_revision() }
+    let drone = matches!(key, Key::Drone(_));
+    Source { id, type_id: fit.source_type(if drone { key } else { Key::Ship }), module, optimal: effect.attribute(EffectAttribute::Range).map_or(0.0, |a| fit.value(key, a)), falloff: effect.attribute(EffectAttribute::Falloff).map_or(0.0, |a| fit.value(key, a)), strengths: JAM_STRENGTH.map(|a| fit.value(key, a)), duration: selected_duration(fit, key, cycle), burst: effect.kind == EffectKind::BurstJammer, offensive: effect.has(EffectFlag::Offensive), revision: if drone { fit.drone_projection_revision() } else { fit.projection_revision() }, owner_revision: None }
 }
 
-fn current_attempt(s: &System, sde: &Sde, src: &Source, victim: &Ball, revision: Option<u64>, player: &Option<(i64, Arc<std::sync::atomic::AtomicBool>)>, npc_generation: Option<u64>) -> Option<(Ball, Ball, f64)> {
+fn current_attempt(s: &System, sde: &Sde, src: &Source, victim: &Ball, revision: Option<u64>, owner_revision: Option<(i64, u64)>, player: &Option<(i64, Arc<std::sync::atomic::AtomicBool>)>, guard: Option<SourceGuard>) -> Option<(Ball, Ball, f64)> {
     let id = victim.id;
     if let Some((character, generation)) = player {
         if generation.load(Ordering::Relaxed) || (!src.burst && !targets_of(*character).contains(&id)) { return None; }
         if !combat::state().active.get(&src.module).is_some_and(|active| Arc::ptr_eq(&active.stop, generation)) { return None; }
     }
-    if npc_generation.is_some_and(|generation| !s.npc_projection_valid(src.id, id, generation)) { return None; }
-    if revision.is_some_and(|r| s.projection_revision(id) != r) || src.revision.is_some_and(|r| s.projection_revision(src.id) != r) { return None; }
+    if guard.is_some_and(|guard| !guard.valid(s)) { return None; }
+    if revision.is_some_and(|r| s.projection_revision(id) != r) || src.revision.is_some_and(|r| s.projection_revision(src.id) != r)
+        || owner_revision.is_some_and(|(ship, r)| s.projection_revision(ship) != r)
+        || src.owner_revision.is_some_and(|(ship, r)| s.projection_revision(ship) != r) { return None; }
     let (a, b) = s.sampled_ball(src.id).zip(s.sampled_ball(id))?;
     if a.mode == MODE_WARP || Some(a.type_id) != src.type_id || player.as_ref().is_some_and(|(character, _)| a.char_id != Some(*character))
         || id == src.id || b.type_id != victim.type_id || b.char_id != victim.char_id || !eligible(sde, &b) { return None; }
@@ -93,29 +97,40 @@ fn current_attempt(s: &System, sde: &Sde, src: &Source, victim: &Ball, revision:
     (multiplier > 0.0).then_some((a, b, multiplier))
 }
 
-async fn apply_one(db: &Db, world: &Arc<World>, system: i64, src: &Source, victim: &Ball, player: Option<(i64, Arc<std::sync::atomic::AtomicBool>)>, npc_generation: Option<u64>) -> Result<(), CallError> {
+async fn apply_one(db: &Db, world: &Arc<World>, system: i64, src: &Source, victim: &Ball, player: Option<(i64, Arc<std::sync::atomic::AtomicBool>)>, guard: Option<SourceGuard>) -> Result<Option<Option<i64>>, CallError> {
     let id = victim.id;
-    let (fit, revision) = if let Some(character) = victim.char_id {
+    let record = world.with(system, move |s| s.drone(id)).await.flatten();
+    let victim_owner = record.as_ref().map(|d| d.owner);
+    let (fit, key, revision, owner_revision) = if let Some(character) = victim.char_id {
         let fit = Fit::load_in_space(db, world, system, character, id).await?;
         let revision = fit.projection_revision();
-        (fit, revision)
+        (fit, Key::Ship, revision, None)
+    } else if let Some(record) = record.filter(|d| d.owner != crate::consts::OWNER_UNOWNED) {
+        let ship = crate::dao::characters::selection::ship_id(db, record.owner).await.map_err(crate::services::db_err)?
+            .ok_or_else(|| CallError::Internal(anyhow::anyhow!("character has no selected ship")))?;
+        let fit = Fit::drone_in_space(db, world, system, record.owner, id).await?;
+        let revision = fit.drone_projection_revision();
+        let owner_revision = fit.projection_revision().map(|r| (ship, r));
+        (fit, Key::Drone(id), revision, owner_revision)
     } else {
-        let Some((projections, revision)) = world.with(system, move |s| (s.projections_on(id), s.projection_revision(id))).await else { return Ok(()) };
-        (Fit::for_space_type(world.sde().clone(), victim.type_id, projections), Some(revision))
+        let Some((projections, revision)) = world.with(system, move |s| (s.projections_on(id), s.projection_revision(id))).await else { return Ok(None) };
+        (Fit::for_space_type(world.sde().clone(), victim.type_id, projections), Key::Ship, Some(revision), None)
     };
-    let Some((index, defense)) = primary(SENSORS.map(|a| fit.value(Key::Ship, a))) else { return Ok(()) };
+    let (index, defense) = primary(SENSORS.map(|a| fit.value(key, a))).unwrap_or((0, 0.0));
     let strength = src.strengths[index];
     let src = src.clone();
     let victim = victim.clone();
     let sde = world.sde().clone();
     let roll = rand01();
-    world.with(system, move |s| {
-        let Some((_, _, multiplier)) = current_attempt(s, &sde, &src, &victim, revision, &player, npc_generation) else { return };
+    Ok(world.with(system, move |s| {
+        if victim_owner.is_some_and(|owner| s.drone(id).is_none_or(|d| d.owner != owner)) { return None; }
+        let Some((_, _, multiplier)) = current_attempt(s, &sde, &src, &victim, revision, owner_revision, &player, guard) else { return None };
+        if src.offensive { s.drone_attack(src.id, id); }
         if roll < chance(strength, defense, multiplier) && src.duration.is_finite() && src.duration > 0.0 {
             combat::jamming::apply(s, src.id, src.module, id, src.duration);
         }
-    }).await;
-    Ok(())
+        Some(s.combat_owner(id))
+    }).await.flatten())
 }
 
 pub(super) async fn start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<CycleOutcome, CallError> {
@@ -148,27 +163,30 @@ pub(super) async fn start(cx: &Ctx, fit: &Fit, cycle: &mut Cycle) -> Result<Cycl
         s.balls().filter(|b| b.id != source_id && eligible(&sde, b) && (dist(a.pos, b.position_at(s.now_ms())) - f64::from(a.radius) - f64::from(b.radius)).max(0.0) <= range).filter_map(|b| s.sampled_ball(b.id)).map(|b| { let revision = s.projection_revision(b.id); (b, revision) }).collect()
     }).await.unwrap_or_default();
     if !burst && candidates.is_empty() { return Ok(CycleOutcome::Stop("target lost")); }
-    for (victim, revision) in candidates {
-        let attempt_source = src.clone();
-        let attempt_victim = victim;
-        let player = Some((cx.char_id, cycle.stop.clone()));
-        let sde = cx.world.sde().clone();
-        let Some((source, victim, _)) = cx.world.with(cx.system_id, move |s| current_attempt(s, &sde, &attempt_source, &attempt_victim, Some(revision), &player, None)).await.flatten() else { continue };
-        if let Some(character) = victim.char_id {
-            crimewatch::aggress(&cx.db, &cx.world, cx.system_id, cx.char_id, source.type_id, module.type_id, character, victim.id).await?;
+    for (victim, _) in candidates {
+        let admitted = apply_one(&cx.db, &cx.world, cx.system_id, &src, &victim, Some((cx.char_id, cycle.stop.clone())), None).await?;
+        if src.offensive {
+            if let (Some(Some(character)), Some(source_type)) = (admitted, src.type_id) {
+                crimewatch::aggress(&cx.db, &cx.world, cx.system_id, cx.char_id, source_type, module.type_id, character, victim.id).await?;
+            }
         }
-        apply_one(&cx.db, &cx.world, cx.system_id, &src, &victim, Some((cx.char_id, cycle.stop.clone())), None).await?;
     }
     Ok(CycleOutcome::Continue)
 }
 
-pub(crate) async fn apply_npc(db: &Db, world: &Arc<World>, system: i64, module: i64, me: &Ball, victim: &Ball, effect: &Effect, duration_ms: f64, generation: u64) -> Result<(), CallError> {
-    let source_id = me.id;
-    let Some((projections, revision)) = world.with(system, move |s| (s.projections_on(source_id), s.projection_revision(source_id))).await else { return Ok(()) };
-    let fit = Fit::for_space_type(world.sde().clone(), me.type_id, projections);
-    let mut src = source(&fit, Key::Ship, me.id, module, effect, duration_ms);
-    src.revision = Some(revision);
-    apply_one(db, world, system, &src, victim, None, Some(generation)).await
+pub(crate) async fn apply_source(cx: &SourceContext<'_>) -> Result<(), CallError> {
+    if !matches!(cx.phase, DronePhase::Begin) { return Ok(()); }
+    let mut src = source(cx.fit, cx.key, cx.source.id, cx.module, cx.effect, cx.duration_ms);
+    if let Some(drone) = cx.drone {
+        src.owner_revision = drone.controller.zip(cx.fit.projection_revision());
+    }
+    let admitted = apply_one(cx.db, cx.world, cx.system, &src, cx.target, None, Some(cx.guard)).await?;
+    if src.offensive {
+        if let (Some(attacker), Some(Some(victim))) = (cx.attacker, admitted) {
+            crimewatch::aggress(cx.db, cx.world, cx.system, attacker, cx.source.type_id, cx.source.type_id, victim, cx.target.id).await?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)] mod tests;

@@ -74,7 +74,7 @@ fn synthetic_reference_fits_with_active_brain_modifiers() {
                 let mut source = fixture_node(super::Location::Char);
                 source.overrides = vec![(2, percent)];
                 if super::effect_running(key, &source, 1, 0, &modifier.domain)
-                    && super::modifier_applies(key, &modifier, super::Key::Ship, &ship, None, true) {
+                    && super::modifier_applies(key, None, &modifier, super::Key::Ship, &ship, None, true) {
                     mods.push((modifier.op, source.base(None, None, modifier.modifying), false));
                 }
             }
@@ -93,7 +93,7 @@ fn skill_level_uses_shared_points_formula_before_node_override() {
     assert_eq!(level, 3);
     let node = super::Node {
         type_id: 1, data_position: None, location: super::Location::Char,
-        online: true, active: false, overloaded: false, projected_effect: None,
+        online: true, active: false, overloaded: false, projected_effect: None, receiver: None,
         charge_type: None, level: Some(level), overrides: vec![(super::ATTR_SKILL_LEVEL, 99.0)], charge_values: vec![],
     };
     assert_eq!(node.base(None, None, super::ATTR_SKILL_LEVEL), 3.0);
@@ -101,13 +101,98 @@ fn skill_level_uses_shared_points_formula_before_node_override() {
 
 fn fixture_node(location: super::Location) -> super::Node {
     super::Node { type_id: 1, data_position: None, location, online: true,
-        active: false, overloaded: false, projected_effect: None,
+        active: false, overloaded: false, projected_effect: None, receiver: None,
         charge_type: None, level: None, overrides: vec![], charge_values: vec![] }
 }
 
 fn fixture_modifier(func: &str, domain: &str) -> super::Modifier {
     super::Modifier { func: func.into(), domain: domain.into(), op: 6,
         modified: 1, modifying: 2, group: Some(10), skill: Some(20), target_category: None }
+}
+
+#[test]
+fn drone_node_overrides_are_independent_of_owner_bonus() {
+    let mut drone = fixture_node(super::Location::Space);
+    drone.overrides = vec![(1, 200.0)];
+    let base = super::Attribute { attribute_id: 1, default_value: Some(100.0), stackable: Some(true) };
+    let owner_bonus = [(super::OP_POST_PERCENT, 20.0, false)];
+    assert_eq!(apply(drone.base(None, Some(&base), 1), &owner_bonus), 240.0);
+    drone.overrides.clear();
+    assert_eq!(apply(drone.base(None, Some(&base), 1), &owner_bonus), 120.0);
+}
+
+#[tokio::test]
+#[ignore = "requires a dedicated database with the retail SDE"]
+async fn real_sde_prospective_drone_and_projection_receivers() {
+    use super::{Fit, Key};
+    use crate::consts::{ATTR_AGILITY, ATTR_MASS, ATTR_MAX_VELOCITY, EFFECT_REMOTE_WEBIFIER_FALLOFF};
+    use crate::services::effects::{projection::Projection, EffectKind};
+    use std::sync::Arc;
+
+    let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
+    // Select the actual skill by SDE name; its node and passive index match an
+    // owner fit loaded from the database.
+    let skill_data = sde.types.iter().find(|t| t.name.as_deref() == Some("Drone Navigation"))
+        .expect("Drone Navigation in SDE");
+    let skill = skill_data.type_id;
+    let drone = 2454; // Hobgoblin I
+    let mut fit = Fit::for_space_type(sde.clone(), 587, vec![]);
+    fit.include_drone(7, drone, vec![(ATTR_MAX_VELOCITY, 200.0), (1, 12.0)]);
+    let unbonused = fit.value(Key::Drone(7), ATTR_MAX_VELOCITY);
+    let drone_data = sde.types.get(drone).expect("Hobgoblin I in SDE");
+    for attr in [ATTR_MASS, ATTR_AGILITY] {
+        let actual = drone_data.fit_attribute(attr).filter(|value| *value > 0.0)
+            .expect("combat drone must have positive SDE mass and agility");
+        assert_eq!(fit.base(Key::Drone(7), attr), actual);
+        assert_eq!(fit.value(Key::Drone(7), attr), actual);
+    }
+    let mut skill_node = fixture_node(super::Location::Char);
+    skill_node.type_id = skill;
+    skill_node.data_position = sde.types.position(skill);
+    skill_node.level = Some(5);
+    fit.nodes.insert(Key::Skill(skill), skill_node);
+    assert!(skill_data.effects().iter().filter_map(|entry| sde.dogma.effect(entry.effect_id))
+        .any(|effect| effect.effect_category.unwrap_or(0) == super::EFFECT_CATEGORY_PASSIVE
+            && effect.modifiers().iter().any(|modifier| modifier.modified == ATTR_MAX_VELOCITY)),
+        "Drone Navigation must have a passive velocity modifier in the SDE");
+    for entry in skill_data.effects() {
+        if entry.effect_id == super::EFFECT_SKILL { continue; }
+        let Some(effect) = sde.dogma.effect(entry.effect_id) else { continue };
+        if effect.effect_category.unwrap_or(0) != super::EFFECT_CATEGORY_PASSIVE { continue; }
+        for (position, modifier) in effect.modifiers().iter().enumerate() {
+            fit.passive_by_attribute.entry(modifier.modified).or_default().push(fit.passive_modifiers.len());
+            fit.passive_modifiers.push((Key::Skill(skill), entry.effect_id, position));
+        }
+    }
+    fit.memo.get_mut().unwrap().clear();
+    let bonused = fit.value(Key::Drone(7), ATTR_MAX_VELOCITY);
+    assert!(bonused > unbonused, "Drone Navigation must increase drone velocity");
+    assert_eq!(fit.source_type(Key::Drone(7)), Some(drone));
+    assert_eq!(fit.overrides(Key::Drone(7)), &[(1, 12.0), (ATTR_MAX_VELOCITY, 200.0)]);
+    fit.include_drone(7, drone, vec![]);
+    let fresh = fit.value(Key::Drone(7), ATTR_MAX_VELOCITY);
+    assert_ne!(fresh, bonused);
+    assert!(fresh > fit.base(Key::Drone(7), ATTR_MAX_VELOCITY));
+    assert!(fit.overrides(Key::Drone(7)).is_empty());
+
+    let web = sde.dogma.effect(EFFECT_REMOTE_WEBIFIER_FALLOFF).expect("web effect in SDE");
+    let modifier = web.modifiers().iter().find(|m| m.domain == "targetID" && m.modified == ATTR_MAX_VELOCITY)
+        .expect("web velocity modifier in SDE");
+    let projection = Projection { source_ship: 1, kind: EffectKind::Modifiers, until_ms: i64::MAX,
+        source_module: 42, source_type: 587, effect_id: EFFECT_REMOTE_WEBIFIER_FALLOFF,
+        values: vec![(modifier.modifying, -60.0)], charge_values: vec![], charge_type: None };
+    let ship_before = fit.value(Key::Ship, ATTR_MAX_VELOCITY);
+    Fit::insert_projections(&sde, &mut fit.nodes, Key::Drone(7), vec![projection.clone()]);
+    fit.memo.get_mut().unwrap().clear();
+    assert!(fit.value(Key::Drone(7), ATTR_MAX_VELOCITY) < fresh);
+    assert_eq!(fit.value(Key::Ship, ATTR_MAX_VELOCITY), ship_before);
+    Fit::insert_projections(&sde, &mut fit.nodes, Key::Ship, vec![projection]);
+    fit.memo.get_mut().unwrap().clear();
+    assert_eq!(fit.nodes[&Key::Projected(42)].receiver, Some(Key::Drone(7)));
+    assert_eq!(fit.nodes[&Key::Projected(43)].receiver, Some(Key::Ship));
+    assert!(fit.value(Key::Ship, ATTR_MAX_VELOCITY) < ship_before);
+    assert!(fit.value(Key::Drone(7), ATTR_MAX_VELOCITY) < fresh);
 }
 
 #[test]
@@ -119,6 +204,28 @@ fn projected_category_gate_uses_receiving_hull() {
         assert_eq!(super::category_matches(Some(CATEGORY_ENTITY), actual), actual == Some(CATEGORY_ENTITY));
         assert_eq!(super::category_matches(Some(CATEGORY_DRONE), actual), actual == Some(CATEGORY_DRONE));
     }
+}
+
+#[test]
+fn drone_and_ship_projections_keep_receivers_and_owner_bonus_separate() {
+    use super::{category_matches, modifier_applies, Key, Location};
+    use crate::consts::{CATEGORY_DRONE, CATEGORY_SHIP};
+    let ship = fixture_node(Location::Space);
+    let drone = fixture_node(Location::Space);
+    let owner = fixture_modifier("OwnerRequiredSkillModifier", "charID");
+    let projected = fixture_modifier("ItemModifier", "targetID");
+    let drone_key = Key::Drone(7);
+    assert!(modifier_applies(Key::Skill(1), None, &owner, drone_key, &drone, None, true));
+    let owner_bonus = (owner.op, 20.0, false);
+    for penalty in [-60.0, -30.0] {
+        assert!(modifier_applies(Key::Projected(2), Some(drone_key), &projected, drone_key, &drone, None, false));
+        assert!(!modifier_applies(Key::Projected(2), Some(drone_key), &projected, Key::Ship, &ship, None, false));
+        assert!(modifier_applies(Key::Projected(3), Some(Key::Ship), &projected, Key::Ship, &ship, None, false));
+        assert!(!modifier_applies(Key::Projected(3), Some(Key::Ship), &projected, drone_key, &drone, None, false));
+        assert!((apply(100.0, &[owner_bonus, (projected.op, penalty, false)]) - 120.0 * (1.0 + penalty / 100.0)).abs() < 1e-9);
+    }
+    assert!(category_matches(Some(CATEGORY_DRONE), Some(CATEGORY_DRONE)));
+    assert!(!category_matches(Some(CATEGORY_SHIP), Some(CATEGORY_DRONE)));
 }
 
 #[test]
@@ -135,10 +242,10 @@ fn item_and_location_domains_select_correct_nodes() {
         ("otherID", Key::Charge(1), true), ("otherID", Key::Charge(2), false),
         ("targetID", Key::Ship, false), ("structureID", Key::Ship, false),
     ] {
-        assert_eq!(applies(source, &fixture_modifier("ItemModifier", domain), target, &ship, None, false), expected, "{domain}");
+        assert_eq!(applies(source, None, &fixture_modifier("ItemModifier", domain), target, &ship, None, false), expected, "{domain}");
     }
-    assert!(applies(Key::Charge(1), &fixture_modifier("ItemModifier", "otherID"), source, &module, None, false));
-    assert!(applies(Key::Projected(9), &fixture_modifier("ItemModifier", "targetID"), Key::Ship, &ship, None, false));
+    assert!(applies(Key::Charge(1), None, &fixture_modifier("ItemModifier", "otherID"), source, &module, None, false));
+    assert!(applies(Key::Projected(9), Some(Key::Ship), &fixture_modifier("ItemModifier", "targetID"), Key::Ship, &ship, None, false));
     for (domain, target, node, expected) in [
         ("shipID", Key::Module(1), &module, true),
         ("shipID", Key::Implant(1), &brain, false),
@@ -149,22 +256,22 @@ fn item_and_location_domains_select_correct_nodes() {
         ("shipID", Key::Drone(1), &drone, true),
         ("structureID", Key::Drone(1), &drone, false),
     ] {
-        assert_eq!(applies(source, &fixture_modifier("LocationModifier", domain), target, node, None, false), expected, "{domain}");
+        assert_eq!(applies(source, None, &fixture_modifier("LocationModifier", domain), target, node, None, false), expected, "{domain}");
     }
     for domain in ["charID", "shipID"] {
         let group = fixture_modifier("LocationGroupModifier", domain);
-        assert!(applies(source, &group, Key::Drone(1), &drone, Some(10), false));
-        assert!(!applies(source, &group, Key::Drone(1), &drone, Some(11), false));
+        assert!(applies(source, None, &group, Key::Drone(1), &drone, Some(10), false));
+        assert!(!applies(source, None, &group, Key::Drone(1), &drone, Some(11), false));
         let required = fixture_modifier("LocationRequiredSkillModifier", domain);
-        assert!(applies(source, &required, Key::Drone(1), &drone, None, true));
-        assert!(!applies(source, &required, Key::Drone(1), &drone, None, false));
+        assert!(applies(source, None, &required, Key::Drone(1), &drone, None, true));
+        assert!(!applies(source, None, &required, Key::Drone(1), &drone, None, false));
     }
     let owner = fixture_modifier("OwnerRequiredSkillModifier", "charID");
-    assert!(applies(source, &owner, Key::Ship, &ship, None, true));
-    assert!(applies(source, &owner, Key::Module(1), &module, None, true));
-    assert!(applies(source, &owner, Key::Drone(1), &drone, None, true));
-    assert!(!applies(source, &owner, Key::Implant(1), &brain, None, true));
-    assert!(!applies(source, &owner, Key::Ship, &ship, None, false));
+    assert!(applies(source, None, &owner, Key::Ship, &ship, None, true));
+    assert!(applies(source, None, &owner, Key::Module(1), &module, None, true));
+    assert!(applies(source, None, &owner, Key::Drone(1), &drone, None, true));
+    assert!(!applies(source, None, &owner, Key::Implant(1), &brain, None, true));
+    assert!(!applies(source, None, &owner, Key::Ship, &ship, None, false));
 }
 
 #[test]
@@ -210,7 +317,7 @@ fn projected_web_and_overload_gate_use_production_selection() {
     assert!(effect_running(Key::Projected(1), &projection, 42, 2, "targetID"));
     assert!(!effect_running(Key::Projected(1), &projection, 41, 2, "targetID"));
     assert!(!effect_running(Key::Projected(1), &projection, 42, 0, "shipID"));
-    assert!(modifier_applies(Key::Projected(1), &modifier, Key::Ship, &target, None, false));
+    assert!(modifier_applies(Key::Projected(1), Some(Key::Ship), &modifier, Key::Ship, &target, None, false));
     let web = projection.base(None, None, modifier.modifying);
     assert!((apply(1.0, &[(6, web, true)]) - 0.4).abs() < 1e-9);
     let expected = 0.4 * (1.0 - 0.6 * (-(1.0f64 / 2.67).powi(2)).exp());
@@ -228,13 +335,13 @@ fn active_brain_sources_change_ship_and_booster_has_penalty() {
         let mut node = fixture_node(Location::Char);
         node.overrides = vec![(2, percent)];
         if effect_running(source, &node, 1, 0, &modifier.domain)
-            && modifier_applies(source, &modifier, Key::Ship, &ship, None, true) {
+            && modifier_applies(source, None, &modifier, Key::Ship, &ship, None, true) {
             collected.push((modifier.op, node.base(None, None, modifier.modifying), false));
         }
     }
     assert_eq!(collected.len(), 3);
     assert!((apply(100.0, &collected) - 118.8).abs() < 1e-9);
-    assert!(!modifier_applies(Key::Implant(1), &modifier, Key::Ship, &ship, None, false));
+    assert!(!modifier_applies(Key::Implant(1), None, &modifier, Key::Ship, &ship, None, false));
 }
 
 #[test]
@@ -266,7 +373,7 @@ fn projection_script_uses_injected_value_and_target_domain() {
     let script = fixture_modifier("ItemModifier", "targetID");
     let default = super::Attribute { attribute_id: 2, default_value: Some(-10.0), stackable: Some(true) };
     assert!(effect_running(Key::Projected(5), &source, 42, 2, &script.domain));
-    assert!(modifier_applies(Key::Projected(5), &script, Key::Ship, &victim, None, false));
+    assert!(modifier_applies(Key::Projected(5), Some(Key::Ship), &script, Key::Ship, &victim, None, false));
     let injected = projected_value(&source, None, Some(&default), script.modifying);
     // A hypothetical victim bonus affects the victim, not the already effective
     // injected source value. The script is a target row with its own attribute.
@@ -300,9 +407,36 @@ fn unknown_type_uses_attribute_default() {
 }
 
 #[test]
+fn drone_physical_base_corrects_only_missing_or_nonpositive_inputs() {
+    use crate::consts::{ATTR_AGILITY, ATTR_MASS, ATTR_MAX_VELOCITY, CATEGORY_DRONE, CATEGORY_SHIP, DRONE_FALLBACK_AGILITY, DRONE_FALLBACK_MASS};
+    let drone = Some(CATEGORY_DRONE);
+    for value in [None, Some(0.0), Some(-1.0)] {
+        assert_eq!(super::physical_base(drone, ATTR_MASS, value), Some(DRONE_FALLBACK_MASS));
+        assert_eq!(super::physical_base(drone, ATTR_AGILITY, value), Some(DRONE_FALLBACK_AGILITY));
+    }
+    // Each attribute is independent, including positive combat-drone inputs.
+    for (mass, agility, expected_mass, expected_agility) in [
+        (None, Some(42.0), DRONE_FALLBACK_MASS, 42.0),
+        (Some(4500.0), Some(0.0), 4500.0, DRONE_FALLBACK_AGILITY),
+        (Some(4500.0), Some(42.0), 4500.0, 42.0),
+    ] {
+        assert_eq!(super::physical_base(drone, ATTR_MASS, mass), Some(expected_mass));
+        assert_eq!(super::physical_base(drone, ATTR_AGILITY, agility), Some(expected_agility));
+    }
+    for category in [Some(CATEGORY_SHIP), None] {
+        for attr in [ATTR_MASS, ATTR_AGILITY] {
+            assert_eq!(super::physical_base(category, attr, Some(0.0)), Some(0.0));
+            assert_eq!(super::physical_base(category, attr, None), None);
+        }
+    }
+    assert_eq!(super::physical_base(drone, ATTR_MAX_VELOCITY, Some(0.0)), Some(0.0));
+    assert_eq!(super::physical_base(drone, ATTR_MAX_VELOCITY, None), None);
+}
+
+#[test]
 fn node_override_precedence_and_modifier() {
     use super::{Node, Location, ATTR_SKILL_LEVEL};
-    let mut node = Node { type_id: 1, data_position: None, location: Location::Char, online: true, active: false, overloaded: false, projected_effect: None, charge_type: None, level: None, overrides: vec![(1, 10.0), (ATTR_SKILL_LEVEL, 99.0)], charge_values: vec![] };
+    let mut node = Node { type_id: 1, data_position: None, location: Location::Char, online: true, active: false, overloaded: false, projected_effect: None, receiver: None, charge_type: None, level: None, overrides: vec![(1, 10.0), (ATTR_SKILL_LEVEL, 99.0)], charge_values: vec![] };
     let meta = super::Attribute { attribute_id: 1, default_value: Some(7.5), stackable: None };
     assert_eq!(node.base(None, Some(&meta), 1), 10.0);
     assert_eq!(node.base(None, None, 2), 0.0);

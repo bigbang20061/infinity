@@ -26,8 +26,9 @@ mod config;
 mod contracts;
 mod corps;
 mod corpwallet;
-mod crimewatch;
+pub(crate) mod crimewatch;
 pub(crate) mod dogma;
+pub(crate) mod drones;
 pub(crate) mod effects;
 mod exploration;
 pub(crate) mod fit;
@@ -115,6 +116,7 @@ pub struct Call<'a> {
     pub bind_params: Option<&'a Value>,
 }
 
+#[derive(Debug)]
 pub enum CallError {
     /// Shown to the player via `eveexceptions.UserError(msg, dict)`.
     #[allow(dead_code)]
@@ -384,6 +386,9 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
                 return r;
             }
             if let Some(r) = ship::dispatch(c, call).await {
+                return r;
+            }
+            if let Some(r) = drones::dispatch(c, call).await {
                 return r;
             }
             if let Some(r) = fitting::dispatch(c, call).await {

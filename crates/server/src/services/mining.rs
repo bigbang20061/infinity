@@ -278,7 +278,7 @@ fn schedule_regrow(db: Db, world: Arc<World>, system: i64, belt: i64, center: V3
 }
 
 /// A rock is gone: out of space and the database; an emptied belt starts growing back.
-async fn exhaust(db: &Db, world: &Arc<World>, id: i64) -> Result<(), CallError> {
+pub(crate) async fn reconcile_depleted(db: &Db, world: &Arc<World>, id: i64) -> Result<(), CallError> {
     let Some(rock) = state().rocks.remove(&id) else { return Ok(()) };
     world.remove_ball(rock.system, id).await;
     crate::dao::asteroids::delete(db, id).await.map_err(db_err)?;
@@ -303,35 +303,113 @@ pub fn is_rock(id: i64) -> bool {
 
 // ---------------------------------------------------------------- extraction
 
-/// Put mined ore in a hold, onto a stack of the same type if there is one, and tell the
-/// pilot (OnItemChange).
-async fn store(db: &Db, sde: &crate::sde::Sde, notify: &NotifyTx, owner: i64, ship: i64, flag: i32, type_id: i32, quantity: i32) -> Result<(), CallError> {
-    let stack = crate::dao::items::transfers::stack(db, ship, flag, type_id, owner).await.map_err(db_err)?;
+fn whole_units(amount: f64, carry: f64, volume: f64) -> (i64, f64) {
+    let total = amount + carry;
+    let units = (total / volume).floor() as i64;
+    (units, total - units as f64 * volume)
+}
+
+fn extraction_amounts(units: i64, waste: i64, available: i64, room: i64) -> (i64, i64) {
+    let taken = units.max(0).min(available.max(0)).min(room.max(0));
+    let wasted = if taken == 0 { 0 } else { waste.max(0).min(available - taken) };
+    (taken, wasted)
+}
+
+/// Capture fitted values before entering an actor turn.
+pub(crate) fn yield_values(fit: &Fit, key: Key) -> [f64; 5] {
+    [fit.value(key, ATTR_MINING_AMOUNT).max(0.0), fit.value(key, ATTR_CRIT_CHANCE),
+     fit.value(key, ATTR_CRIT_BONUS), fit.value(key, ATTR_WASTE_PROBABILITY), fit.value(key, ATTR_WASTE_MULTIPLIER)]
+}
+
+/// A source's fitted yield is an intent until a transaction commits it.
+pub(crate) fn yield_intent(values: [f64; 5], carry: f64, target: i64, type_id: i32, volume: f64) -> (crate::space::drone::PendingMining, f64) {
+    let [amount, crit_chance, crit_bonus, waste_chance, waste_multiplier] = values;
+    let crit = if rand01() < crit_chance { amount * crit_bonus } else { 0.0 };
+    let waste = if rand01() < waste_chance { amount * waste_multiplier } else { 0.0 };
+    let (units, carry) = whole_units(amount + crit, carry, volume);
+    (crate::space::drone::PendingMining { rock: target, type_id, units, waste_units: (waste / volume).floor().max(0.0) as i64, crit_units: (crit / volume).floor().max(0.0) as i64 }, carry)
+}
+
+pub(crate) fn rock_type(target: i64, system: i64) -> Option<i32> {
+    state().rocks.get(&target).filter(|rock| rock.system == system).map(|rock| rock.type_id)
+}
+
+pub(crate) struct Delivery {
+    rock: i64,
+    left: i64,
+    removed: i64,
+    full: bool,
+}
+
+impl Delivery {
+    pub(crate) fn repeat(&self) -> bool { self.left > 0 && !self.full }
+}
+
+pub(crate) enum DeliveryOutcome {
+    Missing,
+    Depleted { rock: i64 },
+    NoYield,
+    Full { flag: i32 },
+    Delivered(Delivery),
+}
+
+pub(crate) fn destination(fit: &Fit) -> (i32, f64) {
+    let hold = fit.value(Key::Ship, ATTR_MINING_HOLD);
+    if hold > 0.0 { (FLAG_MINING_HOLD, hold) } else { (FLAG_CARGO, fit.value(Key::Ship, ATTR_CAPACITY)) }
+}
+
+/// Join the caller's transaction; all notices remain in its post-commit outbox.
+pub(crate) async fn deliver(ex: &(impl crate::db::executor::Executor + ?Sized), outbox: &mut crate::db::outbox::Outbox, sde: &crate::sde::Sde, owner: i64, ship: i64, system: i64, source: i64, pending: &crate::space::drone::PendingMining, (flag, capacity): (i32, f64)) -> Result<DeliveryOutcome, CallError> {
+    let Some(available) = crate::dao::asteroids::lock(ex, system, pending.rock, pending.type_id).await.map_err(db_err)? else { return Ok(DeliveryOutcome::Missing) };
+    if available <= 0 { return Ok(DeliveryOutcome::Depleted { rock: pending.rock }); }
+    if pending.units <= 0 { return Ok(DeliveryOutcome::NoYield); }
+    let t = sde.types.get(pending.type_id).ok_or_else(|| CallError::Internal(anyhow::anyhow!("missing type {}", pending.type_id)))?;
+    let volume = t.volume.unwrap_or(1.0).max(0.01);
+    let used: f64 = crate::dao::items::mining::rows(ex, ship, flag).await.map_err(db_err)?.iter()
+        .filter_map(|item| sde.types.get(item.type_id).map(|t| item.quantity as f64 * t.volume.unwrap_or(0.0))).sum();
+    let room = ((capacity - used) / volume).floor().max(0.0) as i64;
+    let stack = crate::dao::items::transfers::stack(ex, ship, flag, pending.type_id, owner).await.map_err(db_err)?;
+    let stack_room = stack.as_ref().map_or(i64::from(i32::MAX), |r| i64::from(i32::MAX - r.quantity));
+    let (taken, wasted) = extraction_amounts(pending.units, pending.waste_units, available, room.min(stack_room));
+    if taken <= 0 { return Ok(DeliveryOutcome::Full { flag }); }
+    let removed = taken + wasted;
+    if !crate::dao::asteroids::take(ex, pending.rock, available, removed).await.map_err(db_err)? {
+        return Err(CallError::Internal(anyhow::anyhow!("asteroid extraction guard failed")));
+    }
+    let quantity = taken as i32;
     let (item_id, total, change) = match stack {
         Some(r) => {
-            let (id, old) = (r.item_id, r.quantity);
-            crate::dao::items::transfers::add(db, id, quantity).await.map_err(db_err)?;
-            (id, old + quantity, (IX_STACK_SIZE, Value::Int(old as i64)))
+            crate::dao::items::transfers::add(ex, r.item_id, quantity).await.map_err(db_err)?;
+            (r.item_id, r.quantity + quantity, (IX_STACK_SIZE, Value::Int(r.quantity as i64)))
         }
         None => {
-            let id = crate::dao::items::transfers::insert(db, type_id, owner, ship, flag, quantity).await.map_err(db_err)?;
+            let id = crate::dao::items::transfers::insert(ex, pending.type_id, owner, ship, flag, quantity).await.map_err(db_err)?;
             (id, quantity, (IX_LOCATION_ID, Value::Int(0)))
         }
     };
-    let t = sde.types.get(type_id).ok_or_else(|| CallError::Internal(anyhow::anyhow!("missing type {type_id}")))?;
     let item = crate::dao::items::loading::Item {
-        item_id,
-        type_id,
-        owner_id: owner,
-        location_id: ship,
-        flag_id: flag,
-        quantity: total,
-        singleton: false,
-        group_id: t.group_id.unwrap_or(0) as i64,
-        category_id: t.category_id.unwrap_or(0) as i64,
-        custom_info: None,
+        item_id, type_id: pending.type_id, owner_id: owner, location_id: ship, flag_id: flag,
+        quantity: total, singleton: false, group_id: t.group_id.unwrap_or(0) as i64,
+        category_id: t.category_id.unwrap_or(0) as i64, custom_info: None,
     };
-    let _ = notify.send(("OnItemChange".into(), vec![item.row(), Value::Dict(vec![(Value::Int(change.0), change.1)]), Value::None]));
+    outbox.notify_pilot(owner, "OnItemChange", vec![item.row(), Value::Dict(vec![(Value::Int(change.0), change.1)]), Value::None]);
+    outbox.notify_pilot(owner, "OnOreMined", vec![Value::dict([
+        ("oreType", Value::Int(pending.type_id as i64)), ("quantity_added", Value::Int(taken)),
+        ("quantity_removed", Value::Int(taken)), ("hasRewards", Value::Bool(false)),
+        ("amountWasted", Value::Int(wasted)), ("amountCritBonus", Value::Int(pending.crit_units.max(0).min(taken))),
+        ("itemID", Value::Int(pending.rock)), ("moduleItemID", Value::Int(source)),
+    ])]);
+    Ok(DeliveryOutcome::Delivered(Delivery { rock: pending.rock, left: available - removed, removed, full: taken < pending.units.min(available) }))
+}
+
+/// Apply only committed results to the space cache and observers.
+pub(crate) async fn delivered(db: &Db, world: &Arc<World>, system: i64, owner: i64, delivery: Delivery) -> Result<(), CallError> {
+    if let Some(rock) = state().rocks.get_mut(&delivery.rock) { rock.quantity = rock.quantity.min(delivery.left); }
+    let pilots = world.with(system, move |s| s.pilots().filter_map(|b| b.char_id.filter(|c| *c != owner)).collect::<Vec<_>>()).await.unwrap_or_default();
+    for pilot in pilots {
+        world.notify_pilot(pilot, "OnOreMinedByOther", vec![Value::Int(delivery.rock), Value::Int(delivery.removed)]);
+    }
+    if delivery.left == 0 { reconcile_depleted(db, world, delivery.rock).await?; }
     Ok(())
 }
 
@@ -339,73 +417,59 @@ fn tell(notify: &NotifyTx, text: &str) {
     let _ = notify.send(("OnRemoteMessage".into(), vec![Value::str(messages::MSG_CUSTOM_NOTIFY), Value::dict([("notify", Value::unicode(text))])]));
 }
 
+fn full_notice(flag: i32) -> &'static str {
+    if flag == FLAG_MINING_HOLD { messages::MINING_HOLD_FULL } else { messages::CARGO_HOLD_FULL }
+}
+
 /// The end of a mining cycle of `module` on rock `target`: move the yield to the hold.
-/// Returns whether the module should keep cycling.
 #[allow(clippy::too_many_arguments)]
 pub async fn extract(db: &Db, world: &Arc<World>, notify: &NotifyTx, char_id: i64, ship: i64, system: i64, fit: &Fit, module: i64, target: i64) -> Result<bool, CallError> {
-    let Some(rock) = state().rocks.get(&target).cloned() else { return Ok(false) };
-    let Some((gap, pilots)) = world.with(system, move |s| {
+    let Some(type_id) = rock_type(target, system) else { return Ok(false) };
+    let Some(gap) = world.with(system, move |s| {
         let (me, it) = (s.ball(ship)?, s.ball(target)?);
-        let gap = dist(s.sample_position(ship)?, s.sample_position(target)?) - me.radius as f64 - it.radius as f64;
-        let pilots: Vec<i64> = s.pilots().filter_map(|b| b.char_id.filter(|c| *c != char_id)).collect();
-        Some((gap, pilots))
+        Some(dist(s.sample_position(ship)?, s.sample_position(target)?) - me.radius as f64 - it.radius as f64)
     }).await.flatten() else { return Ok(false) };
     if gap > fit.value(Key::Module(module), ATTR_MAX_RANGE) {
         tell(notify, messages::TARGET_OUTSIDE_MINING_RANGE);
         return Ok(false);
     }
-    let unit_volume = world.sde().types.get(rock.type_id).ok_or_else(|| CallError::Internal(anyhow::anyhow!("missing type {}", rock.type_id)))?.volume.unwrap_or(1.0).max(0.01);
-    // Yield this cycle: miningAmount, doubled-up on a critical success, less any residue.
-    let mut amount = fit.value(Key::Module(module), ATTR_MINING_AMOUNT);
-    let crit_bonus = if rand01() < fit.value(Key::Module(module), ATTR_CRIT_CHANCE) { amount * fit.value(Key::Module(module), ATTR_CRIT_BONUS) } else { 0.0 };
-    let wasted = if rand01() < fit.value(Key::Module(module), ATTR_WASTE_PROBABILITY) { amount * fit.value(Key::Module(module), ATTR_WASTE_MULTIPLIER) } else { 0.0 };
-    amount += crit_bonus + state().carry.remove(&module).unwrap_or(0.0);
-    let mut units = (amount / unit_volume).floor() as i64;
-    state().carry.insert(module, amount - units as f64 * unit_volume);
-    let wasted_units = ((wasted / unit_volume).floor() as i64).min((rock.quantity - units).max(0));
-    units = units.min(rock.quantity);
-    // Into the mining hold, or the cargo hold of ships without one.
-    let hold = fit.value(Key::Ship, ATTR_MINING_HOLD);
-    let (flag, capacity) = if hold > 0.0 { (FLAG_MINING_HOLD, hold) } else { (FLAG_CARGO, fit.value(Key::Ship, ATTR_CAPACITY)) };
-    let used: f64 = crate::dao::items::mining::rows(db, ship, flag).await.map_err(db_err)?.iter()
-        .filter_map(|item| world.sde().types.get(item.type_id).map(|t| item.quantity as f64 * t.volume.unwrap_or(0.0))).fold(0.0, |total, v| total + v);
-    let room = ((capacity - used) / unit_volume).floor().max(0.0) as i64;
-    let taken = units.min(room);
-    if taken > 0 {
-        store(db, world.sde(), notify, char_id, ship, flag, rock.type_id, taken as i32).await?;
+    let volume = world.sde().types.get(type_id).ok_or_else(|| CallError::Internal(anyhow::anyhow!("missing type {type_id}")))?.volume.unwrap_or(1.0).max(0.01);
+    let pending = {
+        let mut state = state();
+        let (pending, carry) = yield_intent(yield_values(fit, Key::Module(module)), state.carry.remove(&module).unwrap_or(0.0), target, type_id, volume);
+        state.carry.insert(module, carry);
+        pending
+    };
+    if pending.units == 0 { return Ok(true); }
+    let destination = destination(fit);
+    let sde = world.sde().clone();
+    let _lock = super::market::lock().await;
+    let result = db.transaction(
+        |tx, outbox: &mut crate::db::outbox::Outbox| {
+            let pending = pending.clone();
+            let sde = sde.clone();
+            Box::pin(async move {
+                if !crate::dao::items::ship::lock_reload_ship(tx, ship).await.map_err(db_err)? { return Ok(DeliveryOutcome::Missing); }
+                deliver(tx, outbox, &sde, char_id, ship, system, module, &pending, destination).await
+            })
+        },
+        |value, outbox| async move { crate::db::outbox::dispatch_world(value, outbox, world) },
+    ).await?;
+    match result {
+        DeliveryOutcome::Missing => Ok(false),
+        DeliveryOutcome::Depleted { rock } => { reconcile_depleted(db, world, rock).await?; Ok(false) }
+        DeliveryOutcome::NoYield => Ok(true),
+        DeliveryOutcome::Full { flag } => {
+            tell(notify, full_notice(flag));
+            Ok(false)
+        }
+        DeliveryOutcome::Delivered(result) => {
+            let repeat = result.repeat();
+            if result.full { tell(notify, full_notice(if fit.value(Key::Ship, ATTR_MINING_HOLD) > 0.0 { FLAG_MINING_HOLD } else { FLAG_CARGO })); }
+            delivered(db, world, system, char_id, result).await?;
+            Ok(repeat)
+        }
     }
-    let left = (rock.quantity - taken - wasted_units).max(0);
-    if let Some(r) = state().rocks.get_mut(&target) {
-        r.quantity = left;
-    }
-    crate::dao::asteroids::quantity(db, target, left).await.map_err(db_err)?;
-    let crit_units = ((crit_bonus / unit_volume).floor() as i64).min(taken);
-    let _ = notify.send((
-        "OnOreMined".into(),
-        vec![Value::dict([
-            ("oreType", Value::Int(rock.type_id as i64)),
-            ("quantity_added", Value::Int(taken)),
-            ("quantity_removed", Value::Int(taken)),
-            ("hasRewards", Value::Bool(false)),
-            ("amountWasted", Value::Int(wasted_units)),
-            ("amountCritBonus", Value::Int(crit_units)),
-            ("itemID", Value::Int(target)),
-            ("moduleItemID", Value::Int(module)),
-        ])],
-    ));
-    // Others mining the same rock see it shrink.
-    for pilot in pilots {
-        world.notify_pilot(pilot, "OnOreMinedByOther", vec![Value::Int(target), Value::Int(taken + wasted_units)]);
-    }
-    if left == 0 {
-        exhaust(db, world, target).await?;
-        return Ok(false);
-    }
-    if taken < units {
-        tell(notify, if flag == FLAG_MINING_HOLD { messages::MINING_HOLD_FULL } else { messages::CARGO_HOLD_FULL });
-        return Ok(false);
-    }
-    Ok(true)
 }
 
 

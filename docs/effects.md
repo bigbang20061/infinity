@@ -99,6 +99,47 @@ follow to surface contact and restore the target's movement properties on stop.
 Bomb and micro-jump heading follows moving velocity; when stationary it uses
 the last GOTO direction, then the existing negative Z direction.
 
+## Drones
+
+Drones share the sequential NPC/drone worker, effect registry and Fit evaluator.
+Their persistent inventory item ID is also their space ball ID; drones have no
+pilot character ID. Position and damage are persisted lazily. Orders, control
+and pending mining yield exist only at runtime; reconnecting to drones is not
+supported. An owner may order an uncontrolled owned drone to ReturnBay: its
+truthful owned state suppresses the client's manual Scoop option. Abandoned or
+stateless drones can be manually scooped.
+
+Mining and salvage drones have no mass or agility in the static data; the server gives them the common light-drone values (3000 kg, agility 100).
+
+Published category 18 drones have no maxTargetRange or scanResolution rows,
+and both attributes default to zero. Zero max target range adds no drone-local
+lock limit; zero scan resolution locks immediately in action range. Owner
+control range and action range remain enforced, and positive values retain
+their normal limits and shared lock timing.
+
+Drone launch preferences are synchronized by the client before a menu launch
+(`ui/services/menusvc.py:3613-3615`, `environment/godma.py:2342-2363`);
+individual preference changes also send patches, with initial values from SDE
+attribute defaults (`ui/inflight/drones/droneSettings.py:8-25`). The server
+keeps the validated aggressive and focus-fire preferences per character only in
+memory, preserves untouched fields on partial changes, and clears them on logout.
+Until synchronization, drones use passive, unfocused behavior. No preference
+persistence or real-client verification is claimed.
+
+Aggressive idle controlled drones react only to accepted incoming attacks against
+their owner's piloted ship, using the same aggressor roster as Guard. Current
+live visibility, fitted control and action range, lock, jam and existing legal
+retaliation gates still apply. With focus fire, all idle drones select the lowest
+eligible aggressor ID; without it, sorted idle drone IDs are distributed
+round-robin over sorted eligible aggressor IDs. Explicit work, return and
+delegated orders are not retargeted. This deterministic selection is server
+policy: the client names the checkbox and hint but specifies no algorithm.
+
+Mining drones physically carry pending intent to the ship; asteroid extraction
+and hold delivery commit together at contact. A full hold changes neither.
+Drone deaths do not grant NPC rewards. Salvage drone commands are unsupported,
+and remote assistance does not generate Crimewatch assistance flags.
+
 ## NPC capacitor assistance
 
 NPC capacitor transfers select another live NPC brain in the same system. If
@@ -206,8 +247,7 @@ optimal, and non-finite inputs yield zero. This is strength scaling, not a hit
 roll. Player and NPC projections share this path and the Fit modifier evaluator.
 Generic NPC effect modules have distinct process-local identities and independent
 actor timers; target generations prevent stale queued cycles from restoring a
-lost projection. Drone gameplay and new drone RPCs are not supplied. No
-real-client walkthrough is claimed by this documentation.
+lost projection. No real-client walkthrough is claimed by this documentation.
 
 NPC shots snapshot incoming projections from the actor and evaluate their type
 with the same Fit evaluator. Turret optimal, falloff and tracking, and missile
