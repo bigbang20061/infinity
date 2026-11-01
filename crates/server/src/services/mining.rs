@@ -14,12 +14,17 @@
 //! mining hold, or the cargo hold of ships without one, and tells the client
 //! (OnOreMined -> notifications.oreMinedNotificationAdapter, OnItemChange).
 //! Extraction range uses ship and rock positions sampled at the same system-actor time.
+//! Each delivered extraction appends a personal fact to game.character_mining_ledger in
+//! the caller's transaction, before post-commit notices. The client refreshes its
+//! personal ledger normally; corporate observers and compression are unsupported.
 //!
 //! Reprocessing (the station's bound reprocessingSvc) turns items into their
 //! canonical SDE type materials per portion: the configured station yield, raised by Reprocessing,
 //! Reprocessing Efficiency and the item's own processing skill, less the configured ISK tax.
 //! Output that exceeds a single stack's capacity is refused without consuming inputs.
 
+mod ledger;
+pub(crate) mod retention;
 mod mining_scan_mgr;
 mod reprocessing_svc;
 use super::fit::{Fit, Key};
@@ -387,6 +392,7 @@ pub(crate) async fn deliver(ex: &(impl crate::db::executor::Executor + ?Sized), 
             (id, quantity, (IX_LOCATION_ID, Value::Int(0)))
         }
     };
+    crate::dao::mining_ledger::append(ex, owner, system, pending.type_id, taken, wasted, filetime_now()).await.map_err(db_err)?;
     let item = crate::dao::items::loading::Item {
         item_id, type_id: pending.type_id, owner_id: owner, location_id: ship, flag_id: flag,
         quantity: total, singleton: false, group_id: t.group_id.unwrap_or(0) as i64,
@@ -475,9 +481,10 @@ pub async fn extract(db: &Db, world: &Arc<World>, notify: &NotifyTx, char_id: i6
 
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
-    match (call.service, call.method) {
-        ("miningScanMgr", "perform_scan") => Some(Ok(mining_scan_mgr::perform_scan(c).await)),
-        ("reprocessingSvc", _) if call.bound => Some(reprocessing_svc::reprocessing(c, call).await),
+    match call.service {
+        "characterMiningLedger" => ledger::dispatch(c, call).await,
+        "miningScanMgr" => mining_scan_mgr::dispatch(c, call).await,
+        "reprocessingSvc" => reprocessing_svc::dispatch(c, call).await,
         _ => None,
     }
 }

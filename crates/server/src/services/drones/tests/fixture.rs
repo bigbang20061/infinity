@@ -137,6 +137,7 @@ impl Fixture {
             self.db.execute("DELETE FROM game.pending_reloads WHERE owner_id=$1", &[&owner]).await.unwrap();
             self.db.execute("DELETE FROM game.item_attributes WHERE item_id IN (SELECT item_id FROM game.items WHERE owner_id=$1)", &[&owner]).await.unwrap();
             self.db.execute("DELETE FROM game.items WHERE owner_id=$1", &[&owner]).await.unwrap();
+            self.db.execute("DELETE FROM game.character_mining_ledger WHERE character_id=$1", &[&owner]).await.unwrap();
             self.db.execute("DELETE FROM game.characters WHERE character_id=$1 AND user_id=$2", &[&owner, &self.account]).await.unwrap();
         }
         self.db.execute("DELETE FROM game.accounts WHERE user_id=$1", &[&self.account]).await.unwrap();

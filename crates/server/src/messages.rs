@@ -13,6 +13,7 @@ pub(crate) mod dynamic_items;
 pub(crate) mod fitting;
 pub(crate) mod gm;
 pub(crate) mod industry;
+pub(crate) mod mining;
 pub(crate) mod repair;
 pub(crate) mod scheduler;
 pub(crate) mod lua;

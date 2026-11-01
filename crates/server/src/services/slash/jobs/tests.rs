@@ -23,7 +23,7 @@ async fn cancelled_periodic_job_is_restored_by_seed() {
     assert!(!jobs::upcoming(&db).await.unwrap().iter().any(|job| job.id == scheduler::BILLS));
     scheduler::seed(&db).await.unwrap();
     let counts = jobs::counts(&db).await.unwrap();
-    assert_eq!(counts.iter().map(|row| row.count).sum::<i64>(), 3);
+    assert_eq!(counts.iter().map(|row| row.count).sum::<i64>(), scheduler::PERIODIC_KINDS.len() as i64);
     let due = jobs::upcoming(&db).await.unwrap();
     for kind in scheduler::PERIODIC_KINDS {
         assert!(due.iter().any(|job| job.id == kind && job.kind == kind));

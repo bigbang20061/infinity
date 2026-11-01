@@ -961,6 +961,21 @@ CREATE TABLE IF NOT EXISTS game.asteroid_fields (
     depleted_at bigint
 );
 
+-- Personal mining deliveries (dao/mining_ledger.rs); event_time is FILETIME.
+CREATE TABLE IF NOT EXISTS game.character_mining_ledger (
+    log_id bigserial PRIMARY KEY,
+    character_id bigint NOT NULL,
+    event_time bigint NOT NULL,
+    solar_system_id bigint NOT NULL,
+    type_id integer NOT NULL,
+    quantity bigint NOT NULL CHECK (quantity > 0),
+    quantity_wasted bigint NOT NULL CHECK (quantity_wasted >= 0)
+);
+CREATE INDEX IF NOT EXISTS character_mining_ledger_character_time
+    ON game.character_mining_ledger (character_id, event_time DESC, log_id DESC);
+CREATE INDEX IF NOT EXISTS character_mining_ledger_time
+    ON game.character_mining_ledger (event_time);
+
 -- Durable scheduler (dao/jobs.rs); all timestamps are FILETIME ticks.
 CREATE SEQUENCE IF NOT EXISTS game.jobs_lease_seq;
 CREATE TABLE IF NOT EXISTS game.jobs (

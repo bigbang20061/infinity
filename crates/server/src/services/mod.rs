@@ -66,11 +66,12 @@ pub use exploration::unbury_sites;
 
 pub(crate) fn scheduler_registrations() -> Vec<crate::scheduler::Registration> {
     let game = crate::config::game();
-    use crate::scheduler::{periodic, MARKET, CONTRACTS, BILLS};
+    use crate::scheduler::{periodic, MARKET, CONTRACTS, BILLS, MINING_LEDGER};
     vec![
         periodic(MARKET, market::expire_orders, game.market.maintenance_secs as u64),
         periodic(CONTRACTS, contracts::settle_auctions, game.contracts.maintenance_secs as u64),
         periodic(BILLS, bills::run_billing, game.corporations.bills_maintenance_secs as u64),
+        periodic(MINING_LEDGER, mining::retention::handle, game.mining.ledger_maintenance_secs as u64),
         trade::timeout_registration(),
         crate::scheduler::register(bounty::kill_rights::EXPIRY_KIND, bounty::kill_rights::expire),
         crate::scheduler::register(bounty::payout::KIND, bounty::payout::handle),
