@@ -81,6 +81,7 @@ async fn real_bank_rpcs_and_transactional_rules() {
     crate::tests::init_config();
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let sde = Arc::new(Sde::load(&db).await.unwrap());
+    let station = sde.map.stations().next().expect("station in SDE").station_id;
     use crate::consts::dogma::{ATTR_CPU, ATTR_CPU_OUTPUT, ATTR_POWER, ATTR_POWER_OUTPUT, ATTR_HI_SLOTS, ATTR_TURRET_SLOTS_LEFT, ATTR_LAUNCHER_SLOTS_LEFT, EFFECT_TURRET_FITTED, EFFECT_LAUNCHER_FITTED, ATTR_REQUIRED_SKILLS, ATTR_REQUIRED_SKILL_LEVELS, ATTR_SKILL_TIME_CONSTANT};
     /// SDE dogma effect hiPower, the client high-slot rack effect.
     const EFFECT_HI_POWER: i32 = 12;
@@ -126,7 +127,7 @@ async fn real_bank_rpcs_and_transactional_rules() {
     db.execute("INSERT INTO game.accounts (user_id,user_name,password_hash,role) VALUES ($1,$2,$3,0)", &[&account, &name, &password]).await.unwrap();
     db.execute("INSERT INTO game.characters (character_id,user_id,name,race_id,bloodline_id,gender_id,corporation_id,balance) VALUES ($1,$2,$3,1,1,1,$2,0)", &[&owner, &account, &name]).await.unwrap();
     let insert = "INSERT INTO game.items (type_id,owner_id,location_id,flag_id,quantity,singleton,online) VALUES ($1,$2,$3,$4,1,true,$5) RETURNING item_id";
-    let ship: i64 = db.query_one(insert, &[&hull, &owner, &owner, &FLAG_HANGAR, &false]).await.unwrap().get("item_id");
+    let ship: i64 = db.query_one(insert, &[&hull, &owner, &station, &FLAG_HANGAR, &false]).await.unwrap().get("item_id");
     // Insert in reverse slot order so item-ID order cannot accidentally choose the first slave.
     let mut guns = Vec::new();
     for flag in (27_i32..=34).rev() {
@@ -153,7 +154,7 @@ async fn real_bank_rpcs_and_transactional_rules() {
     let (stream, address) = listener.accept().await.unwrap();
     let mut client = Client::new(Conn::new(stream, address), Arc::new(crate::config::Config::default()), db.clone(), sde,
         crate::chat::Hub::new("localhost"), world.clone(), Login { user_id: account, user_name: name, role: 0, client_id: 1, session_id: 1, language_id: "EN".into() });
-    client.session.apply(vec![("charid", Value::Int(owner)), ("shipid", Value::Int(ship))]);
+    client.session.apply(vec![("charid", Value::Int(owner)), ("shipid", Value::Int(ship)), ("stationid", Value::Int(station))]);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     world.register_pilot(owner, tx.clone());
     client.notify_tx = tx;

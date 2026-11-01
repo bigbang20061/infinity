@@ -7,6 +7,7 @@
 //! Item capacity and contents are read from one game-item statement snapshot.
 //! Corporation deliveries are station-owned custody, viewable by authorized
 //! members and received only through server business operations, never drops.
+//! Player transfers and merges check physical reachability of their inventories.
 
 use crate::dao::items::loading::{Item, ItemQuery};
 use super::items::load_items;
@@ -26,6 +27,8 @@ use tracing::warn;
 
 pub(super) mod gm;
 pub(crate) mod movement;
+mod reachability;
+use reachability::{Endpoint, Reachability};
 
 /// const.containerHangar: "my hangar in the current station".
 const CONTAINER_HANGAR: i64 = 10004;
@@ -326,10 +329,11 @@ async fn mutation_corporate(ex: &(impl Executor + ?Sized), sde: &Sde, item: &Ite
     Ok(false)
 }
 
-async fn apply_merges<X: Send>(db: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<X>, items: Vec<Item>, ops: &[(i64, i64, i64)], me: i64, station: Option<i64>) -> Result<(), CallError> {
+async fn apply_merges<X: Send>(db: &(impl Executor + ?Sized), sde: &Sde, reach: &Reachability, outbox: &mut Outbox<X>, items: Vec<Item>, ops: &[(i64, i64, i64)], me: i64, station: Option<i64>) -> Result<(), CallError> {
     let mut corporate = Vec::new();
     for item in &items {
         if mutation_corporate(db, sde, item, me, station).await? { corporate.push(item.item_id); }
+        reach.check(db, sde, Endpoint { location: item.location_id, flag: item.flag_id }).await?;
     }
     let changes = plan_merges(&items, ops)?;
     if !quantities::apply(db, &changes).await.map_err(db_err)? { return Err(notify_error(messages::INSUFFICIENT_ITEM_QUANTITY)); }
@@ -350,27 +354,65 @@ async fn apply_merges<X: Send>(db: &(impl Executor + ?Sized), sde: &Sde, outbox:
     Ok(())
 }
 
-async fn merge_operations(c: &mut Client, ops: Vec<(i64, i64, i64)>) -> Result<(), CallError> {
+async fn merge_operations(c: &mut Client, container: &Container, source_container: Option<i64>, ops: Vec<(i64, i64, i64)>) -> Result<(), CallError> {
     let _lock = super::market::lock().await;
     let me = c.session.int("charid").unwrap_or(0);
     let station = c.session.int("stationid");
+    let ids: Vec<i64> = ops.iter().flat_map(|&(source, dest, _)| [source, dest]).collect();
+    let snapshots = load_items(&c.db, &c.sde, ItemQuery::Ids(&ids)).await.map_err(db_err)?;
+    let endpoints: Vec<_> = snapshots.iter().map(|item| Endpoint { location: item.location_id, flag: item.flag_id }).collect();
+    let reach = Reachability::capture(c, &endpoints).await?;
+    let container = container.clone();
     let db = c.db.clone();
     let sde = c.sde.clone();
     db.transaction(
         move |tx, outbox: &mut Outbox| {
             let ops = ops.clone();
             let sde = sde.clone();
+            let container = container.clone();
+            let reach = reach.clone();
             Box::pin(async move {
                 let ids: Vec<i64> = ops.iter().flat_map(|&(source, dest, _)| [source, dest]).collect();
                 if !crate::dao::trades::reserved(tx, &ids).await.map_err(db_err)?.is_empty() {
                     return Err(notify_error(messages::trade::TRADE_ITEM_RESERVED));
                 }
                 let items = load_items(tx, &sde, ItemQuery::Ids(&ids)).await.map_err(db_err)?;
-                apply_merges(tx, &sde, outbox, items, &ops, me, station).await
+                for item in &items {
+                    if ops.iter().any(|&(source, _, _)| source == item.item_id)
+                        && source_container.is_some_and(|id| id != item.location_id) {
+                        return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
+                    }
+                    if ops.iter().any(|&(_, dest, _)| dest == item.item_id) {
+                        let matches = match &container {
+                            Container::Hangar { station_id, owner_id } => item.location_id == *station_id && item.owner_id == *owner_id && item.flag_id == FLAG_HANGAR,
+                            Container::Deliveries { station_id, owner_id } => item.location_id == *station_id && item.owner_id == *owner_id && item.flag_id == FLAG_CORP_DELIVERIES,
+                            Container::Item(id) => item.location_id == *id,
+                        };
+                        if !matches { return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION)); }
+                    }
+                }
+                apply_merges(tx, &sde, &reach, outbox, items, &ops, me, station).await
             })
         },
         |value, outbox| async move { dispatch_client(value, outbox, c) },
     ).await
+}
+
+async fn stack_items(ex: &(impl Executor + ?Sized), sde: &Sde, container: &Container, flag: Option<i64>) -> Result<Vec<Item>, CallError> {
+    let flags = flag.map(|f| vec![f as i32]);
+    let items = match container {
+        Container::Hangar { station_id, owner_id } => {
+            let flags = flags.unwrap_or_else(|| vec![FLAG_HANGAR]);
+            load_items(ex, sde, ItemQuery::LocationOwnerFlags(*station_id, *owner_id, &flags)).await
+        }
+        Container::Deliveries { station_id, owner_id } =>
+            load_items(ex, sde, ItemQuery::LocationOwnerFlags(*station_id, *owner_id, &[FLAG_CORP_DELIVERIES])).await,
+        Container::Item(id) => match flags {
+            Some(flags) => load_items(ex, sde, ItemQuery::LocationFlags(*id, &flags)).await,
+            None => load_items(ex, sde, ItemQuery::Location(*id)).await,
+        },
+    };
+    items.map_err(db_err)
 }
 
 /// `StackAll([flag])`: merge every unassembled stack of the same type in the container.
@@ -383,6 +425,15 @@ async fn stack_all(c: &mut Client, container: &Container, flag: Option<i64>) -> 
             return Ok(());
         }
     }
+    let endpoint = match container {
+        Container::Hangar { station_id, .. } => Endpoint { location: *station_id, flag: flag.map(|f| f as i32).unwrap_or(FLAG_HANGAR) },
+        Container::Deliveries { station_id, .. } => Endpoint { location: *station_id, flag: FLAG_CORP_DELIVERIES },
+        Container::Item(id) => Endpoint { location: *id, flag: flag.map(|f| f as i32).unwrap_or(FLAG_CARGO) },
+    };
+    let snapshots = stack_items(&c.db, &c.sde, container, flag).await?;
+    let mut endpoints = vec![endpoint];
+    endpoints.extend(snapshots.iter().map(|item| Endpoint { location: item.location_id, flag: item.flag_id }));
+    let reach = Reachability::capture(c, &endpoints).await?;
     let container = container.clone();
     let db = c.db.clone();
     let sde = c.sde.clone();
@@ -390,26 +441,19 @@ async fn stack_all(c: &mut Client, container: &Container, flag: Option<i64>) -> 
         move |tx, outbox: &mut Outbox| {
             let container = container.clone();
             let sde = sde.clone();
+            let reach = reach.clone();
             Box::pin(async move {
-                let flags: Option<Vec<i32>> = flag.map(|f| vec![f as i32]);
-                let items = match container {
-                    Container::Hangar { station_id, owner_id } => {
-                        let flags = flags.unwrap_or_else(|| vec![FLAG_HANGAR]);
-                        load_items(tx, &sde, ItemQuery::LocationOwnerFlags(station_id, owner_id, &flags)).await.map_err(db_err)?
+                if let Container::Deliveries { station_id, owner_id } = &container {
+                    if station != Some(*station_id) || !may_take_corp_hangar(tx, me, *owner_id, FLAG_CORP_DELIVERIES).await? {
+                        return Err(notify_error(messages::NO_CORPORATION_HANGAR_TAKE_ROLE));
                     }
-                    Container::Deliveries { station_id, owner_id } => {
-                        if station != Some(station_id) || !may_take_corp_hangar(tx, me, owner_id, FLAG_CORP_DELIVERIES).await? { return Err(notify_error(messages::NO_CORPORATION_HANGAR_TAKE_ROLE)); }
-                        load_items(tx, &sde, ItemQuery::LocationOwnerFlags(station_id, owner_id, &[FLAG_CORP_DELIVERIES])).await.map_err(db_err)?
-                    }
-                    Container::Item(id) => match flags {
-                        Some(flags) => load_items(tx, &sde, ItemQuery::LocationFlags(id, &flags)).await.map_err(db_err)?,
-                        None => load_items(tx, &sde, ItemQuery::Location(id)).await.map_err(db_err)?,
-                    },
-                };
+                }
+                let items = stack_items(tx, &sde, &container, flag).await?;
                 let ids: Vec<i64> = items.iter().map(|item| item.item_id).collect();
                 if !crate::dao::trades::reserved(tx, &ids).await.map_err(db_err)?.is_empty() {
                     return Err(notify_error(messages::trade::TRADE_ITEM_RESERVED));
                 }
+                reach.check(tx, &sde, endpoint).await?;
                 let mut first: std::collections::HashMap<(i32, i32), i64> = Default::default();
                 let mut ops = Vec::new();
                 for item in items.iter().filter(|i| !i.singleton) {
@@ -418,7 +462,7 @@ async fn stack_all(c: &mut Client, container: &Container, flag: Option<i64>) -> 
                         None => { first.insert((item.type_id, item.flag_id), item.item_id); }
                     }
                 }
-                apply_merges(tx, &sde, outbox, items, &ops, me, station).await
+                apply_merges(tx, &sde, &reach, outbox, items, &ops, me, station).await
             })
         },
         |value, outbox| async move { dispatch_client(value, outbox, c) },
@@ -607,7 +651,7 @@ pub async fn inventory(c: &mut Client, call: &Call<'_>) -> CallResult {
                     _ => None,
                 })
                 .collect();
-            merge_operations(c, ops).await?;
+            merge_operations(c, &container, call.args.get(1).and_then(Value::as_int), ops).await?;
             Ok(Value::None)
         }
         "StackAll" => {
