@@ -17,13 +17,14 @@
 //! authorized office divisions or station Deliveries.
 //! Corporation-assigned contracts are available to current members acting personally;
 //! corporate courier completion requires current membership and actual package custody.
-//! Contract lifecycle mutations and stack splits commit their database changes atomically;
-//! their notifications are delivered only after commit.
+//! Contract lifecycle mutations guard the previous persisted status and commit atomically;
+//! their notifications are delivered only after commit. Overdue couriers remain in progress
+//! until manually failed, and their acceptors may still complete them.
 //! Contract and item state comes from game tables; station ancestry comes from the loaded SDE.
 //! Skill-based outstanding caps follow the client; listing page sizes use contracts configuration.
 //! Auction settlement scans run as durable periodic jobs registered through the services
-//! scheduler and persisted in game.jobs, not detached maintenance sleeps. Internal scan
-//! errors warn but the scan still completes.
+//! scheduler and persisted in game.jobs, not detached maintenance sleeps. Scan errors
+//! propagate to the scheduler for retry.
 
 mod custody;
 mod ownership;
@@ -51,7 +52,7 @@ use marshal::{DbRowDescriptor, DbType, Value};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::info;
 
 
 const TYPE_PLASTIC_WRAP: i32 = 3468;
@@ -180,9 +181,11 @@ async fn contract(db: &(impl Executor + ?Sized), id: i64) -> Result<Contract, Ca
 }
 
 async fn set_status(db: &(impl Executor + ?Sized), k: &mut Contract, status: i32, completed: i64) -> Result<(), CallError> {
+    if !shared::set_status(db, k.id, k.status, status, completed, k.acceptor, k.acceptor_wallet_key).await.map_err(db_err)? {
+        return Err(user_error(messages::MSG_CON_CONTRACT_NOT_OUTSTANDING, vec![]));
+    }
     k.status = status;
     k.completed = completed;
-    shared::set_status(db, k.id, status, k.completed, k.acceptor, k.acceptor_wallet_key).await.map_err(db_err)?;
     Ok(())
 }
 
@@ -285,8 +288,7 @@ async fn outstanding_counts(db: &(impl Executor + ?Sized), char_id: i64, corp_id
 /// Execute one scheduler-driven auction settlement scan.
 pub(crate) fn settle_auctions(db: Db, world: Arc<World>, _: crate::scheduler::Job) -> std::pin::Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
     Box::pin(async move {
-        if let Err(CallError::Internal(e)) = settle_expired(&db, world.sde(), &world).await { warn!("settling auctions failed: {e:#}"); }
-        Ok(())
+        settle_expired(&db, world.sde(), &world).await.map_err(crate::startup_call_error)
     })
 }
 

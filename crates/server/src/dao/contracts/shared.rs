@@ -1,5 +1,5 @@
 //! Contract item, bid and status persistence for contractProxy.
-//! Uses game contracts, contract items, bids and items; policy stays in services.
+//! Uses game contracts, contract items, bids and items; status writes guard the previous status.
 use crate::db::{executor::Executor, Error};
 use tokio_postgres::Row;
 
@@ -13,8 +13,8 @@ impl Bid { fn from_row(r: &Row) -> Self { Self { bid_id: r.get("bid_id"), contra
 pub(crate) async fn bids(ex: &(impl Executor + ?Sized), ids: &[i64]) -> Result<Vec<Bid>, Error> {
     Ok(ex.query("SELECT bid_id, contract_id, bidder_id, amount, date FROM game.contract_bids WHERE contract_id = ANY($1) ORDER BY amount DESC", &[&ids]).await?.iter().map(Bid::from_row).collect())
 }
-pub(crate) async fn set_status(ex: &(impl Executor + ?Sized), id: i64, status: i32, completed: i64, acceptor: i64, acceptor_wallet_key: i32) -> Result<u64, Error> {
-    ex.execute("UPDATE game.contracts SET status = $2, date_completed = $3, acceptor_id = $4, acceptor_wallet_key = $5 WHERE contract_id = $1", &[&id, &status, &completed, &acceptor, &acceptor_wallet_key]).await
+pub(crate) async fn set_status(ex: &(impl Executor + ?Sized), id: i64, old_status: i32, status: i32, completed: i64, acceptor: i64, acceptor_wallet_key: i32) -> Result<bool, Error> {
+    Ok(ex.execute("UPDATE game.contracts SET status = $2, date_completed = $3, acceptor_id = $4, acceptor_wallet_key = $5 WHERE contract_id = $1 AND status = $6", &[&id, &status, &completed, &acceptor, &acceptor_wallet_key, &old_status]).await? == 1)
 }
 struct ItemId { item_id: i64 }
 impl ItemId { fn from_row(r: &Row) -> Self { Self { item_id: r.get("item_id") } } }

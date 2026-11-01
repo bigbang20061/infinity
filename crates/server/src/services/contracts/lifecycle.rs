@@ -2,6 +2,8 @@
 //! Uses game contracts and items through database access and immutable SDE types and stations.
 //! Requested exchange items retain their identity, state and contents when handed over.
 //! Expiry, courier duration, item counts and text lengths use the configured contracts policy.
+//! Status transitions are guarded; overdue couriers are completed or failed manually.
+//! Auction candidates are rechecked in their settlement transaction.
 
 use super::*;
 use crate::dao::contracts::lifecycle as contract_dao;
@@ -528,26 +530,33 @@ pub(super) async fn settle_expired(db: &Db, sde: &Arc<crate::sde::Sde>, world: &
     let expired = contract_dao::expired_auctions_with_bids(db, TYPE_AUCTION, STATUS_OUTSTANDING, now).await.map_err(db_err)?;
     for k in expired {
         let id = k.id;
-        let settled = db.transaction(
-            |db, outbox: &mut Outbox| {
-                let sde = sde.clone();
-                Box::pin(async move {
-                let sde = &*sde;
-                let mut k = contract(db, id).await?;
-                if let Some(bid) = shared::top_bid(db, id).await.map_err(db_err)? {
-                    settle(db, sde, outbox, &mut k, ownership::FinancialOwner { id: bid.bidder_id, wallet_key: bid.wallet_key }, bid.amount, now).await?;
-                    Ok(Some((bid.bidder_id, bid.amount)))
-                } else {
-                    Ok(None)
-                }
-            })},
-            |value, outbox| async move { dispatch_world(value, outbox, world) },
-        ).await?;
+        let settled = settle_expired_candidate(db, sde, world, id, now).await?;
         if let Some((winner, amount)) = settled {
             info!("contracts: auction {id} went to {winner} for {amount} ISK");
         }
     }
     Ok(())
+}
+
+async fn settle_expired_candidate(db: &Db, sde: &Arc<crate::sde::Sde>, world: &World, id: i64, now: i64) -> Result<Option<(i64, f64)>, CallError> {
+    db.transaction(
+        |db, outbox: &mut Outbox| {
+            let sde = sde.clone();
+            Box::pin(async move {
+                let mut k = contract(db, id).await?;
+                if k.kind != TYPE_AUCTION || k.status != STATUS_OUTSTANDING || !k.expired(now) {
+                    return Ok(None);
+                }
+                if let Some(bid) = shared::top_bid(db, id).await.map_err(db_err)? {
+                    settle(db, &sde, outbox, &mut k, ownership::FinancialOwner { id: bid.bidder_id, wallet_key: bid.wallet_key }, bid.amount, now).await?;
+                    Ok(Some((bid.bidder_id, bid.amount)))
+                } else {
+                    Ok(None)
+                }
+            })
+        },
+        |value, outbox| async move { dispatch_world(value, outbox, world) },
+    ).await
 }
 
 #[cfg(test)] mod tests;
