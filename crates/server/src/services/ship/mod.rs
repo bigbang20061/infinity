@@ -4,6 +4,7 @@
 //! `eve/client/script/parklife/autopilot.py`. Ship attributes and celestial
 //! data come from the SDE; locations are persisted in game tables.
 //! Ship shield, armor and hull condition are persisted in item dogma overrides.
+//! Selected and unpiloted persistent hulls share fitted ball construction.
 //!
 //! Movement commands apply at destiny boundaries; jump and docking waits and arrival cloak
 //! expiry use the actor tick. During the four-second jump wait, the source ballpark
@@ -25,12 +26,12 @@
 
 use super::{db_err, Call, CallError, CallResult};
 use crate::client::{short, Client};
-use crate::consts::{dogma::ATTR_AGILITY, dogma::ATTR_MASS, dogma::ATTR_MAX_VELOCITY, dogma::ATTR_SIGNATURE_RADIUS, FILETIME_SECOND, FLAG_HANGAR, TYPE_CAPSULE};
+use crate::consts::{FILETIME_SECOND, FLAG_HANGAR, TYPE_CAPSULE};
 use crate::db::outbox::{dispatch_client, Effect, Outbox};
 use crate::lua::events::GameEvent;
 use crate::dao::{characters::{ship as character_dao, selection}, items::{ship as item_dao, creation}};
 use crate::messages;
-use crate::space::{self, event, now_ms, special_fx, Ball, V3, CLOAK_RESTORE, MODE_STOP, SPECIAL_FX_UNSPECIFIED_DURATION};
+use crate::space::{self, event, special_fx, Ball, V3, CLOAK_RESTORE, SPECIAL_FX_UNSPECIFIED_DURATION};
 use crate::space::system::Timer;
 use marshal::Value;
 use tracing::{info, warn};
@@ -69,74 +70,14 @@ fn gate_destination(sde: &crate::sde::Sde, from: i64, to: i64, system: i64) -> R
     }))
 }
 
-const ATTR_WARP_SPEED_MULTIPLIER: i32 = 600;
-const ATTR_BASE_WARP_SPEED: i32 = 1281;
-
-/// Server policy: ship radius in metres when the SDE has no radius.
-const DEFAULT_SHIP_RADIUS: f64 = 50.0;
 
 fn f(v: Option<&Value>) -> f64 {
     v.and_then(|v| v.as_float()).unwrap_or(0.0)
 }
 
-/// Build a free ship ball from the ship's type attributes.
+/// Construct the selected ship using its pilot's fit and live projections.
 pub(super) async fn ship_ball(c: &Client, ship_id: i64, pos: [f64; 3]) -> Result<Ball, CallError> {
-    let type_id = required(crate::dao::items::inventory::type_id(&c.db, ship_id).await.map_err(db_err)?, "ship item")?;
-    let r = required(c.sde.types.get(type_id), "ship type")?;
-    let mass = r.attribute(ATTR_MASS).or(r.mass).unwrap_or(1_000_000.0);
-    let warp_mult = r.attribute(ATTR_WARP_SPEED_MULTIPLIER).unwrap_or(1.0);
-    let base_warp = r.attribute(ATTR_BASE_WARP_SPEED).unwrap_or(3.0);
-    let char_id = c.session.int("charid").unwrap_or(0);
-    let corp = c.session.int("corpid").unwrap_or(0);
-    // Movement and signature attributes as fitted (skills, modules), when the ship is the pilot's.
-    let fit = if let Some(system) = c.session.int("solarsystemid") {
-        super::fit::Fit::load_in_space(&c.db, &c.world, system, char_id, ship_id).await?
-    } else {
-        super::fit::Fit::load(&c.db, c.sde.clone(), char_id, ship_id).await?
-    };
-    let fitted = |attr: i32, base: f64| match fit.value(super::fit::Key::Ship, attr) {
-        v if v > 0.0 => v,
-        _ => base,
-    };
-    let mass = fitted(ATTR_MASS, mass);
-    let radius = r.radius.unwrap_or(DEFAULT_SHIP_RADIUS) as f32;
-    let security = super::crimewatch::security_status(&c.db, char_id).await?;
-    let health = super::combat::load_condition_with_fit(&c.db, ship_id, &fit).await?;
-    Ok(Ball {
-        id: ship_id,
-        type_id,
-        owner_id: char_id,
-        corp_id: corp,
-        alliance_id: c.session.int("allianceid").unwrap_or(-1),
-        char_id: Some(char_id),
-        mode: MODE_STOP,
-        radius,
-        signature_radius: Some(fitted(ATTR_SIGNATURE_RADIUS, radius as f64)),
-        mass,
-        max_vel: fitted(ATTR_MAX_VELOCITY, r.attribute(ATTR_MAX_VELOCITY).unwrap_or(200.0)) as f32,
-        agility: fitted(ATTR_AGILITY, r.attribute(ATTR_AGILITY).unwrap_or(3.0)) as f32,
-        speed_fraction: 0.0,
-        pos,
-        vel: [0.0; 3],
-        old_pos: pos, old_vel: [0.0; 3], segment_acceleration: None,
-        goto: [0.0; 3],
-        follow_id: 0,
-        follow_range: 0.0,
-        free: true,
-        global: false,
-        massive: true,
-        interactive: true,
-        warp: space::WarpState::default(),
-        warp_factor: ((warp_mult * base_warp * 1000.0).round() as i64).max(500),
-        last_ms: now_ms(),
-        interpolation_anchor_ms: 0,
-        effect_stamp: 0,
-        cloak: 0,
-        cloak_until: 0,
-        health,
-        launcher: 0,
-        slim: vec![("securityStatus", Value::Float(security))],
-    })
+    balls::selected(c, ship_id, pos).await
 }
 
 /// Refuse docking and gate jumps while the pilot's weapons timer runs (crimewatch).
@@ -553,6 +494,7 @@ fn ensure_moving(b: &mut Ball, tick: i64, ev: &mut Vec<Value>) {
     }
 }
 
+pub(crate) mod balls;
 mod ship;
 mod beyonce;
 

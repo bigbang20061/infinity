@@ -1,4 +1,4 @@
-//! NPC remote repairs using SDE dogma attributes and system-owned health.
+//! NPC remote repairs using SDE dogma attributes and ship or NPC health.
 //! Like player repair effects, range attenuates the repair amount. NPCs assist
 //! only their spawn-group or owner allies, never their hostile target. Server
 //! policy applies shield at cycle start and armor and hull at cycle end.
@@ -6,7 +6,7 @@ use super::{range::range_multiplier, registry::{Effect, EffectAttribute}, repair
 use crate::consts::{dogma::EFFECT_NPC_BEHAVIOR_REMOTE_ARMOR, dogma::EFFECT_NPC_BEHAVIOR_REMOTE_SHIELD,
     dogma::EFFECT_NPC_REMOTE_ARMOR_REPAIRER, dogma::EFFECT_NPC_REMOTE_SHIELD_BOOSTER,
     dogma::EFFECT_NPC_REMOTE_HULL_REPAIRER};
-use crate::services::{combat::groups_health::{npc_health_fraction, repair_npc_in_system, repair_player}, CallError};
+use crate::services::{combat::groups_health::{npc_health_fraction, repair_player}, CallError};
 use crate::space::{dist, Ball, System, MODE_WARP, drone::DronePhase};
 
 pub(crate) fn supported(id: i64) -> bool {
@@ -28,12 +28,26 @@ fn score(fraction: Option<f64>, distance: f64, optimal: f64, falloff: f64) -> Op
     fraction.filter(|value| value.is_finite() && *value < 1.0 && range_multiplier(distance, optimal, falloff) > 0.0)
 }
 
-fn apply(s: &mut System, sde: &crate::sde::Sde, source: i64, hostile: i64, target: i64,
-    generation: u64, layer: usize, amount: f64, optimal: f64, falloff: f64) {
-    if !s.npc_projection_valid(source, hostile, generation) || target == hostile || !s.npc_assist_eligible(source, target) { return; }
-    let Some((me, other)) = s.sampled_ball(source).zip(s.sampled_ball(target)) else { return };
-    if me.mode == MODE_WARP || other.mode == MODE_WARP || range_multiplier(gap(&me, &other), optimal, falloff) <= 0.0 { return; }
-    repair_npc_in_system(s, sde, target, layer, amount);
+fn apply(s: &mut System, db: crate::db::Db, world: std::sync::Arc<crate::space::World>, system: i64,
+    source: i64, hostile: i64, target: i64, generation: u64, layer: usize, amount: f64, optimal: f64, falloff: f64) {
+    let guard = move |s: &System| {
+        if !s.npc_projection_valid(source, hostile, generation) || target == hostile || !s.npc_assist_eligible(source, target) { return false; }
+        let Some((me, other)) = s.sampled_ball(source).zip(s.sampled_ball(target)) else { return false };
+        me.mode != MODE_WARP && other.mode != MODE_WARP && range_multiplier(gap(&me, &other), optimal, falloff) > 0.0
+    };
+    if !guard(s) { return; }
+    let persistent_hull = s.ball(target).is_some_and(|ball| ball.char_id.is_none()
+        && s.persistent_generation(target).is_some()
+        && world.sde().types.get(ball.type_id).and_then(|ty| ty.category_id) == Some(crate::consts::CATEGORY_SHIP));
+    if !persistent_hull {
+        crate::services::combat::groups_health::repair_npc_in_system(s, world.sde(), target, layer, amount);
+        return;
+    }
+    s.defer(async move {
+        if let Err(error) = crate::services::combat::unpiloted::repair(&db, &world, system, target, layer, amount, guard).await {
+            tracing::warn!("NPC remote repair failed: {:?}", error);
+        }
+    });
 }
 
 pub(crate) async fn apply_source(cx: &SourceContext<'_>) -> Result<(), CallError> {
@@ -46,6 +60,9 @@ pub(crate) async fn apply_source(cx: &SourceContext<'_>) -> Result<(), CallError
         SourceGuard::Npc { source, target: hostile, generation } => {
             if !matches!(cx.phase, DronePhase::Begin) || !supported_for_type(&sde, cx.source.type_id, cx.effect) { return Ok(()); }
             let duration_ms = cx.duration_ms;
+            let db = cx.db.clone();
+            let world = cx.world.clone();
+            let system = cx.system;
             cx.world.with(cx.system, move |s| {
                 if !s.npc_projection_valid(source, hostile, generation) { return; }
                 let Some(target) = s.assist_target(source, |me, candidate| {
@@ -55,9 +72,9 @@ pub(crate) async fn apply_source(cx: &SourceContext<'_>) -> Result<(), CallError
                 let Some(me) = s.sampled_ball(source) else { return };
                 let amount = repair::scaled_amount(base, gap(&me, &target), optimal, falloff);
                 if repair::applies_at_start(layer) {
-                    apply(s, &sde, source, hostile, target.id, generation, layer, amount, optimal, falloff);
+                    apply(s, db, world, system, source, hostile, target.id, generation, layer, amount, optimal, falloff);
                 } else if duration_ms.is_finite() && duration_ms > 0.0 {
-                    s.schedule(duration_ms as u64, move |s| apply(s, &sde, source, hostile, target.id, generation, layer, amount, optimal, falloff));
+                    s.schedule(duration_ms as u64, move |s| apply(s, db, world, system, source, hostile, target.id, generation, layer, amount, optimal, falloff));
                 }
             }).await;
         }
@@ -75,7 +92,9 @@ pub(crate) async fn apply_source(cx: &SourceContext<'_>) -> Result<(), CallError
                 if let Some(pilot) = other.char_id {
                     return owner.is_some_and(|owner| owner == pilot || crate::services::fleets::same_fleet(owner, pilot));
                 }
-                s.is_npc(target) || s.drone(target).is_some()
+                s.is_npc(target) || s.drone(target).is_some() || (owner == Some(other.owner_id)
+                    && s.persistent_generation(target).is_some()
+                    && s.sde().is_some_and(|sde| sde.types.get(other.type_id).is_some_and(|ty| ty.category_id == Some(crate::consts::CATEGORY_SHIP))))
             };
             let Some((target_ball, distance, drone_owner)) = cx.world.with(cx.system, move |s| {
                 if !valid(s) { return None; }
@@ -91,9 +110,7 @@ pub(crate) async fn apply_source(cx: &SourceContext<'_>) -> Result<(), CallError
             if let Some(pilot) = target_ball.char_id {
                 repair_player(cx.db, cx.world, cx.system, target, pilot, layer, amount, valid).await?;
             } else {
-                cx.world.with(cx.system, move |s| {
-                    if valid(s) { repair_npc_in_system(s, &sde, target, layer, amount); }
-                }).await;
+                crate::services::combat::unpiloted::repair(cx.db, cx.world, cx.system, target, layer, amount, valid).await?;
             }
         }
     }

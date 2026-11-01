@@ -1,5 +1,5 @@
 use super::*;
-use crate::space::{MODE_GOTO, MODE_WARP};
+use crate::space::{MODE_GOTO, MODE_STOP, MODE_WARP};
 
 fn ship() -> Ball {
     let mut b = Ball {

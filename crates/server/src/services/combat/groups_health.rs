@@ -5,8 +5,8 @@
 //! Confirmed NPC destruction emits a kill event for a known attacker before rewards are attempted.
 //! NPC bounty net and corporation tax commit together; wallet notices and events follow commit.
 //! NPC repairs use the damage cache in the system actor and are not persisted; missing
-//! cache entries represent undamaged NPCs. Player repairs use fitted ship attributes
-//! and remain in memory until the normal condition save.
+//! cache entries represent undamaged NPCs. Persistent unpiloted ships use the fitted
+//! ship condition cache and commit damage and repairs before publishing health.
 use super::*;
 use crate::consts::CATEGORY_MODULE;
 
@@ -290,75 +290,119 @@ fn restore_drone_hp(target: i64, previous: Option<Hp>) {
     }
 }
 
+enum NpcDamage {
+    Drone { owner: i64, generation: u64, type_id: i32 },
+    Applied { dealt: f64, destroyed: Option<Ball>, npc: bool },
+}
+
+fn apply_npc_damage(s: &mut crate::space::System, sde: &crate::sde::Sde, target: i64, raw: [f64; 4], attacker: Option<i64>) -> Option<NpcDamage> {
+    let ball = s.ball(target)?;
+    if ball.char_id.is_some() || (s.persistent_generation(target).is_some()
+        && sde.types.get(ball.type_id).and_then(|t| t.category_id) == Some(crate::consts::CATEGORY_SHIP)) {
+        return None;
+    }
+    let type_id = ball.type_id;
+    if let Some(drone) = s.drone(target) {
+        return Some(NpcDamage::Drone { owner: drone.owner, generation: drone.generation, type_id });
+    }
+    let npc = s.is_npc(target);
+    if let Some(pilot) = attacker { s.add_aggressor(target, pilot); }
+    let (dealt, destroyed, health) = damage_npc_cached(target, || {
+        let max = ATTR_HP.map(|id| attr(sde, type_id, id, 0.0));
+        Hp { now: max, max, resonance: ATTR_RESONANCE.map(|layer| layer.map(|id| attr(sde, type_id, id, 1.0))) }
+    }, raw);
+    let destroyed = if destroyed {
+        let ball = s.destroy_ball(target);
+        forget_ship(target);
+        ball
+    } else {
+        s.set_health(target, health);
+        None
+    };
+    Some(NpcDamage::Applied { dealt, destroyed, npc })
+}
+
 /// Damage an NPC (or any non-player ball); destroys it at zero structure.
 pub(super) async fn damage_npc(db: &Db, world: &World, system: i64, target: i64, raw: [f64; 4], attacker: Option<i64>) -> Result<f64, CallError> {
-    let Some((ball, drone, npc)) = world.with(system, move |s| Some((s.ball(target)?.clone(), s.drone(target), s.is_npc(target)))).await.flatten() else { return Ok(0.0) };
-    let _lock = if drone.is_some() { Some(super::super::market::lock().await) } else { None };
-    if let Some(drone) = &drone {
-        let owner = drone.owner;
-        super::drone_health::refresh_locked(db, world, system, target, owner).await?;
-        if !world.with(system, move |s| s.drone(target).is_some_and(|d| d.owner == owner)).await.unwrap_or(false) {
-            return Ok(0.0);
+    let sde = world.sde().clone();
+    let Some(result) = world.with(system, move |s| apply_npc_damage(s, &sde, target, raw, attacker)).await.flatten() else { return Ok(0.0) };
+    let (owner, generation, type_id) = match result {
+        NpcDamage::Applied { dealt, destroyed, npc } => {
+            if let Some(ball) = destroyed {
+                forget_target(world, target);
+                if npc { finish_npc_kill(db, world, system, target, ball, attacker).await?; }
+            }
+            return Ok(dealt);
         }
+        NpcDamage::Drone { owner, generation, type_id } => (owner, generation, type_id),
+    };
+    let _lock = super::super::market::lock().await;
+    super::drone_health::refresh_locked(db, world, system, target, owner).await?;
+    if !world.with(system, move |s| s.drone_current(target, generation) && s.drone(target).is_some_and(|d| d.owner == owner)).await.unwrap_or(false) {
+        return Ok(0.0);
     }
-    let previous = if drone.is_some() { state().hp.get(&target).cloned() } else { None };
+    let previous = state().hp.get(&target).cloned();
     if let Some(pilot) = attacker {
         world.post(system, move |s| {
             s.add_aggressor(target, pilot);
         });
     }
     let (dealt, destroyed, health) = damage_npc_cached(target, || {
-        let max = ATTR_HP.map(|id| attr(world.sde(), ball.type_id, id, 0.0));
-        Hp { now: max, max, resonance: ATTR_RESONANCE.map(|layer| layer.map(|id| attr(world.sde(), ball.type_id, id, 1.0))) }
+        let max = ATTR_HP.map(|id| attr(world.sde(), type_id, id, 0.0));
+        Hp { now: max, max, resonance: ATTR_RESONANCE.map(|layer| layer.map(|id| attr(world.sde(), type_id, id, 1.0))) }
     }, raw);
     if destroyed {
-        if let Some(drone) = &drone {
-            let owner = drone.owner;
-            let result = db.transaction(
-                |tx, _: &mut Outbox| Box::pin(async move {
-                    crate::dao::items::drones::destroy(tx, target, owner, system).await.map_err(db_err)
-                }),
-                |value, _| async move { Ok(value) },
-            ).await;
-            match result {
-                Ok(true) => {}
-                Ok(false) => {
-                    forget_ship(target);
-                    return Ok(0.0);
-                }
-                Err(error) => {
-                    restore_drone_hp(target, previous);
-                    return Err(error);
-                }
+        let result = db.transaction(
+            |tx, _: &mut Outbox| Box::pin(async move {
+                crate::dao::items::drones::destroy(tx, target, owner, system).await.map_err(db_err)
+            }),
+            |value, _| async move { Ok(value) },
+        ).await;
+        match result {
+            Ok(true) => {}
+            Ok(false) => {
+                forget_ship(target);
+                return Ok(0.0);
             }
-        }
-        let destroyed = world.destroy_ball(system, target).await;
-        forget_ship(target);
-        forget_target(world, target);
-        if let Some(ball) = destroyed.filter(|_| npc) {
-            info!("ball {target} (type {}) destroyed", ball.type_id);
-            if let Some(char_id) = attacker {
-                let mut outbox = Outbox::default();
-                outbox.event(crate::lua::events::GameEvent::NpcKilled { char_id, npc_id: target, type_id: ball.type_id, system_id: system });
-                dispatch_world((), outbox, world)?;
-            }
-            if let Err(e) = reward_kill(db, world, system, &ball, attacker).await {
-                warn!("wreck of {target}: {}", match e {
-                    CallError::Internal(e) => format!("{e:#}"),
-                    CallError::User { msg, .. } => msg,
-                });
-            }
-        }
-    } else {
-        if drone.is_some() {
-            if let Err(error) = super::drone_health::save_condition_in(db, target).await {
+            Err(error) => {
                 restore_drone_hp(target, previous);
                 return Err(error);
             }
         }
+        let destroyed = world.with(system, move |s| {
+            if s.drone_current(target, generation) && s.drone(target).is_some_and(|d| d.owner == owner)
+                && s.ball(target).is_some_and(|b| b.char_id.is_none()) {
+                s.destroy_ball(target)
+            } else { None }
+        }).await.flatten();
+        if destroyed.is_some() {
+            forget_ship(target);
+            forget_target(world, target);
+        }
+    } else {
+        if let Err(error) = super::drone_health::save_condition_in(db, target).await {
+            restore_drone_hp(target, previous);
+            return Err(error);
+        }
         world.set_health(system, target, health);
     }
     Ok(dealt)
+}
+
+async fn finish_npc_kill(db: &Db, world: &World, system: i64, target: i64, ball: Ball, attacker: Option<i64>) -> Result<(), CallError> {
+    info!("ball {target} (type {}) destroyed", ball.type_id);
+    if let Some(char_id) = attacker {
+        let mut outbox = Outbox::default();
+        outbox.event(crate::lua::events::GameEvent::NpcKilled { char_id, npc_id: target, type_id: ball.type_id, system_id: system });
+        dispatch_world((), outbox, world)?;
+    }
+    if let Err(e) = reward_kill(db, world, system, &ball, attacker).await {
+        warn!("wreck of {target}: {}", match e {
+            CallError::Internal(e) => format!("{e:#}"),
+            CallError::User { msg, .. } => msg,
+        });
+    }
+    Ok(())
 }
 
 /// Damage a player's ship; at zero structure it explodes and its pilot is told to eject
@@ -411,18 +455,25 @@ pub(super) async fn damage_player(db: &Db, world: &World, system: i64, ship: i64
 
 /// Damage whatever `target` is: a player's ship or an NPC. `attacker` is the pilot
 /// responsible, if any (NPCs remember them; kills pay them).
-pub(crate) async fn damage(db: &Db, world: &World, system: i64, target: i64, target_pilot: Option<i64>, raw: [f64; DAMAGE_TYPE_COUNT], attacker: Option<i64>) -> Result<f64, CallError> {
-    match target_pilot {
+pub(crate) async fn damage(db: &Db, world: &World, system: i64, target: i64, raw: [f64; DAMAGE_TYPE_COUNT], attacker: Option<i64>) -> Result<f64, CallError> {
+    let Some(char_id) = world.with(system, move |s| s.ball(target).map(|ball| ball.char_id)).await.flatten() else { return Ok(0.0) };
+    match char_id {
         Some(char_id) => damage_player(db, world, system, target, char_id, raw, attacker).await,
-        None => damage_npc(db, world, system, target, raw, attacker).await,
+        None => match super::unpiloted::damage(db, world, system, target, raw).await? {
+            Some(dealt) => Ok(dealt),
+            None => damage_npc(db, world, system, target, raw, attacker).await,
+        },
     }
 }
 /// NPC layer health for assistance selection; an uncached NPC is undamaged.
 pub(crate) fn npc_health_fraction(ball: &Ball, layer: usize) -> Option<f64> {
     if layer >= 3 { return None; }
     let st = state();
-    let Some(hp) = st.hp.get(&ball.id) else { return Some(1.0) };
-    let (now, max) = (hp.now[layer], hp.max[layer]);
+    let (now, max) = if let Some(cond) = st.condition.get(&ball.id) {
+        (cond.now[layer], cond.stats.max[layer])
+    } else if let Some(hp) = st.hp.get(&ball.id) {
+        (hp.now[layer], hp.max[layer])
+    } else { return Some(1.0) };
     if !now.is_finite() || !max.is_finite() || max <= 0.0 { return None; }
     Some((now / max).clamp(0.0, 1.0))
 }
@@ -444,7 +495,7 @@ fn repair_npc_hp(hp: &mut Hp, layer: usize, amount: f64) -> Option<[f64; 3]> {
 pub(crate) fn repair_npc_in_system(s: &mut crate::space::System, sde: &crate::sde::Sde, target: i64, layer: usize, amount: f64) -> bool {
     let Some(ball) = s.ball(target) else { return false };
     let category = sde.types.get(ball.type_id).and_then(|ty| ty.category_id);
-    if ball.char_id.is_some()
+    if ball.char_id.is_some() || (category == Some(crate::consts::CATEGORY_SHIP) && s.persistent_generation(target).is_some())
         || !(category == Some(crate::consts::CATEGORY_SHIP)
             || (category == Some(crate::consts::CATEGORY_ENTITY) && s.is_npc(target))
             || (category == Some(crate::consts::CATEGORY_DRONE) && s.drone(target).is_some()))
@@ -519,7 +570,7 @@ pub(crate) async fn set_damage(c: &Client, system: i64, ship: i64, char_id: i64,
     let max = stats.max;
     cond.stats = stats;
     cond.shield_at = now;
-    save_condition_locked(&c.db, ship, &cond).await?;
+    persist_condition_in(&c.db, ship, &cond).await?;
     let changes = vec![
         attribute_change(char_id, Value::Int(ship), ATTR_SHIELD_CHARGE, Value::Float(cond.now[0]), Value::Float(old[0])),
         attribute_change(char_id, Value::Int(ship), ATTR_ARMOR_DAMAGE, Value::Float(max[1] - cond.now[1]), Value::Float(old_max[1] - old[1])),

@@ -63,12 +63,12 @@ pub(super) async fn end(cx: &Ctx, _fit: &Fit, cycle: &mut Cycle) -> Result<Cycle
         let current = combat::state().active.get(&module).is_some_and(|a| Arc::ptr_eq(&a.stop, &generation));
         if !current || generation.load(Ordering::Relaxed) || s.projection_revision(ship) != revision { return; }
         let Some(ball) = s.sampled_ball(ship).filter(|b| b.mode != MODE_WARP) else { return };
-        let Some(membership) = s.pilot_generation(ship) else { return };
+        let Some(membership) = s.persistent_generation(ship) else { return };
         let Some(heading) = s.heading(ship) else { return };
         let destination = add(ball.pos, scale(heading, range));
         s.set_ball_position(ship, destination, move |ball, s| {
             !generation.load(Ordering::Relaxed) && ball.mode != MODE_WARP
-                && s.pilot_generation(ship) == Some(membership)
+                && s.persistent_generation(ship) == Some(membership)
         });
     }).await;
     Ok(CycleOutcome::Stop("micro jump completed"))

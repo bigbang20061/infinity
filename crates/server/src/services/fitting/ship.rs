@@ -1,6 +1,6 @@
-//! Station ship boarding and assembly, mirroring the client ship service.
-//! Uses game items and characters; corporation and structure access is unsupported.
-//! Boarding saves the previous ship's condition and loads the new ship's dogma overrides.
+//! Station ship boarding and assembly, and GM hull creation in stations or space.
+//! Mirrors the client ship service and uses game items, characters and the SDE.
+//! Boarding saves condition and loads dogma overrides; corporation and structure access is unsupported.
 use crate::services::dogma::ship_state;
 use crate::services::inventory::notify_item_change;
 use crate::services::{db_err, user_error, value_ids, Call, CallResult};
@@ -184,6 +184,40 @@ pub(in crate::services) async fn gm_create_ship(c: &mut Client, owner: i64, type
             }
         },
     ).await
+}
+
+/// Create a caller-owned assembled hull without changing the active ship.
+pub(in crate::services) async fn gm_spawn_ship(c: &mut Client, type_id: i32) -> Result<i64, crate::services::CallError> {
+    let owner = c.session.int("charid").ok_or_else(|| db_err(anyhow::anyhow!("missing spawn character")))?;
+    if c.session.int("stationid").is_some() { return gm_create_ship(c, owner, type_id).await; }
+    if c.sde.types.get(type_id).and_then(|t| t.category_id) != Some(CATEGORY_SHIP) {
+        return Err(crate::services::notify_error(messages::gm::GM_SHIP_TYPE_REQUIRED));
+    }
+    let system = c.session.int("solarsystemid").ok_or_else(|| db_err(anyhow::anyhow!("missing spawn system")))?;
+    let active = c.session.int("shipid").ok_or_else(|| db_err(anyhow::anyhow!("missing active ship")))?;
+    let _lock = crate::services::market::lock().await;
+    let pilot = c.world.with(system, move |s| {
+        let id = s.pilot_ball(owner)?.id;
+        if id != active { return None; }
+        s.sampled_ball(id)
+    }).await.flatten().ok_or_else(|| db_err(anyhow::anyhow!("active pilot not present in system")))?;
+    let radius = crate::services::ship::balls::radius(&c.sde, type_id)?;
+    let distance = crate::config::game().gm.spawn_distance_m + f64::from(pilot.radius) + f64::from(radius);
+    let pos = crate::space::add(pilot.pos, crate::space::scale(crate::services::rand_dir(), distance));
+    let db = c.db.clone();
+    let id = db.transaction(
+        move |tx, _: &mut Outbox| Box::pin(async move {
+            crate::dao::items::creation::positioned(tx, type_id, owner, system, pos).await.map_err(db_err)
+        }),
+        |id, _| async move { Ok(id) },
+    ).await?;
+    let row = crate::dao::items::space_ships::FreeShip {
+        item_id: id, type_id, owner_id: owner, corporation_id: pilot.corp_id,
+        alliance_id: pilot.alliance_id, pos,
+    };
+    let ball = crate::services::ship::balls::unpiloted(&db, c.sde.clone(), &row).await?;
+    c.world.add_persistent_ship(system, ball).await.map_err(db_err)?;
+    Ok(id)
 }
 
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {

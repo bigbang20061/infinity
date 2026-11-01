@@ -75,6 +75,24 @@ fn old_acknowledgement_cannot_mark_reinserted_ship_written() {
 }
 
 #[test]
+fn free_hull_stale_acknowledgement_does_not_clear_replacement() {
+    crate::tests::init_config();
+    let mut s = System::default();
+    s.add_persistent_ship(ball(1, None, 0.0));
+    assert_eq!(s.persistent_balls().count(), 1);
+    s.command(1, |b, _, _| { b.pos[0] = 5.0; Vec::new() });
+    s.tick(1000);
+    let generation = s.persistent_generation(1).unwrap();
+    let old = vec![Position { id: 1, generation, pos: [5.0, 0.0, 0.0] }];
+    s.take(1);
+    s.add_persistent_ship(ball(1, None, 0.0));
+    s.command(1, |b, _, _| { b.pos[0] = 5.0; Vec::new() });
+    s.tick(2000);
+    acknowledge(&mut s, old, &[1].into_iter().collect());
+    assert_eq!(candidates(&s).collect::<Vec<_>>(), vec![(1, s.persistent_generation(1).unwrap())]);
+}
+
+#[test]
 fn no_pilots_keep_cold_skip_and_no_deadline() {
     crate::tests::init_config();
     let mut s = System::default();

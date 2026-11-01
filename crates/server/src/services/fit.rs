@@ -6,6 +6,8 @@
 //! at the evaluation time and apply only selected chance effects; historical
 //! snapshots cover rows still present, not removed items. Projection lifetime
 //! and overload activation are not managed here; callers provide a fit snapshot.
+//! Unpiloted hulls include their fittings, overrides and supplied projections
+//! without pilot skills, brain items, controlled drones or active module state.
 //! Skill effects with fittingUsageChance require loading and filtering
 //! that attribute if such a skill appears in the SDE.
 //! Mining and salvage drones have no mass or agility in the static data; the server gives them the common light-drone values (3000 kg, agility 100).
@@ -132,7 +134,7 @@ impl Node {
 
 // SDE positions remain stable in the immutable Arc<Sde>.
 
-/// A character's active ship with everything that modifies it.
+/// A ship or character and the items that modify it.
 pub struct Fit {
     nodes: HashMap<Key, Node>,
     passive_modifiers: Vec<(Key, i32, usize)>,
@@ -150,6 +152,25 @@ impl Fit {
     /// Load a fit outside space, without incoming projections.
     pub async fn load(db: &(impl crate::db::executor::Executor + ?Sized), sde: Arc<Sde>, char_id: i64, ship: i64) -> Result<Fit, CallError> {
         Self::load_projected(db, sde, char_id, ship, Vec::new()).await
+    }
+
+    /// Load a fitted hull without any pilot, skills, brain or controlled drones.
+    pub(crate) async fn load_unpiloted(db: &(impl crate::db::executor::Executor + ?Sized), sde: Arc<Sde>, ship: i64) -> Result<Fit, CallError> {
+        Self::load_unpiloted_projected(db, sde, ship, Vec::new()).await
+    }
+
+    /// Load an unpiloted fitted hull with explicit incoming projections.
+    pub(crate) async fn load_unpiloted_projected(db: &(impl crate::db::executor::Executor + ?Sized), sde: Arc<Sde>, ship: i64, projections: Vec<super::effects::projection::Projection>) -> Result<Fit, CallError> {
+        Self::load_at(db, sde, None, ship, projections, crate::client::filetime_now(), None).await
+    }
+
+    /// Snapshot incoming effects and their revision for an unpiloted hull.
+    pub(crate) async fn load_unpiloted_in_space(db: &(impl crate::db::executor::Executor + ?Sized), world: &crate::space::World, system: i64, ship: i64) -> Result<Fit, CallError> {
+        let (projections, revision) = world.with(system, move |s| (s.projections_on(ship), s.projection_revision(ship))).await
+            .ok_or_else(|| CallError::Internal(anyhow::anyhow!("system actor stopped")))?;
+        let mut fit = Self::load_unpiloted_projected(db, world.sde().clone(), ship, projections).await?;
+        fit.projection_revision = Some(revision);
+        Ok(fit)
     }
 
     /// Snapshot incoming effects from the live system before loading the fit.
@@ -194,51 +215,54 @@ impl Fit {
 
     /// Load the fit and explicit source-effective incoming projected effects.
     pub(crate) async fn load_projected(db: &(impl crate::db::executor::Executor + ?Sized), sde: Arc<Sde>, char_id: i64, ship: i64, projections: Vec<super::effects::projection::Projection>) -> Result<Fit, CallError> {
-        Self::load_at(db, sde, char_id, ship, projections, crate::client::filetime_now(), None).await
+        Self::load_at(db, sde, Some(char_id), ship, projections, crate::client::filetime_now(), None).await
     }
 
     /// Load a character-only snapshot at an explicit FILETIME.
     pub async fn load_character_at(db: &(impl crate::db::executor::Executor + ?Sized), sde: Arc<Sde>, char_id: i64, at: i64) -> Result<Fit, CallError> {
-        Self::load_at(db, sde, char_id, 0, Vec::new(), at, None).await
+        Self::load_at(db, sde, Some(char_id), 0, Vec::new(), at, None).await
     }
 
     /// Evaluate the same character fit using a borrowed skill snapshot instead
     /// of persisted skills. Levels are still derived from skill points.
     pub(crate) async fn load_character_with_skills_at(db: &(impl crate::db::executor::Executor + ?Sized), sde: Arc<Sde>, char_id: i64, at: i64, skills: &[crate::dao::skills::training::Skill]) -> Result<Fit, CallError> {
-        Self::load_at(db, sde, char_id, 0, Vec::new(), at, Some(skills)).await
+        Self::load_at(db, sde, Some(char_id), 0, Vec::new(), at, Some(skills)).await
     }
 
-    async fn load_at(db: &(impl crate::db::executor::Executor + ?Sized), sde: Arc<Sde>, char_id: i64, ship: i64, projections: Vec<super::effects::projection::Projection>, at: i64, supplied_skills: Option<&[crate::dao::skills::training::Skill]>) -> Result<Fit, CallError> {
+    async fn load_at(db: &(impl crate::db::executor::Executor + ?Sized), sde: Arc<Sde>, char_id: Option<i64>, ship: i64, projections: Vec<super::effects::projection::Projection>, at: i64, supplied_skills: Option<&[crate::dao::skills::training::Skill]>) -> Result<Fit, CallError> {
         let ship_type = crate::dao::items::inventory::type_id(db, ship).await.map_err(db_err)?.unwrap_or(0);
         let loaded_skills;
-        let skills = if let Some(skills) = supplied_skills { skills } else {
+        let skills: &[crate::dao::skills::training::Skill] = if let Some(skills) = supplied_skills { skills } else if let Some(char_id) = char_id {
             loaded_skills = crate::dao::skills::training::current(db, char_id).await.map_err(db_err)?;
             &loaded_skills
-        };
+        } else { &[] };
         let modules = fit_dao::modules(db, ship).await.map_err(db_err)?;
         let charges = fit_dao::charges(db, ship).await.map_err(db_err)?;
-        let brain = fit_dao::brain_items(db, char_id, at).await.map_err(db_err)?;
-        let drones = fit_dao::drones(db, char_id, ship).await.map_err(db_err)?;
-        let ids: Vec<i64> = [ship, char_id].into_iter().chain(modules.iter().map(|m| m.item_id))
+        let brain = if let Some(char_id) = char_id { fit_dao::brain_items(db, char_id, at).await.map_err(db_err)? } else { Vec::new() };
+        let drones = if let Some(char_id) = char_id { fit_dao::drones(db, char_id, ship).await.map_err(db_err)? } else { Vec::new() };
+        let ids: Vec<i64> = std::iter::once(ship).chain(char_id).chain(modules.iter().map(|m| m.item_id))
             .chain(brain.iter().map(|m| m.item_id)).chain(drones.iter().map(|m| m.item_id)).collect();
         let mut overrides: HashMap<i64, Vec<(i32, f64)>> = HashMap::new();
         for row in crate::dao::items::dogma::overrides_for(db, &ids).await.map_err(db_err)? {
             overrides.entry(row.item_id).or_default().push((row.attribute_id, row.value));
         }
         for values in overrides.values_mut() { values.sort_by_key(|entry| entry.0); }
-        let mut character: HashMap<i32, f64> = super::skills::attributes::base_character_attributes(db, &sde, char_id).await?
-            .into_iter().filter_map(|(attr, value)| i32::try_from(attr).ok().map(|attr| (attr, value))).collect();
-        character.extend(overrides.remove(&char_id).unwrap_or_default());
-        let mut character: Vec<_> = character.into_iter().collect();
-        character.sort_by_key(|v| v.0);
-        let active = super::combat::active_modules();
-        let overloaded = super::effects::heat::overloaded_modules();
+        let character = if let Some(char_id) = char_id {
+            let mut character: HashMap<i32, f64> = super::skills::attributes::base_character_attributes(db, &sde, char_id).await?
+                .into_iter().filter_map(|(attr, value)| i32::try_from(attr).ok().map(|attr| (attr, value))).collect();
+            character.extend(overrides.remove(&char_id).unwrap_or_default());
+            let mut character: Vec<_> = character.into_iter().collect();
+            character.sort_by_key(|v| v.0);
+            Some(character)
+        } else { None };
+        let active = if char_id.is_some() { super::combat::active_modules() } else { HashSet::new() };
+        let overloaded = if char_id.is_some() { super::effects::heat::overloaded_modules() } else { HashSet::new() };
         let mut nodes = HashMap::new();
         let node = |type_id, location, online, active, level, overrides| Node {
             type_id, data_position: sde.types.position(type_id), location, online, active,
             overloaded: false, projected_effect: None, receiver: None, charge_type: None, level, overrides, charge_values: Vec::new(),
         };
-        nodes.insert(Key::Char, node(TYPE_CHARACTER, Location::Char, true, false, None, character));
+        if let Some(character) = character { nodes.insert(Key::Char, node(TYPE_CHARACTER, Location::Char, true, false, None, character)); }
         nodes.insert(Key::Ship, node(ship_type, Location::Space, true, false, None, overrides.remove(&ship).unwrap_or_default()));
         for r in skills {
             let rank = sde.types.get(r.type_id).and_then(|d| d.fit_attribute(ATTR_SKILL_TIME_CONSTANT)).unwrap_or(0.0);
@@ -248,8 +272,8 @@ impl Fit {
         let mut module_by_flag = HashMap::new();
         for r in &modules {
             module_by_flag.insert(r.flag_id, r.item_id);
-            let mut module = node(r.type_id, Location::Ship, r.online, r.online && active.contains(&r.item_id), None, overrides.remove(&r.item_id).unwrap_or_default());
-            module.overloaded = r.online && overloaded.contains(&r.item_id);
+            let mut module = node(r.type_id, Location::Ship, r.online, char_id.is_some() && r.online && active.contains(&r.item_id), None, overrides.remove(&r.item_id).unwrap_or_default());
+            module.overloaded = char_id.is_some() && r.online && overloaded.contains(&r.item_id);
             nodes.insert(Key::Module(r.item_id), module);
         }
         for r in &charges {

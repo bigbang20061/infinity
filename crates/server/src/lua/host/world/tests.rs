@@ -75,3 +75,49 @@ async fn world_host_routes_notifications_and_refuses_missing_system() {
     }
     assert!(lua.load("return world.ball(1, npc_id)").eval_async::<Option<Table>>().await.unwrap().is_none());
 }
+
+fn ball(id: i64, type_id: i32) -> crate::space::Ball {
+    crate::space::Ball {
+        id, type_id, owner_id: 1, corp_id: 1, alliance_id: -1,
+        char_id: None, signature_radius: None, mode: crate::space::MODE_STOP, radius: 1.0,
+        mass: 1e6, max_vel: 0.0, agility: 1.0, speed_fraction: 0.0,
+        pos: [0.0; 3], vel: [0.0; 3], old_pos: [0.0; 3], old_vel: [0.0; 3],
+        segment_acceleration: None, goto: [0.0; 3], follow_id: 0, follow_range: 0.0,
+        free: false, global: false, massive: false, interactive: false,
+        warp: crate::space::WarpState::default(), warp_factor: 0, last_ms: 0, interpolation_anchor_ms: 0,
+        effect_stamp: 0, cloak: 0, cloak_until: 0, health: [1.0; 3], launcher: 0, slim: Vec::new(),
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to a dedicated test database with initialized SDE"]
+async fn scheduled_removal_refuses_persistent_ships_at_schedule_and_execution_but_allows_drones() {
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::deployment::DatabaseConfig { schema_on_start: false, ..crate::config::tests::test_database() }).await.unwrap();
+    let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
+    let ship_type = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_SHIP)).expect("SDE ship").type_id;
+    let drone_type = sde.types.iter().find(|t| t.category_id == Some(crate::consts::CATEGORY_DRONE)).expect("SDE drone").type_id;
+    let world = World::new(db.clone(), sde.clone(), 1);
+    let resources = Resources { db, sde, world: world.clone(), store_value_limit_bytes: 1024 };
+    let lua = Lua::new();
+    register(&lua, &lua.globals(), &resources).unwrap();
+    world.system(1).await.unwrap();
+    let (existing, later, drone) = (i64::MAX - 2, i64::MAX - 1, i64::MAX);
+    world.with(1, move |s| {
+        s.add_persistent_ship(ball(existing, ship_type));
+        s.add_persistent_ship(ball(drone, drone_type));
+    }).await.unwrap();
+    lua.globals().set("existing", existing).unwrap();
+    lua.globals().set("drone", drone).unwrap();
+    let error = lua.load("return world.schedule(1, 0, 'remove_ball', {id=existing})")
+        .eval_async::<bool>().await.unwrap_err();
+    assert!(error.to_string().contains("persistent ship hull"));
+    world.with(1, move |s| s.add_persistent_ship(ball(later, ship_type))).await.unwrap();
+    let sde = Arc::clone(&resources.sde);
+    world.schedule(1, 0, move |s| remove_scheduled_ball(s, &sde, 1, later));
+    assert!(lua.load("return world.schedule(1, 0, 'remove_ball', {id=drone})").eval_async::<bool>().await.unwrap());
+    assert!(world.after(1, 0).await);
+    assert!(world.ball(1, existing).await.is_some());
+    assert!(world.ball(1, later).await.is_some());
+    assert!(world.ball(1, drone).await.is_none());
+}

@@ -193,8 +193,8 @@ impl System {
     pub fn pilot_ball(&self, char_id: i64) -> Option<&Ball> {
         self.pilots.get(&char_id).and_then(|id| self.ball(*id))
     }
-    /// Identity of the current pilot-ball membership, invalidated on replacement.
-    pub(crate) fn pilot_generation(&self, ship: i64) -> Option<u64> {
+    /// Identity of persistent ball membership, invalidated on replacement.
+    pub(crate) fn persistent_generation(&self, ship: i64) -> Option<u64> {
         self.snapshot_positions.get(&ship).map(|(generation, _)| *generation)
     }
 

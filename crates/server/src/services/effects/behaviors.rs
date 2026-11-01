@@ -51,10 +51,7 @@ async fn remote_repair(cx: &Ctx, fit: &Fit, cycle: &Cycle, layer: usize) -> Resu
     if let Some(pilot) = pilot {
         crate::services::combat::groups_health::repair_player(&cx.db, &cx.world, cx.system_id, target, pilot, layer, amount, guard).await?;
     } else {
-        let sde = cx.world.sde().clone();
-        cx.world.with(cx.system_id, move |s| {
-            if guard(s) { crate::services::combat::groups_health::repair_npc_in_system(s, &sde, target, layer, amount); }
-        }).await;
+        crate::services::combat::unpiloted::repair(&cx.db, &cx.world, cx.system_id, target, layer, amount, guard).await?;
     }
     Ok(CycleOutcome::Continue)
 }
