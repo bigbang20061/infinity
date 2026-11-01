@@ -37,7 +37,7 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
   - Mutaplasmids: applying a mutaplasmid to a compatible module or drone consumes both and creates one mutated item. Each mutated attribute is drawn uniformly from the mutaplasmid's range, and the result keeps the source's own attributes with those factors applied, so fitting and Show Info use them, including after a restart. The inputs may be in the station hangar, the active ship or an owned container there; an item in a corporation office hangar also needs the division's take role. Mutaplasmid ranges and compatible types come from the imported static data, and a mutaplasmid with missing or malformed data is refused.
 - **Agents.** Kill missions, epic arcs, NPC standings, loyalty points and LP stores. LP store offers come from a catalogue the operator imports from ESI with `lp-import` (see [LP offer import](docs/lp-import.md)); the server itself never contacts ESI. While the catalogue is empty, every NPC corporation offers its race's faction items, priced from retail values, and the server logs a warning at start. You can buy an offer for yourself or, with withdrawal access to the chosen wallet division, for your corporation, which then pays the LP and ISK; the required items always come from your hangar in the station.
 - **Exploration.** Anomalies and signatures, probe and directional scanning, wormholes, the data and relic hacking minigame, and belt rats.
-- **Mining.** Asteroid belts, ore, ice and gas, mining modules, and belt regrowth.
+- **Mining.** Asteroid belts, ore, ice and gas, mining modules, and belt regrowth. The personal mining ledger lists every delivery from mining modules and drones, with the residue wasted; the window shows new entries when the client next reloads it.
 - **Social.** Chat (local, corporation, fleet and other channels), fleets, EVE mail and notifications, the calendar, and bookmarks. Personal contacts: pilots, corporations, alliances and agents with a standing and a watchlist flag, and a separate block list; adding or editing a contact can notify the other pilot. Contacts show as online or offline, and pilots on a watchlist announce when they log on or off.
 - **Corporations and alliances.**
   - Player corporations: founding, applications and invitations, roles and titles, a bounty tax paid into the corporation wallet, and bulletins, contacts and labels.
@@ -67,9 +67,11 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
   - module heat damage from overheating, and repairs at structures
   - mutating items that are fitted, damaged, deployed in space, in a ship maintenance bay or owned by a corporation, and mutaplasmids that need extra inputs; mutated items cannot be renewed or reset
   - compressing items, although compression modules activate; and survey scan results pushed by the scanner: the mining overlay gets them through its own scan call
+  - corporation mining ledgers for moon-drilling structures
   - loot rights: any pilot whose ship is within 2,500 m of a wreck or cargo container in space can take from it, and taking from someone else's does not make the pilot a suspect
 - An industry job installed before this version whose blueprint has since been moved or destroyed is refused at delivery.
 - Mining and salvage drones have no mass or agility in the static data; the server gives them the common light-drone values (3000 kg, agility 100). Drones with no targeting range or scan resolution in the static data lock at once within control range.
+- The personal mining ledger starts with mining done after this version is installed.
 - Some runtime state lives only in memory and is lost when the server restarts:
   - fleets, combat and Crimewatch timers, ECM jams, tractor pulls, and in-progress hacking; a suspect flag from an activated kill right is the exception and is restored with its original deadline;
   - everything spawned into space (NPCs, wrecks, scheduled effects);
@@ -208,6 +210,7 @@ Some keys switch behaviour on or off rather than set a number:
 | `bounty.kill_right_lifetime_days` / `.kill_right_suspect_secs` | `30` / `900` | How long an earned kill right lasts, and how long activating one makes the aggressor a suspect. Both must be positive. |
 | `gm.spawn_distance_m` / `.clear_radius_m` / `.max_spawn_count` | `5000` / `100000` / `100` | Default distance of GM-spawned NPCs and debris, default radius of `/npcclear`, and the most NPCs one GM command may spawn |
 | `salvage.salvage_material_stacks` / `.salvage_quantity_min` / `.salvage_quantity_max` | `1` / `1` / `3` | What a successful salvage gives, since wreck yield tables do not ship with the client: this many stacks of a random published salvaged material, each of between the minimum and maximum units. All must be positive, and the maximum at least the minimum. |
+| `mining.ledger_retention_days` / `.ledger_maintenance_secs` | `90` / `3600` | How many days of personal mining ledger history are kept (90 is the client's chart range), and how often older entries are deleted. Both must be positive. Deleted history does not come back if the retention is raised later. |
 
 ## Database
 
