@@ -1,4 +1,4 @@
-//! contractProxy: contracts between characters (eve/client/script/ui/shared/neocom/contracts).
+//! contractProxy: contracts between characters and corporations (eve/client/script/ui/shared/neocom/contracts).
 //!
 //! * Item exchange: the issuer's items (and any reward) go into escrow; the acceptor pays the
 //!   price and hands over the requested items from their hangar at the start station, where
@@ -13,16 +13,20 @@
 //!
 //! Escrowed items stay in game.items, located at -contractID. An expired or rejected
 //! contract waits for its issuer to delete it and take the escrow back; expired auctions
-//! with bids settle on their own. Contracts cost no fees, and corporation contracts aren't
-//! supported yet.
+//! with bids settle on their own. Contracts cost no fees; corporation custody uses
+//! authorized office divisions or station Deliveries.
+//! Corporation-assigned contracts are available to current members acting personally;
+//! corporate courier completion requires current membership and actual package custody.
 //! Contract lifecycle mutations and stack splits commit their database changes atomically;
 //! their notifications are delivered only after commit.
 //! Contract and item state comes from game tables; station ancestry comes from the loaded SDE.
-//! Creation limits and listing page sizes are operator policies in the contracts configuration.
+//! Skill-based outstanding caps follow the client; listing page sizes use contracts configuration.
 //! Auction settlement scans run as durable periodic jobs registered through the services
 //! scheduler and persisted in game.jobs, not detached maintenance sleeps. Internal scan
 //! errors warn but the scan still completes.
 
+mod custody;
+mod ownership;
 mod lifecycle;
 mod lists;
 
@@ -31,13 +35,12 @@ use lists::{bidding_on, escrow, in_progress, items_in, list_for_owner, login_inf
 
 use crate::dao::contracts::{Contract, query::{self, Filter}, shared};
 use crate::dao::items::loading::{Item, ItemQuery};
-use super::items::{load_items, take_items};
+use super::items::load_items;
 use super::market::{lock, round2, station};
-use super::wallets::{credit, debit};
 use crate::dao::items::transfers;
 use super::{db_err, keyval, notify_error, user_error, value_id_list, value_text, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
-use crate::consts::{ACCOUNT_CASH, FILETIME_DAY, FILETIME_MINUTE, FLAG_HANGAR, IX_LOCATION_ID, IX_OWNER_ID, IX_STACK_SIZE, LOCATION_JUNKYARD};
+use crate::consts::{ACCOUNT_CASH, FILETIME_DAY, FILETIME_MINUTE, FLAG_HANGAR, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD};
 use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::{dispatch_world, Outbox};
@@ -76,9 +79,14 @@ const AVAIL_MY_CORP: i64 = 2;
 
 const SKILL_CONTRACTING: i32 = 25235;
 const SKILL_ADVANCED_CONTRACTING: i32 = 73912;
-// contractscommon
-const NUM_CONTRACTS_BY_SKILL: [i64; 6] = [7, 16, 17, 18, 19, 20];
-const NUM_CONTRACTS_BY_ADVSKILL: [i64; 6] = [21, 22, 23, 24, 25, 26];
+/// contractscommon.NUM_CONTRACTS_BY_SKILL and NUM_CONTRACTS_BY_ADVSKILL.
+const NUM_CONTRACTS_BY_SKILL: [i64; 6] = [1, 5, 9, 13, 17, 21];
+const NUM_CONTRACTS_BY_ADVSKILL: [i64; 6] = [0, 4, 8, 12, 16, 20];
+/// contractscommon.NUM_CONTRACTS_BY_SKILL_CORP and MAX_NUM_CONTRACTS.
+const NUM_CONTRACTS_BY_SKILL_CORP: [i64; 6] = [10, 20, 30, 40, 50, 60];
+const MAX_INTERNAL_CONTRACTS: i64 = 500;
+/// inventorycommon.const.typeCorporationContracting.
+const SKILL_CORPORATION_CONTRACTING: i32 = 25233;
 
 /// Attribute of a client object: an old-style instance, a new-style one (contracts.ContractStruct
 /// pickles as a NewObj with its __dict__ as state), or a dict.
@@ -121,8 +129,9 @@ impl Contract {
     }
 
     /// May `char_id` (of `corp_id`) take this contract?
-    fn available_to(&self, char_id: i64, corp_id: i64) -> bool {
-        self.assignee == 0 || self.assignee == char_id || self.assignee == corp_id
+    async fn available_to(&self, ex: &(impl Executor + ?Sized), char_id: i64, corp_id: i64) -> Result<bool, CallError> {
+        Ok(self.assignee == 0 || self.assignee == char_id
+            || (self.assignee == corp_id && super::corps::membership(ex, char_id).await?.0 == corp_id))
     }
 
     fn keyval(&self, sde: &Sde) -> Value {
@@ -135,12 +144,12 @@ impl Contract {
             ("issuerID", int(self.issuer)),
             ("issuerCorpID", int(self.issuer_corp)),
             ("issuerAllianceID", Value::None),
-            ("issuerWalletKey", int(ACCOUNT_CASH as i64)),
-            ("forCorp", Value::Bool(false)),
-            ("availability", int(if self.assignee == 0 { AVAIL_PUBLIC } else { AVAIL_MYSELF })),
+            ("issuerWalletKey", int(self.issuer_wallet_key as i64)),
+            ("forCorp", Value::Bool(self.for_corp)),
+            ("availability", int(if self.assignee == 0 { AVAIL_PUBLIC } else if super::corps::is_player_corp(self.assignee) { AVAIL_MY_CORP } else { AVAIL_MYSELF })),
             ("assigneeID", int(self.assignee)),
             ("acceptorID", int(self.acceptor)),
-            ("acceptorWalletKey", int(ACCOUNT_CASH as i64)),
+            ("acceptorWalletKey", int(self.acceptor_wallet_key as i64)),
             ("dateIssued", int(self.issued)),
             ("dateExpired", int(self.expires)),
             ("dateAccepted", int(self.accepted)),
@@ -173,7 +182,7 @@ async fn contract(db: &(impl Executor + ?Sized), id: i64) -> Result<Contract, Ca
 async fn set_status(db: &(impl Executor + ?Sized), k: &mut Contract, status: i32, completed: i64) -> Result<(), CallError> {
     k.status = status;
     k.completed = completed;
-    shared::set_status(db, k.id, status, k.completed, k.acceptor).await.map_err(db_err)?;
+    shared::set_status(db, k.id, status, k.completed, k.acceptor, k.acceptor_wallet_key).await.map_err(db_err)?;
     Ok(())
 }
 
@@ -245,49 +254,12 @@ async fn listing(db: &Db, sde: &Sde, list: &[Contract]) -> CallResult {
 }
 
 
-/// Tell `owner` about items now in their hangar at `station`, if they have it open.
-pub(super) async fn show_items<X: Send>(db: &(impl Executor + ?Sized), sde: &crate::sde::Sde, outbox: &mut Outbox<X>, owner: i64, station: i64, ids: &[i64], from: i64) -> Result<(), CallError> {
-    if transfers::docked(db, owner).await.map_err(db_err)? != Some(station) {
-        return Ok(());
-    }
-    for item in load_items(db, sde, ItemQuery::Ids(ids)).await.map_err(db_err)? {
-        outbox.notify_pilot(owner, "OnItemChange", vec![item.row(), Value::Dict(vec![(Value::Int(IX_LOCATION_ID), Value::Int(from))]), Value::None]);
-    }
-    Ok(())
-}
 
-/// Move `quantity` of an item from its owner's hangar into the contract's escrow.
-async fn escrow_item<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, item: Item, quantity: i32, contract_id: i64) -> Result<(), CallError> {
-    let (type_id, owner) = (item.type_id, item.owner_id);
-    let escrow = -contract_id;
-    let (item_id, quantity) = if !item.singleton && quantity < item.quantity {
-        take_items(db, outbox, item, quantity).await?;
-        let id = transfers::insert(db, type_id, owner, escrow, FLAG_HANGAR, quantity).await.map_err(db_err)?;
-        (id, quantity)
-    } else {
-        shared::move_item(db, item.item_id, escrow).await.map_err(db_err)?;
-        let old = item.location_id;
-        let quantity = if item.singleton { 1 } else { item.quantity };
-        let id = item.item_id;
-        let gone = Item { location_id: escrow, ..item };
-        outbox.notify_pilot(owner, "OnItemChange", vec![gone.row(), Value::Dict(vec![(Value::Int(IX_LOCATION_ID), Value::Int(old))]), Value::None]);
-        (id, quantity)
-    };
-    shared::insert_item(db, contract_id, item_id, type_id, quantity).await.map_err(db_err)?;
-    Ok(())
-}
 
 async fn escrowed_ids(db: &(impl Executor + ?Sized), contract_id: i64) -> Result<Vec<i64>, CallError> {
     shared::escrowed_ids(db, contract_id).await.map_err(db_err)
 }
 
-/// Give the escrowed items (and whatever they hold) to `owner` at `location`/`flag`.
-async fn hand_over<X: Send>(db: &(impl Executor + ?Sized), sde: &crate::sde::Sde, outbox: &mut Outbox<X>, contract_id: i64, owner: i64, location: i64, flag: i32) -> Result<(), CallError> {
-    let ids = escrowed_ids(db, contract_id).await?;
-    let plan: Vec<_> = ids.iter().map(|&item_id| transfers::Transfer { item_id, owner, location, flag }).collect();
-    transfers::hand_over(db, &plan).await.map_err(db_err)?;
-    show_items(db, sde, outbox, owner, location, &ids, -contract_id).await
-}
 
 /// Lose the escrowed items (a courier package that no longer exists).
 async fn destroy_escrow(db: &(impl Executor + ?Sized), contract_id: i64) -> Result<(), CallError> {
@@ -296,24 +268,15 @@ async fn destroy_escrow(db: &(impl Executor + ?Sized), contract_id: i64) -> Resu
     Ok(())
 }
 
-async fn top_bid(db: &(impl Executor + ?Sized), contract_id: i64) -> Result<Option<(i64, f64)>, CallError> {
-    Ok(shared::top_bid(db, contract_id).await.map_err(db_err)?.map(|r| (r.bidder_id, r.amount)))
-}
 
-fn tell<X: Send>(outbox: &mut Outbox<X>, char_id: i64, event: &str, contract_id: i64) {
-    if char_id != 0 {
-        outbox.notify_pilot(char_id, event, vec![Value::Int(contract_id)]);
-    }
-}
-
-async fn max_outstanding(db: &(impl Executor + ?Sized), char_id: i64) -> Result<i64, CallError> {
-    let rows = crate::dao::skills::levels::levels_of(db, char_id, &[SKILL_CONTRACTING, SKILL_ADVANCED_CONTRACTING]).await.map_err(db_err)?;
+async fn max_outstanding(db: &(impl Executor + ?Sized), char_id: i64, for_corp: bool) -> Result<i64, CallError> {
+    let rows = crate::dao::skills::levels::levels_of(db, char_id, &[SKILL_CONTRACTING, SKILL_ADVANCED_CONTRACTING, SKILL_CORPORATION_CONTRACTING]).await.map_err(db_err)?;
     let level = |skill: i32| rows.iter().find(|r| r.type_id == skill).map(|r| r.level.clamp(0, 5) as usize).unwrap_or(0);
-    Ok(NUM_CONTRACTS_BY_SKILL[level(SKILL_CONTRACTING)] + NUM_CONTRACTS_BY_ADVSKILL[level(SKILL_ADVANCED_CONTRACTING)])
+    Ok(if for_corp { NUM_CONTRACTS_BY_SKILL_CORP[level(SKILL_CORPORATION_CONTRACTING)] } else { NUM_CONTRACTS_BY_SKILL[level(SKILL_CONTRACTING)] + NUM_CONTRACTS_BY_ADVSKILL[level(SKILL_ADVANCED_CONTRACTING)] })
 }
 
-async fn num_outstanding(db: &(impl Executor + ?Sized), char_id: i64) -> Result<i64, CallError> {
-    shared::num_outstanding(db, char_id, STATUS_OUTSTANDING).await.map_err(db_err)
+async fn outstanding_counts(db: &(impl Executor + ?Sized), char_id: i64, corp_id: i64) -> Result<shared::OutstandingCounts, CallError> {
+    shared::outstanding_counts(db, char_id, corp_id, STATUS_OUTSTANDING).await.map_err(db_err)
 }
 
 // ---------------------------------------------------------------- lifecycle
@@ -333,7 +296,6 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         return None;
     }
     let int = |i: usize| call.args.get(i).and_then(|v| v.as_int()).unwrap_or(0);
-    let me = c.session.int("charid").unwrap_or(0);
     let for_corp = |i: usize| truthy(call.args.get(i));
     Some(match call.method {
         "CreateContract" => match call.args.first() {
@@ -344,12 +306,11 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             Ok(k) => bundles(&c.db, &c.sde, &[k]).await.map(|mut b| b.pop().unwrap_or(Value::None)),
             Err(e) => Err(e),
         },
-        "AcceptContract" if for_corp(1) => Err(notify_error(messages::CORPORATION_CONTRACTS_UNSUPPORTED)),
-        "AcceptContract" => accept(c, int(0)).await,
+        "AcceptContract" => accept(c, int(0), for_corp(1)).await,
         "CompleteContract" => complete(c, int(0), int(1) as i32).await,
         "DeleteContract" => {
             let _trading = lock().await;
-            delete_one(&c.db, &c.sde, &c.world, me, int(0)).await.map(|_| Value::Bool(true))
+            delete_one(c, int(0)).await.map(|_| Value::Bool(true))
         }
         // DeleteMultipleContracts([contractID]) -> (deleted, failed)
         "DeleteMultipleContracts" => {
@@ -357,7 +318,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             let _trading = lock().await;
             let (mut deleted, mut failed) = (vec![], vec![]);
             for id in ids {
-                match delete_one(&c.db, &c.sde, &c.world, me, id).await {
+                match delete_one(c, id).await {
                     Ok(()) => deleted.push(Value::Int(id)),
                     Err(CallError::User { .. }) => failed.push(Value::Int(id)),
                     Err(e) => return Some(Err(e)),
@@ -365,8 +326,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             }
             Ok(Value::tuple([Value::List(deleted), Value::List(failed)]))
         }
-        "PlaceBid" if for_corp(2) => Err(notify_error(messages::CORPORATION_CONTRACTS_UNSUPPORTED)),
-        "PlaceBid" => place_bid(c, int(0), call.args.get(1).and_then(|v| v.as_float()).unwrap_or(0.0)).await,
+        "PlaceBid" => place_bid(c, int(0), call.args.get(1).and_then(|v| v.as_float()).unwrap_or(0.0), for_corp(2)).await,
         // FinishAuction(contractID, isIssuer): expired auctions settle on their own; settle now if due.
         "FinishAuction" => {
             let r = settle_expired(&c.db, &c.sde, &c.world).await;
@@ -374,23 +334,27 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         }
         "SearchContracts" => search(c, call.kwargs).await,
         "GetContractListForOwner" => list_for_owner(c, call).await,
-        "GetMyBids" if for_corp(0) => listing(&c.db, &c.sde, &[]).await,
-        "GetMyBids" => match bidding_on(&c.db, me).await {
-            Ok(list) => listing(&c.db, &c.sde, &list).await,
+        "GetMyBids" => match lists::selected_owner(c, for_corp(0)).await {
+            Ok(Some(owner)) => match bidding_on(&c.db, owner).await { Ok(list) => listing(&c.db, &c.sde, &list).await, Err(e) => Err(e) },
+            Ok(None) => listing(&c.db, &c.sde, &[]).await,
             Err(e) => Err(e),
         },
-        "GetMyExpiredContractList" if for_corp(0) => listing(&c.db, &c.sde, &[]).await,
-        "GetMyExpiredContractList" => match needing_attention(&c.db, me).await {
-            Ok(list) => listing(&c.db, &c.sde, &list).await,
+        "GetMyExpiredContractList" => match lists::selected_owner(c, for_corp(0)).await {
+            Ok(Some(owner)) => match needing_attention(&c.db, owner).await { Ok(list) => listing(&c.db, &c.sde, &list).await, Err(e) => Err(e) },
+            Ok(None) => listing(&c.db, &c.sde, &[]).await,
             Err(e) => Err(e),
         },
         // GetMyCurrentContractList(isAccepted, forCorp)
-        "GetMyCurrentContractList" if for_corp(1) => listing(&c.db, &c.sde, &[]).await,
         "GetMyCurrentContractList" => {
+            let owner = match lists::selected_owner(c, for_corp(1)).await {
+                Ok(Some(owner)) => owner,
+                Ok(None) => return Some(listing(&c.db, &c.sde, &[]).await),
+                Err(e) => return Some(Err(e)),
+            };
             let list = if for_corp(0) {
-                in_progress(&c.db, me).await
+                in_progress(&c.db, owner).await
             } else {
-                query::list(&c.db, Filter::Issuer(me, STATUS_OUTSTANDING)).await.map_err(db_err)
+                query::list(&c.db, Filter::Issuer(owner, STATUS_OUTSTANDING)).await.map_err(db_err)
             };
             match list {
                 Ok(list) => listing(&c.db, &c.sde, &list).await,
@@ -398,22 +362,14 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             }
         }
         "CollectMyPageInfo" => page_info(c).await,
-        "NumOutstandingContracts" => num_outstanding(&c.db, me).await.map(Value::Int),
+        "NumOutstandingContracts" => lists::counts(c).await,
         "GetLoginInfo" => login_info(c).await,
         "GetMyContractEscrow" => escrow(c).await,
         // GetItemsInDockableLocation(stationID, forCorp)
-        "GetItemsInDockableLocation" => items_in(c, int(0), true).await,
-        // GetItemsInContainer(stationID, containerID, forCorp, flag)
-        "GetItemsInContainer" => items_in(c, int(1), false).await,
-        // GetNumItemsInContainers(stationID, [containerID], forCorp, flag) -> {containerID: count}
-        "GetNumItemsInContainers" => {
-            let ids = value_id_list(call.args.get(1));
-            match crate::dao::contracts::reports::container_counts(&c.db, &ids, me).await {
-                Ok(rows) => Ok(Value::Dict(rows.iter().map(|r| (Value::Int(r.location_id), Value::Int(r.count))).collect())),
-                Err(e) => Err(db_err(e)),
-            }
-        }
-        "SplitStack" => split_stack(c, int(0), int(1), int(2)).await,
+        "GetItemsInDockableLocation" => items_in(c, int(0), None, for_corp(1), FLAG_HANGAR).await,
+        "GetItemsInContainer" => items_in(c, int(0), Some(int(1)), for_corp(2), int(3) as i32).await,
+        "GetNumItemsInContainers" => lists::container_counts(c, int(0), &value_id_list(call.args.get(1)), for_corp(2), int(3) as i32).await,
+        "SplitStack" => split_stack(c, int(0), int(1), int(2), for_corp(3), int(4) as i32).await,
         // GetCourierContractFromItemID(wrapItemID) -> the contract, or None
         "GetCourierContractFromItemID" => {
             match query::list(&c.db, Filter::Package(int(0), STATUS_IN_PROGRESS)).await.map_err(db_err) {

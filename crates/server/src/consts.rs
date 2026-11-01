@@ -744,6 +744,8 @@ pub const BLUEPRINT_INFINITE_RUNS: i32 = -1;
 // Client corporation and service roles.
 /// Client appConst.corpRoleDirector.
 pub const ROLE_DIRECTOR: i64 = 1;
+/// Client appConst.corpRoleContractManager.
+pub const ROLE_CONTRACT_MANAGER: i64 = 72_057_594_037_927_936;
 /// Client appConst.corpRoleAccountant.
 pub const ROLE_ACCOUNTANT: i64 = 256;
 /// Client appConst.corpRoleHangarCanTake1; divisions 2-7 are the next bits.

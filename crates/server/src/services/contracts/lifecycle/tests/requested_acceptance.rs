@@ -26,6 +26,7 @@ async fn requested_acceptance_preserves_items_and_rolls_back_failed_settlement()
         kind: TYPE_ITEM_EXCHANGE, issuer: issuer.character, issuer_corp: 1, assignee: 0, start: station, end: 0,
         price: 1.0, reward: 0.0, collateral: 0.0, title: "", description: "", num_days: 0,
         status: STATUS_OUTSTANDING, issued: 0, expires: i64::MAX,
+        for_corp: false, issuer_wallet_key: ACCOUNT_CASH, issuer_hangar_flag: FLAG_HANGAR, issuer_source_location: station,
     }).await.unwrap();
     contract_dao::insert_requested_item(&db, id, blueprint, 1).await.unwrap();
     contract_dao::insert_requested_item(&db, id, stack_type, 3).await.unwrap();
@@ -39,25 +40,25 @@ async fn requested_acceptance_preserves_items_and_rolls_back_failed_settlement()
     ]);
     let duplicate_create = create(&client, &duplicate_payload).await;
     contract_dao::insert_requested_item(&db, id, blueprint, 1).await.unwrap();
-    let duplicate_accept = accept(&client, id).await;
+    let duplicate_accept = accept(&client, id, false).await;
     db.execute("DELETE FROM game.contract_items WHERE ctid IN (SELECT ctid FROM game.contract_items WHERE contract_id = $1 AND type_id = $2 LIMIT 1)", &[&id, &blueprint]).await.unwrap();
     db.execute("UPDATE game.contract_items SET quantity = 11 WHERE contract_id = $1 AND type_id = $2", &[&id, &stack_type]).await.unwrap();
-    let insufficient = accept(&client, id).await;
+    let insufficient = accept(&client, id, false).await;
     db.execute("UPDATE game.contract_items SET quantity = 3 WHERE contract_id = $1 AND type_id = $2", &[&id, &stack_type]).await.unwrap();
     let mut reserved = Vec::new();
     for trade_id in [root, child] {
         db.execute("INSERT INTO game.trades (trade_id, station_id, char_a, char_b, state, created_at, updated_at) VALUES ($1, $2, $3, $4, 'open', 0, 0)", &[&trade_id, &station, &buyer.character, &issuer.character]).await.unwrap();
-        reserved.push(accept(&client, id).await.is_err());
+        reserved.push(accept(&client, id, false).await.is_err());
         db.execute("DELETE FROM game.trades WHERE trade_id = $1", &[&trade_id]).await.unwrap();
     }
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     client.world.register_pilot(buyer.character, tx);
     // The issuer wallet overflows only after the real requested-item transfers.
-    let failure = accept(&client, id).await;
+    let failure = accept(&client, id, false).await;
     let unchanged = db.query_one("SELECT (SELECT owner_id FROM game.items WHERE item_id = $1) AS owner, (SELECT quantity FROM game.items WHERE item_id = $2) AS quantity, (SELECT status FROM game.contracts WHERE contract_id = $3) AS status, (SELECT balance::float8 FROM game.characters WHERE character_id = $4) AS balance", &[&root, &stack, &id, &buyer.character]).await;
     let quiet = rx.try_recv().is_err();
     db.execute("UPDATE game.characters SET balance = 0 WHERE character_id = $1", &[&issuer.character]).await.unwrap();
-    let success = accept(&client, id).await;
+    let success = accept(&client, id, false).await;
     let row = db.query_one("SELECT i.owner_id, i.quantity, i.singleton, b.material_efficiency, b.time_efficiency, b.runs, a.value FROM game.items i JOIN game.blueprints b USING (item_id) JOIN game.item_attributes a USING (item_id) WHERE i.item_id = $1 AND a.attribute_id = 1", &[&root]).await;
     let descendant = db.query_one("SELECT owner_id, location_id FROM game.items WHERE item_id = $1", &[&child]).await;
     let split = db.query_one("SELECT quantity, custom_info, name FROM game.items WHERE owner_id = $1 AND type_id = $2 AND location_id = $3", &[&issuer.character, &stack_type, &station]).await;

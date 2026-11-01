@@ -85,7 +85,7 @@ pub(in crate::services) async fn may_take_corp_hangar(ex: &(impl Executor + ?Siz
 }
 
 /// Resolve the office division or station Deliveries governing an item's ancestry.
-async fn corporate_custody(ex: &(impl Executor + ?Sized), sde: Option<&Sde>, id: i64) -> Result<Option<(i64, i64, i32)>, CallError> {
+pub(in crate::services) async fn corporate_custody(ex: &(impl Executor + ?Sized), sde: Option<&Sde>, id: i64) -> Result<Option<(i64, i64, i32)>, CallError> {
     for row in crate::dao::items::deliveries::ancestry(ex, id).await.map_err(db_err)? {
         if let Some(corp) = super::offices::office_owner(ex, row.location_id).await? {
             return Ok(Some((corp, row.location_id, row.flag_id)));
