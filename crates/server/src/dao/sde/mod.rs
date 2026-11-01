@@ -9,6 +9,7 @@ pub(crate) mod characters;
 pub(crate) mod corporations;
 pub(crate) mod dogma;
 pub(crate) mod dungeons;
+pub(crate) mod dynamic_items;
 pub(crate) mod factions;
 pub(crate) mod industry;
 pub(crate) mod localization;

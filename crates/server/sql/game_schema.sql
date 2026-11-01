@@ -81,6 +81,24 @@ CREATE TABLE IF NOT EXISTS game.item_attributes (
 );
 -- dao/items/dogma: FILETIME of the persisted shield charge.
 ALTER TABLE game.item_attributes ADD COLUMN IF NOT EXISTS updated_at bigint NOT NULL DEFAULT 0;
+
+-- dao/dynamic_items: mutation provenance; consumed inputs intentionally have no foreign keys.
+CREATE TABLE IF NOT EXISTS game.dynamic_items (
+    item_id bigint PRIMARY KEY REFERENCES game.items(item_id) ON DELETE CASCADE,
+    source_item_id bigint NOT NULL,
+    mutator_item_id bigint NOT NULL,
+    source_type_id integer NOT NULL,
+    mutator_type_id integer NOT NULL,
+    result_type_id integer NOT NULL,
+    creator_id bigint NOT NULL,
+    created_at bigint NOT NULL
+);
+CREATE TABLE IF NOT EXISTS game.dynamic_item_modifiers (
+    item_id bigint NOT NULL REFERENCES game.dynamic_items(item_id) ON DELETE CASCADE,
+    attribute_id integer NOT NULL,
+    factor double precision NOT NULL,
+    PRIMARY KEY (item_id, attribute_id)
+);
 -- idCheckers.IsPlayerItem: >= 100,000,000; start far above character IDs.
 SELECT setval('game.items_item_id_seq', GREATEST((SELECT max(item_id) FROM game.items), 1000000000000), true);
 
