@@ -1061,3 +1061,14 @@ CREATE TABLE IF NOT EXISTS game.kill_rights (
     used_at bigint
 );
 CREATE UNIQUE INDEX IF NOT EXISTS kill_rights_unused_pair ON game.kill_rights (from_id, to_id) WHERE used_at IS NULL;
+
+-- Corporate contract ownership and captured custody (dao/contracts).
+-- Defaults: 1000 is the client's master wallet key (appConst accountingKeyCash, ACCOUNT_CASH in consts.rs); 4 is the station hangar flag (inventorycommon const flagHangar, FLAG_HANGAR).
+ALTER TABLE game.contracts ADD COLUMN IF NOT EXISTS for_corp boolean NOT NULL DEFAULT false;
+ALTER TABLE game.contracts ADD COLUMN IF NOT EXISTS issuer_wallet_key integer NOT NULL DEFAULT 1000;
+ALTER TABLE game.contracts ADD COLUMN IF NOT EXISTS acceptor_wallet_key integer NOT NULL DEFAULT 1000;
+ALTER TABLE game.contracts ADD COLUMN IF NOT EXISTS issuer_hangar_flag integer NOT NULL DEFAULT 4;
+ALTER TABLE game.contracts ADD COLUMN IF NOT EXISTS issuer_source_location bigint;
+UPDATE game.contracts SET issuer_source_location = start_station_id WHERE issuer_source_location IS NULL;
+ALTER TABLE game.contracts ALTER COLUMN issuer_source_location SET NOT NULL;
+ALTER TABLE game.contract_bids ADD COLUMN IF NOT EXISTS wallet_key integer NOT NULL DEFAULT 1000;

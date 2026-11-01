@@ -189,8 +189,6 @@ pub(crate) fn target_limit(max_targets: usize) -> String { format!("你最多只
 pub(crate) fn mining_range(range: f64) -> String { format!("目标超出了采矿设备的范围（{:.1} 公里）。", range) }
 
 // Contracts (services/contracts.rs)
-/// Corporation contracts unavailable.
-pub(crate) const CORPORATION_CONTRACTS_UNSUPPORTED: &str = "暂不支持军团合同。";
 /// Contract type required.
 pub(crate) const CONTRACT_TYPE_REQUIRED: &str = "请选择合同类型。";
 /// Contract monetary values must not be negative.

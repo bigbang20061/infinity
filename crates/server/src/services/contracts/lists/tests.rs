@@ -1,5 +1,7 @@
 use super::{location_matches, type_matches};
 
+mod corporate;
+
 #[test]
 fn location_filter_handles_missing_ancestry_and_direct_station() {
     assert!(location_matches(Some(9), 9, [None, None, None]));

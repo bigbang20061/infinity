@@ -1,7 +1,7 @@
 //! Contract lifecycle, list, report, item, bid and status persistence for contractProxy.
 //! The owning service supports `eve/client/script/ui/shared/neocom/contracts`.
 //! Sources include game contracts, contract items, bids and items; static enrichment belongs to services.
-//! Corporation contracts are unsupported; policy, transactions and notifications remain with callers.
+//! Policy, transactions and notifications remain with callers.
 
 pub(crate) mod lifecycle;
 pub(crate) mod query;
@@ -13,6 +13,11 @@ pub(crate) struct Contract {
     pub(crate) kind: i32,
     pub(crate) issuer: i64,
     pub(crate) issuer_corp: i64,
+    pub(crate) for_corp: bool,
+    pub(crate) issuer_wallet_key: i32,
+    pub(crate) acceptor_wallet_key: i32,
+    pub(crate) issuer_hangar_flag: i32,
+    pub(crate) issuer_source_location: i64,
     pub(crate) assignee: i64,
     pub(crate) acceptor: i64,
     pub(crate) start: i64,
@@ -33,7 +38,8 @@ pub(crate) struct Contract {
 }
 
 pub(super) const CONTRACT_SELECT: &str = "SELECT c.contract_id, c.type, c.issuer_id, c.issuer_corp_id, c.assignee_id, c.acceptor_id,
-        c.start_station_id, c.end_station_id,
+        c.start_station_id, c.end_station_id, c.for_corp, c.issuer_wallet_key, c.acceptor_wallet_key,
+        c.issuer_hangar_flag, c.issuer_source_location,
         c.price, c.reward, c.collateral, c.title, c.description, c.volume, c.num_days, c.status,
         c.date_issued, c.date_expired, c.date_accepted, c.date_completed, c.package_id
     FROM game.contracts c";
@@ -43,6 +49,9 @@ impl Contract {
         Self {
             id: r.get("contract_id"), kind: r.get("type"), issuer: r.get("issuer_id"),
             issuer_corp: r.get("issuer_corp_id"), assignee: r.get("assignee_id"), acceptor: r.get("acceptor_id"),
+            for_corp: r.get("for_corp"), issuer_wallet_key: r.get("issuer_wallet_key"),
+            acceptor_wallet_key: r.get("acceptor_wallet_key"), issuer_hangar_flag: r.get("issuer_hangar_flag"),
+            issuer_source_location: r.get("issuer_source_location"),
             start: r.get("start_station_id"), end: r.get("end_station_id"),
             price: r.get("price"), reward: r.get("reward"), collateral: r.get("collateral"), title: r.get("title"),
             description: r.get("description"), volume: r.get("volume"), num_days: r.get("num_days"), status: r.get("status"),

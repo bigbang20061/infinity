@@ -692,6 +692,8 @@ pub const FLAG_IMPLANT: i32 = 89;
 pub const FLAG_CORP_SAG1: i32 = 115;
 /// Client inventorycommon/const.py flagCorpSAG1..7: corporation hangar division count.
 pub const CORP_HANGAR_DIVISIONS: i32 = 7;
+/// Client inventorycommon.const.flagCorpDeliveries.
+pub const FLAG_CORP_DELIVERIES: i32 = 62;
 /// Client inventorycommon.const.locationJunkyard: deleted items.
 pub const LOCATION_JUNKYARD: i64 = 10;
 /// Client carbon const.ixOwnerID: inventory row owner column.
@@ -742,6 +744,8 @@ pub const BLUEPRINT_INFINITE_RUNS: i32 = -1;
 // Client corporation and service roles.
 /// Client appConst.corpRoleDirector.
 pub const ROLE_DIRECTOR: i64 = 1;
+/// Client appConst.corpRoleContractManager.
+pub const ROLE_CONTRACT_MANAGER: i64 = 72_057_594_037_927_936;
 /// Client appConst.corpRoleAccountant.
 pub const ROLE_ACCOUNTANT: i64 = 256;
 /// Client appConst.corpRoleHangarCanTake1; divisions 2-7 are the next bits.
@@ -752,6 +756,16 @@ pub const ROLE_FACTORY_MANAGER: i64 = 1024;
 pub const ROLE_FACTORY_MANUFACTURING: i64 = 1_125_899_906_842_624;
 /// Client industry/const.py: ROLE_FACTORY_SCIENCE.
 pub const ROLE_FACTORY_SCIENCE: i64 = 2_251_799_813_685_248;
+/// Client appConst.corpRoleHangarCanQuery1; divisions 2-7 are the next bits.
+pub const ROLE_HANGAR_CAN_QUERY_1: i64 = 1_048_576;
+/// Client appConst.corpRoleJuniorAccountant.
+pub const ROLE_JUNIOR_ACCOUNTANT: i64 = 4_503_599_627_370_496;
+/// Client appConst.corpRoleTrader.
+pub const ROLE_TRADER: i64 = 18_014_398_509_481_984;
+/// Roles allowed to view corporation deliveries (inventorysvc.py).
+pub const ROLE_DELIVERIES_VIEW: i64 = ROLE_ACCOUNTANT | ROLE_JUNIOR_ACCOUNTANT | ROLE_TRADER;
+/// Roles allowed to take corporation deliveries (itemLocking.py).
+pub const ROLE_DELIVERIES_TAKE: i64 = ROLE_ACCOUNTANT | ROLE_TRADER;
 /// Client carbon/common/script/sys/serviceConst.py: ROLE_PLAYER | ROLE_LOGIN.
 pub const ROLE_PLAYER_LOGIN: i64 = 2305843009213693952 | 4611686018427387904;
 /// Client carbon serviceConst: ROLE_GML | ROLE_GMH | ROLE_LEGIONEER | ROLE_WORLDMOD.

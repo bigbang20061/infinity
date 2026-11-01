@@ -96,7 +96,7 @@ pub(super) fn universe(call: &Call<'_>) -> Option<CallResult> {
         }
 
         // ---- corporations ----
-        ("corpmgr", "GetAssetInventory") | ("corpmgr", "GetAssetInventoryForLocation") | ("corpmgr", "SearchAssets") => Value::list([]),
+        ("corpmgr", "GetAssetInventoryForLocation") | ("corpmgr", "SearchAssets") => Value::list([]),
         // A player character's corporation, or an NPC's (agents) from the SDE.
         ("corpRegistry", "GetOldApplications") | ("corpRegistry", "GetAllianceApplications") => Value::Dict(vec![]),
         ("corpRegistry", "GetPendingAutoKicks") => Value::list([]),

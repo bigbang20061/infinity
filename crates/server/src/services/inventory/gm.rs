@@ -3,6 +3,7 @@
 //! supplies the target's ship and inventory. Modules are not brought online.
 
 use super::*;
+use super::movement::{dispatch_move, move_core, MoveEffect};
 use crate::db::outbox::Notification;
 
 pub(super) fn available(item: &Item, target: i64, type_id: i32, ship: i64, station: Option<i64>) -> bool {

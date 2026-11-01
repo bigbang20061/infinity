@@ -26,7 +26,7 @@ pub(crate) async fn search(ex: &(impl Executor + ?Sized), f: Search) -> Result<(
     sql += &format!(" AND c.assignee_id = {}", arg(&mut params, f.assignee));
     if f.kind == f.combined { sql += &format!(" AND c.type IN ({}, {})", f.exchange, f.auction); }
     else if f.kind != f.all { sql += &format!(" AND c.type = {}", arg(&mut params, f.kind as i32)); }
-    if let Some(issuer) = f.issuer { sql += &format!(" AND c.issuer_id = {}", arg(&mut params, issuer)); }
+    if let Some(issuer) = f.issuer { sql += &format!(" AND (CASE WHEN c.for_corp THEN c.issuer_corp_id ELSE c.issuer_id END) = {}", arg(&mut params, issuer)); }
     for (v, (column, op)) in f.bounds.into_iter().zip([("price", ">="), ("price", "<="), ("reward", ">="), ("reward", "<="), ("collateral", ">="), ("collateral", "<="), ("volume", ">="), ("volume", "<=")]) {
         if let Some(v) = v { sql += &format!(" AND c.{column} {op} {}", arg(&mut params, v)); }
     }
@@ -50,7 +50,7 @@ pub(crate) struct Owner {
 pub(crate) async fn owner(ex: &(impl Executor + ?Sized), f: Owner) -> Result<Vec<Contract>, Error> {
     let mut params: Vec<Box<dyn ToSql + Sync + Send>> = vec![];
     let p_me = arg(&mut params, f.me);
-    let mut sql = match f.issued_by { Some(false) => format!("c.issuer_id = {p_me}"), Some(true) => format!("(c.acceptor_id = {p_me} OR c.assignee_id = {p_me})"), None => format!("(c.issuer_id = {p_me} OR c.acceptor_id = {p_me} OR c.assignee_id = {p_me})") };
+    let mut sql = match f.issued_by { Some(false) => format!("(CASE WHEN c.for_corp THEN c.issuer_corp_id ELSE c.issuer_id END) = {p_me}"), Some(true) => format!("(c.acceptor_id = {p_me} OR c.assignee_id = {p_me})"), None => format!("((CASE WHEN c.for_corp THEN c.issuer_corp_id ELSE c.issuer_id END) = {p_me} OR c.acceptor_id = {p_me} OR c.assignee_id = {p_me})") };
     sql += &if f.status == f.outstanding { format!(" AND c.status = {}", f.outstanding) } else if f.status == f.in_progress { format!(" AND c.status = {}", f.in_progress) } else if f.status == f.finished { format!(" AND c.status NOT IN ({}, {})", f.outstanding, f.in_progress) } else { format!(" AND c.status = {}", arg(&mut params, f.status)) };
     match f.kind { None | Some(-1) => {}, Some(t) if t == f.all => {}, Some(t) if t == f.combined => sql += &format!(" AND c.type IN ({}, {})", f.exchange, f.auction), Some(t) => sql += &format!(" AND c.type = {}", arg(&mut params, t as i32)) }
     if let Some(before) = f.before { sql += &format!(" AND c.contract_id < {}", arg(&mut params, before)); }
@@ -62,9 +62,9 @@ pub(crate) async fn list(ex: &(impl Executor + ?Sized), f: Filter) -> Result<Vec
     let mut p: Vec<Box<dyn ToSql + Sync + Send>> = vec![];
     let sql = match f {
         Filter::Id(id) => { arg(&mut p, id); "c.contract_id = $1" },
-        Filter::Issuer(me, status) => { arg(&mut p, me); arg(&mut p, status); "c.issuer_id = $1 AND c.status = $2" },
+        Filter::Issuer(me, status) => { arg(&mut p, me); arg(&mut p, status); "(CASE WHEN c.for_corp THEN c.issuer_corp_id ELSE c.issuer_id END) = $1 AND c.status = $2" },
         Filter::Package(id, status) => { arg(&mut p, id); arg(&mut p, status); "c.package_id = $1 AND c.status = $2" },
-        Filter::Attention(me, now, outstanding, rejected, progress, day) => { arg(&mut p, me); arg(&mut p, outstanding); arg(&mut p, now); arg(&mut p, rejected); arg(&mut p, progress); arg(&mut p, day); "(c.issuer_id = $1 AND ((c.status = $2 AND c.date_expired <= $3) OR c.status = $4))\n         OR ((c.issuer_id = $1 OR c.acceptor_id = $1) AND c.status = $5 AND c.date_accepted + c.num_days::bigint * $6 <= $3)" },
+        Filter::Attention(me, now, outstanding, rejected, progress, day) => { arg(&mut p, me); arg(&mut p, outstanding); arg(&mut p, now); arg(&mut p, rejected); arg(&mut p, progress); arg(&mut p, day); "((CASE WHEN c.for_corp THEN c.issuer_corp_id ELSE c.issuer_id END) = $1 AND ((c.status = $2 AND c.date_expired <= $3) OR c.status = $4))\n         OR (((CASE WHEN c.for_corp THEN c.issuer_corp_id ELSE c.issuer_id END) = $1 OR c.acceptor_id = $1) AND c.status = $5 AND c.date_accepted + c.num_days::bigint * $6 <= $3)" },
         Filter::Bidding(me, status) => { arg(&mut p, me); arg(&mut p, status); "c.status = $2 AND EXISTS (SELECT 1 FROM game.contract_bids b WHERE b.contract_id = c.contract_id AND b.bidder_id = $1)" },
         Filter::InProgress(me, status) => { arg(&mut p, me); arg(&mut p, status); "c.acceptor_id = $1 AND c.status = $2" },
         Filter::Assigned(me, corp, status, now) => { arg(&mut p, me); arg(&mut p, corp); arg(&mut p, status); arg(&mut p, now); "c.assignee_id IN ($1, $2) AND c.status = $3 AND c.date_expired > $4" },

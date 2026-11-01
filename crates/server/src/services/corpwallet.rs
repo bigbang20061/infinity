@@ -11,7 +11,7 @@ use super::{db_err, has_role_or_is_ceo, keyval, notify_error, Call, CallError, C
 use super::wallets::{corp_balance, corp_credit, corp_debit};
 use crate::dao::wallets::characters;
 use crate::client::Client;
-use crate::consts::{ACCOUNT_CASH, ROLE_ACCOUNTANT, ROLE_DIRECTOR};
+use crate::consts::{ACCOUNT_CASH, ROLE_ACCOUNTANT, ROLE_DIRECTOR, ROLE_JUNIOR_ACCOUNTANT};
 use crate::db::executor::Executor;
 use crate::db::outbox::{Outbox, dispatch_world};
 use crate::messages;
@@ -20,8 +20,6 @@ use tracing::info;
 
 /// Client corporation wallet convention: seven account divisions.
 const DIVISIONS: i32 = 7;
-/// Client appConst.corpRoleJuniorAccountant.
-const ROLE_JUNIOR_ACCOUNTANT: i64 = 4_503_599_627_370_496;
 /// Client appConst.corpRoleAccountCanTake1; other divisions' roles are the next bits.
 const ROLE_CAN_TAKE_1: i64 = 134_217_728;
 
