@@ -2,6 +2,8 @@ use super::*;
 use super::reprocessing_svc::{add_output, output_stack_quantity};
 use crate::services::drones::tests::fixture::Fixture;
 
+mod extraction;
+
 #[test]
 fn field_volume_sampling_uses_half_open_range() {
     crate::tests::init_config();
@@ -215,12 +217,12 @@ async fn laser_full_holds_notify_and_one_unit_still_extracts() {
     let baseline = crate::dao::mining_ledger::list(&f.db, f.owner, i64::MIN, i64::MAX).await.unwrap();
     let (notify, mut notices) = tokio::sync::mpsc::unbounded_channel();
     let fit = Fit::load(&f.db, f.sde.clone(), f.owner, f.ship).await.ok().unwrap();
-    assert!(!extract(&f.db, &f.world, &notify, f.owner, f.ship, f.system, &fit, module, rock).await.ok().unwrap());
+    assert!(!extract(&f.db, &f.world, &notify, f.owner, f.ship, f.system, &fit, module, module_type, crate::consts::FLAG_HI_SLOT_FIRST, rock).await.ok().unwrap());
     assert!(format!("{:?}", notices.try_recv().unwrap()).contains(messages::CARGO_HOLD_FULL));
     assert_eq!(crate::dao::asteroids::lock(&f.db, f.system, rock, ore_type).await.unwrap(), Some(10));
     assert_eq!(crate::dao::mining_ledger::list(&f.db, f.owner, i64::MIN, i64::MAX).await.unwrap(), baseline);
     f.db.execute("UPDATE game.items SET quantity = 2 WHERE item_id = $1", &[&item]).await.unwrap();
-    assert!(!extract(&f.db, &f.world, &notify, f.owner, f.ship, f.system, &fit, module, rock).await.ok().unwrap());
+    assert!(!extract(&f.db, &f.world, &notify, f.owner, f.ship, f.system, &fit, module, module_type, crate::consts::FLAG_HI_SLOT_FIRST, rock).await.ok().unwrap());
     assert!(format!("{:?}", notices.try_recv().unwrap()).contains(messages::CARGO_HOLD_FULL));
     assert_eq!(crate::dao::asteroids::lock(&f.db, f.system, rock, ore_type).await.unwrap(), Some(9));
     let logs = crate::dao::mining_ledger::list(&f.db, f.owner, i64::MIN, i64::MAX).await.unwrap();
@@ -229,13 +231,13 @@ async fn laser_full_holds_notify_and_one_unit_still_extracts() {
     f.set(f.ship, ATTR_MINING_HOLD, volume).await;
     let mining_stack = crate::dao::items::transfers::insert(&f.db, ore_type, f.owner, f.ship, FLAG_MINING_HOLD, 1).await.unwrap();
     let fit = Fit::load(&f.db, f.sde.clone(), f.owner, f.ship).await.ok().unwrap();
-    assert!(!extract(&f.db, &f.world, &notify, f.owner, f.ship, f.system, &fit, module, rock).await.ok().unwrap());
+    assert!(!extract(&f.db, &f.world, &notify, f.owner, f.ship, f.system, &fit, module, module_type, crate::consts::FLAG_HI_SLOT_FIRST, rock).await.ok().unwrap());
     assert!(format!("{:?}", notices.try_recv().unwrap()).contains(messages::MINING_HOLD_FULL));
     assert_eq!(crate::dao::asteroids::lock(&f.db, f.system, rock, ore_type).await.unwrap(), Some(9));
     f.set(f.ship, ATTR_MINING_HOLD, volume * (i32::MAX as f64 + 2.0)).await;
     f.db.execute("UPDATE game.items SET quantity = $2 WHERE item_id = $1", &[&mining_stack, &i32::MAX]).await.unwrap();
     let fit = Fit::load(&f.db, f.sde.clone(), f.owner, f.ship).await.ok().unwrap();
-    assert!(!extract(&f.db, &f.world, &notify, f.owner, f.ship, f.system, &fit, module, rock).await.ok().unwrap());
+    assert!(!extract(&f.db, &f.world, &notify, f.owner, f.ship, f.system, &fit, module, module_type, crate::consts::FLAG_HI_SLOT_FIRST, rock).await.ok().unwrap());
     assert!(format!("{:?}", notices.try_recv().unwrap()).contains(messages::MINING_HOLD_FULL));
     assert_eq!(crate::dao::asteroids::lock(&f.db, f.system, rock, ore_type).await.unwrap(), Some(9));
     assert_eq!(crate::dao::mining_ledger::list(&f.db, f.owner, i64::MIN, i64::MAX).await.unwrap(), logs);
