@@ -60,6 +60,7 @@ mod store;
 pub(crate) mod trade;
 mod universe;
 pub(crate) mod wallets;
+pub(crate) mod wars;
 
 pub use fleets::logged_off as fleet_logged_off;
 pub(crate) use combat::recover_pending_reloads;
@@ -79,6 +80,7 @@ pub(crate) fn scheduler_registrations() -> Vec<crate::scheduler::Registration> {
         crate::scheduler::register(skills::completion::KIND, skills::completion::handle),
         crate::scheduler::register(industry::completion::KIND, industry::completion::handle),
         crate::scheduler::register(chat::expiry::KIND, chat::expiry::handle),
+        crate::scheduler::register(wars::deadlines::KIND, wars::deadlines::handle),
     ]
 }
 
@@ -403,6 +405,9 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
                 return r;
             }
             if let Some(r) = skills::dispatch(c, call).await {
+                return r;
+            }
+            if let Some(r) = wars::dispatch(c, call).await {
                 return r;
             }
             if let Some(r) = fixed::social(call) {

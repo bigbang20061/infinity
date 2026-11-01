@@ -104,8 +104,6 @@ pub(super) fn universe(call: &Call<'_>) -> Option<CallResult> {
         ("corpRegistry", "GetSharesByShareholder") => rowset(&["shareholderID", "shares", "corporationID"], vec![]),
         ("corpRegistry", "GetStructureReinforceDefault") => Value::None,
         ("corpRegistry", "DoesMyCorpAcceptStructures") | ("corpRegistry", "DoesCorpRestrictCorpMails") => Value::Bool(false),
-        ("warsInfoMgr", "GetWarsByOwnerID") => Value::Dict(vec![]),
-        ("warsInfoMgr", "GetTop") | ("warsInfoMgr", "GetWarsRequiringAssistance") => Value::list([]),
         ("allianceRegistry", "GetDaysInAlliance") => Value::Int(0),
         ("allianceRegistry", "GetAllianceMembersOlderThan") => Value::list([]),
 
@@ -203,7 +201,6 @@ pub(super) fn station(call: &Call<'_>) -> Option<CallResult> {
         ("activityMgr", "GetActivityBadgeStatuses") => Value::list([]),
         // The activities window's auto-popup setting (0: open it at login), kept per character.
         ("activityMgr", "ActivitySeen") => Value::None,
-        ("warRegistry", "GetWars") => empty_dict(),
         ("operationsManager", "can_character_play_the_tutorial") => Value::Bool(false),
         ("insurgencySolarsystem", "GetAllVisibleCampaigns") => Value::list([]),
         ("battlepassSeasonMgr", "CallSeasonDataRequested") => Value::None,

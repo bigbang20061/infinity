@@ -11,8 +11,8 @@
 //! alliance. Members back an executor (DeclareExecutorSupport); a candidate backed by
 //! corporations holding more than half the alliance's pilots takes over. Membership changes
 //! reach every online member as a session change (allianceid) and as the client's
-//! OnAlliance*Changed row updates. Wars, bills, sovereignty, capital systems and prime time
-//! aren't supported.
+//! OnAlliance*Changed row updates. Mutual wars are supported separately; bills,
+//! sovereignty, capital systems and prime time aren't supported.
 
 use super::corps::{ceo_of, is_player_corp, membership};
 use crate::dao::alliances as dao;
@@ -50,6 +50,13 @@ const SUGGESTION_MAX_LENGTH: usize = 5;
 const SUGGESTION_FALLBACK_LENGTHS: [usize; 2] = [4, 3];
 /// Server suggestion algorithm: minimum returned name length.
 const SUGGESTION_MIN_LENGTH: usize = 2;
+
+/// A director of the alliance's executor corporation.
+pub(super) async fn executor_director(db: &(impl Executor + ?Sized), me: i64, alliance: i64) -> Result<bool, CallError> {
+    let (corp, roles) = membership(db, me).await?;
+    let executor = dao::executor_corp(db, alliance).await.map_err(db_err)?;
+    Ok(executor == Some(corp) && roles & ROLE_DIRECTOR != 0)
+}
 
 /// `dbutil.CIndexedRowset(header, column)` filled with `rows` keyed by their `column` value.
 fn indexed_rowset(header: &DbRowDescriptor, column: &str, rows: Vec<(i64, Value)>) -> Value {

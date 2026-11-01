@@ -12,3 +12,4 @@ pub(crate) mod lookup;
 pub(crate) mod registry;
 pub(crate) mod dispatch;
 pub(crate) mod roles;
+pub(crate) mod wars;

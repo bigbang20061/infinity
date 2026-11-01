@@ -3,7 +3,7 @@
 //! Shared mechanics in `services::alliances` use the alliance DAO and
 //! `game.alliances`, `game.corporations`, `game.alliance_applications` and
 //! `game.alliance_history`.
-//! Wars, bills, sovereignty, capital systems and prime time are not supported.
+//! Mutual wars are supported separately; bills, sovereignty, capital systems and prime time are not.
 use super::*;
 /// Join a corporation and, when required, make its application effective atomically.
 pub(super) async fn admit(db: &Db, world: &World, alliance: i64, corp: i64, require_application: bool) -> Result<(), CallError> {
@@ -42,12 +42,6 @@ pub(super) async fn admit(db: &Db, world: &World, alliance: i64, corp: i64, requ
         }),
         |value, outbox| async move { dispatch_world(value, outbox, world) },
     ).await
-}
-/// A director of the alliance's executor corporation.
-async fn executor_director(db: &Db, me: i64, alliance: i64) -> Result<bool, CallError> {
-    let (corp, roles) = membership(db, me).await?;
-    let executor = crate::dao::alliances::executor_corp(db, alliance).await.map_err(db_err)?;
-    Ok(executor == Some(corp) && roles & ROLE_DIRECTOR != 0)
 }
 /// A member corporation backs `candidate` as executor; one backed by corporations holding
 /// more than half the alliance's pilots takes over.
@@ -237,7 +231,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             let ch = change(RELATIONSHIP_COLUMNS, line(old).as_deref(), line(relationship).as_deref());
             tell(db, world, alliance, None, "OnAllianceRelationshipChanged", vec![Value::Int(alliance), Value::Int(to), ch]).await.map(|_| Value::None)
         }
-        "DeclareWarAgainst" => Err(notify_error(messages::WAR_DECLARATION_NOT_AVAILABLE)),
+        "DeclareWarAgainst" => Err(notify_error(messages::wars::AGGRESSIVE_UNAVAILABLE)),
         // The alliance's bills (services/bills), paid by the executor's accountants.
         "GetBills" => super::super::bills::bills(db, alliance, false).await,
         "GetBillsReceivable" => super::super::bills::bills(db, alliance, true).await,

@@ -1117,3 +1117,53 @@ ALTER TABLE game.contracts ADD COLUMN IF NOT EXISTS issuer_source_location bigin
 UPDATE game.contracts SET issuer_source_location = start_station_id WHERE issuer_source_location IS NULL;
 ALTER TABLE game.contracts ALTER COLUMN issuer_source_location SET NOT NULL;
 ALTER TABLE game.contract_bids ADD COLUMN IF NOT EXISTS wallet_key integer NOT NULL DEFAULT 1000;
+
+-- dao/wars and dao/killmails/wars: durable mutual wars and immutable kill classification.
+ALTER TABLE game.killmails ADD COLUMN IF NOT EXISTS victim_alliance_id bigint;
+ALTER TABLE game.killmails ADD COLUMN IF NOT EXISTS final_alliance_id bigint;
+
+CREATE TABLE IF NOT EXISTS game.wars (
+    war_id bigserial PRIMARY KEY,
+    declared_by bigint NOT NULL,
+    against bigint NOT NULL,
+    declared_at bigint NOT NULL,
+    starts_at bigint NOT NULL,
+    state text NOT NULL CHECK (state IN ('pending', 'active', 'cooldown', 'ended')),
+    retracted_at bigint,
+    retracted_by bigint,
+    finishes_at bigint,
+    CHECK (declared_by <> against),
+    CHECK (starts_at > declared_at),
+    CHECK ((state IN ('pending', 'active') AND retracted_at IS NULL AND retracted_by IS NULL AND finishes_at IS NULL)
+        OR (state IN ('cooldown', 'ended') AND retracted_at IS NOT NULL AND retracted_by IS NOT NULL
+            AND finishes_at IS NOT NULL AND retracted_by IN (declared_by, against) AND finishes_at > retracted_at))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS wars_ongoing_pair_idx
+    ON game.wars (LEAST(declared_by, against), GREATEST(declared_by, against))
+    WHERE state <> 'ended';
+CREATE INDEX IF NOT EXISTS wars_declared_by_idx ON game.wars (declared_by, war_id);
+CREATE INDEX IF NOT EXISTS wars_against_idx ON game.wars (against, war_id);
+
+CREATE TABLE IF NOT EXISTS game.war_invite_settings (
+    owner_id bigint PRIMARY KEY,
+    blocked boolean NOT NULL DEFAULT false
+);
+CREATE TABLE IF NOT EXISTS game.war_invites (
+    from_owner bigint NOT NULL,
+    to_owner bigint NOT NULL,
+    sent_at bigint NOT NULL,
+    expires_at bigint NOT NULL,
+    PRIMARY KEY (from_owner, to_owner),
+    CHECK (from_owner <> to_owner AND expires_at > sent_at)
+);
+CREATE INDEX IF NOT EXISTS war_invites_to_owner_idx ON game.war_invites (to_owner);
+
+CREATE TABLE IF NOT EXISTS game.killmail_wars (
+    kill_id bigint NOT NULL REFERENCES game.killmails (kill_id),
+    war_id bigint NOT NULL REFERENCES game.wars (war_id),
+    attacker_side bigint NOT NULL,
+    defender_side bigint NOT NULL,
+    PRIMARY KEY (kill_id, war_id),
+    CHECK (attacker_side <> defender_side)
+);
+CREATE INDEX IF NOT EXISTS killmail_wars_war_idx ON game.killmail_wars (war_id, kill_id DESC);

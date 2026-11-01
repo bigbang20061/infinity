@@ -160,3 +160,89 @@ async fn startup_restores_active_kill_rights_without_economy_changes() {
     db.execute("DELETE FROM game.characters WHERE user_id=$1", &[&account]).await.unwrap();
     db.execute("DELETE FROM game.accounts WHERE user_id=$1", &[&account]).await.unwrap();
 }
+
+#[test]
+fn historical_killmail_nullable_snapshots_roundtrip() {
+    let row = crate::dao::killmails::Killmail {
+        kill_id: 1, kill_time: 2, solar_system_id: 3, victim_id: 4, victim_corp_id: 5,
+        victim_alliance_id: None, victim_ship_type: 6, damage_taken: 7.0,
+        final_char_id: None, final_corp_id: None, final_alliance_id: None,
+        final_ship_type: 0, final_weapon_type: 0, final_damage: 0.0,
+        final_sec_status: 0.0, isk_lost: 8.0, blob: String::new(),
+    };
+    let value = killmails::killmail_value(row, Some(9));
+    assert_eq!(marshal::loads(&marshal::dumps(&value)).unwrap(), value);
+}
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to a dedicated initialized database"]
+async fn killmail_writer_indexes_war_and_rolls_back_with_reports() {
+    crate::tests::init_config();
+    let cfg = crate::config::tests::test_database();
+    let (mut client, connection) = cfg.to_pg_config().unwrap().connect(tokio_postgres::NoTls).await.unwrap();
+    tokio::spawn(async move { connection.await.unwrap(); });
+    let mut tx = client.transaction().await.unwrap();
+    let account: i64 = tx.query_one("INSERT INTO game.accounts (user_name,password_hash,role) VALUES (nextval('game.accounts_user_id_seq')::text,''::bytea,0) RETURNING user_id", &[]).await.unwrap().get("user_id");
+    let mut characters = Vec::new();
+    let mut corps = Vec::new();
+    for _ in 0..3 {
+        let character: i64 = tx.query_one("INSERT INTO game.characters (user_id,name,race_id,bloodline_id,gender_id,corporation_id) VALUES ($1,nextval('game.characters_character_id_seq')::text,1,1,1,1) RETURNING character_id", &[&account]).await.unwrap().get("character_id");
+        let corp: i64 = tx.query_one("INSERT INTO game.corporations (name,ticker,ceo_id,creator_id,station_id,created) VALUES (nextval('game.corporations_corporation_id_seq')::text,nextval('game.corporations_corporation_id_seq')::text,$1,$1,1,1) RETURNING corporation_id", &[&character]).await.unwrap().get("corporation_id");
+        tx.execute("UPDATE game.characters SET corporation_id=$1 WHERE character_id=$2", &[&corp, &character]).await.unwrap();
+        characters.push(character);
+        corps.push(corp);
+    }
+    let alliance: i64 = tx.query_one("INSERT INTO game.alliances (name,short_name,executor_corp_id,creator_corp_id,creator_char_id,created) VALUES (nextval('game.alliances_alliance_id_seq')::text,nextval('game.alliances_alliance_id_seq')::text,$1,$1,$2,1) RETURNING alliance_id", &[&corps[0], &characters[0]]).await.unwrap().get("alliance_id");
+    tx.execute("UPDATE game.corporations SET alliance_id=$1 WHERE corporation_id=$2", &[&alliance, &corps[0]]).await.unwrap();
+    let war = crate::dao::wars::create(&tx, alliance, corps[1], 1, 3).await.unwrap().unwrap();
+    let save = tx.savepoint("killmail_writer").await.unwrap();
+    let mut outbox: Outbox = Outbox::default();
+    let mut attackers = [
+        (characters[1], Contribution { damage: 20.0, ship_type: 1, weapon_type: 1, last: 2, illegal: false }),
+        (characters[2], Contribution { damage: 10.0, ship_type: 1, weapon_type: 1, last: 3, illegal: false }),
+    ];
+    let (kill_id, _) = match write_killmail(&save, &mut outbox, 1, characters[0], corps[0], 1, &Lost::new(), &mut attackers, 4).await {
+        Ok(result) => result,
+        Err(_) => panic!("killmail writer failed"),
+    };
+    let rows = save.query("SELECT kill_id FROM game.killmails WHERE victim_id=$1", &[&characters[0]]).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i64>("kill_id"), kill_id);
+    let projections = crate::dao::killmails::wars::by_kills(&save, &[kill_id]).await.unwrap();
+    assert_eq!(projections.len(), 1);
+    let projection = &projections[0];
+    assert_eq!((projection.kill_id, projection.war_id, projection.attacker_side, projection.defender_side), (kill_id, war.war_id, corps[1], alliance));
+    let notes = save.query("SELECT receiver_id,type_id,group_id,sender_id,data FROM game.notifications WHERE receiver_id=ANY($1) ORDER BY type_id", &[&[characters[0], characters[2]].as_slice()]).await.unwrap();
+    assert_eq!(notes.len(), 2);
+    for (note, receiver, kind) in [(&notes[0], characters[0], NOTIFICATION_KILL_REPORT_VICTIM), (&notes[1], characters[2], NOTIFICATION_KILL_REPORT_FINAL_BLOW)] {
+        assert_eq!(note.get::<_, i64>("receiver_id"), receiver);
+        assert_eq!(note.get::<_, i32>("type_id"), kind);
+        assert_eq!(note.get::<_, i32>("group_id"), NOTIFICATION_GROUP_WAR);
+        assert_eq!(note.get::<_, i64>("sender_id"), characters[0]);
+        assert!(note.get::<_, String>("data").contains(&format!("killMailID: {kill_id}")));
+    }
+    save.execute("UPDATE game.corporations SET alliance_id=NULL WHERE corporation_id=$1", &[&corps[0]]).await.unwrap();
+    let mut history = crate::dao::killmails::wars::killmails(&save, war.war_id).await.unwrap();
+    assert_eq!(history.len(), 1);
+    let row = history.pop().unwrap();
+    assert_eq!((row.projection.attacker_side, row.projection.defender_side), (corps[1], alliance));
+    assert_eq!(row.killmail.victim_alliance_id, Some(alliance));
+    assert_eq!(row.killmail.final_char_id, Some(characters[2]));
+    assert_eq!(row.killmail.final_corp_id, Some(corps[2]));
+    assert_eq!(row.killmail.final_alliance_id, None);
+    let value = killmails::killmail_value(row.killmail, Some(row.projection.war_id));
+    let value = marshal::loads(&marshal::dumps(&value)).unwrap();
+    let Value::Instance(_, fields) = value else { panic!("expected KeyVal") };
+    assert_eq!(fields.get("killID"), Some(&Value::Int(kill_id)));
+    assert_eq!(fields.get("victimAllianceID"), Some(&Value::Int(alliance)));
+    assert_eq!(fields.get("finalCharacterID"), Some(&Value::Int(characters[2])));
+    assert_eq!(fields.get("finalCorporationID"), Some(&Value::Int(corps[2])));
+    assert_eq!(fields.get("finalAllianceID"), Some(&Value::None));
+    assert_eq!(fields.get("warID"), Some(&Value::Int(war.war_id)));
+    save.rollback().await.unwrap();
+    assert!(tx.query("SELECT kill_id FROM game.killmails WHERE victim_id=$1", &[&characters[0]]).await.unwrap().is_empty());
+    assert!(crate::dao::killmails::wars::by_kills(&tx, &[kill_id]).await.unwrap().is_empty());
+    assert!(crate::dao::killmails::wars::killmails(&tx, war.war_id).await.unwrap().is_empty());
+    assert!(tx.query_opt("SELECT character_id FROM game.characters WHERE character_id=$1", &[&characters[0]]).await.unwrap().is_some());
+    tx.rollback().await.unwrap();
+}

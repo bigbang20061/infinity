@@ -23,6 +23,7 @@ pub(crate) mod loyalty;
 pub(crate) mod standings;
 pub(crate) mod trade;
 pub(crate) mod skills;
+pub(crate) mod wars;
 
 // Client fitting and online UserError catalogue keys.
 pub(crate) const MSG_FITTING_HAS_SKILL_PREREQUISITES: &str = "FittingHasSkillPrerequisites";
@@ -77,8 +78,6 @@ pub(crate) const ALLIANCE_APPLICATION_STATUS_INVALID: &str = "无效的申请状
 pub(crate) const NOT_AUTHORIZED_TO_REMOVE_CORP_FROM_ALLIANCE: &str = "你无法将该军团移出联盟。";
 /// Alliance relationship update permission.
 pub(crate) const EXECUTOR_CORP_DIRECTOR_REQUIRED_TO_SET_RELATIONSHIP: &str = "只有执行军团的董事才能设置联盟关系。";
-/// War declaration unavailable.
-pub(crate) const WAR_DECLARATION_NOT_AVAILABLE: &str = "战争尚未开放。";
 /// Alliance bill payment permission.
 pub(crate) const BILL_PAYMENT_NOT_AUTHORIZED: &str = "你无法支付该账单。";
 

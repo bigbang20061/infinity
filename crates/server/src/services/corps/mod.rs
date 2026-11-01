@@ -204,7 +204,7 @@ pub async fn corporation_line(db: &Db, corp: i64) -> Result<Option<Vec<Value>>, 
     // Hangar then wallet division names; None for the client's defaults.
     let divisions = r.division_names.unwrap_or_default();
     line.extend((0..CORP_DIVISION_NAME_COUNT).map(|i| divisions.get(i).cloned().flatten().filter(|n| !n.is_empty()).map(Value::unicode).unwrap_or(Value::None)));
-    // ..., chosenExecutorID, allowWar: wars can't be declared yet.
+    // allowWar represents aggressive-war eligibility; mutual wars need no permit.
     line.extend([Value::Bool(r.deleted), Value::Bool(r.is_recruiting), Value::Bool(r.friendly_fire), Value::None, Value::Int(r.created), opt(r.chosen_executor_id), Value::Bool(false)]);
     Ok(Some(line))
 }
