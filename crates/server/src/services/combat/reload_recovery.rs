@@ -1,4 +1,4 @@
-//! Return interrupted ammunition reload reservations before clients connect.
+//! Return interrupted ammunition reload reservations during startup or ship repackaging.
 //!
 //! Mirrors reload handling in `eve/client/script/dogma/clientDogmaLocation.py`;
 //! reads `game.pending_reloads` and `game.items`. Reload timers remain in memory and
@@ -15,7 +15,7 @@ use crate::sde::Sde;
 use crate::services::{CallError, db_err, items::deposit, notify_error};
 
 /// The caller must hold the hull lock; reload IDs must be ascending and belong to that ship.
-pub(super) async fn return_pending<X: Send>(tx: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<X>, reload_ids: &[i64], ship_exists: bool) -> Result<(), CallError> {
+pub(in crate::services) async fn return_pending<X: Send>(tx: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<X>, reload_ids: &[i64], ship_exists: bool) -> Result<(), CallError> {
     let mut groups = BTreeMap::<(i64, i64, i32), i64>::new();
     for &reload_id in reload_ids {
         let Some(row) = pending_reloads::take(tx, reload_id).await.map_err(db_err)? else { continue };
