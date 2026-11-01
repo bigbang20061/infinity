@@ -254,20 +254,29 @@ impl Client {
     pub async fn leave_world(&mut self) -> Result<()> {
         services::combat::reset(self);
         let mut failure = None;
-        let ball = if let (Some(system), Some(ship)) = (self.session.int("solarsystemid"), self.session.int("shipid")) {
-            let _lock = services::market::lock().await;
-            self.world.remove_ball(system, ship).await
-        } else {
-            None
-        };
         if let Some(ship) = self.session.int("shipid") {
-            if let Err(error) = services::combat::save_condition(&self.db, ship).await {
-                let error = match error {
-                    services::CallError::Internal(error) => error,
-                    services::CallError::User { msg, .. } => anyhow::anyhow!(msg),
-                };
-                warn!(ship, %error, "saving condition on leave failed");
-                failure = Some(error);
+            let _lock = services::market::lock().await;
+            let system = self.session.int("solarsystemid");
+            let ball = if let (Some(system), Some(character)) = (system, self.session.int("charid")) {
+                self.world.with(system, move |s| {
+                    if s.pilot_ball(character).is_some_and(|ball| ball.id == ship) {
+                        s.remove_ball(ship)
+                    } else {
+                        None
+                    }
+                }).await.flatten()
+            } else {
+                None
+            };
+            if system.is_none() || ball.is_some() {
+                if let Err(error) = services::combat::save_condition_in(&self.db, ship).await {
+                    let error = match error {
+                        services::CallError::Internal(error) => error,
+                        services::CallError::User { msg, .. } => anyhow::anyhow!(msg),
+                    };
+                    warn!(ship, %error, "saving condition on leave failed");
+                    failure = Some(error);
+                }
             }
             if let Some(b) = ball {
                 if let Err(error) = crate::dao::items::positions::save(&self.db, ship, &b.pos).await {

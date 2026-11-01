@@ -14,6 +14,7 @@ pub(crate) const TURRET: &str = "没有足够的炮台安装位。";
 pub(crate) const LAUNCHER: &str = "没有足够的发射器安装位。";
 pub(crate) const CALIBRATION: &str = "舰船校准值不足。";
 pub(crate) const SLOTS: &str = "没有足够的装备槽位。";
+pub(crate) const BOARD_UNAVAILABLE: &str = "无法登上该舰船。";
 
 /// Render missing skill names and required levels for the client error payload.
 pub(crate) fn required_skills(skills: &[(String, i32)]) -> String {

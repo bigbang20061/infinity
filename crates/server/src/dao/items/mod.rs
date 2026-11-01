@@ -7,6 +7,7 @@
 //! Policy, transactions, refusals, notifications and World are caller concerns.
 
 pub(crate) mod brain;
+pub(crate) mod boarding;
 pub(crate) mod charges;
 pub(crate) mod clones;
 pub(crate) mod combat;

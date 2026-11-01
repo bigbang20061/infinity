@@ -1,14 +1,14 @@
 //! Ship balls for selected and persistent unpiloted hulls. Destiny consumes the
 //! resulting state through `eve/client/script/remote/michelle.py`. Type data
 //! comes from the SDE and fittings and condition from game item dogma rows.
-//! Unpiloted hulls have no pilot or security status; their condition is installed
-//! only when their prepared ball is published.
+//! Prepared piloted and unpiloted hulls publish their condition only when installed.
+//! Unpiloted hulls have no pilot or security status.
 
 use std::sync::Arc;
 use crate::client::Client;
 use crate::consts::dogma::{ATTR_AGILITY, ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_SIGNATURE_RADIUS};
 use crate::dao::items::space_ships::FreeShip;
-use crate::db::Db;
+use crate::db::executor::Executor;
 use crate::sde::Sde;
 use crate::services::{combat, crimewatch, db_err, fit::{Fit, Key}, CallError};
 use crate::space::{self, now_ms, Ball, MODE_STOP};
@@ -51,11 +51,20 @@ pub(super) async fn selected(c: &Client, ship_id: i64, pos: [f64; 3]) -> Result<
 }
 
 /// Prepare an unpiloted persistent ship without publishing its condition.
-pub(crate) async fn unpiloted(db: &Db, sde: Arc<Sde>, ship: &FreeShip) -> Result<PreparedShip, CallError> {
-    let fit = Fit::load_unpiloted(db, sde.clone(), ship.item_id).await?;
-    let condition = combat::prepare_condition_with_fit(db, ship.item_id, &fit).await?;
+pub(crate) async fn unpiloted(ex: &(impl Executor + ?Sized), sde: Arc<Sde>, ship: &FreeShip) -> Result<PreparedShip, CallError> {
+    let fit = Fit::load_unpiloted(ex, sde.clone(), ship.item_id).await?;
+    let condition = combat::prepare_condition_with_fit(ex, ship.item_id, &fit).await?;
     let ball = build(&sde, ship.item_id, ship.type_id, ship.owner_id, ship.corporation_id,
         ship.alliance_id, None, ship.pos, &fit, condition.fractions(), None)?;
+    Ok(PreparedShip { ball, condition })
+}
+
+/// Prepare a piloted persistent ship without publishing its condition.
+pub(crate) async fn piloted(ex: &(impl Executor + ?Sized), sde: Arc<Sde>, ship: &FreeShip, character: i64, security: f64) -> Result<PreparedShip, CallError> {
+    let fit = Fit::load(ex, sde.clone(), character, ship.item_id).await?;
+    let condition = combat::prepare_condition_with_fit(ex, ship.item_id, &fit).await?;
+    let ball = build(&sde, ship.item_id, ship.type_id, ship.owner_id, ship.corporation_id,
+        ship.alliance_id, Some(character), ship.pos, &fit, condition.fractions(), Some(security))?;
     Ok(PreparedShip { ball, condition })
 }
 

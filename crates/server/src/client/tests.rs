@@ -1,4 +1,8 @@
 use super::*;
+use crate::dao::items::creation;
+
+#[path = "../services/combat/groups_health/tests/fixture.rs"]
+mod fixture;
 
 #[test]
 fn unix_milliseconds_convert_to_filetime() {
@@ -94,4 +98,43 @@ fn hours_convert_to_checked_filetime_ticks() {
         assert_eq!(filetime_ticks_from_hours(value), None);
     }
     assert_eq!(filetime_ticks_from_hours(i64::MAX as f64 / FILETIME_HOUR as f64), None);
+}
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
+async fn leave_does_not_remove_or_save_stale_unpiloted_hull() {
+    crate::tests::init_config();
+    let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
+    let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
+    let ship_type = sde.types.iter().find(|t| t.category_id == Some(crate::consts::CATEGORY_SHIP)).unwrap().type_id;
+    let before = fixture::fingerprint(&db).await.unwrap();
+    let fixture = fixture::create(&db, ship_type, 1).await.unwrap();
+    let world = crate::space::World::new(db.clone(), sde.clone(), 1);
+    let test_world = world.clone();
+    let test_db = db.clone();
+    let result = tokio::spawn(async move {
+        let row = crate::dao::items::space_ships::FreeShip {
+            item_id: fixture.ship, type_id: ship_type, owner_id: fixture.character,
+            corporation_id: 1, alliance_id: 0, pos: [1.0, 2.0, 3.0],
+        };
+        let prepared = services::ship::balls::unpiloted(&test_db, sde.clone(), &row).await.ok().unwrap();
+        test_world.add_ship(1, prepared.install()).await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (stream, address) = listener.accept().await.unwrap();
+        let cfg = Arc::new(Config::default());
+        let login = Login { user_id: fixture.account, user_name: "fixture".into(), role: 0, client_id: 1, session_id: 1, language_id: "EN".into() };
+        let mut client = Client::new(Conn::new(stream, address), cfg.clone(), test_db.clone(), sde, crate::chat::Hub::new(&cfg.chat.domain), test_world.clone(), login);
+        client.session.apply(vec![("charid", Value::Int(fixture.character)), ("shipid", Value::Int(fixture.ship)), ("solarsystemid", Value::Int(1))]);
+        client.leave_world().await.unwrap();
+        assert!(test_world.ball(1, fixture.ship).await.is_some());
+        let count: i64 = test_db.query_one("SELECT count(*) AS count FROM game.item_attributes WHERE item_id = $1", &[&fixture.ship]).await.unwrap().get("count");
+        assert_eq!(count, 0);
+    }).await;
+    world.remove_ball(1, fixture.ship).await;
+    services::combat::invalidate_condition(fixture.ship);
+    drop(world);
+    fixture::cleanup(&db, fixture).await.unwrap();
+    assert_eq!(fixture::fingerprint(&db).await.unwrap(), before);
+    result.unwrap();
 }

@@ -3,6 +3,7 @@ use crate::consts::{IX_SINGLETON, IX_STACK_SIZE};
 use marshal::Value;
 
 mod spawn;
+mod boarding;
 
 #[test]
 fn repeated_assembly_conserves_hulls_and_stops_after_conversion() {

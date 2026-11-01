@@ -624,8 +624,6 @@ pub(crate) const MSG_CANT_APPLY_TWICE_TO_ALLIANCE: &str = "CantApplyTwiceToAllia
 pub(crate) const MSG_CANT_ASSEMBLE_MODULAR_SHIP_IN_SPACE: &str = "CantAssembleModularShipInSpace";
 /// Client message `CantBoardShipNotInHangar`.
 pub(crate) const MSG_CANT_BOARD_SHIP_NOT_IN_HANGAR: &str = "CantBoardShipNotInHangar";
-/// Client message `CantBoardShipWhileInSpace`.
-pub(crate) const MSG_CANT_BOARD_SHIP_WHILE_IN_SPACE: &str = "CantBoardShipWhileInSpace";
 /// Client message `CantBoardUnassembledShip`.
 pub(crate) const MSG_CANT_BOARD_UNASSEMBLED_SHIP: &str = "CantBoardUnassembledShip";
 /// Client message `CantRepackageActiveShip`.

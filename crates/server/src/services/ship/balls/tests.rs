@@ -1,5 +1,6 @@
 use super::*;
 use crate::consts::{CATEGORY_SHIP, FLAG_FITTING_FIRST, dogma::{ATTR_ARMOR_HP, ATTR_ARMOR_DAMAGE, ATTR_HULL_DAMAGE, ATTR_SHIELD_CHARGE}};
+use crate::db::Db;
 use crate::dao::{items::{creation, dogma}, skills::training};
 
 #[tokio::test]
@@ -39,6 +40,11 @@ async fn unpiloted_ball_excludes_owner_skills_and_restores_fitted_condition() {
     let loser = combat::prepare_condition_with_fit(&db, ship, &fit).await.ok().unwrap();
     assert!((loser.fractions()[1] - 0.5).abs() < 1e-9);
     dogma::save_condition(&db, ship, &[ATTR_SHIELD_CHARGE, ATTR_ARMOR_DAMAGE, ATTR_HULL_DAMAGE], &[0.0, armor / 4.0, 0.0], ATTR_SHIELD_CHARGE, 0).await.unwrap();
+    let prepared_pilot = super::piloted(&db, sde.clone(), &row, owner, 0.5).await.ok().unwrap();
+    assert!(combat::ship_condition(ship).is_none());
+    assert_eq!(prepared_pilot.ball.char_id, Some(owner));
+    assert!(prepared_pilot.ball.interactive);
+    assert!((prepared_pilot.ball.health[1] - (1.0 - armor / 4.0 / piloted.value(Key::Ship, ATTR_ARMOR_HP))).abs() < 1e-9);
     let prepared = unpiloted(&db, sde, &row).await.ok().unwrap();
     assert!(combat::ship_condition(ship).is_none());
     assert!((prepared.ball.health[1] - 0.75).abs() < 1e-9);
