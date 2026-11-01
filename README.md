@@ -59,12 +59,12 @@ A single process acts as both proxy and sol node. It also serves XMPP chat, the 
   - modules whose effect is not implemented yet, among them mutadaptive remote armor repairers. Activating one is refused with a message, and `/effects unsupported` lists the effects tried since the server started.
   - in direct trades: items from cargo, from inside a container or from a corporation hangar, the active ship, fitted modules and charges, and PLEX; types that cannot be traded are refused anywhere in an offered container or ship
   - the GM bounty reimbursement and bounty cache calls
-- An industry job installed before this version whose blueprint has since been moved or destroyed is refused at delivery.
   - labels for personal contacts
   - LP store offers that cost Analysis Kredits: they are listed, but buying one is refused
   - module heat damage from overheating, and repairs at structures
   - compressing items, although compression modules activate; and survey scan results pushed by the scanner: the mining overlay gets them through its own scan call
   - loot rights: any pilot whose ship is within 2,500 m of a wreck or cargo container in space can take from it, and taking from someone else's does not make the pilot a suspect
+- An industry job installed before this version whose blueprint has since been moved or destroyed is refused at delivery.
 - Some runtime state lives only in memory and is lost when the server restarts:
   - fleets, combat and Crimewatch timers, ECM jams, tractor pulls, and in-progress hacking; a suspect flag from an activated kill right is the exception and is restored with its original deadline;
   - everything spawned into space (NPCs, wrecks, scheduled effects);
