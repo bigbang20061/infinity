@@ -8,8 +8,8 @@
 //! pilot as a session change (corpid, corprole...), which also moves them to the new corp
 //! chat channel. A member's roles are one mask (game.characters.corp_roles) used for all
 //! locations. Static NPC corporations and schools come from the startup SDE. Alliances are
-//! services/alliances; titles, wallet divisions, offices and shares are supported.
-//! Dividends and votes are not supported.
+//! services/alliances; titles, wallet divisions, offices, shares and dividends are supported.
+//! Votes are not supported.
 //! The required management skill level and initial share issuance are operator policies.
 
 use super::{db_err, keyval, notify_error, row, rowset, trimmed_arg_text, value_id_list, Call, CallError, CallResult};
@@ -215,6 +215,7 @@ pub async fn corporation_line(db: &Db, corp: i64) -> Result<Option<Vec<Value>>, 
 
 pub(crate) mod corp_registry;
 pub(crate) mod shares;
+mod dividends;
 mod roles;
 use roles::{delete_title, execute_actions, info_window_data, potential_ceos, resign_ceo, rowset_lines, titles, update_member, update_titles};
 

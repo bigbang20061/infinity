@@ -2,7 +2,7 @@
 //! `eve/client/script/ui/services/corporation`.
 //! Uses the shared corporation mechanics in `services::corps` and its DAOs,
 //! including `game.corporations`, `game.characters`, `game.corp_applications` and startup SDE corporations.
-//! Share ownership uses the corporation ledger; dividends are unsupported and alliance calls have separate handlers.
+//! Share ownership and dividends use the corporation ledger; alliance calls have separate handlers.
 
 use super::*;
 use crate::dao::corporations::dispatch as dispatch_dao;
@@ -220,7 +220,19 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             };
             shares::transfer(db, world, me, governance_bound, issuer, to, quantity, call.method == "MoveCompanyShares").await.map(|_| Value::None)
         }
-        "PayoutDividend" => Err(notify_error(messages::CORP_SHARES_UNAVAILABLE)),
+        "PayoutDividend" => {
+            if call.args.len() != 2 { return Some(Err(notify_error(messages::corporations::INVALID_DIVIDEND))); }
+            match call.args.first() {
+                Some(Value::Bool(true) | Value::Int(1)) => {}
+                Some(Value::Bool(false) | Value::Int(0)) => return Some(Err(notify_error(messages::corporations::MEMBER_DIVIDEND_UNSUPPORTED))),
+                _ => return Some(Err(notify_error(messages::corporations::INVALID_DIVIDEND))),
+            }
+            let amount = match call.args.get(1) {
+                Some(Value::Float(value)) => *value,
+                _ => return Some(Err(notify_error(messages::corporations::INVALID_DIVIDEND))),
+            };
+            dividends::payout(db, world, me, governance_bound, amount).await.map(|_| Value::None)
+        }
         // UpdateCorporation(description, url, taxRate, isRecruiting, lpTaxRate)
         "UpdateCorporation" => {
             let text = |i: usize| call.args.get(i).and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();

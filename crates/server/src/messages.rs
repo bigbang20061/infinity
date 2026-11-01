@@ -300,8 +300,6 @@ pub(crate) const CORP_NOT_RECRUITING: &str = "该军团目前不接受申请。"
 pub(crate) const PERSONNEL_MANAGER_REQUIRED_TO_INVITE: &str = "只有人事经理才能发出邀请。";
 /// Director permission required to edit division names.
 pub(crate) const DIRECTOR_REQUIRED_TO_EDIT_DIVISION_NAMES: &str = "只有董事才能修改部门名称。";
-/// Corporation shares are not available.
-pub(crate) const CORP_SHARES_UNAVAILABLE: &str = "军团股份尚未开放。";
 /// Director permission required to edit corporation information.
 pub(crate) const DIRECTOR_REQUIRED_TO_EDIT_CORP_INFO: &str = "只有董事才能修改军团信息。";
 
