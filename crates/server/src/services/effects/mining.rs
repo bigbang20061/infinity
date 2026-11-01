@@ -54,7 +54,7 @@ fn extraction_outcome(more: bool) -> CycleOutcome {
 pub(super) async fn end(cx: &Ctx, fit: &Fit, cycle: &Cycle) -> CycleOutcome {
     let Some(rock) = cycle.target else { return CycleOutcome::Continue };
     let master = cycle.modules[0].id;
-    match crate::services::mining::extract(&cx.db, &cx.world, &cx.notify, cx.char_id, cx.ship_id, cx.system_id, fit, master, rock).await {
+    match crate::services::mining::extract(&cx.db, &cx.world, &cx.notify, cx.char_id, cx.ship_id, cx.system_id, fit, master, cycle.modules[0].type_id, cycle.modules[0].flag, rock).await {
         Ok(more) => extraction_outcome(more),
         Err(e) => {
             warn!("mining {master}: {}", match e { CallError::Internal(e) => format!("{e:#}"), CallError::User { msg, .. } => msg });
