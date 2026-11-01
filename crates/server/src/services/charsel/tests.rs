@@ -30,7 +30,7 @@ async fn rookie_grants_are_persistent_and_atomic() {
     let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
     let (stream, addr) = listener.accept().await.unwrap();
     let login = Login { user_id: account, user_name: account.to_string(), role: 0, client_id: account, session_id: account, language_id: "EN".into() };
-    let c = Client::new(Conn::new(stream, addr), Arc::new(Config::default()), db.clone(), sde.clone(), crate::chat::Hub::new("localhost"), world, login);
+    let c = Client::new(Conn::new(stream, addr), Arc::new(Config::default()), db.clone(), sde.clone(), crate::chat::Hub::new("localhost", db.clone(), world.clone()), world, login);
     let cases: &[(i32, i32, &[(i32, i32, i32)])] = &[
         (1, 601, &[(3638,27,1),(3651,28,1),(10039,19,1),(21857,20,1),(30839,11,1),(32465,87,1)]),
         (2, 588, &[(3636,27,1),(3651,28,1),(10039,19,1),(21857,20,1),(30839,11,1),(32465,87,1)]),

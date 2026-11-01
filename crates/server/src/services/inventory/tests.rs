@@ -254,7 +254,7 @@ async fn move_item_authorizes_sources_and_destinations() {
     let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
     let (stream, address) = listener.accept().await.unwrap();
     let login = crate::handshake::Login { user_id: account, user_name: "test".into(), role: 0, client_id: 1, session_id: 1, language_id: "EN".into() };
-    let chat = crate::chat::Hub::new(&cfg.chat.domain);
+    let chat = crate::chat::Hub::new(&cfg.chat.domain, db.clone(), world.clone());
     let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg, db.clone(), sde, chat, world.clone(), login);
     client.session.apply(vec![("charid", Value::Int(me)), ("corpid", Value::Int(1)), ("stationid", Value::Int(station)), ("shipid", Value::Int(own_ship))]);
     let hangar = Container::Hangar { station_id: station, owner_id: me };

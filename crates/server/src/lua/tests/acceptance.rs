@@ -139,7 +139,7 @@ async fn real_database_events_and_intercepts() {
         let peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (stream, address) = listener.accept().await.unwrap();
         let login = crate::handshake::Login { user_id: fixture.account, user_name: "acceptance".into(), role: GM_ROLES, client_id: 1, session_id: 1, language_id: "EN".into() };
-        let chat = crate::chat::Hub::new(&cfg.chat.domain);
+        let chat = crate::chat::Hub::new(&cfg.chat.domain, test_db.clone(), world.clone());
         let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg, test_db.clone(), sde.clone(), chat, world.clone(), login);
         client.change_session(vec![("charid", marshal::Value::Int(char_id))]);
         let mut type_id = None;

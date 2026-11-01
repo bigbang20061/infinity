@@ -66,8 +66,8 @@ async fn main() -> Result<()> {
     if let Err(services::CallError::Internal(e)) = services::unbury_sites(&db, &sde).await {
         tracing::warn!("moving sites out of planets failed: {e:#}");
     }
-    let hub = chat::Hub::new(&cfg.chat.domain);
     let world = space::World::new(db.clone(), sde.clone(), cfg.server.system_capacity);
+    let hub = chat::Hub::new(&cfg.chat.domain, db.clone(), world.clone());
     services::trade::recover(&db, &world, sde.clone()).await.map_err(startup_call_error)?;
     lua::start(&cfg, &db, &sde, &world).await?;
     let restored = services::bounty::restore_activations(&db, &world).await.map_err(startup_call_error)?;

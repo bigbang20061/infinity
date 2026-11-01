@@ -61,7 +61,8 @@ async fn hit_chance_command_db_smoke() {
         let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (stream, addr) = listener.accept().await.unwrap();
         let login = Login { user_id: f.account, user_name: "fixture".into(), role: GM_ROLES, client_id: f.character, session_id: f.character, language_id: "EN".into() };
-        let mut client = crate::client::Client::new(Conn::new(stream, addr), Arc::new(Config::default()), test_db, sde, crate::chat::Hub::new("localhost"), test_world.clone(), login);
+        let chat = crate::chat::Hub::new("localhost", test_db.clone(), test_world.clone());
+        let mut client = crate::client::Client::new(Conn::new(stream, addr), Arc::new(Config::default()), test_db, sde, chat, test_world.clone(), login);
         client.session.apply(vec![("charid", Value::Int(f.character)), ("shipid", Value::Int(f.ship)), ("solarsystemid", Value::Int(1))]);
         let target = f.ship + 1_000_000;
         test_world.add_ship(1, ball(f.ship, ship_type, f.character, [0.0; 3], [0.0; 3], 100.0)).await.unwrap();

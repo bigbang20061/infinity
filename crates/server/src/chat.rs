@@ -1,12 +1,11 @@
-//! Minimal XMPP server for the client's chat (xmppchatclient / xmpp packages).
-//!
-//! Covers what the client speaks: stream setup, SASL PLAIN with tokens from
-//! `chatAuthenticationService.GetAuthenticationToken`, resource bind, session,
-//! presence, MUC rooms (`<channel>@conference.<host>/<charID>`) and direct
-//! messages. Plain TCP: the launcher sets `chatserver_disable_tls=1` in prefs.ini.
+//! XMPP transport for `xmppchatclient/xmppchatsvc.py` and `xmppchannelsettings.py`.
+//! Token-authenticated SASL, binding, presence, MUC discovery and messages use
+//! plain TCP (the launcher disables TLS). Durable room metadata and ACLs are
+//! supplied by chat services and their DAO; connections and occupants are runtime
+//! state. Password rooms, corporation/alliance ACLs and proxy ownership are unsupported.
 
 use crate::consts::TYPE_CHARACTER;
-use anyhow::{bail, Result};
+use anyhow::Result;
 use base64::Engine;
 use quick_xml::events::Event;
 use std::collections::HashMap;
@@ -15,6 +14,14 @@ use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+
+mod rooms;
+mod stanzas;
+#[cfg(test)]
+mod tests;
+
+use crate::{db::Db, space::World};
+use stanzas::stanza;
 
 /// RFC 8259: JSON control characters below U+0020 require escaping.
 const JSON_CONTROL_LIMIT: u32 = 0x20;
@@ -72,18 +79,28 @@ pub fn esc(s: &str) -> String {
 
 type Tx = mpsc::UnboundedSender<String>;
 
+#[derive(Clone)]
 struct Occupant {
     full_jid: String,
     tx: Tx,
+    affiliation: String,
+    role: String,
+}
+
+#[derive(Default)]
+struct Rooms {
+    epoch: u64,
+    entries: HashMap<String, HashMap<String, Occupant>>,
 }
 
 /// Shared chat state: auth tokens, connected users, rooms.
-#[derive(Default)]
 pub struct Hub {
     pub host: String,
+    db: Db,
+    world: Arc<World>,
     tokens: Mutex<HashMap<String, String>>,
     users: Mutex<HashMap<String, (String, Tx)>>,
-    rooms: Mutex<HashMap<String, HashMap<String, Occupant>>>,
+    rooms: Mutex<Rooms>,
     /// charID -> `<eve_user_data .../>` sent with presences and user data queries.
     profiles: Mutex<HashMap<String, String>>,
 }
@@ -103,8 +120,9 @@ fn json_str(s: &str) -> String {
 }
 
 impl Hub {
-    pub fn new(host: &str) -> Arc<Hub> {
-        Arc::new(Hub { host: host.to_string(), ..Default::default() })
+    pub fn new(host: &str, db: Db, world: Arc<World>) -> Arc<Hub> {
+        Arc::new(Hub { host: host.to_string(), db, world, tokens: Mutex::new(HashMap::new()),
+            users: Mutex::new(HashMap::new()), rooms: Mutex::new(Rooms::default()), profiles: Mutex::new(HashMap::new()) })
     }
 
     /// Issue (or reuse) the chat password for a character.
@@ -144,27 +162,13 @@ impl Hub {
         let users = self.users.lock().unwrap();
         let Some((jid, tx)) = users.get(&format!("{char_id}@{}", self.host)) else { return };
         let _ = tx.send(format!(
-            "<message from='{channel}@{}' to='{jid}'><x xmlns='http://jabber.org/protocol/muc#user'><invite from='admin@{}'/></x></message>",
-            self.conference(),
-            self.host
+            "<message from='{}' to='{}'><x xmlns='http://jabber.org/protocol/muc#user'><invite from='{}'/></x></message>",
+            esc(&format!("{channel}@{}", self.conference())),
+            esc(jid),
+            esc(&format!("admin@{}", self.host))
         ));
     }
 
-    /// Remove `full_jid` from every room it is in, telling the remaining occupants.
-    fn leave_all(&self, full_jid: &str) {
-        let mut rooms = self.rooms.lock().unwrap();
-        for (room, occ) in rooms.iter_mut() {
-            let gone: Vec<String> = occ.iter().filter(|(_, o)| o.full_jid == full_jid).map(|(n, _)| n.clone()).collect();
-            for nick in gone {
-                occ.remove(&nick);
-                let p = format!("<presence from='{room}/{nick}' type='unavailable'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='none' role='none'/></x></presence>");
-                for o in occ.values() {
-                    let _ = o.tx.send(p.clone());
-                }
-            }
-        }
-        rooms.retain(|_, o| !o.is_empty());
-    }
 }
 
 pub async fn serve(bind: String, hub: Arc<Hub>) -> Result<()> {
@@ -186,6 +190,7 @@ struct Conn {
     tx: Tx,
     user: Option<String>,
     full_jid: Option<String>,
+    password: Option<String>,
 }
 
 async fn connection(stream: TcpStream, hub: Arc<Hub>) -> Result<()> {
@@ -198,12 +203,14 @@ async fn connection(stream: TcpStream, hub: Arc<Hub>) -> Result<()> {
             }
         }
     });
-    let mut c = Conn { hub: hub.clone(), tx, user: None, full_jid: None };
+    let mut c = Conn { hub: hub.clone(), tx, user: None, full_jid: None, password: None };
     let result = read_loop(rd, &mut c).await;
     if let Some(jid) = &c.full_jid {
-        hub.leave_all(jid);
+        hub.leave_all(jid, &c.tx);
         if let Some(user) = &c.user {
-            hub.users.lock().unwrap().remove(&format!("{user}@{}", hub.host));
+            let mut users = hub.users.lock().unwrap();
+            let key = format!("{user}@{}", hub.host);
+            if users.get(&key).is_some_and(|(current, tx)| current == jid && tx.same_channel(&c.tx)) { users.remove(&key); }
         }
         info!("chat: {jid} disconnected");
     }
@@ -231,7 +238,7 @@ async fn read_loop(rd: tokio::net::tcp::OwnedReadHalf, c: &mut Conn) -> Result<(
                 let el = element_from(&e)?;
                 match stack.last_mut() {
                     Some(parent) => parent.children.push(el),
-                    None => stanza(c, el)?,
+                    None => stanza(c, el).await?,
                 }
             }
             Event::Text(t) => {
@@ -252,7 +259,7 @@ async fn read_loop(rd: tokio::net::tcp::OwnedReadHalf, c: &mut Conn) -> Result<(
                 if let Some(el) = stack.pop() {
                     match stack.last_mut() {
                         Some(parent) => parent.children.push(el),
-                        None => stanza(c, el)?,
+                        None => stanza(c, el).await?,
                     }
                 }
             }
@@ -283,18 +290,6 @@ fn stream_opened(c: &mut Conn) {
     let _ = c.tx.send(s);
 }
 
-fn stanza(c: &mut Conn, el: Element) -> Result<()> {
-    match el.local() {
-        "auth" => auth(c, &el),
-        "iq" => iq(c, &el),
-        "presence" => presence(c, &el),
-        "message" => message(c, &el),
-        other => {
-            debug!("chat: ignoring <{other}>");
-            Ok(())
-        }
-    }
-}
 
 fn auth(c: &mut Conn, el: &Element) -> Result<()> {
     let decoded = base64::engine::general_purpose::STANDARD.decode(el.text.trim()).unwrap_or_default();
@@ -305,6 +300,7 @@ fn auth(c: &mut Conn, el: &Element) -> Result<()> {
     };
     if c.hub.check(&user, &pass) {
         c.user = Some(user);
+        c.password = Some(pass);
         let _ = c.tx.send("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>".into());
     } else {
         warn!("chat: auth failed for {user:?}");
@@ -313,122 +309,3 @@ fn auth(c: &mut Conn, el: &Element) -> Result<()> {
     Ok(())
 }
 
-fn iq(c: &mut Conn, el: &Element) -> Result<()> {
-    let id = el.attr("id").unwrap_or("");
-    let Some(user) = c.user.clone() else { bail!("iq before auth") };
-    let host = c.hub.host.clone();
-    if let Some(bind) = el.child("bind") {
-        let resource = bind.child("resource").map(|r| r.text.trim().to_string()).filter(|r| !r.is_empty()).unwrap_or_else(|| "eve".into());
-        let jid = format!("{user}@{host}/{resource}");
-        c.hub.users.lock().unwrap().insert(format!("{user}@{host}"), (jid.clone(), c.tx.clone()));
-        c.full_jid = Some(jid.clone());
-        info!("chat: {jid} online");
-        let _ = c.tx.send(format!(
-            "<iq type='result' id='{}'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><jid>{}</jid></bind></iq>",
-            esc(id),
-            esc(&jid)
-        ));
-        return Ok(());
-    }
-    let to = el.attr("to").unwrap_or(&host);
-    let from = c.full_jid.clone().unwrap_or_default();
-    if let Some(q) = el.child("query").filter(|q| q.attr("xmlns") == Some("urn:xmpp:eve_user_data") && el.attr("type") == Some("get")) {
-        let who = q.attr("jid").unwrap_or("").split('@').next().unwrap_or("");
-        let _ = c.tx.send(format!("<iq type='result' id='{}' from='{}' to='{}'>{}</iq>", esc(id), esc(to), esc(&from), c.hub.profile(who)));
-        return Ok(());
-    }
-    // session, ping, disco, private storage...: acknowledge with an empty result.
-    debug!("chat: iq {} -> generic result: {}", el.attr("type").unwrap_or(""), el.to_xml_with(&[]));
-    let _ = c.tx.send(format!("<iq type='result' id='{}' from='{}' to='{}'/>", esc(id), esc(to), esc(&from)));
-    Ok(())
-}
-
-fn split_jid(jid: &str) -> (&str, Option<&str>) {
-    match jid.split_once('/') {
-        Some((bare, res)) => (bare, Some(res)),
-        None => (jid, None),
-    }
-}
-
-fn presence(c: &mut Conn, el: &Element) -> Result<()> {
-    let Some(full) = c.full_jid.clone() else { return Ok(()) };
-    let Some(to) = el.attr("to") else {
-        // Initial/broadcast presence: echo it back as a server does. The client only
-        // reports itself logged in (xmpp/xmpphandler.py) on its first non-iq stanza.
-        if el.attr("type").is_none() {
-            let _ = c.tx.send(format!("<presence from='{0}' to='{0}'/>", esc(&full)));
-        }
-        return Ok(());
-    };
-    let (room, nick) = split_jid(to);
-    if !room.ends_with(&c.hub.conference()) {
-        return Ok(());
-    }
-    let nick = nick.unwrap_or_else(|| c.user.as_deref().unwrap_or("unknown")).to_string();
-    let id = el.attr("id").unwrap_or("").to_string();
-    let item = |jid: &str| format!("<x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='member' role='participant' jid='{}'/>", esc(jid));
-
-    if el.attr("type") == Some("unavailable") {
-        let mut rooms = c.hub.rooms.lock().unwrap();
-        if let Some(occ) = rooms.get_mut(room) {
-            occ.remove(&nick);
-            let p = format!("<presence from='{room}/{nick}' type='unavailable'>{}</x></presence>", item(&full));
-            let _ = c.tx.send(format!("<presence id='{}' from='{room}/{nick}' to='{full}' type='unavailable'>{}<status code='{MUC_SELF_PRESENCE}'/></x></presence>", esc(&id), item(&full)));
-            for o in occ.values() {
-                let _ = o.tx.send(p.clone());
-            }
-        }
-        return Ok(());
-    }
-
-    let mut rooms = c.hub.rooms.lock().unwrap();
-    let occ = rooms.entry(room.to_string()).or_default();
-    // Existing occupants to the newcomer, then the newcomer to everyone.
-    for (n, o) in occ.iter() {
-        if *n != nick {
-            let _ = c.tx.send(format!("<presence from='{room}/{n}' to='{full}'>{}</x>{}</presence>", item(&o.full_jid), c.hub.profile(n)));
-        }
-    }
-    let me = c.hub.profile(&nick);
-    let announce = format!("<presence from='{room}/{nick}'>{}</x>{me}</presence>", item(&full));
-    for (n, o) in occ.iter() {
-        if *n != nick {
-            let _ = o.tx.send(announce.clone());
-        }
-    }
-    occ.insert(nick.clone(), Occupant { full_jid: full.clone(), tx: c.tx.clone() });
-    let _ = c.tx.send(format!(
-        "<presence id='{}' from='{room}/{nick}' to='{full}'>{}<status code='{MUC_SELF_PRESENCE}'/></x>{me}</presence>",
-        esc(&id),
-        item(&full)
-    ));
-    debug!("chat: {full} joined {room} ({} occupants)", occ.len());
-    Ok(())
-}
-
-fn message(c: &mut Conn, el: &Element) -> Result<()> {
-    let Some(full) = c.full_jid.clone() else { return Ok(()) };
-    let Some(to) = el.attr("to") else { return Ok(()) };
-    let (bare, _) = split_jid(to);
-    if el.attr("type") == Some("groupchat") {
-        let rooms = c.hub.rooms.lock().unwrap();
-        let Some(occ) = rooms.get(bare) else {
-            let _ = c.tx.send(format!(
-                "<message from='{bare}' to='{full}' type='error'><error type='cancel'><item-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>"
-            ));
-            return Ok(());
-        };
-        let nick = occ.iter().find(|(_, o)| o.full_jid == full).map(|(n, _)| n.clone()).unwrap_or_default();
-        let from = format!("{bare}/{nick}");
-        for o in occ.values() {
-            let _ = o.tx.send(el.to_xml_with(&[("from", &from), ("to", &o.full_jid)]));
-        }
-        return Ok(());
-    }
-    // Direct message to a user.
-    let users = c.hub.users.lock().unwrap();
-    if let Some((jid, tx)) = users.get(bare) {
-        let _ = tx.send(el.to_xml_with(&[("from", &full), ("to", jid)]));
-    }
-    Ok(())
-}

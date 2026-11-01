@@ -32,7 +32,7 @@ async fn invocation_deadline_invalidates_context_and_vm_remains_usable() {
     let (stream, address) = listener.accept().await.unwrap();
     let conn = crate::conn::Conn::new(stream, address);
     let login = crate::handshake::Login { user_id: 1, user_name: "test".into(), role: GM_ROLES, client_id: 1, session_id: 1, language_id: "EN".into() };
-    let chat = crate::chat::Hub::new(&cfg.chat.domain);
+    let chat = crate::chat::Hub::new(&cfg.chat.domain, db.clone(), world.clone());
     let mut client = Client::new(conn, cfg, db, sde, chat, world, login);
     let lua = Lua::new();
     crate::lua::value::register(&lua, &lua.globals()).unwrap();
@@ -113,7 +113,7 @@ async fn real_mutations_commit_and_cleanup_fixture_rows() {
         let mut peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (stream, address) = listener.accept().await.unwrap();
         let login = crate::handshake::Login { user_id: fixture.account, user_name: "test".into(), role: GM_ROLES, client_id: 1, session_id: 1, language_id: "EN".into() };
-        let chat = crate::chat::Hub::new(&cfg.chat.domain);
+        let chat = crate::chat::Hub::new(&cfg.chat.domain, test_db.clone(), world.clone());
         let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg, test_db.clone(), sde.clone(), chat, world, login);
         client.change_session(vec![("charid", Value::Int(fixture.chars[0]))]);
         let lua = Lua::new();

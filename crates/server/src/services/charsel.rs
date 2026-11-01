@@ -246,7 +246,6 @@ async fn select_character(c: &mut Client, char_id: i64) -> Result<(), CallError>
         let ball = super::ship::ship_ball(c, ship, pos).await?;
         c.world.add_ship(system, ball).await.map_err(CallError::Internal)?;
     }
-    c.world.register_pilot(char_id, c.notify_tx.clone());
     super::online_status::presence_changed(&c.db, &c.world, char_id, true).await;
     let role = c.session.int("role").unwrap_or(0);
     c.chat.set_profile(char_id, &r.name, r.gender_id as i64, corp, alliance, None, role);

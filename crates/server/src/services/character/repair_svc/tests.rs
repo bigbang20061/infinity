@@ -79,7 +79,7 @@ async fn station_settlement_is_atomic_and_checks_context() {
     let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
     let (stream, addr) = listener.accept().await.unwrap();
     let login = Login { user_id: account, user_name: account.to_string(), role: 0, client_id: owner, session_id: owner, language_id: "EN".into() };
-    let mut c = Client::new(Conn::new(stream, addr), Arc::new(Config::default()), db.clone(), sde.clone(), crate::chat::Hub::new("localhost"), world, login);
+    let mut c = Client::new(Conn::new(stream, addr), Arc::new(Config::default()), db.clone(), sde.clone(), crate::chat::Hub::new("localhost", db.clone(), world.clone()), world, login);
     c.session.apply(vec![("charid", Value::Int(owner)), ("stationid", Value::Int(station)), ("shipid", Value::Int(ship))]);
     let bind = Value::tuple([Value::Int(station), Value::Int(station), Value::Int(0)]);
     let kwargs = Value::Dict(vec![]);

@@ -3,6 +3,33 @@
 use marshal::Value;
 use std::collections::BTreeMap;
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ChatSession {
+    pub character_id: i64,
+    pub system_id: Option<i64>,
+    pub corporation_id: Option<i64>,
+    pub alliance_id: Option<i64>,
+    pub faction_id: Option<i64>,
+    pub fleet_id: Option<i64>,
+    pub role: i64,
+    pub corporation_role: i64,
+}
+
+impl ChatSession {
+    pub fn from_session(session: &Session) -> Option<Self> {
+        Some(Self {
+            character_id: session.int("charid").filter(|id| *id > 0)?,
+            system_id: session.int("solarsystemid2").filter(|id| *id > 0),
+            corporation_id: session.int("corpid").filter(|id| *id > 0),
+            alliance_id: session.int("allianceid").filter(|id| *id > 0),
+            faction_id: session.int("warfactionid").filter(|id| *id > 0),
+            fleet_id: session.int("fleetid").filter(|id| *id > 0),
+            role: session.int("role").unwrap_or(0),
+            corporation_role: session.int("corprole").unwrap_or(0),
+        })
+    }
+}
+
 pub struct Session {
     pub sid: i64,
     attrs: BTreeMap<String, Value>,

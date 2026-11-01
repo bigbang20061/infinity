@@ -102,9 +102,26 @@ impl Client {
 
     /// Change session attributes and queue a SessionChangeNotification for the client.
     pub fn change_session(&mut self, updates: Vec<(&str, Value)>) {
+        let old = crate::session::ChatSession::from_session(&self.session);
         let change = self.session.apply(updates);
         if change.is_empty() {
             return;
+        }
+        let new = crate::session::ChatSession::from_session(&self.session);
+        if old != new {
+            if let Some(previous) = &old {
+                if new.as_ref().map(|s| s.character_id) != Some(previous.character_id) {
+                    self.world.unregister_pilot(previous.character_id);
+                    self.chat.disconnect_character(previous.character_id);
+                }
+            }
+            if let Some(current) = &new {
+                if old.as_ref().map(|s| s.character_id) != Some(current.character_id) {
+                    self.world.register_pilot(current.character_id, self.notify_tx.clone());
+                }
+                self.world.set_chat_session(current.character_id, Some(current.clone()));
+                self.chat.session_changed(current.character_id);
+            }
         }
         info!(user = self.login.user_id, "session change {}", short(&marshal::Value::Dict(change.clone())));
         let packet = Packet::new(
@@ -203,6 +220,12 @@ impl Client {
                                     CallError::User { msg, .. } => warn!("skill brain refresh failed: {msg}"),
                                 }
                             }
+                        } else if event == services::chat::PERMISSIONS_REFRESH {
+                            if let Some(room) = args.first().and_then(|value| value.as_text()) {
+                                if let Err(error) = self.chat.refresh_permissions(&room).await {
+                                    warn!("chat permission refresh failed: {error:?}");
+                                }
+                            }
                         } else if event == "__session" {
                             // Another task changed this pilot's session (corporation membership): [(key, value)].
                             let pairs: Vec<(String, Value)> = args
@@ -290,6 +313,7 @@ impl Client {
             services::fleet_logged_off(&self.world, char_id);
             services::drones::settings::logged_off(char_id);
             self.world.unregister_pilot(char_id);
+            self.chat.disconnect_character(char_id);
             services::online_status::presence_changed(&self.db, &self.world, char_id, false).await;
         }
         if let Err(error) = services::trade::on_leave(self).await {

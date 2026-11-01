@@ -1,5 +1,5 @@
 //! Plain data access for accounts, alliances, asteroids, bills, bookmarks, bounties, calendar,
-//! characters, contracts, corporations, dynamic items, exploration, industry, insurance, items,
+//! characters, chat channels, contracts, corporations, dynamic items, exploration, industry, insurance, items,
 //! kill rights, killmails, mail, market, mining ledger, missions, NPE, offices, orgs, skills, store and wallets.
 //! Aggregates read and write `game` tables and use typed `sde` and `sde_native`
 //! static data; individual headers describe their sources and coverage.
@@ -14,6 +14,7 @@ pub(crate) mod bookmarks;
 pub(crate) mod bounties;
 pub(crate) mod calendar;
 pub(crate) mod characters;
+pub(crate) mod chat_channels;
 pub(crate) mod contracts;
 pub(crate) mod corporations;
 pub(crate) mod dynamic_items;

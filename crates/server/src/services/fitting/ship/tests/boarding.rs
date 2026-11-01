@@ -24,8 +24,9 @@ async fn client(db: Db, sde: Arc<Sde>, world: Arc<World>, account: i64) -> Clien
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
     let (stream, address) = listener.accept().await.unwrap();
+    let chat = crate::chat::Hub::new("localhost", db.clone(), world.clone());
     Client::new(crate::conn::Conn::new(stream, address), Arc::new(crate::config::Config::default()), db, sde,
-        crate::chat::Hub::new("localhost"), world, crate::handshake::Login {
+        chat, world, crate::handshake::Login {
             user_id: account, user_name: "boarding-fixture".into(), role: 0, client_id: account, session_id: account, language_id: "EN".into(),
         })
 }

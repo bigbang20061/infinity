@@ -107,7 +107,7 @@ impl Fixture {
         world.add_ship(system, ball).await.unwrap();
         let cfg = Arc::new(Config::default());
         let login = Login { user_id: account, user_name: "drone-acceptance".into(), role: 0, client_id: owner, session_id: owner, language_id: "EN".into() };
-        let mut client = Client::new(Conn::new(stream, address), cfg.clone(), db.clone(), sde.clone(), crate::chat::Hub::new(&cfg.chat.domain), world.clone(), login);
+        let mut client = Client::new(Conn::new(stream, address), cfg.clone(), db.clone(), sde.clone(), crate::chat::Hub::new(&cfg.chat.domain, db.clone(), world.clone()), world.clone(), login);
         client.session.apply(vec![("charid", Value::Int(owner)), ("corpid", Value::Int(1)), ("shipid", Value::Int(ship)), ("solarsystemid", Value::Int(system))]);
         world.register_pilot(owner, client.notify_tx.clone());
         Self { db, sde, world, client, owner, account, ship, system, _peer: peer, before }

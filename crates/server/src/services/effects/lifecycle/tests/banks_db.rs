@@ -86,7 +86,7 @@ async fn slave_activation_fires_bank_and_offline_stops_actor_cycle() {
         let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (stream, address) = listener.accept().await.unwrap();
         let mut client = Client::new(crate::conn::Conn::new(stream, address), Arc::new(crate::config::Config::default()), d.clone(), sde,
-            crate::chat::Hub::new("localhost"), w.clone(), crate::handshake::Login { user_id: account, user_name: "bank-smoke".into(), role: 0, client_id: 1, session_id: 1, language_id: "EN".into() });
+            crate::chat::Hub::new("localhost", d.clone(), w.clone()), w.clone(), crate::handshake::Login { user_id: account, user_name: "bank-smoke".into(), role: 0, client_id: 1, session_id: 1, language_id: "EN".into() });
         client.session.apply(vec![("charid", Value::Int(character)), ("shipid", Value::Int(ship)), ("solarsystemid", Value::Int(1))]);
         let (notify, mut notifications) = tokio::sync::mpsc::unbounded_channel();
         client.notify_tx = notify.clone();

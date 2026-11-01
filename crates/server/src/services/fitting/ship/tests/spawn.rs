@@ -104,7 +104,7 @@ async fn spawn_preserves_active_ship_and_restores_one_unpiloted_hull() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (stream, address) = listener.accept().await.unwrap();
-        let mut c = Client::new(crate::conn::Conn::new(stream, address), Arc::new(crate::config::Config::default()), test_db.clone(), sde.clone(), crate::chat::Hub::new("localhost"), world.clone(), crate::handshake::Login { user_id: account, user_name: "spawn-fixture".into(), role: 0, client_id: 1, session_id: 1, language_id: "EN".into() });
+        let mut c = Client::new(crate::conn::Conn::new(stream, address), Arc::new(crate::config::Config::default()), test_db.clone(), sde.clone(), crate::chat::Hub::new("localhost", test_db.clone(), world.clone()), world.clone(), crate::handshake::Login { user_id: account, user_name: "spawn-fixture".into(), role: 0, client_id: 1, session_id: 1, language_id: "EN".into() });
         c.session.apply(vec![("charid", Value::Int(owner)), ("shipid", Value::Int(active)), ("solarsystemid", Value::Int(system))]);
         let id = super::super::gm_spawn_ship(&mut c, kind).await.unwrap();
         assert_eq!(c.session.int("shipid"), Some(active));

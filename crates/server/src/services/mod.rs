@@ -19,6 +19,7 @@ mod bookmarks;
 pub(crate) mod bounty;
 mod calendar;
 mod character;
+pub(crate) mod chat;
 mod clones;
 pub(crate) mod combat;
 mod charsel;
@@ -77,6 +78,7 @@ pub(crate) fn scheduler_registrations() -> Vec<crate::scheduler::Registration> {
         crate::scheduler::register(bounty::payout::KIND, bounty::payout::handle),
         crate::scheduler::register(skills::completion::KIND, skills::completion::handle),
         crate::scheduler::register(industry::completion::KIND, industry::completion::handle),
+        crate::scheduler::register(chat::expiry::KIND, chat::expiry::handle),
     ]
 }
 
@@ -318,6 +320,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
             if let Some(reply) = crate::lua::dispatch(c, call).await { return reply; }
         }
         if let Some(reply) = fixed::root(call) { return reply; }
+        if let Some(reply) = chat::root(c, call).await { return reply; }
         if let Some(reply) = station::root(c, call).await { return reply; }
     }
     match (call.service, call.method) {

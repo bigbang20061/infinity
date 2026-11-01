@@ -80,7 +80,7 @@ async fn run_remote_repair(effect_id: i32, layer: usize, interrupt: bool) {
         let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (stream, addr) = listener.accept().await.unwrap();
         let login = Login { user_id: f.account, user_name: f.account.to_string(), role: 0, client_id: f.source, session_id: f.source, language_id: "EN".into() };
-        let mut client = Client::new(Conn::new(stream, addr), Arc::new(Config::default()), test_db.clone(), sde, crate::chat::Hub::new("localhost"), test_world.clone(), login);
+        let mut client = Client::new(Conn::new(stream, addr), Arc::new(Config::default()), test_db.clone(), sde, crate::chat::Hub::new("localhost", test_db.clone(), test_world.clone()), test_world.clone(), login);
         client.session.apply(vec![("charid", Value::Int(f.source)), ("shipid", Value::Int(f.ship)), ("solarsystemid", Value::Int(system))]);
         let (source_tx, mut source_rx) = tokio::sync::mpsc::unbounded_channel();
         client.notify_tx = source_tx;

@@ -85,7 +85,7 @@ async fn rig_confirmation_preserves_then_destroys() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (stream, address) = listener.accept().await.unwrap();
-        let mut c = Client::new(crate::conn::Conn::new(stream, address), Arc::new(crate::config::Config::default()), test_db.clone(), sde, crate::chat::Hub::new("localhost"), world, crate::handshake::Login { user_id: f.account, user_name: "repackage-fixture".into(), role: 0, client_id: 1, session_id: 1, language_id: "EN".into() });
+        let mut c = Client::new(crate::conn::Conn::new(stream, address), Arc::new(crate::config::Config::default()), test_db.clone(), sde, crate::chat::Hub::new("localhost", test_db.clone(), world.clone()), world, crate::handshake::Login { user_id: f.account, user_name: "repackage-fixture".into(), role: 0, client_id: 1, session_id: 1, language_id: "EN".into() });
         c.session.apply(vec![("charid", Value::Int(f.owner))]);
         let (notify, mut events) = tokio::sync::mpsc::unbounded_channel();
         c.notify_tx = notify;
@@ -165,7 +165,7 @@ async fn late_hull_update_failure_rolls_back_rig_and_notices() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (stream, address) = listener.accept().await.unwrap();
-        let mut c = Client::new(crate::conn::Conn::new(stream, address), Arc::new(crate::config::Config::default()), test_db.clone(), sde, crate::chat::Hub::new("localhost"), world, crate::handshake::Login { user_id: f.account, user_name: "repackage-fixture".into(), role: 0, client_id: 1, session_id: 1, language_id: "EN".into() });
+        let mut c = Client::new(crate::conn::Conn::new(stream, address), Arc::new(crate::config::Config::default()), test_db.clone(), sde, crate::chat::Hub::new("localhost", test_db.clone(), world.clone()), world, crate::handshake::Login { user_id: f.account, user_name: "repackage-fixture".into(), role: 0, client_id: 1, session_id: 1, language_id: "EN".into() });
         c.session.apply(vec![("charid", Value::Int(f.owner))]);
         let (notify, mut events) = tokio::sync::mpsc::unbounded_channel();
         c.notify_tx = notify;

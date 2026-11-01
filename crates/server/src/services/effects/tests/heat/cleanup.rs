@@ -26,7 +26,7 @@ async fn primed_unfit_clears_only_after_commit() {
         let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (stream, addr) = listener.accept().await.unwrap();
         let login = Login { user_id: f.account, user_name: f.account.to_string(), role: 0, client_id: f.character, session_id: f.character, language_id: "EN".into() };
-        let mut c = Client::new(Conn::new(stream, addr), Arc::new(Config::default()), d.clone(), sde, crate::chat::Hub::new("localhost"), w.clone(), login);
+        let mut c = Client::new(Conn::new(stream, addr), Arc::new(Config::default()), d.clone(), sde, crate::chat::Hub::new("localhost", d.clone(), w.clone()), w.clone(), login);
         c.session.apply(vec![("charid", Value::Int(f.character)), ("shipid", Value::Int(f.ship)), ("solarsystemid", Value::Int(SYSTEM))]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         c.notify_tx = tx.clone();
@@ -83,7 +83,7 @@ async fn unsupported_overload_does_not_change_state() {
         let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (stream, addr) = listener.accept().await.unwrap();
         let login = Login { user_id: f.account, user_name: f.account.to_string(), role: 0, client_id: f.character, session_id: f.character, language_id: "EN".into() };
-        let mut c = Client::new(Conn::new(stream, addr), Arc::new(Config::default()), d.clone(), sde, crate::chat::Hub::new("localhost"), w.clone(), login);
+        let mut c = Client::new(Conn::new(stream, addr), Arc::new(Config::default()), d.clone(), sde, crate::chat::Hub::new("localhost", d.clone(), w.clone()), w.clone(), login);
         c.session.apply(vec![("charid", Value::Int(f.character)), ("shipid", Value::Int(f.ship)), ("solarsystemid", Value::Int(SYSTEM))]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         c.notify_tx = tx.clone();

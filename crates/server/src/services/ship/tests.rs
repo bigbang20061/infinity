@@ -120,7 +120,7 @@ async fn docking_checks_surface_range_before_accepting() {
     let mut peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
     let (stream, address) = listener.accept().await.unwrap();
     let login = crate::handshake::Login { user_id: 1, user_name: "test".into(), role: 0, client_id: 1, session_id: 1, language_id: "EN".into() };
-    let chat = crate::chat::Hub::new(&cfg.chat.domain);
+    let chat = crate::chat::Hub::new(&cfg.chat.domain, db.clone(), world.clone());
     let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg, db, sde, chat, world.clone(), login);
     client.session.apply(vec![("solarsystemid", Value::Int(system)), ("shipid", Value::Int(123))]);
     let mut vessel = ship();
