@@ -490,7 +490,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS corporations_name_idx ON game.corporations (lo
 CREATE UNIQUE INDEX IF NOT EXISTS corporations_ticker_idx ON game.corporations (upper(ticker)) WHERE NOT deleted;
 SELECT setval('game.corporations_corporation_id_seq', GREATEST((SELECT max(corporation_id) FROM game.corporations), 98000000), true);
 
--- dao/corporations: issued shares and immutable receipts.
+-- dao/corporations: issued shares, immutable receipts and general vote snapshots.
 ALTER TABLE game.corporations ADD COLUMN IF NOT EXISTS issued_shares bigint CHECK (issued_shares > 0);
 CREATE SEQUENCE IF NOT EXISTS game.corp_governance_operation_seq;
 CREATE TABLE IF NOT EXISTS game.corp_shares (
@@ -523,6 +523,44 @@ CREATE TABLE IF NOT EXISTS game.corp_dividend_recipients (
     shares bigint NOT NULL CHECK (shares > 0),
     amount numeric(36,2) NOT NULL CHECK (amount >= 0),
     PRIMARY KEY (operation_id, holder_id)
+);
+CREATE TABLE IF NOT EXISTS game.corp_vote_cases (
+    id bigserial PRIMARY KEY,
+    corporation_id bigint NOT NULL REFERENCES game.corporations,
+    creator_id bigint NOT NULL,
+    title text NOT NULL,
+    description text NOT NULL,
+    starts bigint NOT NULL,
+    ends bigint NOT NULL,
+    closed_at bigint
+);
+CREATE TABLE IF NOT EXISTS game.corp_vote_options (
+    case_id bigint NOT NULL REFERENCES game.corp_vote_cases,
+    option_id integer NOT NULL,
+    text text NOT NULL,
+    PRIMARY KEY (case_id, option_id)
+);
+CREATE TABLE IF NOT EXISTS game.corp_vote_snapshot (
+    case_id bigint NOT NULL REFERENCES game.corp_vote_cases,
+    holder_id bigint NOT NULL,
+    shares bigint NOT NULL CHECK (shares > 0),
+    PRIMARY KEY (case_id, holder_id)
+);
+CREATE TABLE IF NOT EXISTS game.corp_vote_ballots (
+    case_id bigint NOT NULL,
+    character_id bigint NOT NULL,
+    option_id integer NOT NULL,
+    created bigint NOT NULL,
+    PRIMARY KEY (case_id, character_id),
+    FOREIGN KEY (case_id, option_id) REFERENCES game.corp_vote_options
+);
+CREATE TABLE IF NOT EXISTS game.corp_vote_claims (
+    case_id bigint NOT NULL,
+    holder_id bigint NOT NULL,
+    character_id bigint NOT NULL,
+    PRIMARY KEY (case_id, holder_id),
+    FOREIGN KEY (case_id, holder_id) REFERENCES game.corp_vote_snapshot,
+    FOREIGN KEY (case_id, character_id) REFERENCES game.corp_vote_ballots
 );
 -- A member's corporation roles (appConst.corpRole* mask), the same at every location, the
 -- roles they may grant, their titles (game.corp_titles bits) and free-text title.

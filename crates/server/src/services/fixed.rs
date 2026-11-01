@@ -135,8 +135,6 @@ pub(super) fn universe(call: &Call<'_>) -> Option<CallResult> {
         ("corporationSvc", "GetMedalsReceived") => Value::tuple([Value::list([]), Value::list([])]),
         // An NPC corporation's market supply and demand (typeID, sellPrice, buyPrice...): none traded.
         ("corporationSvc", "GetCorpInfo") => Value::list([]),
-        // NPC corporations hold no shareholder votes.
-        ("voteManager", "CanViewVotes") => Value::Bool(false),
         // No shared bookmark folders exist (accessGroupBookmarkMgr.AddFolder keeps none).
         ("accessGroupBookmarkMgr", "SearchFoldersWithAdminAccess") => Value::list([]),
         ("repairableShipMgr", "GetServiceLifeDamage") => Value::Float(0.0),

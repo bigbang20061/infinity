@@ -1,11 +1,12 @@
-//! Corporation persistence for registry, roles, enlistment, shares and dividends.
-//! Services mirror `eve/client/script/ui/services/corporation` calls.
-//! Sources include corporations, characters, share holdings and receipts.
-//! Policy, transactions and notifications are not implemented here; votes are unsupported.
+//! Corporation persistence for registry, roles, enlistment, shares, dividends and votes.
+//! Services mirror `eve/client/script/ui/services/corporation` and voting UI calls.
+//! Sources include corporations, characters, share holdings, receipts and vote tables.
+//! Policy, transactions, notifications and sanctioned vote actions are not implemented here.
 
 pub(crate) mod enlistment;
 pub(crate) mod dividends;
 pub(crate) mod shares;
+pub(crate) mod votes;
 pub(crate) mod lookup;
 pub(crate) mod registry;
 pub(crate) mod dispatch;
