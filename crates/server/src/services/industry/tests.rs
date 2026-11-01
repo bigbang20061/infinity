@@ -23,6 +23,13 @@ fn facility_data_exposes_configured_tax_and_activity_index() {
     let system = data.get("globalModifiers").and_then(|v| v.get("system")).unwrap();
     let Value::Dict(indices) = system else { panic!("system modifiers must be a dictionary") };
     assert!(indices.iter().any(|(activity, index)| activity.as_int() == Some(MANUFACTURING as i64) && index.as_float() == Some(policy.system_cost_index)));
+    let Value::Instance(class, settings) = facility.tax_settings() else { panic!("expected KeyVal") };
+    assert_eq!(*class, Value::str("utillib.KeyVal"));
+    assert_eq!(settings.get("taxCorporation"), data.get("tax"));
+    for name in ["taxAlliance", "taxStandingsHorrible", "taxStandingsBad",
+        "taxStandingsNeutral", "taxStandingsGood", "taxStandingsHigh"] {
+        assert_eq!(settings.get(name), Some(&Value::None));
+    }
 }
 
 fn station_without_services(type_id: Option<i64>, solar_system_id: Option<i64>) -> crate::sde::map::Station {

@@ -1,6 +1,7 @@
 //! Industry job calculations and lifecycle for the client industry package.
 //! Uses blueprint SDE data and game jobs, items and wallets; corporation jobs are unsupported.
-//! Job durations include the configured industry time multiplier.
+//! Job durations include the configured industry time multiplier; NPC fees use the published
+//! facility policy and submitted cost and facility-tax quotes are checked before settlement.
 
 use super::*;
 use crate::sde::{Sde, industry::Activity};
@@ -39,9 +40,45 @@ fn decryptor(sde: &Sde, type_id: i32) -> (f64, i32, i32, i32) {
 struct Plan {
     materials: Vec<(i32, i64)>,
     seconds: i64,
-    total_cost: f64,
+    fees: Fees,
     probability: f64,
     product: Option<i32>,
+}
+
+struct Fees {
+    indexed_cost: f64,
+    facility_tax: f64,
+    scc: f64,
+    security_tax: f64,
+}
+
+impl Fees {
+    fn total(&self) -> f64 {
+        self.indexed_cost + self.facility_tax + self.scc + self.security_tax
+    }
+}
+
+/// The client rounds the base before each fee, but applies the index before rounding cost.
+fn fees(job_cost: f64, activity: i32, security: f64, index: f64, tax: f64, scc_rate: f64, highsec_rate: f64) -> Fees {
+    let base = job_cost.round();
+    let scc_rate = if matches!(activity, RESEARCH_TIME | RESEARCH_MATERIAL) { scc_rate * 0.5 } else { scc_rate };
+    Fees {
+        indexed_cost: (job_cost * index).round(),
+        facility_tax: (base * tax).round(),
+        scc: (base * scc_rate).round(),
+        security_tax: if security >= 0.45 { (base * highsec_rate).round() } else { 0.0 },
+    }
+}
+
+fn validate_quote(cost: Option<&Value>, tax: Option<&Value>, fees: &Fees) -> Result<(), CallError> {
+    for (value, expected) in [(cost, fees.indexed_cost), (tax, fees.facility_tax)] {
+        if let Some(value) = value {
+            if !value.as_float().is_some_and(|n| n.is_finite() && n == expected) {
+                return Err(notify_error(messages::industry::QUOTE_CHANGED));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn job_seconds(seconds: f64, multiplier: f64, runs: i32, max_run_secs: f64) -> Result<i64, CallError> {
@@ -163,11 +200,9 @@ async fn plan(
         },
         _ => 0.0,
     };
-    let base_cost = job_cost.round();
-    let scc = if matches!(activity_id, RESEARCH_TIME | RESEARCH_MATERIAL) { policy.scc_surcharge_rate * 0.5 } else { policy.scc_surcharge_rate };
-    let security_tax = if facility.security >= 0.45 { (base_cost * policy.highsec_security_tax).round() } else { 0.0 };
-    let total_cost = (job_cost * policy.system_cost_index).round() + (base_cost * policy.npc_facility_tax).round() + (base_cost * scc).round() + security_tax;
-    Ok(Plan { materials, seconds, total_cost, probability, product })
+    let fees = fees(job_cost, activity_id, facility.security, facility.system_index(), facility.tax(),
+        policy.scc_surcharge_rate, policy.highsec_security_tax);
+    Ok(Plan { materials, seconds, fees, probability, product })
 }
 
 /// Active jobs per activity of an installer (GetJobCounts).
@@ -192,6 +227,8 @@ pub(super) async fn install(c: &Client, request: &Value) -> CallResult {
         Some(Value::Dict(pairs)) => pairs.iter().filter_map(|(k, v)| Some((k.as_int()? as i32, v.as_int().unwrap_or(0)))).collect(),
         _ => HashMap::new(),
     };
+    let quoted_cost = request.get("cost").cloned();
+    let quoted_tax = request.get("tax").cloned();
     let _trading = lock().await;
     let blueprint_id = int("blueprintID").unwrap_or(0);
     let facility_id = int("facilityID").unwrap_or(0);
@@ -206,6 +243,8 @@ pub(super) async fn install(c: &Client, request: &Value) -> CallResult {
             let requested = requested.clone();
             let fit = Arc::clone(&fit);
             let sde = Arc::clone(&sde);
+            let quoted_cost = quoted_cost.clone();
+            let quoted_tax = quoted_tax.clone();
             Box::pin(async move {
                 let mut bp = blueprint(tx, &sde, blueprint_id).await?;
                 if bp.owner != me {
@@ -277,13 +316,14 @@ pub(super) async fn install(c: &Client, request: &Value) -> CallResult {
                     None
                 };
                 let p = plan(tx, &sde, &fit, &skills, &bp, act, activity_id, runs, licensed_runs, product_request, optional, &fac).await?;
+                validate_quote(quoted_cost.as_ref(), quoted_tax.as_ref(), &p.fees)?;
                 let end = job_deadline(now, p.seconds)?;
 
                 let have = available(tx, me, fac.id).await?;
                 if let Some((t, q)) = p.materials.iter().find(|(t, q)| have.get(t).copied().unwrap_or(0) < *q) {
                     return Err(notify_error(&messages::required_materials_message(q, t)));
                 }
-                debit(tx, outbox, me, p.total_cost).await?;
+                debit(tx, outbox, me, p.fees.total()).await?;
                 for (type_id, quantity) in &p.materials {
                     let mut left = *quantity;
                     let stacks = load_items(tx, &sde, ItemQuery::OwnerLocationFlagTypeStackAscending(me, fac.id, FLAG_HANGAR, *type_id)).await.map_err(db_err)?;
@@ -323,7 +363,7 @@ pub(super) async fn install(c: &Client, request: &Value) -> CallResult {
                     successful_runs: None,
                     product_type: p.product,
                     optional_type: optional,
-                    cost: p.total_cost,
+                    cost: p.fees.total(),
                     probability: p.probability,
                     time: p.seconds,
                     start: now,

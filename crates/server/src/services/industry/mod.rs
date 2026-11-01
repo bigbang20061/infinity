@@ -12,6 +12,8 @@
 //! security tax. These rates, invention skill probability, run limits and completed-job history
 //! are operator policies in the industry configuration. Blueprint and station-operation data
 //! comes from the immutable typed SDE. Corporation jobs aren't supported.
+//! NPC facility tax settings are read-only; submitted cost and tax quotes are checked against
+//! the same configured tax and system index used for settlement.
 
 use super::contracts::{field, show_items};
 use crate::dao::items::loading::{Item, ItemQuery};
@@ -115,6 +117,26 @@ impl Facility {
         a
     }
 
+    fn tax(&self) -> f64 {
+        crate::config::game().industry.npc_facility_tax
+    }
+
+    fn system_index(&self) -> f64 {
+        crate::config::game().industry.system_cost_index
+    }
+
+    fn tax_settings(&self) -> Value {
+        keyval([
+            ("taxCorporation", Value::Float(self.tax())),
+            ("taxAlliance", Value::None),
+            ("taxStandingsHorrible", Value::None),
+            ("taxStandingsBad", Value::None),
+            ("taxStandingsNeutral", Value::None),
+            ("taxStandingsGood", Value::None),
+            ("taxStandingsHigh", Value::None),
+        ])
+    }
+
     /// industryCommon.Facility data.
     fn data(&self) -> Value {
         let empty = || Value::list([]);
@@ -124,7 +146,7 @@ impl Facility {
             (s("facilityID"), Value::Int(self.id)),
             (s("typeID"), Value::Int(self.type_id)),
             (s("ownerID"), Value::Int(self.owner)),
-            (s("tax"), Value::Float(crate::config::game().industry.npc_facility_tax)),
+            (s("tax"), Value::Float(self.tax())),
             (s("solarSystemID"), Value::Int(self.system)),
             (s("online"), Value::Bool(true)),
             (s("serviceAccess"), Value::Dict(vec![])),
@@ -134,7 +156,7 @@ impl Facility {
                 s("globalModifiers"),
                 Value::Dict(vec![
                     (s("faction"), Value::Float(1.0)),
-                    (s("system"), Value::Dict(activities.iter().map(|a| (Value::Int(*a as i64), Value::Float(crate::config::game().industry.system_cost_index))).collect())),
+                    (s("system"), Value::Dict(activities.iter().map(|a| (Value::Int(*a as i64), Value::Float(self.system_index()))).collect())),
                 ]),
             ),
             (
