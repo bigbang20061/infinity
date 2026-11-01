@@ -1,6 +1,11 @@
 //! Shared dogma attribute and effect IDs from the SDE and client
 //! dogma/const.py and skills/skillConst.py. No lookup, state or runtime mechanics.
 
+/// Client dogma/const.py attributeCharisma, attributeIntelligence, attributeMemory,
+/// attributePerception and attributeWillpower. Charisma-to-willpower order is
+/// required for remap and bloodline value mapping.
+pub const CHAR_ATTRIBUTES: [i64; 5] = [164, 165, 166, 167, 168];
+
 /// Client dogma/const.py attributeImplantness.
 pub const ATTR_IMPLANTNESS: i32 = 331;
 /// Client dogma/const.py attributeBoosterness.

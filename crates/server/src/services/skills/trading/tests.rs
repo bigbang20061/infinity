@@ -345,7 +345,8 @@ async fn overdue_training_booster_quote_check_and_settlement_agree() {
     use crate::services::tests::{client, fixture};
     use crate::services::fit::{Fit, Key};
     use crate::dao::skills::queue::QueueEntry;
-    use super::super::{attributes::CHAR_ATTRIBUTES, training};
+    use super::super::training;
+    use crate::consts::dogma::CHAR_ATTRIBUTES;
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let f = fixture::create(&db).await.unwrap();

@@ -88,7 +88,12 @@ fn dogma_runtime_and_character_attributes_are_denied_for_all_actions() {
         let (_, action) = dogma::parse(&owned).unwrap();
         assert_eq!(match action { Action::Query(a) | Action::Set(a, _) | Action::Reset(a) => a, Action::List => panic!("expected attribute action") }, "skillPoints");
         assert_eq!(denied(9999, |name, id| name == "skillPoints" && id == 9999), Some(messages::gm::GM_DOGMA_RUNTIME));
-        assert_eq!(denied(164, |_, _| false), Some(messages::gm::GM_DOGMA_CHARACTER));
+        for id in [164, 165, 166, 167, 168] {
+            assert_eq!(denied(id, |_, _| false), Some(messages::gm::GM_DOGMA_CHARACTER));
+        }
+        for id in [163, 169] {
+            assert_eq!(denied(id, |_, _| false), None);
+        }
         assert_eq!(denied(9999, |_, _| false), None);
     }
 }

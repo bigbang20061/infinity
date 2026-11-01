@@ -3,13 +3,12 @@
 //! Effective values use Fit, including active character implants and boosters.
 use super::{db_err, CallError};
 use crate::client::Client;
+use crate::consts::dogma::CHAR_ATTRIBUTES;
 use crate::db::executor::Executor;
 use crate::services::fit::{Fit, Key};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// SDE dgmAttributeTypes: charisma, intelligence, memory, perception, willpower.
-pub(super) const CHAR_ATTRIBUTES: [i64; 5] = [164, 165, 166, 167, 168];
 /// Server fallback for missing SDE bloodline attributes.
 const FALLBACK_BLOODLINE_ATTRIBUTE: i32 = 5;
 /// Server character attribute calculation offset.

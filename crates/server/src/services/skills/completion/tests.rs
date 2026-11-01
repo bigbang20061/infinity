@@ -270,7 +270,7 @@ async fn manual_attribute_changes_retime_only_when_effective_values_change() {
             assert!(!progress.queue_changed);
             assert!(queue::list(tx, f.character).await.map_err(db_err)? == vec![row]);
             let state = crate::dao::characters::attributes::initialize_respec(tx, f.character, 0).await.map_err(db_err)?;
-            let bases: Vec<i32> = super::super::attributes::CHAR_ATTRIBUTES.iter().map(|id| before[id] as i32 + 10).collect();
+            let bases: Vec<i32> = crate::consts::dogma::CHAR_ATTRIBUTES.iter().map(|id| before[id] as i32 + 10).collect();
             assert!(crate::dao::characters::attributes::save_respec(tx, f.character, &bases, &state, 0, 600, 600).await.map_err(db_err)?);
             super::super::training::retime_after_change_tx(tx, &sde, f.character, 600, &before, &mut progress).await?;
             assert!(progress.queue_changed);
@@ -402,7 +402,7 @@ async fn receiver_replay_empty(db: &Db, character: i64) -> bool {
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn training_booster_expiry_banks_old_rate_and_matches_live_processing() {
     use crate::services::fit::{Fit, Key};
-    use super::super::attributes::CHAR_ATTRIBUTES;
+    use crate::consts::dogma::CHAR_ATTRIBUTES;
     use std::collections::HashMap;
     crate::tests::init_config();
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();

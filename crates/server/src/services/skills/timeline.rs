@@ -4,7 +4,8 @@
 //! reconstruct brain items already removed from the database.
 use std::{collections::HashMap, sync::Arc};
 use crate::{consts::FLAG_BOOSTER, dao::{items::brain::BrainItem, skills::{queue::QueueEntry, training::Skill}}, db::executor::Executor, sde::Sde, services::{db_err, fit::{Fit, Key}, CallError}};
-use super::{attributes::CHAR_ATTRIBUTES, training};
+use super::training;
+use crate::consts::dogma::CHAR_ATTRIBUTES;
 
 pub(super) struct Completion { pub type_id: i32, pub level: i32, pub points: i64, pub end_time: i64 }
 pub(super) enum Event { Completion(Completion), Expiry { at: i64, items: Vec<BrainItem> } }

@@ -42,7 +42,7 @@ async fn biology_does_not_change_persisted_real_booster_duration() {
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn implant_mutation_banks_old_rate_and_retimes_once() {
-    use super::super::super::attributes::CHAR_ATTRIBUTES;
+    use crate::consts::dogma::CHAR_ATTRIBUTES;
     let _market = crate::services::market::lock().await;
     let (db, f, c, _peer) = setup().await;
     let (ty, modifying, modified) = c.sde.types.iter().filter(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_IMPLANT) && t.group_id != Some(GROUP_BOOSTER)
@@ -87,7 +87,7 @@ async fn implant_mutation_banks_old_rate_and_retimes_once() {
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn booster_activation_banks_and_notifies_training_once() {
-    use super::super::super::attributes::CHAR_ATTRIBUTES;
+    use crate::consts::dogma::CHAR_ATTRIBUTES;
     let _market = crate::services::market::lock().await;
     let (db, f, c, _peer) = setup().await;
     let (ty, modifying, modified) = c.sde.types.iter().filter(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_IMPLANT) && t.group_id == Some(GROUP_BOOSTER)
