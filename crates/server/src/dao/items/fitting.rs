@@ -2,7 +2,7 @@
 //! Client services own policy, transactions and notification ordering.
 use crate::db::{executor::Executor, Error};
 use crate::dao::items::loading::Item;
-use crate::consts::{BLUEPRINT_INFINITE_RUNS, INDUSTRY_JOB_STATUS_INSTALLED, FLAG_HANGAR};
+use crate::consts::{BLUEPRINT_INFINITE_RUNS, INDUSTRY_JOB_STATUS_INSTALLED, INDUSTRY_JOB_STATUS_READY, FLAG_HANGAR};
 use std::collections::BTreeMap;
 use tokio_postgres::Row;
 
@@ -50,14 +50,15 @@ pub(crate) async fn delete(ex: &(impl Executor + ?Sized), owner: i64, id: i64) -
 pub(crate) async fn delete_many(ex: &(impl Executor + ?Sized), owner: i64, ids: &[i64]) -> Result<u64, Error> { ex.execute("DELETE FROM game.fittings WHERE owner_id = $1 AND fitting_id = ANY($2)", &[&owner, &ids]).await }
 pub(crate) async fn rename(ex: &(impl Executor + ?Sized), id: i64, owner: i64, name: &str, description: &str) -> Result<u64, Error> { ex.execute("UPDATE game.fittings SET name = $3, description = $4 WHERE fitting_id = $1 AND owner_id = $2", &[&id, &owner, &name, &description]).await }
 pub(crate) async fn blueprints(ex: &(impl Executor + ?Sized), owner: i64, item: Option<i64>) -> Result<Vec<Blueprint>, Error> {
+    let statuses = [INDUSTRY_JOB_STATUS_INSTALLED, INDUSTRY_JOB_STATUS_READY];
     Ok(ex.query("SELECT i.item_id, i.type_id, i.owner_id, i.location_id, i.flag_id, i.quantity, i.singleton,
                     loc.type_id AS location_type_id, loc.location_id AS location_parent_id, ch.solar_system_id AS character_system_id,
                     COALESCE(b.material_efficiency, 0)::bigint AS material_efficiency, COALESCE(b.time_efficiency, 0)::bigint AS time_efficiency,
                     COALESCE(b.runs, $3::int)::bigint AS runs,
-                    (SELECT j.job_id FROM game.industry_jobs j WHERE j.blueprint_id = i.item_id AND j.status = $4::int LIMIT 1) AS job_id
+                    (SELECT j.job_id FROM game.industry_jobs j WHERE j.blueprint_id = i.item_id AND j.status = ANY($4::int[]) LIMIT 1) AS job_id
              FROM game.items i
              LEFT JOIN game.items loc ON loc.item_id = i.location_id
              LEFT JOIN game.characters ch ON ch.character_id = i.owner_id
              LEFT JOIN game.blueprints b ON b.item_id = i.item_id
-             WHERE i.owner_id = $1 AND ($2::bigint IS NULL OR i.item_id = $2) AND i.location_id > 0", &[&owner, &item, &BLUEPRINT_INFINITE_RUNS, &INDUSTRY_JOB_STATUS_INSTALLED]).await?.iter().map(Blueprint::from_row).collect())
+             WHERE i.owner_id = $1 AND ($2::bigint IS NULL OR i.item_id = $2) AND i.location_id > 0", &[&owner, &item, &BLUEPRINT_INFINITE_RUNS, &statuses.as_slice()]).await?.iter().map(Blueprint::from_row).collect())
 }

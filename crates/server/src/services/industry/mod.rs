@@ -3,30 +3,33 @@
 //! the client's industry package, which works out the same numbers to preview a job).
 //!
 //! Stations with a factory (station service 14) manufacture; stations with a laboratory (15)
-//! research, copy and invent. A job takes its blueprint from the facility, its materials from
-//! the owner's item hangar there and its cost from their wallet, and delivers to that hangar.
+//! research, copy and invent. Jobs use the owner's selected authorized custody locations
+//! and a separately authorized personal or corporation wallet.
 //! The server works out materials, time and cost itself, as the industry package does:
 //! materials from the blueprint's ME, time from its TE and the character's industry
 //! attributes (services::fit), and cost from the estimated item value (adjusted prices) times
 //! the system cost index plus the facility tax, the SCC surcharge and, in high-sec, the
 //! security tax. These rates, invention skill probability, run limits and completed-job history
 //! are operator policies in the industry configuration. Blueprint and station-operation data
-//! comes from the immutable typed SDE. Corporation jobs aren't supported.
+//! comes from the immutable typed SDE.
+//! NPC facility tax settings are read-only; submitted cost and tax quotes are checked against
+//! the same configured tax and system index used for settlement.
+//! Deadlines in game.jobs persist readiness across restarts; delivery remains explicit.
+//! Structures and reactions are not supported.
+//! Legacy jobs whose blueprint was already missing or moved before custody prevention
+//! are refused at delivery and may require operator repair.
 
-use super::contracts::{field, show_items};
-use crate::dao::items::loading::{Item, ItemQuery};
+use super::contracts::field;
+use crate::dao::items::loading::ItemQuery;
 use super::items::load_items;
 use crate::dao::industry::{self as industry_dao, Blueprint, Job};
 use super::fit::{Fit, Key};
-use super::items::{deliver, take_items};
 use super::market::{jumps, lock};
-use super::wallets::debit;
 use super::{db_err, keyval, notify_error, rand01, user_error, value_id_list, Call, CallError, CallResult};
 use crate::client::{filetime_now, Client};
-use crate::consts::{BLUEPRINT_COPY_QUANTITY, FILETIME_DAY, FILETIME_SECOND, FLAG_HANGAR, INDUSTRY_JOB_STATUS_INSTALLED, IX_LOCATION_ID, LOCATION_JUNKYARD};
-use crate::db::Db;
+use crate::consts::{BLUEPRINT_COPY_QUANTITY, FILETIME_DAY, FILETIME_SECOND, INDUSTRY_JOB_STATUS_INSTALLED, INDUSTRY_JOB_STATUS_READY, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD};
 use crate::db::executor::Executor;
-use crate::db::outbox::{dispatch_world, Outbox};
+use crate::db::outbox::{dispatch_client, Outbox};
 use crate::messages;
 use crate::sde::industry::{MANUFACTURING, RESEARCH_TIME, RESEARCH_MATERIAL, COPYING, INVENTION};
 use marshal::Value;
@@ -115,6 +118,26 @@ impl Facility {
         a
     }
 
+    fn tax(&self) -> f64 {
+        crate::config::game().industry.npc_facility_tax
+    }
+
+    fn system_index(&self) -> f64 {
+        crate::config::game().industry.system_cost_index
+    }
+
+    fn tax_settings(&self) -> Value {
+        keyval([
+            ("taxCorporation", Value::Float(self.tax())),
+            ("taxAlliance", Value::None),
+            ("taxStandingsHorrible", Value::None),
+            ("taxStandingsBad", Value::None),
+            ("taxStandingsNeutral", Value::None),
+            ("taxStandingsGood", Value::None),
+            ("taxStandingsHigh", Value::None),
+        ])
+    }
+
     /// industryCommon.Facility data.
     fn data(&self) -> Value {
         let empty = || Value::list([]);
@@ -124,7 +147,7 @@ impl Facility {
             (s("facilityID"), Value::Int(self.id)),
             (s("typeID"), Value::Int(self.type_id)),
             (s("ownerID"), Value::Int(self.owner)),
-            (s("tax"), Value::Float(crate::config::game().industry.npc_facility_tax)),
+            (s("tax"), Value::Float(self.tax())),
             (s("solarSystemID"), Value::Int(self.system)),
             (s("online"), Value::Bool(true)),
             (s("serviceAccess"), Value::Dict(vec![])),
@@ -134,7 +157,7 @@ impl Facility {
                 s("globalModifiers"),
                 Value::Dict(vec![
                     (s("faction"), Value::Float(1.0)),
-                    (s("system"), Value::Dict(activities.iter().map(|a| (Value::Int(*a as i64), Value::Float(crate::config::game().industry.system_cost_index))).collect())),
+                    (s("system"), Value::Dict(activities.iter().map(|a| (Value::Int(*a as i64), Value::Float(self.system_index()))).collect())),
                 ]),
             ),
             (
@@ -144,20 +167,6 @@ impl Facility {
         ])
     }
 
-    fn location(&self, owner: i64) -> Value {
-        Value::reduce(
-            "industry.job.Location",
-            vec![],
-            Some(Value::dict([
-                ("itemID", Value::Int(self.id)),
-                ("typeID", Value::Int(self.type_id)),
-                ("ownerID", Value::Int(owner)),
-                ("flagID", Value::Int(FLAG_HANGAR as i64)),
-                ("canView", Value::Bool(true)),
-                ("canTake", Value::Bool(true)),
-            ])),
-        )
-    }
 }
 
 fn facility(sde: &crate::sde::Sde, id: i64) -> Result<Facility, CallError> {
@@ -165,10 +174,6 @@ fn facility(sde: &crate::sde::Sde, id: i64) -> Result<Facility, CallError> {
         .ok_or_else(|| notify_error(messages::NO_INDUSTRIAL_SERVICES))
 }
 
-/// The owner's materials in their item hangar at a facility: typeID -> quantity.
-async fn available(db: &(impl Executor + ?Sized), owner: i64, station: i64) -> Result<HashMap<i32, i64>, CallError> {
-    industry_dao::available(db, owner, station, FLAG_HANGAR).await.map_err(db_err)
-}
 
 
 impl Job {
@@ -183,13 +188,15 @@ impl Job {
             ("blueprintID", Value::Int(self.blueprint_id)),
             ("blueprintTypeID", Value::Int(self.blueprint_type as i64)),
             ("blueprintCopy", Value::Bool(self.blueprint_copy)),
-            ("blueprintLocationID", Value::Int(self.facility)),
-            ("blueprintLocationFlagID", Value::Int(FLAG_HANGAR as i64)),
+            ("blueprintLocationID", Value::Int(self.blueprint_location)),
+            ("blueprintLocationFlagID", Value::Int(self.blueprint_flag as i64)),
             ("facilityID", Value::Int(self.facility)),
             ("stationID", Value::Int(self.facility)),
             ("solarSystemID", Value::Int(self.system)),
-            ("outputLocationID", Value::Int(self.facility)),
-            ("outputFlagID", Value::Int(FLAG_HANGAR as i64)),
+            ("inputLocationID", Value::Int(self.input_location)),
+            ("inputFlagID", Value::Int(self.input_flag as i64)),
+            ("outputLocationID", Value::Int(self.output_location)),
+            ("outputFlagID", Value::Int(self.output_flag as i64)),
             ("runs", Value::Int(self.runs as i64)),
             ("licensedRuns", Value::Int(self.licensed_runs as i64)),
             ("successfulRuns", opt(self.successful_runs.map(|v| v as i64))),
@@ -209,18 +216,28 @@ impl Job {
     }
 }
 
-async fn job(db: &Db, id: i64) -> Result<Job, CallError> {
+async fn job(db: &(impl Executor + ?Sized), id: i64) -> Result<Job, CallError> {
     industry_dao::job(db, id).await.map_err(db_err)?
         .ok_or_else(|| user_error(messages::MSG_INDUSTRY_JOB_NOT_FOUND, vec![]))
 }
 
-fn tell_job<X>(outbox: &mut Outbox<X>, j: &Job) {
+async fn tell_job<X>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, j: &Job) -> Result<(), CallError> {
     let successful = j.successful_runs.map(|v| Value::Int(v as i64)).unwrap_or(Value::None);
     let args = vec![Value::Int(j.id), Value::Int(j.owner), Value::Int(j.blueprint_id), Value::Int(j.installer), Value::Int(j.status as i64), successful];
-    outbox.notify_pilot(j.installer, "OnIndustryJob", args);
-    outbox.notify_pilot(j.owner, "OnBlueprintsUpdated", vec![Value::Int(j.owner)]);
+    let mut recipients = if super::corps::is_player_corp(j.owner) {
+        crate::dao::characters::members::active_ids(db, j.owner).await.map_err(db_err)?
+    } else { vec![j.owner] };
+    recipients.sort_unstable();
+    recipients.dedup();
+    for recipient in recipients {
+        outbox.notify_pilot(recipient, "OnIndustryJob", args.clone());
+        outbox.notify_pilot(recipient, "OnBlueprintsUpdated", vec![Value::Int(j.owner)]);
+    }
+    Ok(())
 }
 
+mod authorization;
+pub(crate) mod completion;
 mod facility_manager;
 mod industry_manager;
 mod industry_monitor;

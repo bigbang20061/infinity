@@ -10,6 +10,7 @@ pub(crate) mod contacts;
 pub(crate) mod effects;
 pub(crate) mod fitting;
 pub(crate) mod gm;
+pub(crate) mod industry;
 pub(crate) mod repair;
 pub(crate) mod scheduler;
 pub(crate) mod lua;
@@ -419,8 +420,6 @@ pub(crate) fn analyzer_range(gap: f64, range: f64) -> String { format!("目标�
 pub(crate) const NO_INDUSTRIAL_SERVICES: &str = "该空间站没有工业服务。";
 /// Project exceeds duration limit.
 pub(crate) const INDUSTRY_PROJECT_TOO_LONG: &str = "该项目耗时过长，请减少流程数。";
-/// Corporation industry unsupported.
-pub(crate) const CORPORATION_INDUSTRY_UNSUPPORTED: &str = "暂不支持军团工业项目。";
 /// Blueprint is already in use.
 pub(crate) const BLUEPRINT_IN_USE: &str = "该蓝图正在被一个项目使用。";
 /// Activity unavailable at facility.

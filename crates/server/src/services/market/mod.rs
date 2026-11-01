@@ -449,6 +449,9 @@ async fn place_sell(c: &Client, item_id: i64, station_id: i64, type_id: i64, pri
     if item.owner_id != me || item.location_id != station_id || item.flag_id != FLAG_HANGAR || item.type_id as i64 != type_id {
         return Err(notify_error(messages::MARKET_SELL_ITEM_MUST_BE_IN_STATION_HANGAR));
     }
+    if crate::dao::industry::has_active_blueprint_job(db, &[item.item_id]).await.map_err(db_err)? {
+        return Err(notify_error(messages::industry::BLUEPRINT_ACTIVE));
+    }
     if item.singleton {
         return Err(user_error(messages::MSG_REPACKAGE_BEFORE_SELLING, vec![("item".into(), Value::Int(type_id))]));
     }

@@ -1,5 +1,5 @@
 //! `industryManager` dispatch for the client industry package, using industry jobs and blueprints.
-//! Corporation industry is not supported; cancellation only succeeds while a job is installed.
+//! Cancellation only succeeds while a job is installed.
 
 use super::*;
 
@@ -16,14 +16,18 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             let owner = int(0);
             let completed = call.args.get(1).is_some_and(|v| matches!(v, Value::Bool(true)) || v.as_int().is_some_and(|i| i != 0));
             let cutoff = if completed { filetime_now().saturating_sub(crate::config::game().industry.history_days.saturating_mul(FILETIME_DAY)) } else { 0 };
-            match industry_dao::jobs_by_owner(&c.db, owner, completed, INDUSTRY_JOB_STATUS_INSTALLED, cutoff).await {
-                Ok(rows) => Ok(Value::list(rows.iter().map(Job::keyval))),
-                Err(e) => Err(db_err(e)),
+            match authorization::owner(&c.db, me, owner, None).await {
+                Ok(()) => industry_dao::jobs_by_owner(&c.db, owner, completed, INDUSTRY_JOB_STATUS_INSTALLED, cutoff).await.map(|rows| Value::list(rows.iter().map(Job::keyval))).map_err(db_err),
+                Err(e) => Err(e),
             }
         }
-        ("industryManager", "GetJob") => job(&c.db, int(0)).await.map(|j| j.keyval()),
+        ("industryManager", "GetJob") => match job(&c.db, int(0)).await {
+            Ok(j) => authorization::owner(&c.db, me, j.owner, None).await.map(|()| j.keyval()),
+            Err(e) => Err(e),
+        },
         ("industryManager", "GetJobCounts") => {
-            job_counts(&c.db, int(0)).await.map(|counts| Value::Dict(counts.into_iter().map(|(a, n)| (Value::Int(a as i64), Value::Int(n))).collect()))
+            if int(0) != me { Err(user_error(messages::MSG_INDUSTRY_JOB_ACCESS_DENIED, vec![])) }
+            else { job_counts(&c.db, me).await.map(|counts| Value::Dict(counts.into_iter().map(|(a, n)| (Value::Int(a as i64), Value::Int(n))).collect())) }
         }
         // CompleteJob(jobID, solarSystemID)
         ("industryManager", "CompleteJob") => complete(c, int(0)).await.map(|_| Value::None),
@@ -48,25 +52,24 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         // CancelJob(jobID, solarSystemID): the materials and cost are lost.
         ("industryManager", "CancelJob") => {
             let _trading = lock().await;
-            match job(&c.db, int(0)).await {
-                Ok(mut j) if (j.owner == me || j.installer == me) && j.status == INDUSTRY_JOB_STATUS_INSTALLED => {
+            let db = c.db.clone();
+            let id = int(0);
+            db.transaction(
+                |tx, outbox: &mut Outbox| Box::pin(async move {
+                    let mut j = job(tx, id).await?;
+                    authorization::owner(tx, me, j.owner, None).await?;
                     j.status = STATUS_CANCELLED;
                     j.completed = Some(filetime_now());
                     j.completed_by = Some(me);
-                    match industry_dao::cancel_job(&c.db, &j, me, INDUSTRY_JOB_STATUS_INSTALLED).await {
-                        Ok(0) => Err(notify_error(messages::INDUSTRY_PROJECT_CANNOT_CANCEL)),
-                        Ok(_) => {
-                            info!("industry: {me} cancelled job {}", j.id);
-                            let mut outbox = Outbox::default();
-                            tell_job(&mut outbox, &j);
-                            dispatch_world(Value::None, outbox, &c.world)
-                        }
-                        Err(e) => Err(db_err(e)),
+                    if industry_dao::cancel_job(tx, &j, me, INDUSTRY_JOB_STATUS_INSTALLED).await.map_err(db_err)? == 0 {
+                        return Err(notify_error(messages::INDUSTRY_PROJECT_CANNOT_CANCEL));
                     }
-                }
-                Ok(_) => Err(notify_error(messages::INDUSTRY_PROJECT_CANNOT_CANCEL)),
-                Err(e) => Err(e),
-            }
+                    completion::cancel(tx, id).await?;
+                    tell_job(tx, outbox, &j).await?;
+                    Ok(Value::None)
+                }),
+                |value, outbox| async move { dispatch_client(value, outbox, c) },
+            ).await
         }
         _ => return None,
     })

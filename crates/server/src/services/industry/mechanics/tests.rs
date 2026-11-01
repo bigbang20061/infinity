@@ -1,4 +1,5 @@
-use super::{job_deadline, job_seconds, FILETIME_SECOND};
+use super::{fees, validate_quote, job_deadline, job_seconds, FILETIME_SECOND, MANUFACTURING, RESEARCH_TIME, RESEARCH_MATERIAL};
+use marshal::Value;
 
 #[test]
 fn duration_multiplier_applies_before_rounding_and_duration_guard() {
@@ -29,4 +30,39 @@ fn deadline_rejects_duration_multiplication_overflow() {
 #[test]
 fn deadline_rejects_timestamp_addition_overflow() {
     assert!(job_deadline(i64::MAX, 1).is_err());
+}
+
+#[test]
+fn fees_round_components_independently_and_index_unrounded_cost() {
+    let f = fees(10.6, MANUFACTURING, 0.45, 0.1, 0.14, 0.14, 0.14);
+    assert_eq!(f.indexed_cost, 1.0);
+    assert_eq!(f.facility_tax, 2.0);
+    assert_eq!(f.scc, 2.0);
+    assert_eq!(f.security_tax, 2.0);
+    assert_eq!(f.total(), 7.0);
+    let fractional = fees(10.6, MANUFACTURING, 0.44, 0.14, 0.0, 0.0, 0.14);
+    assert_eq!(fractional.indexed_cost, 1.0);
+    assert_eq!(fractional.security_tax, 0.0);
+}
+
+#[test]
+fn research_discount_applies_to_scc_only() {
+    for activity in [RESEARCH_TIME, RESEARCH_MATERIAL] {
+        let f = fees(100.0, activity, 0.5, 0.1, 0.1, 0.1, 0.1);
+        assert_eq!((f.indexed_cost, f.facility_tax, f.scc, f.security_tax, f.total()),
+            (10.0, 10.0, 5.0, 10.0, 35.0));
+    }
+}
+
+#[test]
+fn separate_optional_quotes_must_be_finite_numeric_and_match() {
+    let f = fees(100.0, MANUFACTURING, 0.5, 0.1, 0.2, 0.1, 0.1);
+    assert!(validate_quote(None, None, &f).is_ok());
+    assert!(validate_quote(Some(&Value::Int(10)), Some(&Value::Float(20.0)), &f).is_ok());
+    assert!(validate_quote(Some(&Value::Int(11)), None, &f).is_err());
+    assert!(validate_quote(None, Some(&Value::Int(21)), &f).is_err());
+    for bad in [Value::Float(f64::NAN), Value::Float(f64::INFINITY), Value::str("10"), Value::None, Value::Bool(true)] {
+        assert!(validate_quote(Some(&bad), None, &f).is_err());
+        assert!(validate_quote(None, Some(&bad), &f).is_err());
+    }
 }

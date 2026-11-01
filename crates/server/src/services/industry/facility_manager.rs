@@ -1,5 +1,5 @@
 //! `facilityManager` dispatch for the client industry package, using SDE station facilities.
-//! Corporation industry is not supported.
+//! NPC facility tax settings are read-only.
 
 use super::*;
 
@@ -28,16 +28,17 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         ("facilityManager", "GetFacilityLocations") => {
             let owner = call.args.get(1).and_then(|v| v.as_int()).unwrap_or(me);
             match facility(&c.sde, int(0)) {
-                Ok(f) if owner == me => Ok(Value::list([f.location(me)])),
-                Ok(_) | Err(CallError::User { .. }) => Ok(Value::list([])),
+                Ok(f) => authorization::locations(&c.db, &c.sde, me, owner, &f).await.map(|locations| Value::list(locations.iter().map(authorization::Location::value))),
+                Err(CallError::User { .. }) => Ok(Value::list([])),
                 Err(e) => Err(e),
             }
         }
         ("facilityManager", "GetMaxActivityModifiers") => {
             Ok(Value::Dict([MANUFACTURING, RESEARCH_TIME, RESEARCH_MATERIAL, COPYING, INVENTION].iter().map(|a| (Value::Int(*a as i64), Value::Float(1.0))).collect()))
         }
-        ("facilityManager", "GetFacilityTaxes") => Ok(Value::Dict(vec![])),
-        ("facilityManager", "SetFacilityTaxes") => Ok(Value::None),
+        ("facilityManager", "GetFacilityTaxes") => facility(&c.sde, int(0)).map(|f| f.tax_settings()),
+        ("facilityManager", "SetFacilityTaxes") => facility(&c.sde, int(0))
+            .and_then(|_| Err(notify_error(messages::industry::NPC_TAX_IMMUTABLE))),
 
         _ => return None,
     })
