@@ -44,7 +44,7 @@ async fn wait_flushes_queued_notifications_and_forwards_later_destiny() {
     let mut peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
     let (stream, address) = listener.accept().await.unwrap();
     let login = Login { user_id: 1, user_name: "test".into(), role: 0, client_id: 1, session_id: 1, language_id: "EN".into() };
-    let chat = crate::chat::Hub::new(&cfg.chat.domain);
+    let chat = crate::chat::Hub::new(&cfg.chat.domain, db.clone(), world.clone());
     let mut client = Client::new(Conn::new(stream, address), cfg, db, sde, chat, world, login);
     client.notify("OnDockingAccepted", vec![Value::Int(42)]);
     let tx = client.destiny_tx.clone();
@@ -124,7 +124,7 @@ async fn leave_does_not_remove_or_save_stale_unpiloted_hull() {
         let (stream, address) = listener.accept().await.unwrap();
         let cfg = Arc::new(Config::default());
         let login = Login { user_id: fixture.account, user_name: "fixture".into(), role: 0, client_id: 1, session_id: 1, language_id: "EN".into() };
-        let mut client = Client::new(Conn::new(stream, address), cfg.clone(), test_db.clone(), sde, crate::chat::Hub::new(&cfg.chat.domain), test_world.clone(), login);
+        let mut client = Client::new(Conn::new(stream, address), cfg.clone(), test_db.clone(), sde, crate::chat::Hub::new(&cfg.chat.domain, test_db.clone(), test_world.clone()), test_world.clone(), login);
         client.session.apply(vec![("charid", Value::Int(fixture.character)), ("shipid", Value::Int(fixture.ship)), ("solarsystemid", Value::Int(1))]);
         client.leave_world().await.unwrap();
         assert!(test_world.ball(1, fixture.ship).await.is_some());

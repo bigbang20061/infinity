@@ -22,13 +22,11 @@ mod jump_timers;
 mod ship;
 mod macho_net;
 mod chat_authentication_service;
-mod xmpp_chat_mgr;
 
 pub(super) async fn root(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     match call.service {
         "machoNet" => macho_net::dispatch(c, call).await,
         "chatAuthenticationService" => chat_authentication_service::dispatch(c, call).await,
-        "XmppChatMgr" => xmpp_chat_mgr::dispatch(c, call).await,
         _ => None,
     }
 }

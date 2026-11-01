@@ -391,7 +391,7 @@ async fn gm_damage_survives_reload_and_snapshot_then_heal_clears_it() {
     let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
     let (stream, addr) = listener.accept().await.unwrap();
     let login = Login { user_id: account, user_name: account.to_string(), role: 0, client_id: owner, session_id: owner, language_id: "EN".into() };
-    let c = Client::new(Conn::new(stream, addr), Arc::new(Config::default()), db.clone(), sde, crate::chat::Hub::new("localhost"), world.clone(), login);
+    let c = Client::new(Conn::new(stream, addr), Arc::new(Config::default()), db.clone(), sde, crate::chat::Hub::new("localhost", db.clone(), world.clone()), world.clone(), login);
     let stats = ship_stats(&db, &world, system, owner, ship).await.ok().unwrap();
     let before = dogma::overrides(&db, ship).await.unwrap().len();
     set_damage(&c, system, ship, owner + 1, [false, true, true], 0.5).await.ok().unwrap();

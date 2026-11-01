@@ -66,7 +66,7 @@ async fn perform_scan_uses_online_survey_range_then_integrated_range() {
         let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (stream, address) = listener.accept().await.unwrap();
         let login = crate::handshake::Login { user_id: account, user_name: "test".into(), role: 0, client_id: 1, session_id: 1, language_id: "EN".into() };
-        let chat = crate::chat::Hub::new(&cfg.chat.domain);
+        let chat = crate::chat::Hub::new(&cfg.chat.domain, test_db.clone(), test_world.clone());
         let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg, test_db.clone(), sde, chat, test_world, login);
         client.session.apply(vec![("charid", Value::Int(character)), ("shipid", Value::Int(ship)), ("solarsystemid", Value::Int(system))]);
         let expected_inner = Value::tuple([Value::Int(inner), Value::Int(ore as i64), Value::Int(17)]);

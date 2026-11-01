@@ -11,6 +11,9 @@ pub const CATEGORY_IMPLANT: i32 = 20;
 /// Client inventorycommon.const.groupBooster.
 pub const GROUP_BOOSTER: i32 = 303;
 
+/// `inventorycommon/const.py:48-59`: first wormhole solar-system ID.
+pub const WORMHOLE_SYSTEM_START: i64 = 31_000_000;
+
 
 /// `dogma/const.py` dgmGroupableGroupIDs: weapon groups permitted in banks.
 pub const GROUPABLE_GROUP_IDS: [i64; 19] = [53, 55, 56, 74, 506, 507, 508, 509, 510, 511, 512, 524, 771, 1245, 1327, 1328, 1562, 1673, 1674];

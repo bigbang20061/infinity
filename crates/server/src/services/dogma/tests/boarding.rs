@@ -19,7 +19,8 @@ async fn reconciled_ship_state_is_a_four_tuple_under_outer_lock() {
         let cfg = Arc::new(crate::config::Config::default());
         let world = crate::space::World::new(test_db.clone(), sde.clone(), 1);
         let login = crate::handshake::Login { user_id: fixture.account, user_name: "fixture".into(), role: 0, client_id: 1, session_id: 1, language_id: "EN".into() };
-        let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg.clone(), test_db, sde, crate::chat::Hub::new(&cfg.chat.domain), world, login);
+        let chat = crate::chat::Hub::new(&cfg.chat.domain, test_db.clone(), world.clone());
+        let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg.clone(), test_db, sde, chat, world, login);
         assert!(ship_state_core(&client, fixture.ship).await.is_err());
         client.session.apply(vec![("charid", Value::Int(fixture.character)), ("shipid", Value::Int(fixture.ship))]);
         let _lock = crate::services::market::lock().await;

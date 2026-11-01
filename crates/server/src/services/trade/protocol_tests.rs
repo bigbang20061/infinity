@@ -8,7 +8,8 @@ async fn client(db: Db, sde: Arc<Sde>, world: Arc<World>, user: i64, character: 
     let peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
     let (stream, addr) = listener.accept().await.unwrap();
     let login = Login { user_id: user, user_name: user.to_string(), role: 0, client_id: character, session_id: character, language_id: "EN".into() };
-    let mut client = Client::new(Conn::new(stream, addr), Arc::new(Config::default()), db, sde, crate::chat::Hub::new("localhost"), world, login);
+    let chat = crate::chat::Hub::new("localhost", db.clone(), world.clone());
+    let mut client = Client::new(Conn::new(stream, addr), Arc::new(Config::default()), db, sde, chat, world, login);
     client.session.apply(vec![("charid", Value::Int(character)), ("stationid", Value::Int(station)), ("shipid", Value::Int(0))]);
     (client, peer)
 }

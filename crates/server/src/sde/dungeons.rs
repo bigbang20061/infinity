@@ -3,10 +3,7 @@
 //! Sources are `sde_native.dungeons` and the loaded SDE map; live dungeon layouts are excluded.
 
 use std::collections::HashMap;
-use crate::{consts::GROUP_PLANET, dao, db::Db, sde::map::Map};
-
-/// Existing exploration SQL's boundary between known space and wormhole systems.
-const WORMHOLE_SYSTEM_START: i64 = 31_000_000;
+use crate::{consts::{GROUP_PLANET, WORMHOLE_SYSTEM_START}, dao, db::Db, sde::map::Map};
 /// Existing exploration SQL's exclusive destination-system upper bound.
 const DESTINATION_SYSTEM_END: i64 = 31_002_605;
 /// Existing exploration SQL excludes Jove regions from destinations.

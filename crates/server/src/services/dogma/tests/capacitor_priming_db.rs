@@ -46,7 +46,7 @@ async fn ship_get_info_priming_does_not_refill_capacitor() {
         let (stream, address) = listener.accept().await.unwrap();
         let cfg = Arc::new(crate::config::Config::default());
         let login = crate::handshake::Login { user_id: fixture.account, user_name: "fixture".into(), role: 0, client_id: 1, session_id: 1, language_id: "EN".into() };
-        let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg.clone(), test_db.clone(), sde, crate::chat::Hub::new(&cfg.chat.domain), test_world.clone(), login);
+        let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg.clone(), test_db.clone(), sde, crate::chat::Hub::new(&cfg.chat.domain, test_db.clone(), test_world.clone()), test_world.clone(), login);
         client.session.apply(vec![("charid", Value::Int(fixture.character)), ("shipid", Value::Int(fixture.ship)), ("solarsystemid", Value::Int(system))]);
         let fit = fit::Fit::load_in_space(&test_db, &test_world, system, fixture.character, fixture.ship).await.ok().expect("fit");
         let capacity = fit.value(fit::Key::Ship, ATTR_CAPACITOR_CAPACITY);

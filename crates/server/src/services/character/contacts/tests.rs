@@ -136,7 +136,7 @@ async fn service_contacts_and_presence() {
     let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
     let (stream, address) = listener.accept().await.unwrap();
     let mut client = Client::new(Conn::new(stream, address), Arc::new(crate::config::Config::default()), db.clone(), sde,
-        crate::chat::Hub::new("localhost"), world.clone(),
+        crate::chat::Hub::new("localhost", db.clone(), world.clone()), world.clone(),
         Login { user_id: account, user_name: name, role: 0, client_id: 1, session_id: 1, language_id: "EN".into() });
     client.session.apply(vec![("charid", Value::Int(owner))]);
     let (owner_tx, mut owner_rx) = tokio::sync::mpsc::unbounded_channel();

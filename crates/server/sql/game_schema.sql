@@ -52,6 +52,51 @@ BEGIN
 END $$;
 CREATE UNIQUE INDEX IF NOT EXISTS characters_name_idx ON game.characters (lower(name)) WHERE NOT deleted;
 CREATE INDEX IF NOT EXISTS characters_user_idx ON game.characters (user_id);
+
+-- dao/chat_channels: durable custom room metadata and access control.
+CREATE SEQUENCE IF NOT EXISTS game.chat_channel_id_seq;
+CREATE TABLE IF NOT EXISTS game.chat_channels (
+    name text PRIMARY KEY,
+    category text NOT NULL CHECK (category IN ('player', 'private')),
+    display_name text NOT NULL,
+    owner_id bigint NOT NULL REFERENCES game.characters(character_id),
+    public boolean NOT NULL DEFAULT false,
+    motd text NOT NULL DEFAULT '',
+    moderated boolean NOT NULL DEFAULT false,
+    members_by_default boolean NOT NULL DEFAULT true,
+    private_low bigint REFERENCES game.characters(character_id),
+    private_high bigint REFERENCES game.characters(character_id),
+    CHECK (owner_id > 0),
+    CHECK (
+        (category = 'player' AND name ~ '^player_[1-9][0-9]*$'
+         AND private_low IS NULL AND private_high IS NULL)
+        OR
+        (category = 'private' AND private_low IS NOT NULL AND private_high IS NOT NULL
+         AND private_low > 0 AND private_low < private_high
+         AND owner_id IN (private_low, private_high) AND NOT public
+         AND name = 'private_' || private_low::text || '_' || private_high::text)
+    )
+);
+CREATE UNIQUE INDEX IF NOT EXISTS chat_channels_player_display_name_idx
+    ON game.chat_channels (lower(display_name)) WHERE category = 'player';
+CREATE TABLE IF NOT EXISTS game.chat_channel_members (
+    channel_name text NOT NULL REFERENCES game.chat_channels(name) ON DELETE CASCADE,
+    character_id bigint NOT NULL REFERENCES game.characters(character_id),
+    affiliation text NOT NULL CHECK (affiliation IN ('none', 'member', 'admin', 'outcast')),
+    invited boolean NOT NULL DEFAULT false,
+    voice text NOT NULL DEFAULT 'default' CHECK (voice IN ('default', 'muted', 'voiced')),
+    voice_expires_at bigint CHECK (voice_expires_at IS NULL OR voice_expires_at > 0),
+    ban_expires_at bigint CHECK (ban_expires_at IS NULL OR ban_expires_at > 0),
+    PRIMARY KEY (channel_name, character_id),
+    CHECK (character_id > 0)
+);
+CREATE INDEX IF NOT EXISTS chat_channel_members_character_idx
+    ON game.chat_channel_members (character_id, channel_name);
+-- Special-room MOTDs are metadata only; session authority controls admission.
+CREATE TABLE IF NOT EXISTS game.chat_system_motds (
+    channel_name text PRIMARY KEY CHECK (channel_name ~ '^(corp|alliance)_[1-9][0-9]*$'),
+    motd text NOT NULL DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS game.items (
     item_id     bigserial PRIMARY KEY,
     type_id     integer NOT NULL,

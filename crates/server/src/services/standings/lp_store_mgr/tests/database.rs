@@ -91,7 +91,7 @@ async fn committed_settlement_and_refusals_are_atomic() {
         let mut peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (stream, address) = listener.accept().await.unwrap();
         let login = crate::handshake::Login { user_id: f.account, user_name: "test".into(), role: 0, client_id: 1, session_id: 1, language_id: "EN".into() };
-        let chat = crate::chat::Hub::new(&cfg.chat.domain);
+        let chat = crate::chat::Hub::new(&cfg.chat.domain, test_db.clone(), world.clone());
         let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg, test_db.clone(), sde, chat, world, login);
         client.change_session(vec![("charid", Value::Int(f.buyer)), ("corpid", Value::Int(f.corp)), ("stationid", Value::Int(f.station)), ("corpAccountKey", Value::Int(i64::from(ACCOUNT_CASH)))]);
         assert!(take_offer(&mut client, f.issuer, f.offer, 2, false).await.is_ok());
