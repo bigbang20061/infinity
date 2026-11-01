@@ -396,6 +396,20 @@ pub const ATTR_ARMOR_DAMAGE_AMOUNT: i32 = 84;
 pub const ATTR_STRUCTURE_DAMAGE_AMOUNT: i32 = 83;
 /// SDE dgmAttributeTypes: charged_armor_damage_multiplier.
 pub const ATTR_CHARGED_ARMOR_DAMAGE_MULTIPLIER: i32 = 1886;
+/// Client dogma.const attributeLowSlots.
+pub const ATTR_LOW_SLOTS: i32 = 12;
+/// Client dogma.const attributeMedSlots.
+pub const ATTR_MED_SLOTS: i32 = 13;
+/// Client dogma.const attributeHiSlots.
+pub const ATTR_HI_SLOTS: i32 = 14;
+/// Client dogma.const attributeRigSlots.
+pub const ATTR_RIG_SLOTS: i32 = 1137;
+/// Client dogma.const attributeHeatLow.
+pub const ATTR_HEAT_LOW: i32 = 1177;
+/// Client dogma.const attributeHeatMed.
+pub const ATTR_HEAT_MED: i32 = 1176;
+/// Client dogma.const attributeHeatHi.
+pub const ATTR_HEAT_HI: i32 = 1175;
 /// SDE dgmEffects: npcBehaviorRemoteArmorRepairer.
 pub const EFFECT_NPC_BEHAVIOR_REMOTE_ARMOR: i32 = 6741;
 /// SDE dgmEffects: npcBehaviorRemoteShieldBooster.

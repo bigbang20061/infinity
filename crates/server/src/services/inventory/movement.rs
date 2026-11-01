@@ -16,6 +16,7 @@ const MAX_CARGO_CONTAINER_TRANSFER_DISTANCE: f64 = 2500.0;
 pub(super) enum MoveEffect {
     Bank(super::super::combat::banks::BankStop),
     Online(super::super::effects::online::OnlineChanged),
+    ClearHeat(i64, Vec<i64>),
 }
 
 impl From<super::super::effects::online::OnlineChanged> for MoveEffect {
@@ -28,6 +29,7 @@ pub(super) fn dispatch_move<T>(value: T, outbox: Outbox<MoveEffect>, c: &Client,
         match entry {
             Effect::Operation(MoveEffect::Bank(stop)) => super::super::combat::banks::apply_stop(stop),
             Effect::Operation(MoveEffect::Online(change)) => super::super::effects::online::apply_online_changed(change),
+            Effect::Operation(MoveEffect::ClearHeat(ship, modules)) => super::super::effects::heat::clear_modules(ship, &modules),
             Effect::Notification(notification) => super::super::effects::online::dispatch_notification(gm::route_target(notification, target, c.session.int("charid")), c)?,
             Effect::Event(event) => crate::lua::on_event(event),
         }
@@ -147,6 +149,11 @@ pub(crate) async fn move_item(c: &mut Client, container: &Container, item_id: i6
                 }
                 let before = if departure && !online { Some(super::super::combat::banks::snapshot(tx, item.location_id, &[item.item_id]).await?) } else { None };
                 let master = if departure && !online { super::super::combat::targeting_charges::master_for_member(tx, item.location_id, item.item_id).await? } else { item.item_id };
+                if departure && !online {
+                    let mut modules = super::super::combat::targeting_charges::bank(tx, item.location_id, master).await?;
+                    if !modules.contains(&item.item_id) { modules.push(item.item_id); }
+                    outbox.operation(MoveEffect::ClearHeat(item.location_id, modules));
+                }
                 let moved_id = move_core(tx, &sde, outbox, &item, owner, location, flag, take).await?;
                 if is_fitting_flag(flag) {
                     super::super::effects::fitting::validate_fit(tx, sde.clone(), owner, location, moved_id).await?;

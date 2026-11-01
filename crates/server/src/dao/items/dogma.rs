@@ -32,6 +32,11 @@ pub(crate) async fn set_override(ex: &(impl Executor + ?Sized), item: i64, attri
     Ok(ex.execute("WITH target AS (SELECT item_id FROM game.items WHERE item_id = $1 AND singleton FOR UPDATE) INSERT INTO game.item_attributes (item_id, attribute_id, value) SELECT item_id, $2, $3 FROM target ON CONFLICT (item_id, attribute_id) DO UPDATE SET value = EXCLUDED.value", &[&item, &attribute, &value]).await? != 0)
 }
 
+/// Write an override only if its previously observed value has not changed.
+pub(crate) async fn set_override_if(ex: &(impl Executor + ?Sized), item: i64, attribute: i32, old: Option<f64>, value: f64) -> Result<bool, Error> {
+    Ok(ex.execute("WITH target AS (SELECT item_id FROM game.items WHERE item_id = $1 AND singleton FOR UPDATE) INSERT INTO game.item_attributes (item_id, attribute_id, value) SELECT item_id, $2, $4 FROM target WHERE $3::float8 IS NULL OR EXISTS (SELECT 1 FROM game.item_attributes WHERE item_id = $1 AND attribute_id = $2 AND value = $3) ON CONFLICT (item_id, attribute_id) DO UPDATE SET value = EXCLUDED.value WHERE game.item_attributes.value = $3", &[&item, &attribute, &old, &value]).await? != 0)
+}
+
 pub(crate) async fn clear_override(ex: &(impl Executor + ?Sized), item: i64, attribute: i32) -> Result<(), Error> {
     ex.execute("DELETE FROM game.item_attributes WHERE item_id = $1 AND attribute_id = $2", &[&item, &attribute]).await?;
     Ok(())

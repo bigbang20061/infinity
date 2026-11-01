@@ -12,6 +12,7 @@ pub(crate) mod projected;
 pub(crate) mod range;
 pub(crate) mod environment;
 pub(crate) mod notify;
+pub(crate) mod heat;
 pub(crate) mod unsupported;
 pub(crate) mod propulsion;
 pub(crate) mod weapons;

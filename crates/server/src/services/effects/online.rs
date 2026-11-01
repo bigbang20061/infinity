@@ -25,6 +25,8 @@ pub(in crate::services) struct OnlinePolicy {
 
 pub(in crate::services) struct OnlineChanged {
     pub bank_stops: Vec<crate::services::combat::banks::BankStop>,
+    pub ship: i64,
+    pub clear_heat: Vec<i64>,
 }
 
 impl OnlinePolicy {
@@ -46,6 +48,10 @@ pub(in crate::services) async fn set_online_core<E: From<OnlineChanged> + Send>(
     if !crate::dao::items::ship::lock_reload_ship(ex, ship).await.map_err(db_err)? { return Err(refuse()); }
     let (hull, module) = subject_core(ex, sde, policy, ship, item, EFFECT_ONLINE as i32, false).await?;
     let was_online = crate::dao::items::dogma::online(ex, ship).await.map_err(db_err)?.iter().any(|entry| entry.item_id == item);
+    if online {
+        let fit = crate::services::fit::Fit::load(ex, sde.clone(), policy.owner, ship).await?;
+        super::heat::damage::validate(&fit, item)?;
+    }
     if was_online == online && online {
         reconcile_core(ex, sde, outbox, policy.owner, ship).await?;
         return Ok(false);
@@ -67,6 +73,7 @@ async fn mutate_online<E: From<OnlineChanged> + Send>(
     let owner = hull.owner_id;
     let before = if online { None } else { Some(crate::services::combat::banks::snapshot(ex, ship, &[item]).await?) };
     let master = if online { item } else { crate::services::combat::targeting_charges::master_for_member(ex, ship, item).await? };
+    let clear_heat = if online { Vec::new() } else { crate::services::combat::targeting_charges::bank(ex, ship, master).await? };
     let item_stop = if online { None } else { crate::services::combat::banks::capture_stop(item) };
     let changed = was_online != online;
     if changed && crate::dao::items::combat::set_online(ex, item, ship, owner, module.flag_id, module.type_id, hull.type_id, hull.location_id, hull.flag_id, hull.singleton, online).await.map_err(db_err)? == 0 { return Err(refuse()); }
@@ -79,9 +86,9 @@ async fn mutate_online<E: From<OnlineChanged> + Send>(
             queue_notification(outbox, notify, owner, "OnWeaponBanksChanged", vec![Value::Int(ship), crate::services::combat::banks(ex, ship).await?]);
         }
     }
-    if changed || bank_changed {
+    if changed || bank_changed || !clear_heat.is_empty() {
         bank_stops.extend(item_stop);
-        outbox.operation(OnlineChanged { bank_stops }.into());
+        outbox.operation(OnlineChanged { bank_stops, ship, clear_heat }.into());
     }
     if changed {
         let now = filetime_now();
@@ -101,6 +108,7 @@ fn queue_notification<E>(outbox: &mut Outbox<E>, sender: Option<&NotifyTx>, owne
 
 pub(in crate::services) fn apply_online_changed(change: OnlineChanged) {
     for stop in change.bank_stops { crate::services::combat::banks::apply_stop(stop); }
+    if !change.clear_heat.is_empty() { super::heat::clear_modules(change.ship, &change.clear_heat); }
 }
 pub(in crate::services) fn dispatch_notification(notification: crate::db::outbox::Notification, c: &Client) -> Result<(), CallError> {
     match notification {
@@ -161,6 +169,15 @@ pub(in crate::services) async fn reconcile_core<E: From<OnlineChanged> + Send>(
     if !crate::dao::items::ship::lock_reload_ship(ex, ship).await.map_err(db_err)? { return Err(refuse()); }
     let hull = load_items(ex, sde, ItemQuery::Id(ship)).await.map_err(db_err)?.into_iter().next().ok_or_else(refuse)?;
     if hull.owner_id != owner || hull.category_id != i64::from(crate::consts::CATEGORY_SHIP) || !hull.singleton { return Err(refuse()); }
+    let fit = crate::services::fit::Fit::load(ex, sde.clone(), owner, ship).await?;
+    let mut burnt = crate::dao::items::dogma::online(ex, ship).await.map_err(db_err)?;
+    burnt.sort_unstable_by_key(|module| module.item_id);
+    for entry in burnt {
+        if !super::heat::damage::burnt(&fit, entry.item_id) { continue; }
+        let module = load_items(ex, sde, ItemQuery::Id(entry.item_id)).await.map_err(db_err)?.into_iter().next().ok_or_else(refuse)?;
+        if module.owner_id != owner || module.location_id != ship || !module.singleton || !crate::services::inventory::is_fitting_flag(module.flag_id) { return Err(refuse()); }
+        if !mutate_online(ex, outbox, &hull, &module, false, true, None).await? { return Err(refuse()); }
+    }
     let mut remaining = crate::dao::items::dogma::online(ex, ship).await.map_err(db_err)?.len();
     while let Some(item) = super::fitting::overload_candidate(ex, sde.clone(), owner, ship).await? {
         if remaining == 0 { return Err(refuse()); }
