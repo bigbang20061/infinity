@@ -1,10 +1,13 @@
 //! Industry job calculations and lifecycle for the client industry package.
-//! Uses blueprint SDE data and game jobs, items and wallets; corporation jobs are unsupported.
+//! Uses blueprint SDE data and game jobs, items and authorized wallets.
 //! Job durations include the configured industry time multiplier; NPC fees use the published
 //! facility policy and submitted cost and facility-tax quotes are checked before settlement.
 
 use super::*;
 use crate::sde::{Sde, industry::Activity};
+use crate::dao::items::quantities::{self, QuantityChange};
+use crate::services::{inventory, items, wallets};
+use std::collections::BTreeMap;
 
 
 /// industryCommon.GetBlueprintPrice: the adjusted value of what the blueprint's manufacturing
@@ -124,10 +127,13 @@ async fn plan(
         .materials
         .iter()
         .map(|(t, q)| {
-            let quantity = ((*q as f64 * me_factor * material_runs) * 100.0).round() / 100.0;
-            (*t, (quantity.ceil() as i64).max(runs as i64))
+            let quantity = (((*q as f64 * me_factor * material_runs) * 100.0).round() / 100.0).ceil();
+            if !quantity.is_finite() || quantity >= i64::MAX as f64 {
+                return Err(notify_error(messages::BLUEPRINT_RUN_COUNT_EXCEEDED));
+            }
+            Ok((*t, (quantity as i64).max(runs as i64)))
         })
-        .collect();
+        .collect::<Result<_, CallError>>()?;
     let mut probability = 1.0;
     if activity_id == INVENTION {
         let base = act.products.iter().map(|p| p.2).sum::<f64>() / act.products.len().max(1) as f64;
@@ -211,20 +217,18 @@ pub(super) async fn job_counts(db: &(impl Executor + ?Sized), installer: i64) ->
 }
 
 /// `InstallJob(job.dump())` -> jobID.
-pub(super) async fn install(c: &Client, request: &Value) -> CallResult {
-    let (db, world) = (&c.db, &*c.world);
+pub(super) async fn install(c: &mut Client, request: &Value) -> CallResult {
+    let db = c.db.clone();
     let me = c.session.int("charid").unwrap_or(0);
     let int = |k: &str| request.get(k).filter(|v| !v.is_none()).and_then(|v| v.as_int());
-    let activity_id = int("activityID").unwrap_or(0) as i32;
+    let activity_id = int("activityID").and_then(|n| i32::try_from(n).ok()).unwrap_or(0);
     let max_runs = crate::config::game().industry.max_runs.min(i32::MAX as i64) as i32;
-    let runs = int("runs").unwrap_or(1).clamp(1, max_runs as i64) as i32;
-    let licensed_runs = int("licensedRuns").unwrap_or(1).max(1) as i32;
-    let account_owner = request.get("account").and_then(|v| v.items()).and_then(|a| a.first()).and_then(|v| v.as_int()).unwrap_or(me);
-    if account_owner != me {
-        return Err(notify_error(messages::CORPORATION_INDUSTRY_UNSUPPORTED));
-    }
+    let runs = i32::try_from(int("runs").unwrap_or(1)).ok().filter(|n| *n > 0 && *n <= max_runs)
+        .ok_or_else(|| notify_error(messages::BLUEPRINT_RUN_COUNT_EXCEEDED))?;
+    let licensed_runs = i32::try_from(int("licensedRuns").unwrap_or(1)).ok().filter(|n| *n > 0)
+        .ok_or_else(|| notify_error(messages::BLUEPRINT_RUN_COUNT_EXCEEDED))?;
     let requested: HashMap<i32, i64> = match request.get("materials") {
-        Some(Value::Dict(pairs)) => pairs.iter().filter_map(|(k, v)| Some((k.as_int()? as i32, v.as_int().unwrap_or(0)))).collect(),
+        Some(Value::Dict(pairs)) => pairs.iter().filter_map(|(k, v)| Some((i32::try_from(k.as_int()?).ok()?, v.as_int().unwrap_or(0)))).collect(),
         _ => HashMap::new(),
     };
     let quoted_cost = request.get("cost").cloned();
@@ -232,11 +236,14 @@ pub(super) async fn install(c: &Client, request: &Value) -> CallResult {
     let _trading = lock().await;
     let blueprint_id = int("blueprintID").unwrap_or(0);
     let facility_id = int("facilityID").unwrap_or(0);
-    let product_request = int("productTypeID").map(|p| p as i32);
+    let product_request = int("productTypeID").and_then(|p| i32::try_from(p).ok());
     let here = c.session.int("solarsystemid2").unwrap_or(0);
     let ship = c.session.int("shipid").unwrap_or(0);
-    let fit = Arc::new(Fit::load(db, c.sde.clone(), me, ship).await?);
+    let fit = Arc::new(if let Some(system) = c.session.int("solarsystemid") {
+        Fit::load_in_space(&db, &c.world, system, me, ship).await?
+    } else { Fit::load(&db, c.sde.clone(), me, ship).await? });
     let sde = Arc::clone(&c.sde);
+    let request = request.clone();
     let now = filetime_now();
     let j = db.transaction(
         |tx, outbox: &mut Outbox| {
@@ -245,12 +252,19 @@ pub(super) async fn install(c: &Client, request: &Value) -> CallResult {
             let sde = Arc::clone(&sde);
             let quoted_cost = quoted_cost.clone();
             let quoted_tax = quoted_tax.clone();
+            let request = request.clone();
             Box::pin(async move {
                 let mut bp = blueprint(tx, &sde, blueprint_id).await?;
-                if bp.owner != me {
-                    return Err(user_error(messages::MSG_INDUSTRY_BLUEPRINT_ACCESS_DENIED, vec![]));
+                authorization::owner(tx, me, bp.owner, Some(activity_id)).await?;
+                if request.get("characterID").and_then(Value::as_int).is_some_and(|id| id != me) {
+                    return Err(user_error(messages::MSG_INDUSTRY_JOB_ACCESS_DENIED, vec![]));
                 }
-                let busy = industry_dao::blueprint_busy(tx, bp.item_id, INDUSTRY_JOB_STATUS_INSTALLED).await.map_err(db_err)?;
+                if let Some(corp) = request.get("corporationID").and_then(Value::as_int) {
+                    if super::super::corps::membership(tx, me).await?.0 != corp {
+                        return Err(user_error(messages::MSG_INDUSTRY_JOB_ACCESS_DENIED, vec![]));
+                    }
+                }
+                let busy = industry_dao::has_active_blueprint_job(tx, &[bp.item_id]).await.map_err(db_err)?;
                 if busy {
                     return Err(notify_error(messages::BLUEPRINT_IN_USE));
                 }
@@ -261,6 +275,13 @@ pub(super) async fn install(c: &Client, request: &Value) -> CallResult {
                 if bp.station != Some(fac.id) {
                     return Err(notify_error(messages::BLUEPRINT_MUST_BE_AT_FACILITY));
                 }
+                let locations = authorization::locations(tx, &sde, me, bp.owner, &fac).await?;
+                if !locations.iter().any(|l| l.item_id == bp.location && l.flag_id == bp.flag && l.can_view) {
+                    return Err(user_error(messages::MSG_INDUSTRY_BLUEPRINT_ACCESS_DENIED, vec![]));
+                }
+                let input = authorization::select_location(request.get("inputLocation"), &locations, true)?;
+                let output = authorization::select_location(request.get("outputLocation"), &locations, false)?;
+                let (wallet_owner, wallet_account_key) = authorization::payer(tx, me, request.get("account")).await?;
                 let Some(act) = sde.industry.activity(bp.type_id, activity_id) else {
                     return Err(notify_error(messages::BLUEPRINT_ACTIVITY_INVALID));
                 };
@@ -319,39 +340,53 @@ pub(super) async fn install(c: &Client, request: &Value) -> CallResult {
                 validate_quote(quoted_cost.as_ref(), quoted_tax.as_ref(), &p.fees)?;
                 let end = job_deadline(now, p.seconds)?;
 
-                let have = available(tx, me, fac.id).await?;
-                if let Some((t, q)) = p.materials.iter().find(|(t, q)| have.get(t).copied().unwrap_or(0) < *q) {
-                    return Err(notify_error(&messages::required_materials_message(q, t)));
-                }
-                debit(tx, outbox, me, p.fees.total()).await?;
+                let mut changes = BTreeMap::new();
+                let mut originals = BTreeMap::new();
                 for (type_id, quantity) in &p.materials {
                     let mut left = *quantity;
-                    let stacks = load_items(tx, &sde, ItemQuery::OwnerLocationFlagTypeStackAscending(me, fac.id, FLAG_HANGAR, *type_id)).await.map_err(db_err)?;
+                    let stacks = load_items(tx, &sde, ItemQuery::OwnerLocationFlagTypeStackAscending(bp.owner, input.item_id, input.flag_id, *type_id)).await.map_err(db_err)?;
                     for s in stacks {
-                        if left == 0 {
-                            break;
-                        }
-                        let n = (s.quantity as i64).min(left);
-                        take_items(tx, outbox, s, n as i32).await?;
+                        let remaining = changes.get(&s.item_id).and_then(|change: &QuantityChange| change.quantity).unwrap_or(s.quantity);
+                        if changes.get(&s.item_id).is_some_and(|change| change.quantity.is_none()) { continue; }
+                        let n = i64::from(remaining).min(left);
+                        if n <= 0 { break; }
+                        let quantity = remaining - n as i32;
+                        changes.insert(s.item_id, QuantityChange::new(&s, (quantity > 0).then_some(quantity)));
+                        originals.insert(s.item_id, s);
                         left -= n;
+                        if left == 0 { break; }
                     }
+                    if left != 0 { return Err(notify_error(&messages::required_materials_message(quantity, type_id))); }
                 }
-                // A blueprint in a stack is split off as its own item for the job.
+                if !quantities::apply(tx, &changes).await.map_err(db_err)? {
+                    return Err(notify_error(messages::STACK_CANNOT_BE_SPLIT));
+                }
+                for (id, change) in &changes {
+                    if change.quantity.is_some() {
+                        inventory::notify_item_change(tx, &sde, outbox, *id, vec![(IX_STACK_SIZE, Value::Int(change.expected_quantity as i64))]).await?;
+                    } else if let Some(item) = originals.remove(id) { inventory::notify_item_removed(outbox, item); }
+                }
+                if wallet_owner == me { wallets::debit(tx, outbox, me, p.fees.total()).await?; }
+                else { wallets::corp_debit(tx, outbox, wallet_owner, wallet_account_key, p.fees.total()).await?; }
+                // Split a blueprint stack without changing its owner's physical custody.
                 if !bp.singleton {
-                    let location = industry_dao::item_location(tx, bp.item_id).await.map_err(db_err)?;
-                    if bp.quantity > 1 {
-                        let stack = load_items(tx, &sde, ItemQuery::Id(bp.item_id)).await.map_err(db_err)?.pop().ok_or_else(|| user_error(messages::MSG_BLUEPRINT_NOT_FOUND, vec![]))?;
-                        take_items(tx, outbox, stack, 1).await?;
-                        bp.item_id = crate::dao::items::creation::rookie_ship(tx, bp.type_id, me, location, FLAG_HANGAR).await.map_err(db_err)?;
-                        show_items(tx, &sde, outbox, me, location, &[bp.item_id], LOCATION_JUNKYARD).await?;
+                    let stack = load_items(tx, &sde, ItemQuery::Id(bp.item_id)).await.map_err(db_err)?.pop().ok_or_else(|| user_error(messages::MSG_BLUEPRINT_NOT_FOUND, vec![]))?;
+                    if stack.quantity > 1 {
+                        bp.item_id = inventory::split_stack(tx, &stack, 1, bp.owner, bp.location, bp.flag, true).await?;
+                        set_blueprint(tx, bp.item_id, bp.me, bp.te, bp.runs).await?;
+                        inventory::notify_item_change(tx, &sde, outbox, stack.item_id, vec![(IX_STACK_SIZE, Value::Int(stack.quantity as i64))]).await?;
+                        inventory::notify_item_change(tx, &sde, outbox, bp.item_id, vec![(IX_LOCATION_ID, Value::Int(LOCATION_JUNKYARD))]).await?;
                     } else {
-                        industry_dao::make_singleton(tx, bp.item_id).await.map_err(db_err)?;
+                        if !crate::dao::items::inventory::move_item(tx, &stack, bp.location, bp.flag, bp.owner, true).await.map_err(db_err)? {
+                            return Err(notify_error(messages::STACK_CANNOT_BE_SPLIT));
+                        }
+                        inventory::notify_item_change(tx, &sde, outbox, bp.item_id, vec![(crate::consts::IX_SINGLETON, Value::Bool(false))]).await?;
                     }
                 }
                 let mut j = Job {
                     id: 0,
                     installer: me,
-                    owner: me,
+                    owner: bp.owner,
                     activity: activity_id,
                     blueprint_id: bp.item_id,
                     blueprint_type: bp.type_id,
@@ -371,13 +406,16 @@ pub(super) async fn install(c: &Client, request: &Value) -> CallResult {
                     completed: None,
                     completed_by: None,
                     status: INDUSTRY_JOB_STATUS_INSTALLED,
+                    input_location: input.item_id, input_flag: input.flag_id,
+                    output_location: output.item_id, output_flag: output.flag_id,
+                    wallet_owner, wallet_account_key, blueprint_location: bp.location, blueprint_flag: bp.flag,
                 };
                 j.id = industry_dao::insert_job(tx, &j).await.map_err(db_err)?;
-                tell_job(outbox, &j);
+                tell_job(tx, outbox, &j).await?;
                 Ok(j)
             })
         },
-        |j, outbox| async move { dispatch_world(j, outbox, world) },
+        |j, outbox| async move { dispatch_client(j, outbox, c) },
     ).await?;
     info!("industry: {me} installed job {} (activity {activity_id}, {runs} runs of {}) at {} for {} ISK, {}s", j.id, j.blueprint_type, j.facility, j.cost, j.time);
     Ok(Value::Int(j.id))
@@ -386,43 +424,51 @@ pub(super) async fn install(c: &Client, request: &Value) -> CallResult {
 /// Remove a used-up blueprint copy.
 async fn destroy_blueprint<X: Send>(db: &(impl Executor + ?Sized), sde: &crate::sde::Sde, outbox: &mut Outbox<X>, item_id: i64) -> Result<(), CallError> {
     if let Some(item) = load_items(db, sde, ItemQuery::Id(item_id)).await.map_err(db_err)?.pop() {
-        let owner = item.owner_id;
         industry_dao::delete_blueprint_item(db, item_id).await.map_err(db_err)?;
-        let old = item.location_id;
-        let gone = Item { location_id: LOCATION_JUNKYARD, ..item };
-        outbox.notify_pilot(owner, "OnItemChange", vec![gone.row(), Value::Dict(vec![(Value::Int(IX_LOCATION_ID), Value::Int(old))]), Value::None]);
+        inventory::notify_item_removed(outbox, item);
     }
     Ok(())
 }
 
-/// New blueprint copies in `owner`'s hangar at `station`.
+/// New blueprint copies in the selected output division.
 #[allow(clippy::too_many_arguments)]
-async fn make_copies<X: Send>(db: &(impl Executor + ?Sized), sde: &crate::sde::Sde, outbox: &mut Outbox<X>, owner: i64, station: i64, type_id: i32, count: i32, me: i32, te: i32, runs: i32) -> Result<(), CallError> {
-    let mut ids = vec![];
+async fn make_copies<X: Send>(db: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<X>, j: &Job, type_id: i32, count: i32, me: i32, te: i32, runs: i32) -> Result<(), CallError> {
     for _ in 0..count {
-        let id = industry_dao::insert_copy(db, type_id, owner, station, FLAG_HANGAR, BLUEPRINT_COPY_QUANTITY).await.map_err(db_err)?;
+        let id = industry_dao::insert_copy(db, type_id, j.owner, j.output_location, j.output_flag, BLUEPRINT_COPY_QUANTITY).await.map_err(db_err)?;
         set_blueprint(db, id, me, te, runs).await?;
-        ids.push(id);
+        inventory::notify_item_change(db, sde, outbox, id, vec![(IX_LOCATION_ID, Value::Int(LOCATION_JUNKYARD))]).await?;
     }
-    show_items(db, sde, outbox, owner, station, &ids, LOCATION_JUNKYARD).await
+    Ok(())
 }
 
-/// Deliver a finished job's output to the owner's hangar at the facility.
+/// Deliver a finished job's output to its selected custody location.
+/// Legacy jobs whose blueprint was already moved or lost before custody prevention are
+/// refused at delivery; an operator may need to repair their blueprint custody.
 async fn deliver_job<X: Send>(db: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<X>, j: &mut Job, by: i64, invention_successful: i32, completed: i64) -> Result<(), CallError> {
-    let bp = match blueprint(db, sde, j.blueprint_id).await {
-        Ok(bp) => Some(bp),
-        Err(CallError::User { .. }) => None,
-        Err(error) => return Err(error),
-    };
+    let bp = blueprint(db, sde, j.blueprint_id).await?;
+    if bp.item_id != j.blueprint_id || bp.type_id != j.blueprint_type || bp.owner != j.owner
+        || bp.location != j.blueprint_location || bp.flag != j.blueprint_flag
+        || bp.copy != j.blueprint_copy || bp.station != Some(j.facility)
+    {
+        return Err(user_error(messages::MSG_INDUSTRY_BLUEPRINT_ACCESS_DENIED, vec![]));
+    }
+    let successful = if j.activity == INVENTION { invention_successful } else { j.runs };
+    j.status = STATUS_DELIVERED;
+    j.successful_runs = Some(successful);
+    j.completed = Some(completed);
+    j.completed_by = Some(by);
+    if industry_dao::deliver_job(db, j, INDUSTRY_JOB_STATUS_INSTALLED).await.map_err(db_err)? == 0 {
+        return Err(notify_error(messages::INDUSTRY_PROJECT_ALREADY_DELIVERED));
+    }
     let act = sde.industry.activity(j.blueprint_type, j.activity);
-    let mut successful = j.runs;
     match (j.activity, &act) {
         (MANUFACTURING, Some(act)) => {
             if let Some(&(product, per_run, _)) = act.products.iter().find(|p| Some(p.0) == j.product_type).or(act.products.first()) {
-                let quantity = (per_run * j.runs as i64).min(i32::MAX as i64) as i32;
-                deliver(db, sde, outbox, j.owner, j.facility, product, quantity).await?;
+                let quantity = per_run.checked_mul(j.runs as i64).and_then(|n| i32::try_from(n).ok()).filter(|n| *n > 0)
+                    .ok_or_else(|| notify_error(messages::BLUEPRINT_RUN_COUNT_EXCEEDED))?;
+                items::deposit(db, sde, outbox, j.owner, j.output_location, j.output_flag, product, quantity, LOCATION_JUNKYARD).await?;
             }
-            if let Some(bp) = bp.filter(|b| b.copy) {
+            if bp.copy {
                 let left = bp.runs - j.runs;
                 if left <= 0 {
                     destroy_blueprint(db, sde, outbox, bp.item_id).await?;
@@ -432,62 +478,45 @@ async fn deliver_job<X: Send>(db: &(impl Executor + ?Sized), sde: &Sde, outbox: 
             }
         }
         (RESEARCH_TIME, _) => {
-            if let Some(bp) = bp {
-                set_blueprint(db, bp.item_id, bp.me, (bp.te + 2 * j.runs).min(MAX_TIME_EFFICIENCY), bp.runs).await?;
-            }
+            set_blueprint(db, bp.item_id, bp.me, (bp.te + 2 * j.runs).min(MAX_TIME_EFFICIENCY), bp.runs).await?;
         }
         (RESEARCH_MATERIAL, _) => {
-            if let Some(bp) = bp {
-                set_blueprint(db, bp.item_id, (bp.me + j.runs).min(MAX_MATERIAL_EFFICIENCY), bp.te, bp.runs).await?;
-            }
+            set_blueprint(db, bp.item_id, (bp.me + j.runs).min(MAX_MATERIAL_EFFICIENCY), bp.te, bp.runs).await?;
         }
         (COPYING, _) => {
-            let (me, te) = bp.as_ref().map(|b| (b.me, b.te)).unwrap_or((0, 0));
-            make_copies(db, sde, outbox, j.owner, j.facility, j.blueprint_type, j.runs, me, te, j.licensed_runs).await?;
+            make_copies(db, sde, outbox, j, j.blueprint_type, j.runs, bp.me, bp.te, j.licensed_runs).await?;
         }
         (INVENTION, Some(act)) => {
-            successful = invention_successful;
             let (_, d_me, d_te, d_runs) = match j.optional_type {
                 Some(d) => decryptor(sde, d),
                 None => (1.0, 0, 0, 0),
             };
             if let Some(&(product, per_run, _)) = act.products.iter().find(|p| Some(p.0) == j.product_type).or(act.products.first()) {
                 if successful > 0 {
-                    let runs = (per_run as i32 + d_runs).max(1);
-                    make_copies(db, sde, outbox, j.owner, j.facility, product, successful, INVENTION_MATERIAL_EFFICIENCY + d_me, INVENTION_TIME_EFFICIENCY + d_te, runs).await?;
+                    let runs = per_run.checked_add(i64::from(d_runs)).and_then(|n| i32::try_from(n.max(1)).ok())
+                        .ok_or_else(|| notify_error(messages::BLUEPRINT_RUN_COUNT_EXCEEDED))?;
+                    make_copies(db, sde, outbox, j, product, successful, INVENTION_MATERIAL_EFFICIENCY + d_me, INVENTION_TIME_EFFICIENCY + d_te, runs).await?;
                 }
             }
-            if let Some(bp) = bp {
-                let left = bp.runs - j.runs;
-                if left <= 0 {
-                    destroy_blueprint(db, sde, outbox, bp.item_id).await?;
-                } else {
-                    set_blueprint(db, bp.item_id, bp.me, bp.te, left).await?;
-                }
+            let left = bp.runs - j.runs;
+            if left <= 0 {
+                destroy_blueprint(db, sde, outbox, bp.item_id).await?;
+            } else {
+                set_blueprint(db, bp.item_id, bp.me, bp.te, left).await?;
             }
         }
         _ => {}
     }
-    j.status = STATUS_DELIVERED;
-    j.successful_runs = Some(successful);
-    j.completed = Some(completed);
-    j.completed_by = Some(by);
-    let affected = industry_dao::deliver_job(db, j, INDUSTRY_JOB_STATUS_INSTALLED).await.map_err(db_err)?;
-    if affected == 0 {
-        return Err(notify_error(messages::INDUSTRY_PROJECT_ALREADY_DELIVERED));
-    }
-    tell_job(outbox, j);
+    tell_job(db, outbox, j).await?;
     Ok(())
 }
 
-pub(super) async fn complete(c: &Client, id: i64) -> Result<(), CallError> {
-    let (db, world) = (&c.db, &*c.world);
+pub(super) async fn complete(c: &mut Client, id: i64) -> Result<(), CallError> {
+    let db = c.db.clone();
     let me = c.session.int("charid").unwrap_or(0);
     let _trading = lock().await;
-    let j = job(db, id).await?;
-    if j.owner != me && j.installer != me {
-        return Err(user_error(messages::MSG_INDUSTRY_JOB_ACCESS_DENIED, vec![]));
-    }
+    let j = job(&db, id).await?;
+    authorization::owner(&db, me, j.owner, None).await?;
     if j.status != INDUSTRY_JOB_STATUS_INSTALLED {
         return Err(notify_error(messages::INDUSTRY_PROJECT_ALREADY_DELIVERED));
     }
@@ -499,14 +528,20 @@ pub(super) async fn complete(c: &Client, id: i64) -> Result<(), CallError> {
     let sde = Arc::clone(&c.sde);
     let delivered = db.transaction(
         |tx, outbox: &mut Outbox| {
-            let mut j = j.clone();
+            let expected = j.clone();
             let sde = Arc::clone(&sde);
             Box::pin(async move {
+                let mut j = job(tx, id).await?;
+                authorization::owner(tx, me, j.owner, None).await?;
+                if j.status != INDUSTRY_JOB_STATUS_INSTALLED || j.activity != expected.activity || j.runs != expected.runs || j.probability != expected.probability {
+                    return Err(notify_error(messages::INDUSTRY_PROJECT_ALREADY_DELIVERED));
+                }
+                if j.end > completed { return Err(notify_error(messages::INDUSTRY_PROJECT_NOT_COMPLETE)); }
                 deliver_job(tx, &sde, outbox, &mut j, me, successful, completed).await?;
                 Ok(j)
             })
         },
-        |j, outbox| async move { dispatch_world(j, outbox, world) },
+        |j, outbox| async move { dispatch_client(j, outbox, c) },
     ).await?;
     info!("industry: job {} delivered ({}/{} runs)", delivered.id, delivered.successful_runs.unwrap_or(0), delivered.runs);
     Ok(())

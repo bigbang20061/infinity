@@ -1,5 +1,5 @@
 //! `facilityManager` dispatch for the client industry package, using SDE station facilities.
-//! NPC facility tax settings are read-only; corporation industry is not supported.
+//! NPC facility tax settings are read-only.
 
 use super::*;
 
@@ -28,8 +28,8 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         ("facilityManager", "GetFacilityLocations") => {
             let owner = call.args.get(1).and_then(|v| v.as_int()).unwrap_or(me);
             match facility(&c.sde, int(0)) {
-                Ok(f) if owner == me => Ok(Value::list([f.location(me)])),
-                Ok(_) | Err(CallError::User { .. }) => Ok(Value::list([])),
+                Ok(f) => authorization::locations(&c.db, &c.sde, me, owner, &f).await.map(|locations| Value::list(locations.iter().map(authorization::Location::value))),
+                Err(CallError::User { .. }) => Ok(Value::list([])),
                 Err(e) => Err(e),
             }
         }

@@ -50,3 +50,14 @@ fn station_without_services_requires_type_before_filtering() {
 fn station_without_services_requires_system_before_filtering() {
     Facility::from_station_services(&station_without_services(Some(1), None), false, false);
 }
+
+mod corporation;
+
+pub(super) async fn database_fingerprint(db: &crate::db::Db) -> Vec<String> {
+    let mut result = Vec::new();
+    for table in ["accounts", "characters", "corporations", "corp_titles", "corp_wallets", "offices", "skills", "items", "blueprints", "industry_jobs", "market_orders", "market_order_history", "market_transactions", "trades", "trade_items", "jobs"] {
+        let sql = format!("SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY row_to_json(t)::text), '')) AS fingerprint FROM game.{table} t");
+        result.push(db.query_one(&sql, &[]).await.unwrap().get("fingerprint"));
+    }
+    result
+}

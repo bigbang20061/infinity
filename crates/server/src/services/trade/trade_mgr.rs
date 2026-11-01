@@ -70,6 +70,9 @@ async fn stage(ex: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<Tra
     if !invalid.is_empty() {
         return Err(user_error(messages::trade::MSG_CANNOT_TRADE_NON_TRADABLE, vec![("itemList".into(), Value::tuple([Value::Int(UE_TYPEIDL), Value::list(invalid.into_iter().map(Value::Int))]))]));
     }
+    if crate::dao::industry::has_active_blueprint_job(ex, &tree_ids).await.map_err(db_err)? {
+        return Err(notify_error(messages::industry::BLUEPRINT_ACTIVE));
+    }
     let mut staged = Vec::new();
     for item in &items {
         let q = quantity.unwrap_or(i64::from(item.quantity));

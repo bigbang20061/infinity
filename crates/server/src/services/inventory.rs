@@ -18,7 +18,7 @@ use crate::dao::items::inventory as inventory_dao;
 use crate::dao::items::quantities::{self, QuantityChange};
 use super::{db_err, keyval, notify_error, value_id_list, Call, CallError, CallResult};
 use crate::client::{short, Client};
-use crate::consts::{ATTR_CAPACITY, CATEGORY_SHIP, FLAG_CARGO, FLAG_CORP_SAG1, FLAG_FITTING_FIRST, FLAG_FITTING_LAST, FLAG_HANGAR, FLAG_PILOT, FLAG_RIG_FIRST, FLAG_RIG_LAST, FLAG_SUBSYSTEM_FIRST, FLAG_SUBSYSTEM_LAST, IX_FLAG, IX_LOCATION_ID, IX_SINGLETON, IX_STACK_SIZE, LOCATION_JUNKYARD, ROLE_DIRECTOR, ROLE_HANGAR_CAN_TAKE_1, TYPE_CHARACTER};
+use crate::consts::{ATTR_CAPACITY, CATEGORY_SHIP, CORP_HANGAR_DIVISIONS, FLAG_CARGO, FLAG_CORP_SAG1, FLAG_FITTING_FIRST, FLAG_FITTING_LAST, FLAG_HANGAR, FLAG_PILOT, FLAG_RIG_FIRST, FLAG_RIG_LAST, FLAG_SUBSYSTEM_FIRST, FLAG_SUBSYSTEM_LAST, IX_FLAG, IX_LOCATION_ID, IX_SINGLETON, IX_STACK_SIZE, LOCATION_JUNKYARD, ROLE_DIRECTOR, ROLE_HANGAR_CAN_TAKE_1, TYPE_CHARACTER};
 use crate::db::executor::Executor;
 use crate::db::outbox::{dispatch_client, Outbox};
 use crate::messages;
@@ -31,8 +31,6 @@ pub(super) mod gm;
 
 /// const.containerHangar: "my hangar in the current station".
 const CONTAINER_HANGAR: i64 = 10004;
-/// Existing server policy for the highest corporation-hangar division index.
-const MAX_CORP_HANGAR_DIVISION_INDEX: i32 = 6;
 /// Internal bound-object name for a single inventory.
 pub const INVENTORY: &str = "invInventory";
 
@@ -193,6 +191,9 @@ pub(crate) async fn trash_items(c: &mut Client, ids: &[i64]) -> Result<(), CallE
                 if !crate::dao::trades::reserved(tx, &ids).await.map_err(db_err)?.is_empty() {
                     return Err(notify_error(messages::trade::TRADE_ITEM_RESERVED));
                 }
+                if crate::dao::industry::has_active_blueprint_job(tx, &ids).await.map_err(db_err)? {
+                    return Err(notify_error(messages::industry::BLUEPRINT_ACTIVE));
+                }
                 let mut items = load_items(tx, &sde, ItemQuery::IdsOwner(&ids, char_id)).await.map_err(db_err)?;
                 items.sort_by_key(|item| item.item_id);
                 for item in items {
@@ -236,7 +237,7 @@ async fn authorized_source(c: &Client, item: &Item, source: Option<i64>, char_id
     if source.is_some_and(|id| id != item.location_id) { return Ok(false); }
     if let Some(corp) = super::offices::office_owner(&c.db, item.location_id).await? {
         let (my_corp, roles) = super::corps::membership(&c.db, char_id).await?;
-        let take = ROLE_HANGAR_CAN_TAKE_1 << (item.flag_id - FLAG_CORP_SAG1).clamp(0, MAX_CORP_HANGAR_DIVISION_INDEX);
+        let take = ROLE_HANGAR_CAN_TAKE_1 << (item.flag_id - FLAG_CORP_SAG1).clamp(0, CORP_HANGAR_DIVISIONS - 1);
         if my_corp != corp || roles & (take | ROLE_DIRECTOR) == 0 {
             return Err(CallError::User { msg: messages::MSG_CUSTOM_NOTIFY.into(), dict: vec![("notify".into(), Value::unicode(messages::NO_CORPORATION_HANGAR_TAKE_ROLE))] });
         }
@@ -268,7 +269,7 @@ async fn authorized_destination(c: &Client, container: &Container, flag: Option<
                     return Err(CallError::User { msg: messages::MSG_CUSTOM_NOTIFY.into(), dict: vec![("notify".into(), Value::unicode(messages::NOT_YOUR_CORPORATION_HANGAR))] });
                 }
                 let sag = FLAG_CORP_SAG1;
-                return Ok(Some((*id, corp, flag.filter(|f| (sag..sag + 7).contains(f)).unwrap_or(sag))));
+                return Ok(Some((*id, corp, flag.filter(|f| (sag..sag + CORP_HANGAR_DIVISIONS).contains(f)).unwrap_or(sag))));
             }
             let Some(item) = load_items(&c.db, &c.sde, ItemQuery::Id(*id)).await.map_err(db_err)?.into_iter().next() else { return Ok(None) };
             if item.owner_id != char_id { return Ok(None); }
@@ -372,6 +373,9 @@ async fn move_core<X: Send>(
 ) -> Result<i64, CallError> {
     if !crate::dao::trades::reserved(tx, &[item.item_id, location]).await.map_err(db_err)?.is_empty() {
         return Err(notify_error(messages::trade::TRADE_ITEM_RESERVED));
+    }
+    if crate::dao::industry::has_active_blueprint_job(tx, &[item.item_id]).await.map_err(db_err)? {
+        return Err(notify_error(messages::industry::BLUEPRINT_ACTIVE));
     }
     let item_id = item.item_id;
     let fitting = is_fitting_flag(flag);

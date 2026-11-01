@@ -311,6 +311,23 @@ CREATE TABLE IF NOT EXISTS game.industry_jobs (
 );
 CREATE INDEX IF NOT EXISTS industry_jobs_owner_idx ON game.industry_jobs (owner_id, status);
 CREATE INDEX IF NOT EXISTS industry_jobs_blueprint_idx ON game.industry_jobs (blueprint_id) WHERE status = 1;
+-- Industry custody (dao/industry.rs). Legacy jobs were personal; flagHangar=4 and accountingKeyCash=1000.
+ALTER TABLE game.industry_jobs ADD COLUMN IF NOT EXISTS input_location_id bigint;
+ALTER TABLE game.industry_jobs ADD COLUMN IF NOT EXISTS input_flag_id integer;
+ALTER TABLE game.industry_jobs ADD COLUMN IF NOT EXISTS output_location_id bigint;
+ALTER TABLE game.industry_jobs ADD COLUMN IF NOT EXISTS output_flag_id integer;
+ALTER TABLE game.industry_jobs ADD COLUMN IF NOT EXISTS wallet_owner_id bigint;
+ALTER TABLE game.industry_jobs ADD COLUMN IF NOT EXISTS wallet_account_key integer;
+ALTER TABLE game.industry_jobs ADD COLUMN IF NOT EXISTS blueprint_location_id bigint;
+ALTER TABLE game.industry_jobs ADD COLUMN IF NOT EXISTS blueprint_flag_id integer;
+UPDATE game.industry_jobs SET
+    input_location_id = COALESCE(input_location_id, facility_id), input_flag_id = COALESCE(input_flag_id, 4),
+    output_location_id = COALESCE(output_location_id, facility_id), output_flag_id = COALESCE(output_flag_id, 4),
+    wallet_owner_id = COALESCE(wallet_owner_id, owner_id), wallet_account_key = COALESCE(wallet_account_key, 1000),
+    blueprint_location_id = COALESCE(blueprint_location_id, facility_id), blueprint_flag_id = COALESCE(blueprint_flag_id, 4)
+WHERE owner_id = installer_id AND (input_location_id IS NULL OR input_flag_id IS NULL OR output_location_id IS NULL
+    OR output_flag_id IS NULL OR wallet_owner_id IS NULL OR wallet_account_key IS NULL
+    OR blueprint_location_id IS NULL OR blueprint_flag_id IS NULL);
 
 -- Crimewatch (services/crimewatch.rs): -10 .. +10.
 ALTER TABLE game.characters ADD COLUMN IF NOT EXISTS security_status double precision NOT NULL DEFAULT 0;

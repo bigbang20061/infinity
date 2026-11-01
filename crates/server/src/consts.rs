@@ -657,6 +657,8 @@ pub const FLAG_BOOSTER: i32 = 88;
 pub const FLAG_IMPLANT: i32 = 89;
 /// Client inventorycommon.const.flagCorpSAG1; other divisions follow it.
 pub const FLAG_CORP_SAG1: i32 = 115;
+/// Client inventorycommon/const.py flagCorpSAG1..7: corporation hangar division count.
+pub const CORP_HANGAR_DIVISIONS: i32 = 7;
 /// Client inventorycommon.const.locationJunkyard: deleted items.
 pub const LOCATION_JUNKYARD: i64 = 10;
 /// Client carbon const.ixOwnerID: inventory row owner column.
@@ -699,6 +701,8 @@ pub const CORPORATION_TYPE_PLAYER: i64 = 2;
 // Client industry job and blueprint conventions.
 /// Client industry job status: installed.
 pub const INDUSTRY_JOB_STATUS_INSTALLED: i32 = 1;
+/// Client industry/const.py STATUS_READY.
+pub const INDUSTRY_JOB_STATUS_READY: i32 = 3;
 /// Client blueprint original convention: infinite runs, distinct from quantity encoding.
 pub const BLUEPRINT_INFINITE_RUNS: i32 = -1;
 
@@ -709,6 +713,12 @@ pub const ROLE_DIRECTOR: i64 = 1;
 pub const ROLE_ACCOUNTANT: i64 = 256;
 /// Client appConst.corpRoleHangarCanTake1; divisions 2-7 are the next bits.
 pub const ROLE_HANGAR_CAN_TAKE_1: i64 = 8192;
+/// Client industry/const.py: ROLE_FACTORY_MANAGER.
+pub const ROLE_FACTORY_MANAGER: i64 = 1024;
+/// Client industry/const.py: ROLE_FACTORY_MANUFACTURING.
+pub const ROLE_FACTORY_MANUFACTURING: i64 = 1_125_899_906_842_624;
+/// Client industry/const.py: ROLE_FACTORY_SCIENCE.
+pub const ROLE_FACTORY_SCIENCE: i64 = 2_251_799_813_685_248;
 /// Client carbon/common/script/sys/serviceConst.py: ROLE_PLAYER | ROLE_LOGIN.
 pub const ROLE_PLAYER_LOGIN: i64 = 2305843009213693952 | 4611686018427387904;
 /// Client carbon serviceConst: ROLE_GML | ROLE_GMH | ROLE_LEGIONEER | ROLE_WORLDMOD.
