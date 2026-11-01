@@ -424,35 +424,64 @@ fn movement(c: &mut Client, f: impl FnOnce(&mut Ball, i64, &space::System) -> Ve
 /// `min_range` (at least 2.5 km) off that object's surface on the near side; without,
 /// `min_range` short of the point itself (bookmarks, mission sites, warp-in points),
 /// as Ballpark::RealWarp places it.
+pub(super) fn valid_warp_geometry(object: Option<(V3, f64)>, point: V3, min_range: f64) -> bool {
+    point.iter().all(|v| v.is_finite()) && min_range.is_finite()
+        && object.is_none_or(|(pos, radius)| pos.iter().all(|v| v.is_finite()) && radius.is_finite())
+}
+
 pub(super) async fn warp_to(c: &mut Client, object: Option<(V3, f64)>, point: V3, min_range: f64, on_exit: Option<Timer>) -> CallResult {
-    if !point.iter().all(|v| v.is_finite()) || !min_range.is_finite()
-        || object.is_some_and(|(pos, radius)| !pos.iter().all(|v| v.is_finite()) || !radius.is_finite()) {
-        return Ok(Value::None);
-    }
+    if !valid_warp_geometry(object, point, min_range) { return Ok(Value::None); }
     let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) else { return Ok(Value::None) };
-    let char_id = c.session.int("charid").unwrap_or(0);
-    let mut on_exit = on_exit;
-    loop {
-        let fit = super::fit::Fit::load_in_space(&c.db, &c.world, system, char_id, ship).await?;
-        let Some(revision) = fit.projection_revision() else { return Ok(Value::None) };
-        let scrambled = fit.value(super::fit::Key::Ship, crate::consts::dogma::ATTR_WARP_SCRAMBLE_STATUS) > 0.0;
-        let result = c.world.with(system, move |s| {
-            commit_warp(s, ship, revision, scrambled, object, point, min_range, on_exit)
-        }).await;
-        let Some((current, callback)) = result else { return Ok(Value::None) };
-        if !current {
-            on_exit = callback;
-            continue;
-        }
-        if scrambled {
-            return Err(super::notify_error(messages::effects::WARP_SCRAMBLED));
-        }
-        break;
-    }
+    let pilot = c.session.int("charid").unwrap_or(0);
+    warp_pilot(&c.db, &c.world, system, pilot, ship, object, point, min_range, on_exit, None).await?;
     Ok(Value::None)
 }
 
-fn commit_warp(s: &mut space::System, ship: i64, revision: u64, scrambled: bool,
+pub(super) async fn warp_destination(c: &mut Client, order: Option<super::fleets::warp::Order>,
+    object: Option<(V3, f64)>, point: V3, min_range: f64, on_exit: Option<Timer>, destination: Value) -> CallResult {
+    match order {
+        Some(order) => super::fleets::warp::execute(c, order, object, point, min_range, on_exit, destination).await,
+        None => warp_to(c, object, point, min_range, on_exit).await,
+    }
+}
+
+/// Load and fence each pilot's own fit; preserve the callback across stale revisions.
+pub(super) async fn warp_pilot(db: &crate::db::Db, world: &space::World, system: i64, pilot: i64, ship: i64,
+    object: Option<(V3, f64)>, point: V3, min_range: f64, mut on_exit: Option<Timer>,
+    order: Option<std::sync::Arc<super::fleets::warp::Order>>) -> Result<(bool, Option<Timer>), CallError> {
+    loop {
+        let fit = super::fit::Fit::load_in_space(db, world, system, pilot, ship).await?;
+        let Some(revision) = fit.projection_revision() else { return Ok((false, on_exit)) };
+        let scrambled = fit.value(super::fit::Key::Ship, crate::consts::dogma::ATTR_WARP_SCRAMBLE_STATUS) > 0.0;
+        let is_fleet = order.is_some();
+        let guard = order.clone();
+        let result = world.with(system, move |s| {
+            let mut callback = on_exit;
+            let result = if let Some(order) = guard {
+                super::fleets::warp::commit(s, &order, pilot, ship, |s| {
+                    commit_warp(s, ship, revision, scrambled, object, point, min_range, callback.take())
+                })
+            } else {
+                Some(commit_warp(s, ship, revision, scrambled, object, point, min_range, callback.take()))
+            };
+            match result {
+                Some((current, returned)) => (Some(current), returned),
+                None => (None, callback),
+            }
+        }).await;
+        let Some((current, callback)) = result else { return Ok((false, None)) };
+        on_exit = callback;
+        let Some(current) = current else { return Ok((false, on_exit)) };
+        if !current { continue; }
+        if scrambled {
+            if is_fleet { return Ok((false, on_exit)); }
+            return Err(super::notify_error(messages::effects::WARP_SCRAMBLED));
+        }
+        return Ok((true, on_exit));
+    }
+}
+
+pub(super) fn commit_warp(s: &mut space::System, ship: i64, revision: u64, scrambled: bool,
     object: Option<(V3, f64)>, point: V3, min_range: f64, on_exit: Option<Timer>) -> (bool, Option<Timer>) {
     if s.projection_revision(ship) != revision || scrambled {
         return (s.projection_revision(ship) == revision, on_exit);

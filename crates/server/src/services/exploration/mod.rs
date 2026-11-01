@@ -488,7 +488,7 @@ pub(super) async fn scan_result_position(db: &Db, system: i64, char_id: i64, tar
     Ok(Some(site.pos))
 }
 
-pub async fn warp_to_scan(c: &mut Client, target: &str, min_range: f64) -> CallResult {
+pub(super) async fn warp_to_scan(c: &mut Client, target: &str, min_range: f64, order: Option<super::fleets::warp::Order>) -> CallResult {
     let (Some(system), Some(char_id)) = (c.session.int("solarsystemid"), c.session.int("charid")) else { return Ok(Value::None) };
     let site = system_sites(system).into_iter().find(|s| s.target == target);
     let Some(site) = site else { return Err(notify_error(messages::SCAN_RESULT_GONE)) };
@@ -497,7 +497,7 @@ pub async fn warp_to_scan(c: &mut Client, target: &str, min_range: f64) -> CallR
     }
     if site.wormhole.is_some() {
         ensure_wormhole_ball(&c.db, &c.world, site.id).await?;
-        return super::ship::warp_to(c, Some((site.pos, 3000.0)), site.pos, min_range, None).await;
+        return super::ship::warp_destination(c, order, Some((site.pos, 3000.0)), site.pos, min_range, None, Value::Dict(vec![])).await;
     }
     let db = c.db.clone();
     let world = Arc::downgrade(&c.world);
@@ -511,7 +511,7 @@ pub async fn warp_to_scan(c: &mut Client, target: &str, min_range: f64) -> CallR
             }
         });
     });
-    super::ship::warp_to(c, None, site.pos, min_range, Some(on_exit)).await
+    super::ship::warp_destination(c, order, None, site.pos, min_range, Some(on_exit), Value::Dict(vec![])).await
 }
 
 

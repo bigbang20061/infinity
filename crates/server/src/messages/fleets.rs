@@ -1,7 +1,7 @@
-//! Fleet player-visible text used by `services/fleets/fleet_object_handler.rs`.
-//! Fleet state is process-local.
+//! Fleet player-visible names, invitations and refusals for
+//! `eve/client/script/parklife/fleetSvc.py`. Text is server-authored and reads
+//! no data source; client catalogue keys and localisation are not handled here.
 
-// Fleets (services/fleets.rs)
 /// Initial fleet wing display name.
 pub(crate) const FLEET_INITIAL_WING_NAME: &str = "联队 1";
 /// Initial fleet squad display name.
@@ -28,8 +28,6 @@ pub(crate) const FLEET_INVITATION_EXPIRED: &str = "该邀请已过期。";
 pub(crate) const FLEET_LEADER_REQUIRED_TO_REMOVE_MEMBER: &str = "只有舰队指挥官才能移除成员。";
 /// Fleet disband permission.
 pub(crate) const FLEET_LEADER_REQUIRED_TO_DISBAND: &str = "只有舰队指挥官才能解散舰队。";
-/// Fleet member movement permission.
-pub(crate) const FLEET_LEADER_REQUIRED_TO_MOVE_MEMBER: &str = "只有舰队指挥官才能调动成员。";
 /// Fleet wing creation permission.
 pub(crate) const FLEET_LEADER_REQUIRED_TO_ADD_WING: &str = "只有舰队指挥官才能添加联队。";
 /// Fleet wing lookup missing.
@@ -42,6 +40,18 @@ pub(crate) const FLEET_STRUCTURE_MUST_BE_EMPTY: &str = "请先将其中的成员
 pub(crate) const FLEET_LEADER_REQUIRED_TO_CHANGE_STRUCTURE: &str = "只有舰队指挥官才能调整舰队结构。";
 /// Fleet hierarchy rename permission.
 pub(crate) const FLEET_LEADER_REQUIRED_TO_RENAME_WING_OR_SQUAD: &str = "只有舰队指挥官才能重命名联队和中队。";
+/// Invalid fleet operation arguments.
+pub(crate) const INVALID_REQUEST: &str = "舰队请求无效。";
+/// Fleet leader authority required.
+pub(crate) const LEADER_REQUIRED: &str = "只有舰队指挥官才能执行此操作。";
+/// Fleet setups are not supported.
+pub(crate) const LOAD_SETUP_UNSUPPORTED: &str = "暂不支持加载舰队配置。";
+/// Fleet warp authority required.
+pub(crate) const WARP_NOT_AUTHORIZED: &str = "你无权发起此次舰队跃迁。";
+/// Fleet advertisement unavailable.
+pub(crate) const AD_NOT_AVAILABLE: &str = "该舰队招募广告不可用。";
+/// Arrangement cannot automatically remove unmatched members.
+pub(crate) const ARRANGE_REMOVAL_UNSUPPORTED: &str = "无法自动移除不符合条件的成员，请手动调动或移除。";
 /// Fleet invitation question.
 pub(crate) fn fleet_invitation(name: &str) -> String { format!("{name}邀请你加入舰队。是否接受？") }
 /// Default fleet wing name.

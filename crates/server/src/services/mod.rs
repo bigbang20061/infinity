@@ -35,7 +35,7 @@ pub(crate) mod effects;
 mod exploration;
 pub(crate) mod fit;
 mod fixed;
-mod fleets;
+pub(crate) mod fleets;
 mod fitting;
 mod hacking;
 pub(crate) mod industry;

@@ -1,6 +1,6 @@
-//! Fleet object handler (eve/client/script/parklife/fleetSvc.py).
-//! Fleet state is process-local; fleet composition reads character and item data.
-//! Advertising, boosts and fleet warps are not modelled.
+//! Fleet object handler for `eve/client/script/parklife/fleetSvc.py`.
+//! Fleet state is process-local; ship types are read from character and item data.
+//! Saved fleet setups and boosts are not supported.
 
 use super::*;
 
@@ -10,36 +10,42 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
     let world = c.world.clone();
     match (call.service, call.method) {
         ("fleetObjectHandler", "CreateFleet") if !call.bound => {
-            if c.session.int("fleetid").is_some() {
+            let mut st = state();
+            if c.session.int("fleetid").is_some() || !st.can_create(me) {
                 return Some(Err(CallError::User { msg: messages::MSG_FLEET_ERROR.into(), dict: vec![] }));
             }
             let id = next_id();
             let (wing, squad) = (next_id(), next_id());
-            state().fleets.insert(
-                id,
-                Fleet {
-                    members: HashMap::new(),
-                    wings: vec![Wing { id: wing, name: messages::fleets::FLEET_INITIAL_WING_NAME.into(), squads: vec![Squad { id: squad, name: messages::fleets::FLEET_INITIAL_SQUAD_NAME.into() }] }],
-                    motd: String::new(),
-                    invites: HashMap::new(),
-                },
-            );
+            st.fleets.insert(id, Fleet::new(me, vec![Wing { id: wing, name: messages::fleets::FLEET_INITIAL_WING_NAME.into(), squads: vec![Squad { id: squad, name: messages::fleets::FLEET_INITIAL_SQUAD_NAME.into() }] }]));
+            drop(st);
             return Some(Ok(c.bind("fleetObjectHandler", Value::Int(id))));
         }
         _ => {}
     }
     let fleet_id = bound_fleet(call);
+    if !call.bound {
+        return None;
+    }
+    if call.method != "Init" {
+        let st = state();
+        let permitted = if matches!(call.method, "AcceptInvite" | "RejectInvite") {
+            st.fleets.get(&fleet_id).is_some_and(|f| f.invites.contains_key(&me))
+        } else {
+            st.is_member(fleet_id, me)
+        };
+        if !permitted {
+            return Some(Err(notify_error(messages::fleets::PILOT_NOT_IN_FLEET)));
+        }
+    }
     Some(match call.method {
-        // Init(shipTypeID, setupName, adInfoData): the creator leads from the first squad.
+        // The creator occupies the fleet command slot, outside all wings and squads.
         "Init" => {
-            let member = {
-                let mut st = state();
-                let Some(f) = st.fleets.get_mut(&fleet_id) else { return Some(Err(notify_error(messages::fleets::FLEET_NOT_FOUND))) };
-                let squad = f.wings.first().and_then(|w| w.squads.first().map(|s| (w.id, s.id))).unwrap_or((NONE_ID, NONE_ID));
-                let m = Member { wing: squad.0, squad: squad.1, role: ROLE_LEADER, job: JOB_CREATOR, ship_type: int(0).unwrap_or(0) };
-                f.members.insert(me, m.clone());
-                st.of.insert(me, fleet_id);
-                m
+            let ship_type = match crate::dao::characters::routing::fleet_member_locations(&c.db, &[me]).await {
+                Ok(rows) => rows.first().and_then(|r| r.type_id).map(i64::from).unwrap_or(0),
+                Err(e) => return Some(Err(CallError::Internal(e.into()))),
+            };
+            let Some(member) = state().initialize(fleet_id, me, ship_type) else {
+                return Some(Err(notify_error(messages::fleets::PILOT_NOT_IN_FLEET)));
             };
             let pairs = session_pairs(Some(fleet_id), Some(&member));
             set_own_session(c, &pairs);
@@ -54,10 +60,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
                 ("fleetID", Value::Int(fleet_id)),
                 ("members", Value::Dict(f.members.iter().map(|(ch, m)| (Value::Int(*ch), member_value(*ch, m))).collect())),
                 ("wings", wings_value(f)),
-                (
-                    "options",
-                    keyval([("isFreeMove", Value::Bool(false)), ("isRegistered", Value::Bool(false)), ("isVoiceEnabled", Value::Bool(false)), ("autoJoinSquadID", Value::None)]),
-                ),
+                ("options", options_value(&f.options)),
                 ("motd", Value::unicode(f.motd.as_str())),
             ]))
         }
@@ -69,6 +72,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         "SetMotdEx" => {
             let motd = call.args.first().and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
             let mut st = state();
+            if !st.is_member(fleet_id, me) { return Some(Err(notify_error(messages::fleets::PILOT_NOT_IN_FLEET))); }
             match st.fleets.get_mut(&fleet_id) {
                 Some(f) if is_leader(f, me) => {
                     f.motd = motd.clone();
@@ -94,47 +98,22 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
                 Err(e) => Err(CallError::Internal(e.into())),
             }
         }
-        // Invite(charID, wingID, squadID, role)
-        "Invite" => {
-            let target = int(0).unwrap_or(0);
-            let (wing, squad, role) = (int(1).unwrap_or(NONE_ID), int(2).unwrap_or(NONE_ID), int(3).unwrap_or(ROLE_MEMBER));
-            {
-                let mut st = state();
-                if st.of.contains_key(&target) {
-                    return Some(Err(notify_error(messages::fleets::PILOT_ALREADY_IN_FLEET)));
-                }
-                let Some(f) = st.fleets.get_mut(&fleet_id) else { return Some(Err(notify_error(messages::fleets::FLEET_NOT_FOUND))) };
-                if !f.members.contains_key(&me) {
-                    return Some(Err(notify_error(messages::fleets::PILOT_NOT_IN_FLEET)));
-                }
-                if f.members.len() >= MAX_MEMBERS {
-                    return Some(Err(notify_error(messages::fleets::FLEET_FULL)));
-                }
-                f.invites.insert(target, (wing, squad, role));
-            }
-            let name = crate::dao::characters::routing::character_name(&c.db, me).await.ok().flatten().unwrap_or_default();
-            let question = messages::fleets::fleet_invitation(&name);
-            world.notify_pilot(
-                target,
-                "OnFleetInvite",
-                vec![Value::Int(fleet_id), Value::Int(me), Value::str(messages::MSG_CUSTOM_QUESTION), Value::dict([("header", Value::unicode(messages::fleets::FLEET_INVITATION_HEADER)), ("question", Value::unicode(question))])],
-            );
-            Ok(Value::None)
-        }
+        "Invite" => invite(c, fleet_id, int(0).unwrap_or(0), int(1), int(2), int(3)).await,
         // AcceptInvite(shipTypeID)
         "AcceptInvite" => {
+            let ship_type = match crate::dao::characters::routing::fleet_member_locations(&c.db, &[me]).await {
+                Ok(rows) => rows.first().and_then(|r| r.type_id).map(i64::from).unwrap_or(0),
+                Err(e) => return Some(Err(CallError::Internal(e.into()))),
+            };
             let joined = {
                 let mut st = state();
-                if st.of.contains_key(&me) {
-                    return Some(Err(notify_error(messages::fleets::PILOT_ALREADY_IN_FLEET_SELF)));
-                }
+                if st.of.contains_key(&me) { return Some(Err(notify_error(messages::fleets::PILOT_ALREADY_IN_FLEET_SELF))); }
                 let Some(f) = st.fleets.get_mut(&fleet_id) else { return Some(Err(notify_error(messages::fleets::FLEET_NOT_FOUND))) };
-                let Some((wing, squad, role)) = f.invites.remove(&me) else { return Some(Err(notify_error(messages::fleets::FLEET_INVITATION_EXPIRED))) };
-                let fallback = f.wings.first().and_then(|w| w.squads.first().map(|s| (w.id, s.id))).unwrap_or((NONE_ID, NONE_ID));
-                let valid = f.wings.iter().any(|w| w.id == wing && (squad == NONE_ID || w.squads.iter().any(|s| s.id == squad)));
-                let (wing, squad) = if valid { (wing, squad) } else { fallback };
-                let role = if role == ROLE_LEADER { ROLE_MEMBER } else { role };
-                let m = Member { wing, squad, role, job: JOB_NONE, ship_type: int(0).unwrap_or(0) };
+                let Some(&(wing, squad, role)) = f.invites.get(&me) else { return Some(Err(notify_error(messages::fleets::FLEET_INVITATION_EXPIRED))) };
+                if f.members.len() >= f.max_members { return Some(Err(notify_error(messages::fleets::FLEET_FULL))); }
+                let m = Member::new(wing, squad, role, JOB_NONE, ship_type);
+                if !super::arrangement::valid_slot(f, me, &m) { return Some(Err(notify_error(messages::fleets::INVALID_REQUEST))); }
+                f.invites.remove(&me);
                 f.members.insert(me, m.clone());
                 broadcast(&world, f, Some(me), "OnFleetJoin", vec![member_value(me, &m)]);
                 st.of.insert(me, fleet_id);
@@ -155,70 +134,109 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             }
             Ok(Value::None)
         }
+        "SetTakesFleetWarp" | "SetAcceptsConduitJumpsValue" | "SetAcceptsRegroupValue" => {
+            let value = match call.args.first() {
+                Some(Value::Bool(value)) => *value,
+                Some(Value::Int(0)) => false,
+                Some(Value::Int(1)) => true,
+                _ => return Some(Err(notify_error(messages::fleets::PILOT_NOT_IN_FLEET))),
+            };
+            let mut st = state();
+            if !st.is_member(fleet_id, me) {
+                return Some(Err(notify_error(messages::fleets::PILOT_NOT_IN_FLEET)));
+            }
+            let f = st.fleets.get_mut(&fleet_id).unwrap();
+            let member = f.members.get_mut(&me).unwrap();
+            let before = member.clone();
+            match call.method {
+                "SetTakesFleetWarp" => member.opt_outs.accepts_fleet_warp = value,
+                "SetAcceptsConduitJumpsValue" => member.opt_outs.accepts_conduit_jumps = value,
+                _ => member.opt_outs.accepts_fleet_regroups = value,
+            }
+            let after = member.clone();
+            broadcast(&world, f, None, "OnFleetMemberChanged", changed(me, fleet_id, &before, &after, f.members.len() == 1));
+            Ok(Value::None)
+        }
         "LeaveFleet" => {
-            remove_member(&world, fleet_id, me);
+            let mut st = state();
+            if !st.is_member(fleet_id, me) { return Some(Err(notify_error(messages::fleets::PILOT_NOT_IN_FLEET))); }
+            remove_member_from(&mut st, &world, fleet_id, me);
             Ok(Value::None)
         }
         "KickMember" => {
             let target = int(0).unwrap_or(0);
-            let allowed = state().fleets.get(&fleet_id).is_some_and(|f| is_leader(f, me) && f.members.contains_key(&target));
+            let mut st = state();
+            let allowed = st.is_member(fleet_id, me) && st.is_member(fleet_id, target) && st.fleets.get(&fleet_id).is_some_and(|f| is_leader(f, me));
             if !allowed {
                 return Some(Err(notify_error(messages::fleets::FLEET_LEADER_REQUIRED_TO_REMOVE_MEMBER)));
             }
-            remove_member(&world, fleet_id, target);
+            remove_member_from(&mut st, &world, fleet_id, target);
             Ok(Value::None)
         }
         "DisbandFleet" => {
-            let members: Vec<i64> = match state().fleets.get(&fleet_id) {
+            let mut st = state();
+            if !st.is_member(fleet_id, me) { return Some(Err(notify_error(messages::fleets::PILOT_NOT_IN_FLEET))); }
+            let members: Vec<i64> = match st.fleets.get(&fleet_id) {
                 Some(f) if is_leader(f, me) => f.members.keys().copied().collect(),
                 _ => return Some(Err(notify_error(messages::fleets::FLEET_LEADER_REQUIRED_TO_DISBAND))),
             };
             for ch in members {
-                remove_member(&world, fleet_id, ch);
+                remove_member_from(&mut st, &world, fleet_id, ch);
             }
             Ok(Value::None)
         }
         // MakeLeader(charID) / MoveMember(charID, wingID, squadID, role)
-        "MakeLeader" | "MoveMember" => {
-            let target = int(0).unwrap_or(0);
+        "MakeLeader" | "MoveMember" | "MassMoveMembers" => {
             let mut st = state();
-            let Some(f) = st.fleets.get_mut(&fleet_id) else { return Some(Err(notify_error(messages::fleets::FLEET_NOT_FOUND))) };
-            let free_move = target == me && call.method == "MoveMember";
-            if !is_leader(f, me) && !free_move {
-                return Some(Err(notify_error(messages::fleets::FLEET_LEADER_REQUIRED_TO_MOVE_MEMBER)));
+            if !st.is_member(fleet_id, me) { return Some(Err(notify_error(messages::fleets::PILOT_NOT_IN_FLEET))); }
+            let mass = call.method == "MassMoveMembers";
+            let ids: Vec<i64> = if mass {
+                let Some(values) = call.args.first().and_then(Value::items) else { return Some(Err(notify_error(messages::fleets::INVALID_REQUEST))) };
+                let Some(ids) = values.iter().map(Value::as_int).collect() else { return Some(Err(notify_error(messages::fleets::INVALID_REQUEST))) };
+                ids
+            } else { vec![int(0).unwrap_or(0)] };
+            if ids.iter().any(|id| !st.is_member(fleet_id, *id)) { return Some(Err(notify_error(messages::fleets::PILOT_NOT_IN_FLEET_TARGET))); }
+            let f = st.fleets.get_mut(&fleet_id).unwrap();
+            let transfer = !mass && (call.method == "MakeLeader" || int(3) == Some(ROLE_LEADER)) && ids[0] != me;
+            if !is_leader(f, me) && !(f.options.free_move && !mass && ids == [me] && call.method == "MoveMember") {
+                return Some(Err(notify_error(messages::fleets::LEADER_REQUIRED)));
             }
-            let Some(before) = f.members.get(&target).cloned() else { return Some(Err(notify_error(messages::fleets::PILOT_NOT_IN_FLEET_TARGET))) };
-            let mut after = before.clone();
-            if call.method == "MakeLeader" {
-                after.role = ROLE_LEADER;
-            } else {
-                after.wing = int(1).unwrap_or(before.wing);
-                after.squad = int(2).unwrap_or(before.squad);
-                after.role = int(3).unwrap_or(before.role).clamp(ROLE_LEADER, ROLE_MEMBER);
-            }
-            let mut changes = vec![(target, before, after.clone())];
-            // There is one leader; the old one becomes a member.
-            if after.role == ROLE_LEADER {
-                for (ch, m) in f.members.iter_mut().filter(|(ch, m)| **ch != target && m.role == ROLE_LEADER) {
-                    let old = m.clone();
-                    m.role = ROLE_MEMBER;
-                    changes.push((*ch, old, m.clone()));
+            let mut changes = Vec::new();
+            for id in &ids {
+                let Some(before) = f.members.get(id) else { return Some(Err(notify_error(messages::fleets::PILOT_NOT_IN_FLEET_TARGET))) };
+                let mut after = before.clone();
+                if call.method == "MakeLeader" {
+                    after.wing = NONE_ID; after.squad = NONE_ID; after.role = ROLE_LEADER; after.job |= JOB_CREATOR;
+                } else {
+                    after.wing = int(1).unwrap_or(before.wing);
+                    after.squad = int(2).unwrap_or(before.squad);
+                    after.role = int(3).unwrap_or(before.role);
+                    if transfer { after.job |= JOB_CREATOR; }
+                    if !is_leader(f, me) && (before.role != ROLE_MEMBER || after.role != ROLE_MEMBER) {
+                        return Some(Err(notify_error(messages::fleets::LEADER_REQUIRED)));
+                    }
                 }
+                changes.push((*id, after));
             }
-            if let Some(m) = f.members.get_mut(&target) {
-                *m = after;
+            if transfer {
+                let Some((wing, squad)) = f.wings.iter().find_map(|w| w.squads.first().map(|s| (w.id, s.id))) else { return Some(Err(notify_error(messages::fleets::INVALID_REQUEST))) };
+                let mut old_leader = f.members[&me].clone();
+                old_leader.wing = wing; old_leader.squad = squad; old_leader.role = ROLE_MEMBER; old_leader.job &= !JOB_CREATOR;
+                changes.push((me, old_leader));
             }
-            let only = f.members.len() == 1;
-            for (ch, before, after) in changes {
-                world.notify_pilot(ch, "__session", session_pairs(Some(fleet_id), Some(&after)));
-                broadcast(&world, f, None, "OnFleetMemberChanged", changed(ch, fleet_id, &before, &after, only));
-            }
-            Ok(Value::None)
+            let Some(changes) = super::arrangement::apply(f, changes) else { return Some(Err(notify_error(messages::fleets::INVALID_REQUEST))) };
+            if transfer { super::fleet_proxy::leader_changed(&world, f, ids[0]); }
+            let changes: Vec<_> = changes.into_iter().filter(|(_, before, after)| (before.wing, before.squad, before.role, before.job) != (after.wing, after.squad, after.role, after.job)).collect();
+            let moved: Vec<_> = changes.iter().map(|(id, _, _)| Value::Int(*id)).collect();
+            super::arrangement::publish(&world, fleet_id, f, changes);
+            if mass { Ok(Value::list(moved)) } else { Ok(Value::None) }
         }
         "CreateWing" => {
             let mut st = state();
+            if !st.is_member(fleet_id, me) { return Some(Err(notify_error(messages::fleets::PILOT_NOT_IN_FLEET))); }
             match st.fleets.get_mut(&fleet_id) {
                 Some(f) if is_leader(f, me) => {
+                    if f.wings.len() >= MAX_WINGS { return Some(Err(notify_error(messages::fleets::INVALID_REQUEST))); }
                     let id = next_id();
                     let n = f.wings.len() + 1;
                     f.wings.push(Wing { id, name: messages::fleets::fleet_wing_name(n), squads: vec![] });
@@ -232,10 +250,12 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         "CreateSquad" => {
             let wing = int(0).unwrap_or(0);
             let mut st = state();
+            if !st.is_member(fleet_id, me) { return Some(Err(notify_error(messages::fleets::PILOT_NOT_IN_FLEET))); }
             match st.fleets.get_mut(&fleet_id) {
                 Some(f) if is_leader(f, me) => {
                     let id = next_id();
                     let Some(w) = f.wings.iter_mut().find(|w| w.id == wing) else { return Some(Err(notify_error(messages::fleets::FLEET_WING_NOT_FOUND))) };
+                    if w.squads.len() >= MAX_SQUADS { return Some(Err(notify_error(messages::fleets::INVALID_REQUEST))); }
                     let n = w.squads.len() + 1;
                     w.squads.push(Squad { id, name: messages::fleets::fleet_squad_name(n) });
                     broadcast(&world, f, None, "OnFleetSquadAdded", vec![Value::Int(wing), Value::Int(id)]);
@@ -247,11 +267,18 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         "DeleteWing" | "DeleteSquad" => {
             let id = int(0).unwrap_or(0);
             let mut st = state();
+            if !st.is_member(fleet_id, me) { return Some(Err(notify_error(messages::fleets::PILOT_NOT_IN_FLEET))); }
             match st.fleets.get_mut(&fleet_id) {
                 Some(f) if is_leader(f, me) => {
+                    let exists = if call.method == "DeleteWing" { f.wings.iter().any(|w| w.id == id) } else { f.wings.iter().any(|w| w.squads.iter().any(|s| s.id == id)) };
+                    if !exists { return Some(Err(notify_error(messages::fleets::INVALID_REQUEST))); }
                     let occupied = f.members.values().any(|m| m.wing == id || m.squad == id);
                     if occupied {
                         return Some(Err(notify_error(messages::fleets::FLEET_STRUCTURE_MUST_BE_EMPTY)));
+                    }
+                    let old_options = options_value(&f.options);
+                    if f.options.auto_join_squad.is_some_and(|s| s == id || f.wings.iter().any(|w| w.id == id && w.squads.iter().any(|sq| sq.id == s))) {
+                        f.options.auto_join_squad = None;
                     }
                     if call.method == "DeleteWing" {
                         f.wings.retain(|w| w.id != id);
@@ -262,6 +289,7 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
                         }
                         broadcast(&world, f, None, "OnFleetSquadDeleted", vec![Value::Int(id)]);
                     }
+                    if old_options != options_value(&f.options) { broadcast(&world, f, None, "OnFleetOptionsChanged", vec![old_options, options_value(&f.options)]); }
                     Ok(Value::None)
                 }
                 _ => Err(notify_error(messages::fleets::FLEET_LEADER_REQUIRED_TO_CHANGE_STRUCTURE)),
@@ -272,37 +300,158 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             let id = int(0).unwrap_or(0);
             let name = value_text(call.args.get(1), MAX_NAME_LENGTH);
             let mut st = state();
+            if !st.is_member(fleet_id, me) { return Some(Err(notify_error(messages::fleets::PILOT_NOT_IN_FLEET))); }
             match st.fleets.get_mut(&fleet_id) {
                 Some(f) if is_leader(f, me) => {
-                    let event = if call.method == "ChangeWingName" {
-                        for w in f.wings.iter_mut().filter(|w| w.id == id) {
-                            w.name = name.clone();
-                        }
-                        "OnFleetWingNameChanged"
-                    } else {
-                        for s in f.wings.iter_mut().flat_map(|w| w.squads.iter_mut()).filter(|s| s.id == id) {
-                            s.name = name.clone();
-                        }
-                        "OnFleetSquadNameChanged"
-                    };
+                    let wing = call.method == "ChangeWingName";
+                    if !f.rename_structure(id, &name, wing) {
+                        return Some(Err(notify_error(if wing { messages::fleets::FLEET_WING_NOT_FOUND } else { messages::fleets::INVALID_REQUEST })));
+                    }
+                    let event = if wing { "OnFleetWingNameChanged" } else { "OnFleetSquadNameChanged" };
                     broadcast(&world, f, None, event, vec![Value::Int(id), Value::unicode(name)]);
                     Ok(Value::None)
                 }
                 _ => Err(notify_error(messages::fleets::FLEET_LEADER_REQUIRED_TO_RENAME_WING_OR_SQUAD)),
             }
         }
-        // SendBroadcast(name, scope, itemID, typeID)
-        "SendBroadcast" => {
-            let name = call.args.first().cloned().unwrap_or(Value::None);
-            let scope = call.args.get(1).cloned().unwrap_or(Value::None);
-            let item = call.args.get(2).cloned().unwrap_or(Value::None);
-            let type_id = call.args.get(3).cloned().unwrap_or(Value::None);
-            let system = c.session.int("solarsystemid2").map(Value::Int).unwrap_or(Value::None);
-            if let Some(f) = state().fleets.get(&fleet_id) {
-                broadcast(&world, f, None, "OnFleetBroadcast", vec![name, scope, Value::Int(me), system, item, type_id]);
+        "GetFleetMaxSize" | "GetJoinRequests" | "SetOptions" | "SetAutoJoinSquadID" | "SetFleetMaxSize" | "RejectJoinRequest" | "LoadFleetSetup" => {
+            let mut st = state();
+            if !st.is_member(fleet_id, me) { return Some(Err(notify_error(messages::fleets::PILOT_NOT_IN_FLEET))); }
+            let f = st.fleets.get_mut(&fleet_id).unwrap();
+            if !is_leader(f, me) { return Some(Err(notify_error(messages::fleets::LEADER_REQUIRED))); }
+            match call.method {
+                "GetFleetMaxSize" => Ok(Value::Int(f.max_members as i64)),
+                "GetJoinRequests" => Ok(Value::Dict(f.join_requests.iter().map(|(id, v)| (Value::Int(*id), v.clone())).collect())),
+                "LoadFleetSetup" => Err(notify_error(messages::fleets::LOAD_SETUP_UNSUPPORTED)),
+                "RejectJoinRequest" => {
+                    let target = int(0).unwrap_or(0);
+                    if f.join_requests.remove(&target).is_some() {
+                        world.notify_pilot(target, "OnFleetJoinRejected", vec![Value::Int(target)]);
+                        let requests = Value::Dict(f.join_requests.iter().map(|(id, v)| (Value::Int(*id), v.clone())).collect());
+                        world.notify_pilot(me, "OnJoinRequestUpdate", vec![requests]);
+                    }
+                    Ok(Value::None)
+                }
+                "SetFleetMaxSize" => {
+                    let Some(size) = int(0).and_then(|n| usize::try_from(n).ok()).filter(|n| *n >= f.members.len() && *n >= 1 && *n <= MAX_MEMBERS) else { return Some(Err(notify_error(messages::fleets::INVALID_REQUEST))) };
+                    f.max_members = size;
+                    Ok(Value::None)
+                }
+                "SetAutoJoinSquadID" => {
+                    let squad = match call.args.first() {
+                        Some(Value::None) => None,
+                        Some(v) => match v.as_int() { Some(NONE_ID) => None, Some(id) => Some(id), None => return Some(Err(notify_error(messages::fleets::INVALID_REQUEST))) },
+                        None => return Some(Err(notify_error(messages::fleets::INVALID_REQUEST))),
+                    };
+                    if squad.is_some_and(|id| !f.wings.iter().any(|w| w.squads.iter().any(|s| s.id == id))) { return Some(Err(notify_error(messages::fleets::INVALID_REQUEST))); }
+                    let old = options_value(&f.options);
+                    f.options.auto_join_squad = squad;
+                    broadcast(&world, f, None, "OnFleetOptionsChanged", vec![old, options_value(&f.options)]);
+                    Ok(Value::None)
+                }
+                _ => {
+                    let value = call.args.first().and_then(|v| crate::services::value_field(v, "isFreeMove")).and_then(bool_value);
+                    let Some(value) = value else { return Some(Err(notify_error(messages::fleets::INVALID_REQUEST))) };
+                    let old = options_value(&f.options);
+                    f.options.free_move = value;
+                    broadcast(&world, f, None, "OnFleetOptionsChanged", vec![old, options_value(&f.options)]);
+                    Ok(Value::None)
+                }
             }
+        }
+        "FinishMove" => {
+            let member = {
+                let st = state();
+                if !st.is_member(fleet_id, me) { return Some(Err(notify_error(messages::fleets::PILOT_NOT_IN_FLEET))); }
+                st.fleets[&fleet_id].members[&me].clone()
+            };
+            set_own_session(c, &session_pairs(Some(fleet_id), Some(&member)));
             Ok(Value::None)
         }
+        "UpdateMemberInfo" => {
+            let ship_type = match crate::dao::characters::routing::fleet_member_locations(&c.db, &[me]).await {
+                Ok(rows) => rows.first().and_then(|r| r.type_id).map(i64::from).unwrap_or(0),
+                Err(e) => return Some(Err(CallError::Internal(e.into()))),
+            };
+            let mut st = state();
+            if !st.is_member(fleet_id, me) { return Some(Err(notify_error(messages::fleets::PILOT_NOT_IN_FLEET))); }
+            let f = st.fleets.get_mut(&fleet_id).unwrap();
+            let member = f.members.get_mut(&me).unwrap();
+            let before = member.clone();
+            member.ship_type = ship_type;
+            let after = member.clone();
+            broadcast(&world, f, None, "OnFleetMemberChanged", changed(me, fleet_id, &before, &after, f.members.len() == 1));
+            Ok(Value::None)
+        }
+        "ArrangeMembersByShipType" | "ArrangeMembersByPreCount" | "ArrangeMembersByEvenlyDistribute" | "ArrangeMembersByAllToFirst" => {
+            let mut st = state();
+            if !st.is_member(fleet_id, me) { return Some(Err(notify_error(messages::fleets::PILOT_NOT_IN_FLEET))); }
+            let f = st.fleets.get_mut(&fleet_id).unwrap();
+            if !is_leader(f, me) { return Some(Err(notify_error(messages::fleets::LEADER_REQUIRED))); }
+            let wing = int(0).unwrap_or(NONE_ID);
+            if !f.wings.iter().any(|w| w.id == wing && !w.squads.is_empty()) { return Some(Err(notify_error(messages::fleets::INVALID_REQUEST))); }
+            let mut ids: Vec<_> = f.members.iter().filter(|(_, m)| m.wing == wing && m.role == ROLE_MEMBER).map(|(id, _)| *id).collect();
+            ids.sort_unstable();
+            if call.method == "ArrangeMembersByShipType" {
+                let Some(types) = call.args.get(1).and_then(Value::items) else { return Some(Err(notify_error(messages::fleets::INVALID_REQUEST))) };
+                let Some(types): Option<Vec<i64>> = types.iter().map(Value::as_int).collect() else { return Some(Err(notify_error(messages::fleets::INVALID_REQUEST))) };
+                if types.is_empty() { return Some(Err(notify_error(messages::fleets::INVALID_REQUEST))); }
+                ids.retain(|id| types.contains(&f.members[id].ship_type));
+                if call.args.get(3).and_then(bool_value).unwrap_or(false) { return Some(Ok(Value::Int(ids.len() as i64))); }
+                if call.args.get(2).and_then(bool_value).unwrap_or(false) { return Some(Err(notify_error(messages::fleets::ARRANGE_REMOVAL_UNSUPPORTED))); }
+            }
+            let per = if call.method == "ArrangeMembersByPreCount" {
+                let Some(n) = int(1).and_then(|v| usize::try_from(v).ok()).filter(|n| *n > 0) else { return Some(Err(notify_error(messages::fleets::INVALID_REQUEST))) };
+                n
+            } else { 1 };
+            let Some(changes) = super::arrangement::plan(f, wing, &ids, call.method, per) else { return Some(Err(notify_error(messages::fleets::INVALID_REQUEST))) };
+            let Some(changes) = super::arrangement::apply(f, changes) else { return Some(Err(notify_error(messages::fleets::INVALID_REQUEST))) };
+            super::arrangement::publish(&world, fleet_id, f, changes);
+            Ok(Value::Bool(true))
+        }
+        "SendBroadcast" => super::broadcasts::send(c, Some(fleet_id), call, super::broadcasts::BroadcastDestination::Universe).await,
         _ => return None,
     })
+}
+
+pub(super) fn notify_invite(world: &World, fleet_id: i64, inviter: i64, target: i64, name: &str) {
+    let question = messages::fleets::fleet_invitation(name);
+    world.notify_pilot(target, "OnFleetInvite", vec![Value::Int(fleet_id), Value::Int(inviter), Value::str(messages::MSG_CUSTOM_QUESTION), Value::dict([("header", Value::unicode(messages::fleets::FLEET_INVITATION_HEADER)), ("question", Value::unicode(question))])]);
+}
+
+pub(super) async fn invite(c: &mut Client, fleet_id: i64, target: i64, wing: Option<i64>, squad: Option<i64>, role: Option<i64>) -> CallResult {
+    let me = c.session.int("charid").unwrap_or(0);
+    let name = crate::dao::characters::routing::character_name(&c.db, me).await.ok().flatten().unwrap_or_default();
+    {
+        let mut st = state();
+        if !valid_invite_target(me, target, c.world.is_online(target), c.world.chat_session(target).is_some()) {
+            return Err(notify_error(messages::fleets::INVALID_REQUEST));
+        }
+        if !st.is_member(fleet_id, me) { return Err(notify_error(messages::fleets::PILOT_NOT_IN_FLEET)); }
+        if st.of.contains_key(&target) { return Err(notify_error(messages::fleets::PILOT_ALREADY_IN_FLEET)); }
+        let f = st.fleets.get_mut(&fleet_id).unwrap();
+        if !is_leader(f, me) { return Err(notify_error(messages::fleets::LEADER_REQUIRED)); }
+        if f.members.len() >= f.max_members { return Err(notify_error(messages::fleets::FLEET_FULL)); }
+        let default = f.options.auto_join_squad.and_then(|id| f.wings.iter().find(|w| w.squads.iter().any(|s| s.id == id)).map(|w| (w.id, id)))
+            .or_else(|| f.wings.iter().find_map(|w| w.squads.first().map(|s| (w.id, s.id))));
+        let (default_wing, default_squad) = default.unwrap_or((NONE_ID, NONE_ID));
+        let (wing, squad, role) = (wing.unwrap_or(default_wing), squad.unwrap_or(default_squad), role.unwrap_or(ROLE_MEMBER));
+        let member = Member::new(wing, squad, role, JOB_NONE, 0);
+        if role == ROLE_LEADER || !super::arrangement::valid_slot(f, target, &member) { return Err(notify_error(messages::fleets::INVALID_REQUEST)); }
+        f.invites.insert(target, (wing, squad, role));
+        if f.join_requests.remove(&target).is_some() {
+            let requests = Value::Dict(f.join_requests.iter().map(|(id, value)| (Value::Int(*id), value.clone())).collect());
+            c.world.notify_pilot(me, "OnJoinRequestUpdate", vec![requests]);
+        }
+    }
+    notify_invite(&c.world, fleet_id, me, target, &name);
+    Ok(Value::None)
+}
+
+pub(super) fn valid_invite_target(inviter: i64, target: i64, online: bool, has_session: bool) -> bool {
+    target > 0 && target != inviter && online && has_session
+}
+
+fn bool_value(value: &Value) -> Option<bool> {
+    match value { Value::Bool(v) => Some(*v), Value::Int(0) => Some(false), Value::Int(1) => Some(true), _ => None }
 }

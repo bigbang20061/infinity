@@ -59,17 +59,29 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         ("beyonce", "CmdWarpToStuff") if a.first().and_then(|v| v.as_text()).as_deref() == Some("scan") => {
             let target = a.get(1).and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
             let min_range = call.kwargs.get("minRange").and_then(|v| v.as_float()).unwrap_or(0.0);
-            crate::services::exploration::warp_to_scan(c, &target, min_range).await
+            let order = if call.kwargs.get("fleet").is_some_and(|v| matches!(v, Value::Bool(true)) || v.as_int().is_some_and(|i| i != 0)) {
+                match super::super::fleets::warp::authorize(c).await { Ok(order) => Some(order), Err(err) => return Some(Err(err)) }
+            } else { None };
+            crate::services::exploration::warp_to_scan(c, &target, min_range, order).await
         }
         ("beyonce", "CmdWarpToStuff") | ("beyonce", "CmdWarpToStuffAutopilot") => {
+            let mut order = if call.kwargs.get("fleet").is_some_and(|v| matches!(v, Value::Bool(true)) || v.as_int().is_some_and(|i| i != 0)) {
+                match super::super::fleets::warp::authorize(c).await { Ok(order) => Some(order), Err(err) => return Some(Err(err)) }
+            } else { None };
             let target = a.get(1).and_then(|v| v.as_int()).unwrap_or(0);
             let min_range = call.kwargs.get("minRange").and_then(|v| v.as_float()).unwrap_or(0.0);
             // 'char': a fleet member's ship.
             let by_pilot = a.first().and_then(|v| v.as_text()).as_deref() == Some("char");
+            let me = c.session.int("charid").unwrap_or(0);
+            if by_pilot && order.as_ref().is_some_and(|order| !super::super::fleets::warp::permits_target(order, target)) {
+                return Some(Ok(Value::None));
+            }
             let found = if let Some(sys) = c.session.int("solarsystemid") {
                 c.world.with(sys, move |s| {
-                    if by_pilot { s.pilot_ball(target) } else { s.ball(target) }
-                        .map(|b| (b.id, b.position_at(s.now_ms()), b.radius as f64, s.warp_in(b.id)))
+                    let b = if by_pilot { s.pilot_ball(target) } else { s.ball(target) }?;
+                    if !s.fleet_broadcast_visible(me, b.id)
+                        || (by_pilot && (b.char_id != Some(target) || b.owner_id != target)) { return None; }
+                    Some((b.id, b.position_at(s.now_ms()), b.radius as f64, s.warp_in(b.id)))
                 }).await.flatten()
             } else {
                 None
@@ -77,6 +89,9 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             let Some((id, pos, radius, warp_in)) = found else {
                 return Some(Ok(Value::None));
             };
+            if by_pilot {
+                if let Some(order) = order.as_mut() { super::super::fleets::warp::target(order, target, id); }
+            }
             let on_exit: Option<Timer> = if !by_pilot {
                 c.session.int("solarsystemid").map(|system| {
                     let db = c.db.clone();
@@ -93,9 +108,12 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
                 })
             } else { None };
             // Suns, planets, moons and belts land at their warp-in point, not off the surface.
+            let destination = if !by_pilot && c.sde.map.celestial(id).is_some() {
+                Value::dict([("celestialID", Value::Int(id))])
+            } else { Value::Dict(vec![]) };
             match warp_in {
-                Some(point) => warp_to(c, None, point, min_range, on_exit).await,
-                None => warp_to(c, Some((pos, radius)), pos, min_range, on_exit).await,
+                Some(point) => warp_destination(c, order, None, point, min_range, on_exit, destination).await,
+                None => warp_destination(c, order, Some((pos, radius)), pos, min_range, on_exit, destination).await,
             }
         }
         ("beyonce", "CmdStargateJump") => {

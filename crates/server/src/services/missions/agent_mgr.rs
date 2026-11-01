@@ -412,6 +412,9 @@ async fn do_action(c: &mut Client, agent: &Agent, action: Option<i64>) -> CallRe
 async fn warp_to_location(c: &mut Client, agent: &Agent, call: &Call<'_>) -> CallResult {
     let kind = call.args.first().and_then(|v| v.as_text()).map(|s| s.into_owned()).unwrap_or_default();
     let range = call.args.get(2).and_then(|v| v.as_float()).unwrap_or(0.0);
+    let order = if call.args.get(3).is_some_and(|v| matches!(v, Value::Bool(true)) || v.as_int().is_some_and(|i| i != 0)) {
+        Some(super::super::fleets::warp::authorize(c).await?)
+    } else { None };
     let here = c.session.int("solarsystemid");
     match kind.as_str() {
         "dungeon" => {
@@ -420,7 +423,7 @@ async fn warp_to_location(c: &mut Client, agent: &Agent, call: &Call<'_>) -> Cal
                 return Ok(Value::None);
             }
             ensure_site(c, &m).await?;
-            super::ship::warp_to(c, None, m.pos, range, None).await
+            super::ship::warp_destination(c, order, None, m.pos, range, None, Value::Dict(vec![])).await
         }
         "agenthomebase" => {
             let (station, _, system, pos) = agent_station(c, agent).await?;
@@ -428,7 +431,7 @@ async fn warp_to_location(c: &mut Client, agent: &Agent, call: &Call<'_>) -> Cal
                 return Ok(Value::None);
             }
             let radius = c.world.with(system, move |s| s.ball(station).map(|b| b.radius as f64)).await.flatten().unwrap_or(FALLBACK_STATION_RADIUS);
-            super::ship::warp_to(c, Some((pos, radius)), pos, range, None).await
+            super::ship::warp_destination(c, order, Some((pos, radius)), pos, range, None, Value::dict([("celestialID", Value::Int(station))])).await
         }
         _ => Ok(Value::None),
     }

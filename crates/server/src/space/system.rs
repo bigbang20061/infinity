@@ -66,6 +66,7 @@ pub struct System {
     pilots: HashMap<i64, i64>,
     observers: HashMap<i64, (i64, DestinyTx)>,
     registry: Arc<Pilots>,
+    pub(super) world: std::sync::Weak<World>,
     target_states: HashMap<i64, TargetState>,
     free_ids: Vec<i64>,
     collision_scratch: Vec<collision::Snapshot>,
@@ -193,6 +194,28 @@ impl System {
 
     pub fn pilot_ball(&self, char_id: i64) -> Option<&Ball> {
         self.pilots.get(&char_id).and_then(|id| self.ball(*id))
+    }
+    /// Current ballpark visibility for a pilot with a live matching observer.
+    pub(crate) fn fleet_broadcast_visible(&self, character: i64, ball: i64) -> bool {
+        let Some(ego) = self.pilot_ball(character).map(|pilot| pilot.id) else { return false };
+        let Some((observer_ego, tx)) = self.observers.get(&character) else { return false };
+        *observer_ego == ego && !tx.is_closed()
+            && self.ball(ball).is_some_and(|target| target.cloak == 0 || target.id == ego)
+    }
+    /// Snapshot a pilot's real actor-owned damage state and visibility.
+    pub(crate) fn fleet_damage_snapshot(&self, character: i64) -> Option<(i64, u8, Value)> {
+        let ball = self.pilot_ball(character)?;
+        Some((ball.id, ball.cloak, ball.damage_state()))
+    }
+
+    /// Targeted ballpark function, only while the destination observer owns its ego.
+    pub(crate) fn fleet_damage_update(&self, watcher: i64, source_system: i64, ship: i64, cloak: u8, damage: Value) {
+        let Some(ego) = self.pilot_ball(watcher).map(|ball| ball.id) else { return };
+        let Some((observer_ego, tx)) = self.observers.get(&watcher) else { return };
+        if *observer_ego != ego || tx.is_closed() || (self.id == source_system && (cloak == 0 || ship == ego)) { return; }
+        // michelle.py:875-879,1594-1599: a ballpark function, not a service event.
+        let update = event(self.current_time, "OnFleetDamageStateChange", vec![Value::Int(ship), damage]);
+        self.registry.notify_pilot(watcher, "DoDestinyUpdate", vec![Value::list([update]), Value::Bool(false)]);
     }
     /// Identity of persistent ball membership, invalidated on replacement.
     pub(crate) fn persistent_generation(&self, ship: i64) -> Option<u64> {
@@ -462,8 +485,18 @@ impl System {
     pub fn set_health(&mut self, id: i64, health: [f64; DAMAGE_LAYER_COUNT]) {
         let Some(b) = self.balls.get_mut(&id) else { return };
         b.health = health;
-        let update = event(self.current_time, "OnDamageStateChange", vec![Value::Int(id), b.damage_state()]);
+        let damage = b.damage_state();
+        let character = b.char_id;
+        let cloak = b.cloak;
+        let update = event(self.current_time, "OnDamageStateChange", vec![Value::Int(id), damage.clone()]);
         self.broadcast(id, vec![update]);
+        // The actor captures visibility; fleet ownership is consulted only by the deferred worker.
+        if let (Some(character), Some(world)) = (character, self.world.upgrade()) {
+            let system = self.id;
+            self.defer(async move {
+                crate::services::fleets::damage::route(world, character, system, id, cloak, damage, None).await;
+            });
+        }
     }
     /// Return the largest active compressor range supporting this type.
     pub(crate) fn compressor_range(&self, ship: i64, type_id: i32, sde: &crate::sde::Sde) -> Option<f64> {
