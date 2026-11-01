@@ -7,7 +7,7 @@
 //! Loot rights and suspect flags are not implemented.
 
 use super::*;
-use crate::consts::{CORP_HANGAR_DIVISIONS, FLAG_CORP_SAG1, IX_FLAG, IX_SINGLETON, ROLE_DIRECTOR, ROLE_HANGAR_CAN_TAKE_1};
+use crate::consts::{CORP_HANGAR_DIVISIONS, IX_FLAG, IX_SINGLETON, IX_OWNER_ID};
 
 const FLAG_AUTOFIT: i32 = 0;
 /// appConst.py:1475, maxCargoContainerTransferDistance, in metres.
@@ -38,12 +38,8 @@ pub(super) fn dispatch_move<T>(value: T, outbox: Outbox<MoveEffect>, c: &Client,
 
 async fn authorized_source(c: &Client, item: &Item, source: Option<i64>, char_id: i64) -> Result<bool, CallError> {
     if source.is_some_and(|id| id != item.location_id) { return Ok(false); }
-    if let Some(corp) = super::super::offices::office_owner(&c.db, item.location_id).await? {
-        let (my_corp, roles) = super::super::corps::membership(&c.db, char_id).await?;
-        let take = ROLE_HANGAR_CAN_TAKE_1 << (item.flag_id - FLAG_CORP_SAG1).clamp(0, CORP_HANGAR_DIVISIONS - 1);
-        if my_corp != corp || roles & (take | ROLE_DIRECTOR) == 0 {
-            return Err(CallError::User { msg: messages::MSG_CUSTOM_NOTIFY.into(), dict: vec![("notify".into(), Value::unicode(messages::NO_CORPORATION_HANGAR_TAKE_ROLE))] });
-        }
+    if let Some(allowed) = custody_allowed(&c.db, &c.sde, item.item_id, char_id, c.session.int("stationid"), true).await? {
+        if !allowed { return Err(notify_error(messages::NO_CORPORATION_HANGAR_TAKE_ROLE)); }
         return Ok(true);
     }
     if item.owner_id == char_id { return Ok(true); }
@@ -61,7 +57,9 @@ async fn authorized_source(c: &Client, item: &Item, source: Option<i64>, char_id
 }
 
 async fn authorized_destination(c: &Client, container: &Container, flag: Option<i32>, char_id: i64) -> Result<Option<(i64, i64, i32)>, CallError> {
+    if flag == Some(FLAG_CORP_DELIVERIES) { return Ok(None); }
     match container {
+        Container::Deliveries { .. } => Ok(None),
         Container::Hangar { station_id, owner_id } => {
             if *owner_id != char_id || c.session.int("stationid") != Some(*station_id) { return Ok(None); }
             Ok(Some((*station_id, *owner_id, flag.filter(|f| *f != FLAG_AUTOFIT).unwrap_or(FLAG_HANGAR))))
@@ -74,6 +72,7 @@ async fn authorized_destination(c: &Client, container: &Container, flag: Option<
                 let sag = FLAG_CORP_SAG1;
                 return Ok(Some((*id, corp, flag.filter(|f| (sag..sag + CORP_HANGAR_DIVISIONS).contains(f)).unwrap_or(sag))));
             }
+            if corporate_custody(&c.db, Some(&c.sde), *id).await?.is_some() { return Ok(None); }
             let Some(item) = load_items(&c.db, &c.sde, ItemQuery::Id(*id)).await.map_err(db_err)?.into_iter().next() else { return Ok(None) };
             if item.owner_id != char_id { return Ok(None); }
             let default = if item.category_id == CATEGORY_SHIP as i64 { FLAG_CARGO } else { FLAG_HANGAR };
@@ -91,7 +90,7 @@ pub(crate) async fn move_item(c: &mut Client, container: &Container, item_id: i6
     let allowed_source = authorized_source(c, &item, source, char_id).await?;
     let destination = if allowed_source { authorized_destination(c, container, flag, char_id).await? } else { None };
     let Some((location, owner, flag)) = destination else {
-        let destination = match container { Container::Hangar { station_id, .. } => *station_id, Container::Item(id) => *id };
+        let destination = match container { Container::Hangar { station_id, .. } | Container::Deliveries { station_id, .. } => *station_id, Container::Item(id) => *id };
         warn!(char_id, item_id, destination, "inventory move authorization refused");
         return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
     };
@@ -109,6 +108,9 @@ pub(crate) async fn move_item(c: &mut Client, container: &Container, item_id: i6
             let sde = sde.clone();
             let policy = policy.clone();
             Box::pin(async move {
+                if custody_allowed(tx, &sde, item.item_id, char_id, station, true).await? == Some(false) {
+                    return Err(notify_error(messages::NO_CORPORATION_HANGAR_TAKE_ROLE));
+                }
                 let destination_fitting = is_fitting_flag(flag) || (flag == FLAG_AUTOFIT
                     && (item.category_id == i64::from(crate::consts::CATEGORY_MODULE) || item.category_id == i64::from(crate::consts::CATEGORY_SUBSYSTEM)));
                 let source_fitting = is_fitting_flag(item.flag_id);
@@ -182,17 +184,33 @@ pub(super) async fn move_core<X: Send>(
     }
     let item_id = item.item_id;
     let fitting = is_fitting_flag(flag);
+    let corporate = corporate_custody(tx, Some(sde), item.item_id).await?.is_some();
     if let Some(q) = take {
         let id = split_stack(tx, item, q as i32, owner, location, flag, fitting).await?;
-        notify_item_change(tx, sde, outbox, item_id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
-        notify_item_change(tx, sde, outbox, id, vec![(IX_LOCATION_ID, Value::Int(item.location_id)), (IX_FLAG, Value::Int(item.flag_id as i64))]).await?;
+        if item.owner_id != owner && corporate {
+            let left = Item { quantity: item.quantity - q as i32, ..item.clone() };
+            notify_corp_item_change(tx, outbox, &left, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
+        } else {
+            notify_item_change(tx, sde, outbox, item_id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
+        }
+        let mut change = vec![(IX_LOCATION_ID, Value::Int(item.location_id)), (IX_FLAG, Value::Int(item.flag_id as i64))];
+        if item.owner_id != owner { change.push((IX_OWNER_ID, Value::Int(item.owner_id))); }
+        notify_item_change(tx, sde, outbox, id, change).await?;
         Ok(id)
     } else {
+        if item.owner_id != owner && corporate {
+            let gone = Item { location_id: LOCATION_JUNKYARD, ..item.clone() };
+            notify_corp_item_change(tx, outbox, &gone, vec![(IX_LOCATION_ID, Value::Int(item.location_id))]).await?;
+        }
         let singleton = item.singleton || fitting;
         if !inventory_dao::move_item(tx, item, location, flag, owner, singleton).await.map_err(db_err)? {
             return Err(notify_error(messages::INSUFFICIENT_ITEM_QUANTITY));
         }
+        if item.owner_id != owner && corporate {
+            crate::dao::items::transfers::hand_over(tx, &[crate::dao::items::transfers::Transfer { item_id, owner, location, flag }]).await.map_err(db_err)?;
+        }
         let mut change = vec![(IX_LOCATION_ID, Value::Int(item.location_id)), (IX_FLAG, Value::Int(item.flag_id as i64))];
+        if item.owner_id != owner { change.push((IX_OWNER_ID, Value::Int(item.owner_id))); }
         if singleton != item.singleton {
             change.push((IX_SINGLETON, Value::Bool(item.singleton)));
         }

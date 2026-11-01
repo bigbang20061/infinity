@@ -37,7 +37,7 @@ impl GameItem {
 
 /// The existing item predicates, with parameters in their original SQL order.
 pub(crate) enum ItemQuery<'a> {
-    Id(i64), Ids(&'a [i64]), IdAt(i64, i64), IdsOwner(&'a [i64], i64),
+    Id(i64), Ids(&'a [i64]), IdAt(i64, i64),
     IdsOwnerLocations(&'a [i64], i64, i64, i64),
     Location(i64), IdOrLocation(i64), LocationFlags(i64, &'a [i32]), LocationOwnerFlags(i64, i64, &'a [i32]),
     LocationOwner(i64, i64), Owner(i64), OwnerExceptSelf(i64), LocationExceptFlag(i64, i32),
@@ -54,7 +54,6 @@ pub(crate) async fn load_items(ex: &(impl Executor + ?Sized), query: ItemQuery<'
         Id(..) => "i.item_id = $1",
         Ids(..) => "i.item_id = ANY($1)",
         IdAt(..) => "i.item_id = $1 AND i.location_id = $2",
-        IdsOwner(..) => "i.item_id = ANY($1) AND i.owner_id = $2",
         IdsOwnerLocations(..) => "i.item_id = ANY($1) AND i.owner_id = $2 AND (i.location_id = $3 OR i.location_id = $4)",
         Location(..) => "i.location_id = $1",
         IdOrLocation(..) => "i.item_id = $1 OR i.location_id = $1",
@@ -83,7 +82,6 @@ pub(crate) async fn load_items(ex: &(impl Executor + ?Sized), query: ItemQuery<'
         Id(a) | Location(a) | IdOrLocation(a) | Owner(a) | OwnerExceptSelf(a) => ex.query(&sql, &[a]).await?,
         Ids(a) => ex.query(&sql, &[a]).await?,
         IdAt(a,b) | LocationOwner(a,b) | OwnerLocation(a,b) => ex.query(&sql, &[a,b]).await?,
-        IdsOwner(a,b) => ex.query(&sql, &[a,b]).await?,
         IdsOwnerLocations(a,b,c,d) => ex.query(&sql, &[a,b,c,d]).await?,
         LocationFlags(a,b) => ex.query(&sql, &[a,b]).await?,
         LocationOwnerFlags(a,b,c) => ex.query(&sql, &[a,b,c]).await?,

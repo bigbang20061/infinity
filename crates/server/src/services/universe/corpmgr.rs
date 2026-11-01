@@ -1,12 +1,39 @@
-//! corpmgr service; see the parent feature for data sources and limitations.
+//! corpmgr public information and corporation delivery asset locations.
+//! The client contracts and corporation assets UIs consume station locations from
+//! `game.items` and loaded SDE station metadata. Other asset modes remain empty.
 
 use super::*;
+use crate::services::keyval;
 
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     let my_corp = c.session.int("corpid").unwrap_or(0);
     let arg_int = |i: usize| call.args.get(i).and_then(|v| v.as_int());
     Some(Ok(match (call.service, call.method) {
         ("corpmgr", "GetCorporations") => return Some(corporation(c, arg_int(0).unwrap_or(my_corp)).await),
+        ("corpmgr", "GetAssetInventory") => {
+            if !call.args.get(1).and_then(Value::as_text).is_some_and(|mode| mode == "deliveries") {
+                return Some(Ok(Value::list([])));
+            }
+            let corp = arg_int(0).unwrap_or(0);
+            let me = c.session.int("charid").unwrap_or(0);
+            match crate::services::inventory::may_view_corp_hangar(&c.db, me, corp, crate::consts::FLAG_CORP_DELIVERIES).await {
+                Ok(true) => {}
+                Ok(false) => return Some(Ok(Value::list([]))),
+                Err(error) => return Some(Err(error)),
+            }
+            let locations = match crate::dao::items::deliveries::locations(&c.db, corp).await {
+                Ok(rows) => rows,
+                Err(error) => return Some(Err(db_err(error))),
+            };
+            Value::list(locations.into_iter().filter_map(|row| {
+                let station = c.sde.map.station(row.location_id)?;
+                Some(keyval([
+                    ("locationID", Value::Int(row.location_id)),
+                    ("solarsystemID", station.solar_system_id.map(Value::Int).unwrap_or(Value::None)),
+                    ("itemCount", Value::Int(row.item_count)),
+                ]))
+            }))
+        }
         // Show info on a corporation (corporationInfoWindow reads ceoID, stationID, shares...).
         ("corpmgr", "GetPublicInfo") => return Some(corporation(c, arg_int(0).unwrap_or(my_corp)).await),
         ("corpmgr", "GetCorporationIDForCharacter") => {
@@ -20,3 +47,5 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         _ => return None,
     }))
 }
+
+#[cfg(test)] mod tests;

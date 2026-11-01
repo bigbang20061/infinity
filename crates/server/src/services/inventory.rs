@@ -5,6 +5,8 @@
 //! Merge plans are guarded against stale snapshots. Staged trade items and their
 //! descendants cannot be moved, split, merged, trashed, renamed or accessed here.
 //! Item capacity and contents are read from one game-item statement snapshot.
+//! Corporation deliveries are station-owned custody, viewable by authorized
+//! members and received only through server business operations, never drops.
 
 use crate::dao::items::loading::{Item, ItemQuery};
 use super::items::load_items;
@@ -13,6 +15,7 @@ use crate::dao::items::quantities::{self, QuantityChange};
 use super::{db_err, keyval, notify_error, value_id_list, Call, CallError, CallResult};
 use crate::client::{short, Client};
 use crate::consts::{ATTR_CAPACITY, CATEGORY_SHIP, FLAG_CARGO, FLAG_FITTING_FIRST, FLAG_FITTING_LAST, FLAG_HANGAR, FLAG_PILOT, FLAG_RIG_FIRST, FLAG_RIG_LAST, FLAG_SUBSYSTEM_FIRST, FLAG_SUBSYSTEM_LAST, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD, TYPE_CHARACTER};
+use crate::consts::{CORP_HANGAR_DIVISIONS, FLAG_CORP_DELIVERIES, FLAG_CORP_SAG1, ROLE_DELIVERIES_TAKE, ROLE_DELIVERIES_VIEW, ROLE_DIRECTOR, ROLE_HANGAR_CAN_QUERY_1, ROLE_HANGAR_CAN_TAKE_1};
 use crate::db::executor::Executor;
 use crate::db::outbox::{dispatch_client, Outbox};
 use crate::messages;
@@ -26,6 +29,8 @@ pub(crate) mod movement;
 
 /// const.containerHangar: "my hangar in the current station".
 const CONTAINER_HANGAR: i64 = 10004;
+/// inventorycommon.const.containerCorpMarket: corporation station deliveries.
+const CONTAINER_CORP_MARKET: i64 = 10012;
 /// Internal bound-object name for a single inventory.
 pub const INVENTORY: &str = "invInventory";
 
@@ -34,6 +39,8 @@ pub const INVENTORY: &str = "invInventory";
 pub(crate) enum Container {
     /// The character's hangar in a station.
     Hangar { station_id: i64, owner_id: i64 },
+    /// Corporation-owned deliveries at a station.
+    Deliveries { station_id: i64, owner_id: i64 },
     /// Any item acting as a container (ship, character, can...).
     Item(i64),
 }
@@ -44,9 +51,57 @@ fn container_of(params: Option<&Value>) -> Option<Container> {
         [Value::Int(station), Value::Int(CONTAINER_HANGAR), Value::Int(owner)] => {
             Some(Container::Hangar { station_id: *station, owner_id: *owner })
         }
+        [Value::Int(station), Value::Int(CONTAINER_CORP_MARKET), Value::Int(owner)] => {
+            Some(Container::Deliveries { station_id: *station, owner_id: *owner })
+        }
         [Value::Int(item)] => Some(Container::Item(*item)),
         _ => None,
     }
+}
+
+fn corp_hangar_role(flag: i32, take: bool) -> Option<i64> {
+    if flag == FLAG_CORP_DELIVERIES {
+        Some(if take { ROLE_DELIVERIES_TAKE } else { ROLE_DELIVERIES_VIEW })
+    } else if (FLAG_CORP_SAG1..FLAG_CORP_SAG1 + CORP_HANGAR_DIVISIONS).contains(&flag) {
+        let base = if take { ROLE_HANGAR_CAN_TAKE_1 } else { ROLE_HANGAR_CAN_QUERY_1 };
+        Some(base << (flag - FLAG_CORP_SAG1))
+    } else {
+        None
+    }
+}
+
+pub(in crate::services) async fn may_view_corp_hangar(ex: &(impl Executor + ?Sized), char_id: i64, corp_id: i64, flag: i32) -> Result<bool, CallError> {
+    match corp_hangar_role(flag, false) {
+        Some(role) => super::has_role_or_is_ceo(ex, char_id, corp_id, role | ROLE_DIRECTOR).await,
+        None => Ok(false),
+    }
+}
+
+pub(in crate::services) async fn may_take_corp_hangar(ex: &(impl Executor + ?Sized), char_id: i64, corp_id: i64, flag: i32) -> Result<bool, CallError> {
+    match corp_hangar_role(flag, true) {
+        Some(role) => super::has_role_or_is_ceo(ex, char_id, corp_id, role | ROLE_DIRECTOR).await,
+        None => Ok(false),
+    }
+}
+
+/// Resolve the office division or station Deliveries governing an item's ancestry.
+async fn corporate_custody(ex: &(impl Executor + ?Sized), sde: Option<&Sde>, id: i64) -> Result<Option<(i64, i64, i32)>, CallError> {
+    for row in crate::dao::items::deliveries::ancestry(ex, id).await.map_err(db_err)? {
+        if let Some(corp) = super::offices::office_owner(ex, row.location_id).await? {
+            return Ok(Some((corp, row.location_id, row.flag_id)));
+        }
+        if row.flag_id == FLAG_CORP_DELIVERIES && sde.is_none_or(|sde| sde.map.station(row.location_id).is_some())
+            && super::corps::is_player_corp(row.owner_id) {
+            return Ok(Some((row.owner_id, row.location_id, row.flag_id)));
+        }
+    }
+    Ok(None)
+}
+
+async fn custody_allowed(ex: &(impl Executor + ?Sized), sde: &Sde, id: i64, me: i64, station: Option<i64>, take: bool) -> Result<Option<bool>, CallError> {
+    let Some((corp, location, flag)) = corporate_custody(ex, Some(sde), id).await? else { return Ok(None) };
+    let role = if take { may_take_corp_hangar(ex, me, corp, flag).await? } else { may_view_corp_hangar(ex, me, corp, flag).await? };
+    Ok(Some(role && (flag != FLAG_CORP_DELIVERIES || station == Some(location))))
 }
 
 fn kw_or_arg<'a>(call: &'a Call<'_>, name: &str, idx: usize) -> Option<&'a Value> {
@@ -54,25 +109,41 @@ fn kw_or_arg<'a>(call: &'a Call<'_>, name: &str, idx: usize) -> Option<&'a Value
 }
 
 async fn list(c: &Client, container: &Container, flags: Option<Vec<i64>>) -> Result<Vec<Item>, CallError> {
-    let flags: Option<Vec<i32>> = flags.map(|f| f.into_iter().map(|x| x as i32).collect());
-    match container {
+    let flags: Option<Vec<i32>> = flags.map(|f| f.into_iter().filter_map(|x| i32::try_from(x).ok()).collect());
+    let me = c.session.int("charid").unwrap_or(0);
+    let items = match container {
         Container::Hangar { station_id, owner_id } => {
+            if *owner_id != me || c.session.int("stationid") != Some(*station_id) { return Ok(vec![]); }
             let flags = flags.unwrap_or_else(|| vec![FLAG_HANGAR]);
-            load_items(&c.db, &c.sde, ItemQuery::LocationOwnerFlags(*station_id, *owner_id, &flags)).await.map_err(db_err)
+            load_items(&c.db, &c.sde, ItemQuery::LocationOwnerFlags(*station_id, *owner_id, &flags)).await.map_err(db_err)?
         }
-        // Another corporation's hangars stay closed.
-        Container::Item(item_id) if super::offices::office_owner(&c.db, *item_id).await?.is_some_and(|corp| c.session.int("corpid") != Some(corp)) => Ok(vec![]),
+        Container::Deliveries { station_id, owner_id } => {
+            if c.session.int("stationid") != Some(*station_id) || c.sde.map.station(*station_id).is_none()
+                || !may_view_corp_hangar(&c.db, me, *owner_id, FLAG_CORP_DELIVERIES).await?
+                || flags.as_ref().is_some_and(|f| !f.contains(&FLAG_CORP_DELIVERIES)) { return Ok(vec![]); }
+            load_items(&c.db, &c.sde, ItemQuery::LocationOwnerFlags(*station_id, *owner_id, &[FLAG_CORP_DELIVERIES])).await.map_err(db_err)?
+        }
         Container::Item(item_id) => match flags {
-            Some(flags) => load_items(&c.db, &c.sde, ItemQuery::LocationFlags(*item_id, &flags)).await.map_err(db_err),
-            None => load_items(&c.db, &c.sde, ItemQuery::Location(*item_id)).await.map_err(db_err),
+            Some(flags) => load_items(&c.db, &c.sde, ItemQuery::LocationFlags(*item_id, &flags)).await.map_err(db_err)?,
+            None => load_items(&c.db, &c.sde, ItemQuery::Location(*item_id)).await.map_err(db_err)?,
         },
+    };
+    let mut visible = Vec::new();
+    for item in items {
+        if let Some(allowed) = custody_allowed(&c.db, &c.sde, item.item_id, me, c.session.int("stationid"), false).await? {
+            if !allowed { continue; }
+        } else if matches!(container, Container::Item(id) if c.sde.map.station(*id).is_some()) && item.owner_id != me {
+            continue;
+        }
+        visible.push(item);
     }
+    Ok(visible)
 }
 
 /// The container's own item row (`GetSelfInvItem`).
 async fn self_item(c: &Client, container: &Container) -> Result<Value, CallError> {
     let id = match container {
-        Container::Hangar { station_id, .. } => *station_id,
+        Container::Hangar { station_id, .. } | Container::Deliveries { station_id, .. } => *station_id,
         Container::Item(id) => *id,
     };
     if let Some(item) = load_items(&c.db, &c.sde, ItemQuery::Id(id)).await.map_err(db_err)?.into_iter().next() {
@@ -122,7 +193,7 @@ fn item_capacity(items: &[Item], id: i64, data: impl Fn(i32) -> (Option<f64>, Op
 
 async fn capacity(c: &Client, container: &Container) -> Result<Value, CallError> {
     let (cap, used) = match container {
-        Container::Hangar { .. } => (1e12, 0.0),
+        Container::Hangar { .. } | Container::Deliveries { .. } => (1e12, 0.0),
         Container::Item(id) => {
             let items = load_items(&c.db, &c.sde, ItemQuery::IdOrLocation(*id)).await.map_err(db_err)?;
             item_capacity(&items, *id, |type_id| {
@@ -147,6 +218,26 @@ pub async fn notify_item_change<X: Send>(db: &(impl Executor + ?Sized), sde: &Sd
     if let Some(item) = load_items(db, sde, ItemQuery::Id(item_id)).await.map_err(db_err)?.into_iter().next() {
         let change = Value::Dict(change.into_iter().map(|(k, v)| (Value::Int(k), v)).collect());
         outbox.notify_client("OnItemChange", vec![item.row(), change, Value::None]);
+    }
+    Ok(())
+}
+
+/// Queue a provided corporate row to members authorized to view its division.
+pub(in crate::services) async fn notify_corp_item_change<X: Send>(ex: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, item: &Item, change: Vec<(i64, Value)>) -> Result<(), CallError> {
+    let parent = if item.location_id == LOCATION_JUNKYARD {
+        change.iter().find_map(|(key, value)| (*key == IX_LOCATION_ID).then(|| value.as_int()).flatten()).unwrap_or(item.location_id)
+    } else { item.location_id };
+    let custody = if corp_hangar_role(item.flag_id, false).is_some() {
+        Some((item.owner_id, parent, item.flag_id))
+    } else {
+        corporate_custody(ex, None, parent).await?
+    };
+    let Some((corp, _, flag)) = custody else { return Ok(()) };
+    let change = Value::Dict(change.into_iter().map(|(k, v)| (Value::Int(k), v)).collect());
+    for char_id in crate::dao::characters::members::active_ids(ex, corp).await.map_err(db_err)? {
+        if may_view_corp_hangar(ex, char_id, corp, flag).await? {
+            outbox.notify_pilot(char_id, "OnItemChange", vec![item.row(), change.clone(), Value::None]);
+        }
     }
     Ok(())
 }
@@ -186,9 +277,13 @@ pub(crate) async fn trash_items(c: &mut Client, ids: &[i64]) -> Result<(), CallE
                 if crate::dao::industry::has_active_blueprint_job(tx, &ids).await.map_err(db_err)? {
                     return Err(notify_error(messages::industry::BLUEPRINT_ACTIVE));
                 }
-                let mut items = load_items(tx, &sde, ItemQuery::IdsOwner(&ids, char_id)).await.map_err(db_err)?;
+                let mut items = load_items(tx, &sde, ItemQuery::Ids(&ids)).await.map_err(db_err)?;
                 items.sort_by_key(|item| item.item_id);
                 for item in items {
+                    if corporate_custody(tx, Some(&sde), item.item_id).await?.is_some() {
+                        return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
+                    }
+                    if item.owner_id != char_id { continue; }
                     if Some(item.item_id) != ship {
                         inventory_dao::delete(tx, item.item_id).await.map_err(db_err)?;
                         notify_item_removed(outbox, item);
@@ -211,6 +306,7 @@ fn plan_merges(items: &[Item], ops: &[(i64, i64, i64)]) -> Result<BTreeMap<i64, 
         if source == dest { continue; }
         let (Some(&(src, Some(src_qty))), Some(&(dst, Some(dst_qty)))) = (states.get(&source), states.get(&dest)) else { continue };
         if src.type_id != dst.type_id || src.singleton || dst.singleton || src_qty <= 0 { continue; }
+        if (src.owner_id, src.location_id, src.flag_id) != (dst.owner_id, dst.location_id, dst.flag_id) { return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION)); }
         let take = requested.clamp(1, i64::from(src_qty)) as i32;
         let total = dst_qty.checked_add(take).ok_or_else(|| notify_error(messages::INSUFFICIENT_ITEM_QUANTITY))?;
         states.get_mut(&source).unwrap().1 = if take == src_qty { None } else { Some(src_qty - take) };
@@ -221,12 +317,30 @@ fn plan_merges(items: &[Item], ops: &[(i64, i64, i64)]) -> Result<BTreeMap<i64, 
     }).collect())
 }
 
-async fn apply_merges<X: Send>(db: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<X>, items: Vec<Item>, ops: &[(i64, i64, i64)]) -> Result<(), CallError> {
+async fn mutation_corporate(ex: &(impl Executor + ?Sized), sde: &Sde, item: &Item, me: i64, station: Option<i64>) -> Result<bool, CallError> {
+    if let Some(allowed) = custody_allowed(ex, sde, item.item_id, me, station, true).await? {
+        if !allowed { return Err(notify_error(messages::NO_CORPORATION_HANGAR_TAKE_ROLE)); }
+        return Ok(true);
+    }
+    if item.owner_id != me { return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION)); }
+    Ok(false)
+}
+
+async fn apply_merges<X: Send>(db: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<X>, items: Vec<Item>, ops: &[(i64, i64, i64)], me: i64, station: Option<i64>) -> Result<(), CallError> {
+    let mut corporate = Vec::new();
+    for item in &items {
+        if mutation_corporate(db, sde, item, me, station).await? { corporate.push(item.item_id); }
+    }
     let changes = plan_merges(&items, ops)?;
     if !quantities::apply(db, &changes).await.map_err(db_err)? { return Err(notify_error(messages::INSUFFICIENT_ITEM_QUANTITY)); }
     for item in items {
         if let Some(change) = changes.get(&item.item_id) {
-            if change.quantity.is_none() {
+            if corporate.contains(&item.item_id) {
+                let updated = if let Some(quantity) = change.quantity { Item { quantity, ..item.clone() } } else { Item { location_id: LOCATION_JUNKYARD, ..item.clone() } };
+                let key = if change.quantity.is_some() { IX_STACK_SIZE } else { IX_LOCATION_ID };
+                let old = if change.quantity.is_some() { item.quantity as i64 } else { item.location_id };
+                notify_corp_item_change(db, outbox, &updated, vec![(key, Value::Int(old))]).await?;
+            } else if change.quantity.is_none() {
                 notify_item_removed(outbox, item);
             } else {
                 notify_item_change(db, sde, outbox, item.item_id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
@@ -238,6 +352,8 @@ async fn apply_merges<X: Send>(db: &(impl Executor + ?Sized), sde: &Sde, outbox:
 
 async fn merge_operations(c: &mut Client, ops: Vec<(i64, i64, i64)>) -> Result<(), CallError> {
     let _lock = super::market::lock().await;
+    let me = c.session.int("charid").unwrap_or(0);
+    let station = c.session.int("stationid");
     let db = c.db.clone();
     let sde = c.sde.clone();
     db.transaction(
@@ -250,7 +366,7 @@ async fn merge_operations(c: &mut Client, ops: Vec<(i64, i64, i64)>) -> Result<(
                     return Err(notify_error(messages::trade::TRADE_ITEM_RESERVED));
                 }
                 let items = load_items(tx, &sde, ItemQuery::Ids(&ids)).await.map_err(db_err)?;
-                apply_merges(tx, &sde, outbox, items, &ops).await
+                apply_merges(tx, &sde, outbox, items, &ops, me, station).await
             })
         },
         |value, outbox| async move { dispatch_client(value, outbox, c) },
@@ -260,6 +376,8 @@ async fn merge_operations(c: &mut Client, ops: Vec<(i64, i64, i64)>) -> Result<(
 /// `StackAll([flag])`: merge every unassembled stack of the same type in the container.
 async fn stack_all(c: &mut Client, container: &Container, flag: Option<i64>) -> Result<(), CallError> {
     let _lock = super::market::lock().await;
+    let me = c.session.int("charid").unwrap_or(0);
+    let station = c.session.int("stationid");
     if let Container::Item(id) = container {
         if super::offices::office_owner(&c.db, *id).await?.is_some_and(|corp| c.session.int("corpid") != Some(corp)) {
             return Ok(());
@@ -279,6 +397,10 @@ async fn stack_all(c: &mut Client, container: &Container, flag: Option<i64>) -> 
                         let flags = flags.unwrap_or_else(|| vec![FLAG_HANGAR]);
                         load_items(tx, &sde, ItemQuery::LocationOwnerFlags(station_id, owner_id, &flags)).await.map_err(db_err)?
                     }
+                    Container::Deliveries { station_id, owner_id } => {
+                        if station != Some(station_id) || !may_take_corp_hangar(tx, me, owner_id, FLAG_CORP_DELIVERIES).await? { return Err(notify_error(messages::NO_CORPORATION_HANGAR_TAKE_ROLE)); }
+                        load_items(tx, &sde, ItemQuery::LocationOwnerFlags(station_id, owner_id, &[FLAG_CORP_DELIVERIES])).await.map_err(db_err)?
+                    }
                     Container::Item(id) => match flags {
                         Some(flags) => load_items(tx, &sde, ItemQuery::LocationFlags(id, &flags)).await.map_err(db_err)?,
                         None => load_items(tx, &sde, ItemQuery::Location(id)).await.map_err(db_err)?,
@@ -296,7 +418,7 @@ async fn stack_all(c: &mut Client, container: &Container, flag: Option<i64>) -> 
                         None => { first.insert((item.type_id, item.flag_id), item.item_id); }
                     }
                 }
-                apply_merges(tx, &sde, outbox, items, &ops).await
+                apply_merges(tx, &sde, outbox, items, &ops, me, station).await
             })
         },
         |value, outbox| async move { dispatch_client(value, outbox, c) },
@@ -328,6 +450,14 @@ pub async fn broker(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             if container == CONTAINER_HANGAR {
                 let station = c.session.int("stationid").unwrap_or(0);
                 c.bind(INVENTORY, Value::tuple([Value::Int(station), Value::Int(CONTAINER_HANGAR), Value::Int(char_id)]))
+            } else if container == CONTAINER_CORP_MARKET {
+                let station = c.session.int("stationid").unwrap_or(0);
+                let corp = call.args.get(1).and_then(Value::as_int).unwrap_or(0);
+                match may_view_corp_hangar(&c.db, char_id, corp, FLAG_CORP_DELIVERIES).await {
+                    Ok(true) if c.sde.map.station(station).is_some() => c.bind(INVENTORY, Value::tuple([Value::Int(station), Value::Int(CONTAINER_CORP_MARKET), Value::Int(corp)])),
+                    Ok(_) => return Some(Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))),
+                    Err(error) => return Some(Err(error)),
+                }
             } else {
                 warn!(user = c.login.user_id, "invbroker::GetInventory for unsupported container {container}");
                 c.bind(INVENTORY, Value::tuple([Value::Int(container)]))
@@ -351,15 +481,24 @@ pub async fn broker(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
             }
             let db = c.db.clone();
             let sde = c.sde.clone();
+            let station = c.session.int("stationid");
             let r = db.transaction(
                 move |tx, outbox: &mut Outbox| {
                     let item = item.clone();
                     let sde = sde.clone();
                     Box::pin(async move {
+                        let corporate = mutation_corporate(tx, &sde, &item, char_id, station).await?;
                         let (owner, location, flag) = (item.owner_id, item.location_id, item.flag_id);
                         let id = split_stack(tx, &item, qty, owner, location, flag, false).await?;
-                        notify_item_change(tx, &sde, outbox, item_id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
-                        notify_item_change(tx, &sde, outbox, id, vec![(IX_LOCATION_ID, Value::Int(0))]).await?;
+                        if corporate {
+                            let left = Item { quantity: item.quantity - qty, ..item.clone() };
+                            let new = load_items(tx, &sde, ItemQuery::Id(id)).await.map_err(db_err)?.into_iter().next().ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
+                            notify_corp_item_change(tx, outbox, &left, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
+                            notify_corp_item_change(tx, outbox, &new, vec![(IX_LOCATION_ID, Value::Int(0))]).await?;
+                        } else {
+                            notify_item_change(tx, &sde, outbox, item_id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
+                            notify_item_change(tx, &sde, outbox, id, vec![(IX_LOCATION_ID, Value::Int(0))]).await?;
+                        }
                         Ok(Value::Int(id))
                     })
                 },
@@ -406,12 +545,23 @@ pub async fn inventory(c: &mut Client, call: &Call<'_>) -> CallResult {
     let Some(container) = container_of(call.bind_params) else {
         return Err(CallError::Internal(anyhow::anyhow!("bad inventory bind params {:?}", call.bind_params)));
     };
+    if let Container::Deliveries { station_id, owner_id } = &container {
+        let me = c.session.int("charid").unwrap_or(0);
+        if c.session.int("stationid") != Some(*station_id) || c.sde.map.station(*station_id).is_none()
+            || !may_view_corp_hangar(&c.db, me, *owner_id, FLAG_CORP_DELIVERIES).await? {
+            return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
+        }
+    }
     if let Container::Item(id) = &container {
         if super::trade::is_trade_container(*id) {
             return Err(notify_error(messages::trade::TRADE_CONTAINER_RESERVED));
         }
         if !crate::dao::trades::reserved(&c.db, &[*id]).await.map_err(db_err)?.is_empty() {
             return Err(notify_error(messages::trade::TRADE_CONTAINER_RESERVED));
+        }
+        let me = c.session.int("charid").unwrap_or(0);
+        if custody_allowed(&c.db, &c.sde, *id, me, c.session.int("stationid"), false).await? == Some(false) {
+            return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
         }
     }
     match call.method {
