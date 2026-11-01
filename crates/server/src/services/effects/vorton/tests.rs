@@ -51,7 +51,7 @@ async fn chain_weapon_types_have_both_arc_attributes() {
     }).await.unwrap();
     let sde = crate::sde::Sde::load(&db).await.unwrap();
     let weapons: Vec<_> = sde.types.iter().filter(|t| t.effects().iter()
-        .any(|e| e.effect_id == crate::consts::EFFECT_CHAIN_LIGHTNING)).collect();
+        .any(|e| e.effect_id == crate::consts::dogma::EFFECT_CHAIN_LIGHTNING)).collect();
     assert!(!weapons.is_empty());
     for weapon in weapons {
         assert!(weapon.attribute(ATTR_VORTON_ARC_RANGE).is_some_and(|v| v.is_finite() && v > 0.0));

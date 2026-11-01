@@ -81,7 +81,7 @@ async fn real_bank_rpcs_and_transactional_rules() {
     crate::tests::init_config();
     let db = Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let sde = Arc::new(Sde::load(&db).await.unwrap());
-    let gun = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_MODULE) && t.group_id.is_some_and(|g| GROUPABLE_GROUP_IDS.contains(&i64::from(g))) && sde.types.effects(t.type_id).iter().any(|e| e.effect_id == crate::consts::EFFECT_ONLINE as i32)).expect("groupable online module in SDE").type_id;
+    let gun = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_MODULE) && t.group_id.is_some_and(|g| GROUPABLE_GROUP_IDS.contains(&i64::from(g))) && sde.types.effects(t.type_id).iter().any(|e| e.effect_id == crate::consts::dogma::EFFECT_ONLINE as i32)).expect("groupable online module in SDE").type_id;
     let hull = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_SHIP)).expect("ship in SDE").type_id;
     let ammo: Vec<i32> = sde.types.iter().filter(|t| t.category_id == Some(CATEGORY_CHARGE)).take(2).map(|t| t.type_id).collect();
     assert_eq!(ammo.len(), 2);

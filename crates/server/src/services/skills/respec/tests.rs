@@ -185,7 +185,7 @@ async fn stale_entitlement_write_is_refused() {
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn remap_banks_overdue_booster_expiry_at_its_real_time() {
-    use crate::{consts::{ATTR_BOOSTERNESS, ATTR_SKILL_TIME_CONSTANT, FILETIME_MINUTE, FLAG_BOOSTER}, services::tests::{client, fixture}};
+    use crate::{consts::{dogma::ATTR_BOOSTERNESS, dogma::ATTR_SKILL_TIME_CONSTANT, FILETIME_MINUTE, FLAG_BOOSTER}, services::tests::{client, fixture}};
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let f = fixture::create(&db).await.unwrap();

@@ -120,7 +120,7 @@ pub(in crate::services) async fn gm_unload(c: &mut Client, ship: i64, owner: i64
                     return Err(refuse());
                 }
                 for module in &modules {
-                    if super::super::effects::lifecycle::has_effect(sde.types.effects(module.type_id), crate::consts::EFFECT_ONLINE as i32) {
+                    if super::super::effects::lifecycle::has_effect(sde.types.effects(module.type_id), crate::consts::dogma::EFFECT_ONLINE as i32) {
                         set_online_core(tx, &sde, &policy, outbox, ship, module.item_id, false).await?;
                     }
                 }

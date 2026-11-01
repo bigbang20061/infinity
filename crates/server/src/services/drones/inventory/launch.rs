@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 use marshal::Value;
 use crate::client::Client;
-use crate::consts::{ATTR_DRONE_BANDWIDTH, ATTR_MAX_ACTIVE_DRONES, CATEGORY_DRONE, CATEGORY_SHIP, FLAG_DRONE_BAY, IX_FLAG, IX_LOCATION_ID, IX_SINGLETON, IX_STACK_SIZE};
+use crate::consts::{dogma::ATTR_DRONE_BANDWIDTH, dogma::ATTR_MAX_ACTIVE_DRONES, CATEGORY_DRONE, CATEGORY_SHIP, FLAG_DRONE_BAY, IX_FLAG, IX_LOCATION_ID, IX_SINGLETON, IX_STACK_SIZE};
 use crate::dao::items::{drones, loading::ItemQuery, ship as ship_dao};
 use crate::db::outbox::{dispatch_client, Outbox};
 use crate::messages::drones as text;

@@ -2,7 +2,7 @@
 //! Client counterparts are named in `dogma/const.py` and `dogma/pythonEffects`.
 //! Out-of-scope effects are rejected even if they contain modifier rows;
 //! classifying a later-wave kind does not implement its lifecycle behavior.
-use crate::{consts::*, sde::Sde};
+use crate::{consts::{*, dogma::*}, sde::Sde};
 use super::{EffectKind, JammingType};
 
 /// Client inventorycommon/const.py: groupMissileLauncherFestival.

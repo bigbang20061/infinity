@@ -20,7 +20,7 @@ async fn biology_does_not_change_persisted_real_booster_duration() {
     let now = filetime_now();
     let mut durations = Vec::new();
     for level in [0, 5] {
-        let rank = c.sde.types.attribute(biology, crate::consts::ATTR_SKILL_TIME_CONSTANT).expect("Biology rank");
+        let rank = c.sde.types.attribute(biology, crate::consts::dogma::ATTR_SKILL_TIME_CONSTANT).expect("Biology rank");
         let points = super::super::super::formulas::sp_for_level(rank, i64::from(level));
         db.execute("INSERT INTO game.skills (character_id,type_id,level,skill_points) VALUES ($1,$2,$3,$4) ON CONFLICT (character_id,type_id) DO UPDATE SET level=EXCLUDED.level,skill_points=EXCLUDED.skill_points", &[&f.character, &biology, &level, &points]).await.unwrap();
         let source = item(&db, f.character, ty, STATION, 1).await;
@@ -51,7 +51,7 @@ async fn implant_mutation_banks_old_rate_and_retimes_once() {
     for (id, level) in requirements(&c.sde, ty) { skill_rows::starting_skill(&db, f.character, id, level, 0).await.unwrap(); }
     let primary = c.sde.dogma.attributes_by_name("primaryAttribute").next().expect("primary skill attribute").attribute_id;
     let secondary = c.sde.dogma.attributes_by_name("secondaryAttribute").next().expect("secondary skill attribute").attribute_id;
-    let skill = c.sde.types.iter().find(|t| t.attribute(crate::consts::ATTR_SKILL_TIME_CONSTANT).is_some() && [primary, secondary].into_iter().any(|a| t.attribute(a) == Some(f64::from(modified))) && !requirements(&c.sde, ty).any(|(id, _)| id == t.type_id)).expect("skill using modified training attribute required").type_id;
+    let skill = c.sde.types.iter().find(|t| t.attribute(crate::consts::dogma::ATTR_SKILL_TIME_CONSTANT).is_some() && [primary, secondary].into_iter().any(|a| t.attribute(a) == Some(f64::from(modified))) && !requirements(&c.sde, ty).any(|(id, _)| id == t.type_id)).expect("skill using modified training attribute required").type_id;
     skill_rows::starting_skill(&db, f.character, skill, 0, 0).await.unwrap();
     let now = filetime_now();
     let start = now - crate::consts::FILETIME_MINUTE;
@@ -98,7 +98,7 @@ async fn booster_activation_banks_and_notifies_training_once() {
     for (id, level) in requirements(&c.sde, ty) { skill_rows::starting_skill(&db, f.character, id, level, 0).await.unwrap(); }
     let primary = c.sde.dogma.attributes_by_name("primaryAttribute").next().expect("primary skill attribute").attribute_id;
     let secondary = c.sde.dogma.attributes_by_name("secondaryAttribute").next().expect("secondary skill attribute").attribute_id;
-    let skill = c.sde.types.iter().find(|t| t.attribute(crate::consts::ATTR_SKILL_TIME_CONSTANT).is_some() && [primary, secondary].into_iter().any(|a| t.attribute(a) == Some(f64::from(modified))) && !requirements(&c.sde, ty).any(|(id, _)| id == t.type_id)).expect("skill using booster attribute required").type_id;
+    let skill = c.sde.types.iter().find(|t| t.attribute(crate::consts::dogma::ATTR_SKILL_TIME_CONSTANT).is_some() && [primary, secondary].into_iter().any(|a| t.attribute(a) == Some(f64::from(modified))) && !requirements(&c.sde, ty).any(|(id, _)| id == t.type_id)).expect("skill using booster attribute required").type_id;
     skill_rows::starting_skill(&db, f.character, skill, 0, 0).await.unwrap();
     let now = filetime_now();
     let start = now - crate::consts::FILETIME_MINUTE;

@@ -4,7 +4,7 @@
 use super::lifecycle::{Cycle, CycleOutcome, Module};
 use super::notify::fire_fx;
 use super::registry::EffectFlag;
-use crate::consts::{ATTR_MAX_RANGE, EFFECT_MINING_CLOUDS};
+use crate::consts::{dogma::ATTR_MAX_RANGE, dogma::EFFECT_MINING_CLOUDS};
 use crate::messages;
 use crate::services::{combat::{Ctx, targeting_charges::targets_of}, fit::{Fit, Key}, user_error, CallError};
 use crate::space::{dist, metres_to_km, System};

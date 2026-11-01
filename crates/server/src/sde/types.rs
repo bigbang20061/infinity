@@ -3,7 +3,7 @@
 //! `eve/common/script/dogma/baseDogmaLocation.py:1960-1967`.
 //! Presentation fields and other inventory tables are outside this dataset.
 use std::collections::{HashMap, HashSet};
-use crate::{consts::{ATTR_CAPACITY, ATTR_MASS, ATTR_RADIUS, ATTR_VOLUME, EFFECT_SKILL}, dao::sde::types as dao, db::Db};
+use crate::{consts::{dogma::ATTR_CAPACITY, dogma::ATTR_MASS, dogma::ATTR_RADIUS, dogma::ATTR_VOLUME, dogma::EFFECT_SKILL}, dao::sde::types as dao, db::Db};
 
 pub(crate) struct TypeData {
     pub(crate) type_id: i32,

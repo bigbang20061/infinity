@@ -13,7 +13,7 @@ use super::*;
 use super::attributes::{character_attributes_at, CHAR_ATTRIBUTES};
 use super::formulas::sp_for_level;
 use crate::client::filetime_now;
-use crate::consts::{CATEGORY_SKILL, FILETIME_MINUTE, MAX_SKILL_LEVEL};
+use crate::consts::{CATEGORY_SKILL, FILETIME_MINUTE, dogma::MAX_SKILL_LEVEL};
 use crate::db::executor::Executor;
 use crate::db::outbox::Outbox;
 use crate::services::effects::online::{self, OnlineChanged};

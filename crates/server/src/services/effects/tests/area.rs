@@ -1,6 +1,6 @@
 //! Smartbomb and bomb damage through real fitted effects and the system actor.
 use super::fixture;
-use crate::{consts::{ATTR_EM_DAMAGE, ATTR_SHIELD_CAPACITY, ATTR_SHIELD_EM_DAMAGE_RESONANCE, CATEGORY_MODULE, CATEGORY_SHIP, EFFECT_EMP_WAVE, FLAG_HI_SLOT_FIRST}, dao::items::dogma, services::{combat::{self, ActiveModule, Ctx, groups_health::npc_health_fraction}, effects::{aoe, lifecycle::{ActivationOwner, Cycle, Module}, registry}, fit::Fit}, space::World};
+use crate::{consts::{dogma::ATTR_EM_DAMAGE, dogma::ATTR_SHIELD_CAPACITY, dogma::ATTR_SHIELD_EM_DAMAGE_RESONANCE, CATEGORY_MODULE, CATEGORY_SHIP, dogma::EFFECT_EMP_WAVE, FLAG_HI_SLOT_FIRST}, dao::items::dogma, services::{combat::{self, ActiveModule, Ctx, groups_health::npc_health_fraction}, effects::{aoe, lifecycle::{ActivationOwner, Cycle, Module}, registry}, fit::Fit}, space::World};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
 #[tokio::test]
@@ -23,7 +23,7 @@ async fn smartbomb_damages_near_owned_unpiloted_ball_but_not_source_or_outside()
     let near = -f.ship;
     let outside = -f.module;
     let result = tokio::spawn(async move {
-        dogma::set_override(&test_db, f.module, crate::consts::ATTR_EMP_FIELD_RANGE, 100.0).await.unwrap();
+        dogma::set_override(&test_db, f.module, crate::consts::dogma::ATTR_EMP_FIELD_RANGE, 100.0).await.unwrap();
         for attr in combat::ATTR_DAMAGE { dogma::set_override(&test_db, f.module, attr, if attr == ATTR_EM_DAMAGE { 1.0 } else { 0.0 }).await.unwrap(); }
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         test_world.register_pilot(f.character, tx.clone());
@@ -67,7 +67,7 @@ async fn smartbomb_damages_near_owned_unpiloted_ball_but_not_source_or_outside()
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL with SDE; run serially"]
 async fn bomb_flies_before_dealing_raw_damage_to_launcher_and_consumes_one_charge() {
-    use crate::consts::{ATTR_EXPLOSION_DELAY, ATTR_MAX_VELOCITY, ATTR_SHIELD_EXPLOSIVE_DAMAGE_RESONANCE, ATTR_SHIELD_KINETIC_DAMAGE_RESONANCE, ATTR_SHIELD_THERMAL_DAMAGE_RESONANCE, CATEGORY_CHARGE};
+    use crate::consts::{dogma::ATTR_EXPLOSION_DELAY, dogma::ATTR_MAX_VELOCITY, dogma::ATTR_SHIELD_EXPLOSIVE_DAMAGE_RESONANCE, dogma::ATTR_SHIELD_KINETIC_DAMAGE_RESONANCE, dogma::ATTR_SHIELD_THERMAL_DAMAGE_RESONANCE, CATEGORY_CHARGE};
     use crate::services::{combat::targeting_charges::loaded, effects::bombs, fit::Key};
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
@@ -83,7 +83,7 @@ async fn bomb_flies_before_dealing_raw_damage_to_launcher_and_consumes_one_charg
         && t.group_id.is_some_and(|g| groups.contains(&f64::from(g)))
         && t.attribute(ATTR_EXPLOSION_DELAY).is_some_and(|v| v >= 3000.0 && v <= 30000.0)
         && t.attribute(ATTR_MAX_VELOCITY).is_some_and(|v| v > 0.0)
-        && t.attribute(crate::consts::ATTR_EMP_FIELD_RANGE).is_some_and(|v| v > 0.0)
+        && t.attribute(crate::consts::dogma::ATTR_EMP_FIELD_RANGE).is_some_and(|v| v > 0.0)
         && combat::ATTR_DAMAGE.iter().any(|&a| t.attribute(a).is_some_and(|v| v > 0.0))).expect("compatible damaging bomb");
     let weapon = launcher.type_id;
     let ammo = charge.type_id;
@@ -107,7 +107,7 @@ async fn bomb_flies_before_dealing_raw_damage_to_launcher_and_consumes_one_charg
         let key = Key::Charge(f.module);
         let delay = fit.value(key, ATTR_EXPLOSION_DELAY);
         let velocity = fit.value(key, ATTR_MAX_VELOCITY);
-        let radius = fit.value(key, crate::consts::ATTR_EMP_FIELD_RANGE);
+        let radius = fit.value(key, crate::consts::dogma::ATTR_EMP_FIELD_RANGE);
         let raw: f64 = combat::ATTR_DAMAGE.iter().map(|&a| fit.value(key, a).max(0.0)).sum();
         let fitted_resonances = resonances.map(|attr| fit.value(Key::Ship, attr));
         let inputs = format!("hull={hull} ammo={ammo} delay_ms={delay} velocity={velocity} radius={radius} raw={raw} shield_resonances={fitted_resonances:?}");
@@ -175,7 +175,7 @@ async fn bomb_flies_before_dealing_raw_damage_to_launcher_and_consumes_one_charg
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL with SDE; run serially"]
 async fn vorton_spends_one_charge_and_limits_arcs_around_primary() {
-    use crate::consts::{ATTR_DAMAGE_MULTIPLIER, ATTR_MAX_LOCKED_TARGETS, ATTR_MAX_RANGE, ATTR_MAX_TARGET_RANGE, ATTR_SCAN_RESOLUTION, CATEGORY_CHARGE, EFFECT_CHAIN_LIGHTNING};
+    use crate::consts::{dogma::ATTR_DAMAGE_MULTIPLIER, dogma::ATTR_MAX_LOCKED_TARGETS, dogma::ATTR_MAX_RANGE, dogma::ATTR_MAX_TARGET_RANGE, dogma::ATTR_SCAN_RESOLUTION, CATEGORY_CHARGE, dogma::EFFECT_CHAIN_LIGHTNING};
     use crate::services::{combat::targeting_charges::{add_target_ctx, clear_locks_on, loaded, targets_of}, effects::vorton};
     use marshal::Value;
     crate::tests::init_config();

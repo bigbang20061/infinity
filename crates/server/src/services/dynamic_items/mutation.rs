@@ -4,7 +4,7 @@
 //! before transaction retries. Deployed entities require World removal and are
 //! unsupported; only reachable local inventory custody is accepted.
 use std::collections::{BTreeMap, HashSet};
-use crate::{client::filetime_now, consts::{ATTR_CAPACITY, ATTR_HULL_DAMAGE, ATTR_MASS, ATTR_RADIUS, ATTR_VOLUME, CARGO_CONTAINER_GROUPS, CATEGORY_SHIP, CORP_HANGAR_DIVISIONS, FLAG_BOOSTER, FLAG_CARGO, FLAG_CORP_SAG1, FLAG_HANGAR, FLAG_IMPLANT, FLAG_PILOT, IX_LOCATION_ID, IX_STACK_SIZE, ROLE_DIRECTOR, ROLE_HANGAR_CAN_TAKE_1}, dao::{self, items::{creation, dogma, loading::{Item, ItemQuery}, quantities::{self, QuantityChange}}}, db::{executor::Executor, outbox::Outbox}, messages::dynamic_items as msg, sde::{Sde, dynamic_items::Mutation}, services::{db_err, fit::base_attribute, has_role_or_is_ceo, inventory, items::load_items, notify_error, CallError}};
+use crate::{client::filetime_now, consts::{dogma::ATTR_CAPACITY, dogma::ATTR_HULL_DAMAGE, dogma::ATTR_MASS, dogma::ATTR_RADIUS, dogma::ATTR_VOLUME, CARGO_CONTAINER_GROUPS, CATEGORY_SHIP, CORP_HANGAR_DIVISIONS, FLAG_BOOSTER, FLAG_CARGO, FLAG_CORP_SAG1, FLAG_HANGAR, FLAG_IMPLANT, FLAG_PILOT, IX_LOCATION_ID, IX_STACK_SIZE, ROLE_DIRECTOR, ROLE_HANGAR_CAN_TAKE_1}, dao::{self, items::{creation, dogma, loading::{Item, ItemQuery}, quantities::{self, QuantityChange}}}, db::{executor::Executor, outbox::Outbox}, messages::dynamic_items as msg, sde::{Sde, dynamic_items::Mutation}, services::{db_err, fit::base_attribute, has_role_or_is_ceo, inventory, items::load_items, notify_error, CallError}};
 use marshal::Value;
 
 /// Server policy: bound ancestry traversal to prevent cycles and pathological nesting.

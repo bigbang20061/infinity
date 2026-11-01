@@ -123,7 +123,7 @@ async fn signature_uses_cached_type_and_default_values() {
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to a dedicated test database with SDE"]
 async fn missile_uses_signature_and_speed_at_impact() {
-    use crate::consts::{ATTR_SHIELD_CAPACITY, ATTR_SHIELD_EM_DAMAGE_RESONANCE, CATEGORY_ENTITY};
+    use crate::consts::{dogma::ATTR_SHIELD_CAPACITY, dogma::ATTR_SHIELD_EM_DAMAGE_RESONANCE, CATEGORY_ENTITY};
     use crate::services::combat::groups_health::npc_health_fraction;
 
     crate::tests::init_config();

@@ -1,7 +1,7 @@
 use std::{future::Future, task::Poll, time::Duration};
 use anyhow::{anyhow, ensure, Result};
 use marshal::Value;
-use crate::{consts::*, services::{Call, CallError, combat, effects::{registry::{self, EffectAttribute}, EffectKind, JammingType}, fit::{Fit, Key}}};
+use crate::{consts::{*, dogma::*}, services::{Call, CallError, combat, effects::{registry::{self, EffectAttribute}, EffectKind, JammingType}, fit::{Fit, Key}}};
 use super::fixture::Fixture;
 
 fn error(e: CallError) -> anyhow::Error {

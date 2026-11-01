@@ -15,7 +15,7 @@
 
 use super::{db_err, notify_error, rand01, Call, CallError, CallResult};
 use crate::client::Client;
-use crate::consts::{ATTR_MAX_RANGE, ATTR_REQUIRED_SKILL_1, SKILL_ARCHAEOLOGY, SKILL_HACKING};
+use crate::consts::{dogma::ATTR_MAX_RANGE, dogma::ATTR_REQUIRED_SKILL_1, SKILL_ARCHAEOLOGY, SKILL_HACKING};
 use crate::messages;
 use crate::space::{dist, metres_to_km};
 use marshal::Value;

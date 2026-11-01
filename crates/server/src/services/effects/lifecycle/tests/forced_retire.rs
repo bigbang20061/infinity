@@ -46,7 +46,7 @@ async fn fixture_fingerprint(db: &crate::db::Db) -> Vec<String> {
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn forced_cycle_stop_publishes_once_and_consumes_propulsion_generation() {
-    use crate::consts::{ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_SPEED_FACTOR};
+    use crate::consts::{dogma::ATTR_MASS, dogma::ATTR_MAX_VELOCITY, dogma::ATTR_SPEED_FACTOR};
     use crate::space::{Ball, World, WarpState, MODE_STOP};
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
@@ -58,8 +58,8 @@ async fn forced_cycle_stop_publishes_once_and_consumes_propulsion_generation() {
     let module_type = sde.types.iter().find(|t| t.effects().iter().any(|e| e.effect_id == EFFECT_MICROWARPDRIVE)
         && positive(t.fit_attribute(ATTR_SPEED_FACTOR)) && positive(t.fit_attribute(speed_boost)))
         .expect("microwarpdrive with positive speed factor and thrust").type_id;
-    let scram_type = sde.types.iter().find(|t| sde.types.effects(t.type_id).iter().any(|e| e.effect_id == crate::consts::EFFECT_WARP_SCRAMBLE)).unwrap().type_id;
-    let modifying = sde.dogma.effect(crate::consts::EFFECT_WARP_SCRAMBLE).unwrap().modifiers().iter()
+    let scram_type = sde.types.iter().find(|t| sde.types.effects(t.type_id).iter().any(|e| e.effect_id == crate::consts::dogma::EFFECT_WARP_SCRAMBLE)).unwrap().type_id;
+    let modifying = sde.dogma.effect(crate::consts::dogma::EFFECT_WARP_SCRAMBLE).unwrap().modifiers().iter()
         .find(|row| row.domain == "targetID" && row.modified == ATTR_ACTIVATION_BLOCKED).unwrap().modifying;
     let before = fixture_fingerprint(&db).await;
     let (account, character, ship, module) = db.transaction(
@@ -109,7 +109,7 @@ async fn forced_cycle_stop_publishes_once_and_consumes_propulsion_generation() {
         test_world.with(1, move |s| {
             s.upsert_projection(ship, super::super::super::projection::Projection {
                 source_ship: source, source_module: -module, source_type: scram_type,
-                effect_id: crate::consts::EFFECT_WARP_SCRAMBLE,
+                effect_id: crate::consts::dogma::EFFECT_WARP_SCRAMBLE,
                 kind: EffectKind::Projected { jamming: super::super::super::JammingType::Scramble },
                 until_ms: i64::MAX, values: vec![(modifying, 1.0)], charge_values: vec![], charge_type: None,
             });

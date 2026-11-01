@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use marshal::Value;
 use crate::client::Client;
-use crate::consts::{ATTR_DRONE_CAPACITY, CATEGORY_DRONE, CATEGORY_SHIP, DRONE_SCOOP_RANGE, FLAG_DRONE_BAY, IX_FLAG, IX_LOCATION_ID, IX_OWNER_ID, OWNER_UNOWNED};
+use crate::consts::{dogma::ATTR_DRONE_CAPACITY, CATEGORY_DRONE, CATEGORY_SHIP, DRONE_SCOOP_RANGE, FLAG_DRONE_BAY, IX_FLAG, IX_LOCATION_ID, IX_OWNER_ID, OWNER_UNOWNED};
 use crate::dao::items::{drones, loading::ItemQuery, ship as ship_dao};
 use crate::db::{Db, executor::Executor, outbox::{dispatch_world, Outbox}};
 use crate::messages::drones as text;

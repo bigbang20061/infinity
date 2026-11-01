@@ -1,6 +1,6 @@
 //! Database-backed scanner and tractor cycles through the system actor.
 use super::fixture;
-use crate::{consts::{ATTR_CAPACITOR_CAPACITY, ATTR_MAX_LOCKED_TARGETS, ATTR_MAX_RANGE, ATTR_MAX_TARGET_RANGE, ATTR_MAX_TRACTOR_VELOCITY, ATTR_SCAN_RESOLUTION, CATEGORY_MODULE, CATEGORY_SHIP, CARGO_CONTAINER_GROUPS, EFFECT_CARGO_SCAN, EFFECT_SHIP_SCAN, EFFECT_SURVEY_SCAN, EFFECT_TRACTOR_BEAM, FLAG_CARGO, FLAG_HI_SLOT_FIRST, GROUP_WRECK}, dao::items::dogma, services::{combat::{self, ActiveModule, Ctx, groups_health, targeting_charges}, effects::{lifecycle::{ActivationOwner, Cycle, CycleOutcome, Module}, registry, scan, tractor}, fit::Fit}, space::{World, MODE_FOLLOW, MODE_STOP}};
+use crate::{consts::{dogma::ATTR_CAPACITOR_CAPACITY, dogma::ATTR_MAX_LOCKED_TARGETS, dogma::ATTR_MAX_RANGE, dogma::ATTR_MAX_TARGET_RANGE, dogma::ATTR_MAX_TRACTOR_VELOCITY, dogma::ATTR_SCAN_RESOLUTION, CATEGORY_MODULE, CATEGORY_SHIP, CARGO_CONTAINER_GROUPS, dogma::EFFECT_CARGO_SCAN, dogma::EFFECT_SHIP_SCAN, dogma::EFFECT_SURVEY_SCAN, dogma::EFFECT_TRACTOR_BEAM, FLAG_CARGO, FLAG_HI_SLOT_FIRST, GROUP_WRECK}, dao::items::dogma, services::{combat::{self, ActiveModule, Ctx, groups_health, targeting_charges}, effects::{lifecycle::{ActivationOwner, Cycle, CycleOutcome, Module}, registry, scan, tractor}, fit::Fit}, space::{World, MODE_FOLLOW, MODE_STOP}};
 use marshal::Value;
 use std::sync::{Arc, atomic::{AtomicBool, AtomicI64, Ordering}};
 
@@ -33,7 +33,7 @@ async fn scanner(effect_id: i32) {
     crate::tests::init_config();
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
-    let hull = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_SHIP) && t.attribute(ATTR_CAPACITOR_CAPACITY).is_some_and(|v| v > 0.0) && t.attribute(crate::consts::ATTR_RECHARGE_RATE).is_some_and(|v| v > 10000.0)).expect("capacitor hull").type_id;
+    let hull = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_SHIP) && t.attribute(ATTR_CAPACITOR_CAPACITY).is_some_and(|v| v > 0.0) && t.attribute(crate::consts::dogma::ATTR_RECHARGE_RATE).is_some_and(|v| v > 10000.0)).expect("capacitor hull").type_id;
     let module = module_type(&sde, effect_id);
     let effect = registry::resolve(&sde, effect_id).expect("scanner effect");
     let before = fixture::fingerprint(&db).await.unwrap();

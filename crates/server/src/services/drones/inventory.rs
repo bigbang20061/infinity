@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use crate::consts::{ATTR_AGILITY, ATTR_MASS, ATTR_MAX_VELOCITY, ATTR_SIGNATURE_RADIUS, CATEGORY_DRONE, OWNER_UNOWNED};
+use crate::consts::{dogma::ATTR_AGILITY, dogma::ATTR_MASS, dogma::ATTR_MAX_VELOCITY, dogma::ATTR_SIGNATURE_RADIUS, CATEGORY_DRONE, OWNER_UNOWNED};
 use crate::dao::items::drones;
 use crate::db::Db;
 use crate::sde::Sde;

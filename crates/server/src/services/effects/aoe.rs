@@ -3,7 +3,7 @@
 //! damage uses the shared combat pipeline. Effects and damage are transient.
 use super::lifecycle::{Cycle, CycleOutcome, Module};
 use super::registry::Effect;
-use crate::consts::ATTR_EMP_FIELD_RANGE;
+use crate::consts::dogma::ATTR_EMP_FIELD_RANGE;
 use crate::messages;
 use crate::db::Db;
 use crate::services::combat::{self, Ctx, ATTR_DAMAGE, groups_health::damage};

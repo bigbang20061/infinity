@@ -1,7 +1,7 @@
 //! Database-backed remote repair activation and guarded mutation regressions.
 use super::*;
 use crate::{
-    config::Config, conn::Conn, consts::{CATEGORY_MODULE, CATEGORY_SHIP, EFFECT_MUTADAPTIVE_REMOTE_ARMOR_REPAIRER, EFFECT_REMOTE_ARMOR_REPAIRER, EFFECT_REMOTE_HULL_REPAIRER, EFFECT_REMOTE_SHIELD_BOOSTER, FLAG_FITTING_FIRST},
+    config::Config, conn::Conn, consts::{CATEGORY_MODULE, CATEGORY_SHIP, dogma::EFFECT_MUTADAPTIVE_REMOTE_ARMOR_REPAIRER, dogma::EFFECT_REMOTE_ARMOR_REPAIRER, dogma::EFFECT_REMOTE_HULL_REPAIRER, dogma::EFFECT_REMOTE_SHIELD_BOOSTER, FLAG_FITTING_FIRST},
     db::Error, handshake::Login,
     services::effects::{lifecycle, registry::{self, EffectAttribute}},
     space::{WarpState, MODE_STOP},
@@ -65,7 +65,7 @@ async fn run_remote_repair(effect_id: i32, layer: usize, interrupt: bool) {
         && t.effects().iter().any(|e| e.effect_id == effect_id)
         && (effect_id == EFFECT_MUTADAPTIVE_REMOTE_ARMOR_REPAIRER || (effect.attribute(EffectAttribute::Duration).and_then(|a| t.attribute(a)).is_some_and(|v| v >= 3000.0 && v <= 30000.0)
         && effect.attribute(EffectAttribute::Discharge).and_then(|a| t.attribute(a)).is_some_and(|v| v > 0.0)
-        && t.attribute([crate::consts::ATTR_SHIELD_BONUS, crate::consts::ATTR_ARMOR_DAMAGE_AMOUNT, crate::consts::ATTR_STRUCTURE_DAMAGE_AMOUNT][layer]).is_some_and(|v| v > 0.0)))).expect("remote repair module").type_id;
+        && t.attribute([crate::consts::dogma::ATTR_SHIELD_BONUS, crate::consts::dogma::ATTR_ARMOR_DAMAGE_AMOUNT, crate::consts::dogma::ATTR_STRUCTURE_DAMAGE_AMOUNT][layer]).is_some_and(|v| v > 0.0)))).expect("remote repair module").type_id;
     let ship_type = sde.types.iter().filter(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_SHIP)
         && [ATTR_SHIELD_CAPACITY, ATTR_ARMOR_HP, ATTR_STRUCTURE_HP, ATTR_SHIELD_RECHARGE_RATE, ATTR_CAPACITOR_CAPACITY, ATTR_RECHARGE_RATE].iter().all(|&a| t.attribute(a).is_some_and(|v| v > 10.0)))
         .max_by(|a, b| a.attribute(ATTR_CAPACITOR_CAPACITY).unwrap().total_cmp(&b.attribute(ATTR_CAPACITOR_CAPACITY).unwrap())).expect("ship with health and capacitor").type_id;
@@ -116,7 +116,7 @@ async fn run_remote_repair(effect_id: i32, layer: usize, interrupt: bool) {
         assert_eq!(&payload[..2], &[Value::Int(f.module), Value::Int(i64::from(effect_id))]);
         assert_eq!(payload[3], Value::Int(1));
         let fit = Fit::load_in_space(&test_db, &test_world, system, f.source, f.ship).await.ok().unwrap();
-        let amount = fit.value(Key::Module(f.module), [crate::consts::ATTR_SHIELD_BONUS, crate::consts::ATTR_ARMOR_DAMAGE_AMOUNT, crate::consts::ATTR_STRUCTURE_DAMAGE_AMOUNT][layer]);
+        let amount = fit.value(Key::Module(f.module), [crate::consts::dogma::ATTR_SHIELD_BONUS, crate::consts::dogma::ATTR_ARMOR_DAMAGE_AMOUNT, crate::consts::dogma::ATTR_STRUCTURE_DAMAGE_AMOUNT][layer]);
         let expected = (target_before[layer] + amount).min(state().condition[&f.victim].stats.max[layer]);
         let duration = fit.value(Key::Module(f.module), effect.attribute(EffectAttribute::Duration).unwrap()).max(250.0) as u64;
         assert!(test_world.after(system, 1500).await);

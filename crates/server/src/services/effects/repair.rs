@@ -4,7 +4,7 @@
 //! Fueled ancillary armor uses its charge multiplier; fueled shield bypasses
 //! capacitor discharge. Mutadaptive remote repair remains unsupported.
 use crate::services::{combat::{Ctx, groups_health::repair_player}, fit::{Fit, Key}};
-use crate::consts::{ATTR_SHIELD_BONUS, ATTR_ARMOR_DAMAGE_AMOUNT, ATTR_STRUCTURE_DAMAGE_AMOUNT};
+use crate::consts::{dogma::ATTR_SHIELD_BONUS, dogma::ATTR_ARMOR_DAMAGE_AMOUNT, dogma::ATTR_STRUCTURE_DAMAGE_AMOUNT};
 
 pub(super) fn amount_attribute(layer: usize) -> i32 {
     match layer {

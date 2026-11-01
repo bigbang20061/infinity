@@ -3,7 +3,7 @@ use super::*;
 use crate::services::combat::groups_health::tests::drain_exact;
 use std::sync::{Arc, atomic::AtomicBool};
 use crate::{
-    consts::{ATTR_CAPACITOR_CAPACITY, ATTR_CHARGE, ATTR_QUANTITY, ATTR_RECHARGE_RATE, CATEGORY_CHARGE, CATEGORY_MODULE, CATEGORY_SHIP, EFFECT_POWER_BOOSTER, FLAG_FITTING_FIRST},
+    consts::{dogma::ATTR_CAPACITOR_CAPACITY, dogma::ATTR_CHARGE, dogma::ATTR_QUANTITY, dogma::ATTR_RECHARGE_RATE, CATEGORY_CHARGE, CATEGORY_MODULE, CATEGORY_SHIP, dogma::EFFECT_POWER_BOOSTER, FLAG_FITTING_FIRST},
     db::{Db, Error},
     services::{combat, effects::{lifecycle::{ActivationOwner, CycleOutcome}, registry}},
     space::{Ball, World, WarpState, MODE_STOP},

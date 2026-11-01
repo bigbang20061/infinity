@@ -50,7 +50,7 @@ async fn extraction_failure_rolls_back_and_success_consumes_once() {
     let (mut c, peer) = client(db.clone(), f.character).await;
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     c.world.register_pilot(f.character, sender);
-    let skill = c.sde.types.iter().find(|t| t.category_id == Some(crate::consts::CATEGORY_SKILL) && t.published == Some(true) && super::super::formulas::sp_for_level(super::super::training::skill_type(&c.sde, t.type_id).rank, i64::from(crate::consts::MAX_SKILL_LEVEL)) >= BUCKET).expect("published skill").type_id;
+    let skill = c.sde.types.iter().find(|t| t.category_id == Some(crate::consts::CATEGORY_SKILL) && t.published == Some(true) && super::super::formulas::sp_for_level(super::super::training::skill_type(&c.sde, t.type_id).rank, i64::from(crate::consts::dogma::MAX_SKILL_LEVEL)) >= BUCKET).expect("published skill").type_id;
     let filler = c.sde.types.iter().find(|t| t.type_id != skill && t.category_id == Some(crate::consts::CATEGORY_SKILL) && t.published == Some(true) && super::super::requirements::requirements(&c.sde, t.type_id).next().is_none()).expect("filler skill").type_id;
     let station = 60000001_i64;
     db.execute("UPDATE game.characters SET station_id=$2 WHERE character_id=$1", &[&f.character, &station]).await.unwrap();
@@ -269,7 +269,7 @@ async fn extraction_refuses_clone_floor_and_overtraining_atomically() {
     c.world.register_pilot(f.character, sender);
     let clone_skill = crate::consts::SKILL_INFOMORPH_PSYCHOLOGY;
     assert!(c.sde.types.get(clone_skill).is_some(), "clone skill");
-    let filler = c.sde.types.iter().find(|t| t.type_id != clone_skill && t.category_id == Some(crate::consts::CATEGORY_SKILL) && t.published == Some(true) && super::super::requirements::requirements(&c.sde, t.type_id).next().is_none() && super::super::formulas::sp_for_level(super::super::training::skill_type(&c.sde, t.type_id).rank, i64::from(crate::consts::MAX_SKILL_LEVEL)) >= BUCKET).expect("filler skill").type_id;
+    let filler = c.sde.types.iter().find(|t| t.type_id != clone_skill && t.category_id == Some(crate::consts::CATEGORY_SKILL) && t.published == Some(true) && super::super::requirements::requirements(&c.sde, t.type_id).next().is_none() && super::super::formulas::sp_for_level(super::super::training::skill_type(&c.sde, t.type_id).rank, i64::from(crate::consts::dogma::MAX_SKILL_LEVEL)) >= BUCKET).expect("filler skill").type_id;
     let reserve = c.sde.types.iter().find(|t| t.type_id != clone_skill && t.type_id != filler && t.category_id == Some(crate::consts::CATEGORY_SKILL) && t.published == Some(true) && super::super::requirements::requirements(&c.sde, t.type_id).next().is_none()).expect("reserve skill").type_id;
     let station = 60000001_i64;
     db.execute("UPDATE game.characters SET station_id=$2 WHERE character_id=$1", &[&f.character, &station]).await.unwrap();
@@ -297,7 +297,7 @@ async fn extraction_refuses_clone_floor_and_overtraining_atomically() {
         db.execute("DELETE FROM game.skills WHERE character_id=$1 AND type_id=$2", &[&f.character, &tier]).await.unwrap();
     }
     db.execute("DELETE FROM game.jump_clones WHERE owner_id=$1", &[&f.character]).await.unwrap();
-    let cap = super::super::formulas::sp_for_level(super::super::training::skill_type(&c.sde, filler).rank, i64::from(crate::consts::MAX_SKILL_LEVEL));
+    let cap = super::super::formulas::sp_for_level(super::super::training::skill_type(&c.sde, filler).rank, i64::from(crate::consts::dogma::MAX_SKILL_LEVEL));
     db.execute("UPDATE game.skills SET skill_points=$3 WHERE character_id=$1 AND type_id=$2", &[&f.character, &filler, &(cap + 1)]).await.unwrap();
     let args = [Value::Dict(vec![(Value::Int(i64::from(filler)), Value::Int(BUCKET))]), Value::Int(item), Value::Int(1)];
     let before = fingerprint(&db, f.character).await;
@@ -359,7 +359,7 @@ async fn overdue_training_booster_quote_check_and_settlement_agree() {
     let existing = crate::dao::skills::training::current(&db, f.character).await.unwrap();
     let mut found = false;
     'types: for data in c.sde.types.iter() {
-        if data.attribute(crate::consts::ATTR_BOOSTERNESS).is_none() { continue; }
+        if data.attribute(crate::consts::dogma::ATTR_BOOSTERNESS).is_none() { continue; }
         for entry in data.effects() {
             let Some(effect) = c.sde.dogma.effect(entry.effect_id) else { continue };
             if effect.effect_category.unwrap_or(0) != 0 { continue; }
@@ -372,7 +372,7 @@ async fn overdue_training_booster_quote_check_and_settlement_agree() {
                 let old = CHAR_ATTRIBUTES.iter().map(|&id| (id, before.value(Key::Char, id as i32))).collect();
                 let new = CHAR_ATTRIBUTES.iter().map(|&id| (id, after.value(Key::Char, id as i32))).collect();
                 if old != new {
-                    for skill in c.sde.types.iter().filter(|skill| skill.attribute(crate::consts::ATTR_SKILL_TIME_CONSTANT).is_some() && !existing.iter().any(|row| row.type_id == skill.type_id)) {
+                    for skill in c.sde.types.iter().filter(|skill| skill.attribute(crate::consts::dogma::ATTR_SKILL_TIME_CONSTANT).is_some() && !existing.iter().any(|row| row.type_id == skill.type_id)) {
                         let mut row = QueueEntry { position: 0, type_id: skill.type_id, to_level: 1, start_sp: 0, dest_sp: 100_000, start_time: None, end_time: None };
                         let mut slower = row.clone();
                         let Ok(old_end) = training::schedule(&c.sde, &mut row, &old, start) else { continue };
@@ -439,10 +439,10 @@ async fn expiry_resets_cache_before_consumption_and_spent_credit_survives_replay
     let mut seen: std::collections::BTreeSet<_> = existing.iter().map(|skill| skill.type_id).collect();
     let mut points = 0_i64;
     for skill in c.sde.types.iter().filter(|t| t.category_id == Some(crate::consts::CATEGORY_SKILL) && t.published == Some(true)) {
-        let Some(rank) = skill.attribute(crate::consts::ATTR_SKILL_TIME_CONSTANT).filter(|rank| rank.is_finite() && *rank > 0.0) else { continue };
+        let Some(rank) = skill.attribute(crate::consts::dogma::ATTR_SKILL_TIME_CONSTANT).filter(|rank| rank.is_finite() && *rank > 0.0) else { continue };
         if !seen.insert(skill.type_id) { continue; }
-        let skill_points = super::super::formulas::sp_for_level(rank, i64::from(crate::consts::MAX_SKILL_LEVEL));
-        crate::dao::skills::training::starting_skill(&db, f.character, skill.type_id, crate::consts::MAX_SKILL_LEVEL, skill_points).await.unwrap();
+        let skill_points = super::super::formulas::sp_for_level(rank, i64::from(crate::consts::dogma::MAX_SKILL_LEVEL));
+        crate::dao::skills::training::starting_skill(&db, f.character, skill.type_id, crate::consts::dogma::MAX_SKILL_LEVEL, skill_points).await.unwrap();
         points += skill_points;
         if points >= FREE_ZONE { break; }
     }

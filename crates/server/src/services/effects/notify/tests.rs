@@ -36,9 +36,9 @@ fn jam_notifications_preserve_identity_filetime_and_milliseconds() {
 
 #[test]
 fn npc_scram_slots_distinguish_mwd_blocking() {
-    assert_eq!(ewar_slot_by_id(crate::consts::EFFECT_NPC_WARP_SCRAMBLE), Some("warpScrambler"));
-    assert_eq!(ewar_slot_by_id(crate::consts::EFFECT_NPC_WARP_SCRAMBLE_MWD), Some("warpScramblerMWD"));
-    assert_eq!(ewar_slot_by_id(crate::consts::EFFECT_NPC_BEHAVIOR_WARP_SCRAMBLE), Some("warpScramblerMWD"));
+    assert_eq!(ewar_slot_by_id(crate::consts::dogma::EFFECT_NPC_WARP_SCRAMBLE), Some("warpScrambler"));
+    assert_eq!(ewar_slot_by_id(crate::consts::dogma::EFFECT_NPC_WARP_SCRAMBLE_MWD), Some("warpScramblerMWD"));
+    assert_eq!(ewar_slot_by_id(crate::consts::dogma::EFFECT_NPC_BEHAVIOR_WARP_SCRAMBLE), Some("warpScramblerMWD"));
 }
 
 #[test]

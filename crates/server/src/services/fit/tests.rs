@@ -125,7 +125,7 @@ fn drone_node_overrides_are_independent_of_owner_bonus() {
 #[ignore = "requires a dedicated database with the retail SDE"]
 async fn real_sde_prospective_drone_and_projection_receivers() {
     use super::{Fit, Key};
-    use crate::consts::{ATTR_AGILITY, ATTR_MASS, ATTR_MAX_VELOCITY, EFFECT_REMOTE_WEBIFIER_FALLOFF};
+    use crate::consts::{dogma::ATTR_AGILITY, dogma::ATTR_MASS, dogma::ATTR_MAX_VELOCITY, dogma::EFFECT_REMOTE_WEBIFIER_FALLOFF};
     use crate::services::effects::{projection::Projection, EffectKind};
     use std::sync::Arc;
 
@@ -408,7 +408,7 @@ fn unknown_type_uses_attribute_default() {
 
 #[test]
 fn drone_physical_base_corrects_only_missing_or_nonpositive_inputs() {
-    use crate::consts::{ATTR_AGILITY, ATTR_MASS, ATTR_MAX_VELOCITY, CATEGORY_DRONE, CATEGORY_SHIP, DRONE_FALLBACK_AGILITY, DRONE_FALLBACK_MASS};
+    use crate::consts::{dogma::ATTR_AGILITY, dogma::ATTR_MASS, dogma::ATTR_MAX_VELOCITY, CATEGORY_DRONE, CATEGORY_SHIP, DRONE_FALLBACK_AGILITY, DRONE_FALLBACK_MASS};
     let drone = Some(CATEGORY_DRONE);
     for value in [None, Some(0.0), Some(-1.0)] {
         assert_eq!(super::physical_base(drone, ATTR_MASS, value), Some(DRONE_FALLBACK_MASS));
@@ -483,7 +483,7 @@ async fn selected_booster_effect_changes_fit_and_wire_brain() {
     let (c, _peer) = client(db.clone(), f.character).await;
     let mut exercised = false;
     'types: for data in c.sde.types.iter() {
-        if data.attribute(crate::consts::ATTR_BOOSTERNESS).is_none() { continue; }
+        if data.attribute(crate::consts::dogma::ATTR_BOOSTERNESS).is_none() { continue; }
         for entry in data.effects() {
             let Some(effect) = c.sde.dogma.effect(entry.effect_id) else { continue };
             if effect.effect_category.unwrap_or(0) != 0 || !effect.fitting_usage_chance_attribute_id.is_some_and(|id| data.attribute(id).is_some()) { continue; }

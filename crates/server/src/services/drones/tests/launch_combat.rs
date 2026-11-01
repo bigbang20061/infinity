@@ -1,6 +1,6 @@
 use std::{collections::HashSet, future::Future, task::Poll};
 use marshal::Value;
-use crate::{consts::*, services::{Call, fit::{Fit, Key}, effects::{EffectKind, registry}}, space::drone::DroneOrder};
+use crate::{consts::{*, dogma::*}, services::{Call, fit::{Fit, Key}, effects::{EffectKind, registry}}, space::drone::DroneOrder};
 use super::fixture::Fixture;
 
 async fn catch_scenario(future: impl Future<Output = ()>) -> std::thread::Result<()> {

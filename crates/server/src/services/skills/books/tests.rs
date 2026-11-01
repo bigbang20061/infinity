@@ -134,9 +134,9 @@ async fn overdue_completion_is_merged_with_book_injection_and_start() {
         db.execute("UPDATE game.characters SET station_id=$2 WHERE character_id=$1", &[&f.character, &station]).await.unwrap();
         db.execute("INSERT INTO game.skills (character_id,type_id,level,skill_points) VALUES ($1,$2,0,0)", &[&f.character, &trained]).await.unwrap();
         db.execute("INSERT INTO game.skill_queue (character_id,position,type_id,to_level,start_sp,dest_sp,start_time,end_time) VALUES ($1,0,$2,1,0,$3,1,2)", &[&f.character, &trained, &points]).await.unwrap();
-        let booster_type = sde.types.iter().find(|t| t.attribute(crate::consts::ATTR_BOOSTERNESS).is_some_and(|slot| slot > 0.0)).expect("booster in SDE").type_id;
+        let booster_type = sde.types.iter().find(|t| t.attribute(crate::consts::dogma::ATTR_BOOSTERNESS).is_some_and(|slot| slot > 0.0)).expect("booster in SDE").type_id;
         let booster: i64 = db.query_one("INSERT INTO game.items (type_id,owner_id,location_id,flag_id,singleton,brain_activated_at,brain_expires_at) VALUES ($1,$2,$2,$3,true,1,3) RETURNING item_id", &[&booster_type, &f.character, &crate::consts::FLAG_BOOSTER]).await.unwrap().get("item_id");
-        db.execute("INSERT INTO game.item_attributes (item_id,attribute_id,value) VALUES ($1,$2,0)", &[&booster, &crate::consts::ATTR_SKILL_TIME_CONSTANT]).await.unwrap();
+        db.execute("INSERT INTO game.item_attributes (item_id,attribute_id,value) VALUES ($1,$2,0)", &[&booster, &crate::consts::dogma::ATTR_SKILL_TIME_CONSTANT]).await.unwrap();
         let item = crate::dao::items::transfers::insert(&db, book, f.character, station, crate::consts::FLAG_HANGAR, 1).await.unwrap();
         super::super::completion::reschedule(&db, f.character).await.unwrap_or_else(|_| panic!("scheduling failed"));
         let before = fixture::skill_fingerprint(&db, f.character).await.unwrap();
@@ -152,7 +152,7 @@ async fn overdue_completion_is_merged_with_book_injection_and_start() {
         assert_eq!(fixture::skill_fingerprint(&db, f.character).await.unwrap(), before);
         assert_eq!(db.query_one("SELECT row_to_json(j)::text AS state FROM game.jobs j WHERE job_id=$1", &[&job]).await.unwrap().get::<_, String>("state"), jobs_before);
         assert!(db.query_opt("SELECT item_id FROM game.items WHERE item_id=$1 AND brain_activated_at=1 AND brain_expires_at=3", &[&booster]).await.unwrap().is_some());
-        assert!(db.query_opt("SELECT item_id FROM game.item_attributes WHERE item_id=$1 AND attribute_id=$2 AND value=0", &[&booster, &crate::consts::ATTR_SKILL_TIME_CONSTANT]).await.unwrap().is_some());
+        assert!(db.query_opt("SELECT item_id FROM game.item_attributes WHERE item_id=$1 AND attribute_id=$2 AND value=0", &[&booster, &crate::consts::dogma::ATTR_SKILL_TIME_CONSTANT]).await.unwrap().is_some());
         assert!(db.query_opt("SELECT item_id FROM game.items WHERE item_id=$1", &[&item]).await.unwrap().is_some());
         assert!(history::list(&db, f.character, 50).await.unwrap().is_empty());
         let effects = db.transaction(|tx, outbox: &mut Outbox<crate::services::effects::online::OnlineChanged>| {

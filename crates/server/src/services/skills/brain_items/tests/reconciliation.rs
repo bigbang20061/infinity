@@ -1,7 +1,7 @@
 //! Implant destruction must reconcile every owned online hull atomically.
 use super::super::*;
 use super::fixtures::*;
-use crate::{consts::{ATTR_CPU, ATTR_CPU_LOAD, ATTR_CPU_OUTPUT, ATTR_POWER, ATTR_POWER_LOAD, ATTR_POWER_OUTPUT, CATEGORY_MODULE, CATEGORY_SHIP, EFFECT_ONLINE, FLAG_HI_SLOT_FIRST}, db::outbox::{Effect, Notification}, services::skills::{formulas, training}};
+use crate::{consts::{dogma::ATTR_CPU, dogma::ATTR_CPU_LOAD, dogma::ATTR_CPU_OUTPUT, dogma::ATTR_POWER, dogma::ATTR_POWER_LOAD, dogma::ATTR_POWER_OUTPUT, CATEGORY_MODULE, CATEGORY_SHIP, dogma::EFFECT_ONLINE, FLAG_HI_SLOT_FIRST}, db::outbox::{Effect, Notification}, services::skills::{formulas, training}};
 
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
@@ -66,7 +66,7 @@ async fn implant_destruction_reconciles_owned_hulls_and_rolls_back() {
     for &ship in &ships { assert!(dogma::online(&db, ship).await.unwrap().is_empty()); }
     for &module in &modules {
         assert!(effects.iter().any(|entry| matches!(entry, Effect::Notification(Notification::Pilot { event, args, .. }) if event == "OnGodmaShipEffect" && args.first().and_then(Value::as_int) == Some(module) && args.get(3).and_then(Value::as_int) == Some(0))));
-        assert!(effects.iter().any(|entry| matches!(entry, Effect::Notification(Notification::Pilot { event, args, .. }) if event == "OnModuleAttributeChanges" && matches!(args.as_slice(), [Value::List(changes)] if changes.iter().any(|change| matches!(change, Value::Tuple(row) if row.get(2) == Some(&Value::Int(module)) && row.get(3) == Some(&Value::Int(i64::from(crate::consts::ATTR_IS_ONLINE))) && row.get(5) == Some(&Value::Int(0))))))));
+        assert!(effects.iter().any(|entry| matches!(entry, Effect::Notification(Notification::Pilot { event, args, .. }) if event == "OnModuleAttributeChanges" && matches!(args.as_slice(), [Value::List(changes)] if changes.iter().any(|change| matches!(change, Value::Tuple(row) if row.get(2) == Some(&Value::Int(module)) && row.get(3) == Some(&Value::Int(i64::from(crate::consts::dogma::ATTR_IS_ONLINE))) && row.get(5) == Some(&Value::Int(0))))))));
     }
     c.world.unregister_pilot(f.character);
     cleanup(&db, f).await;

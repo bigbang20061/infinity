@@ -10,7 +10,7 @@
 use std::sync::{Arc, atomic::Ordering};
 use super::{EffectKind, lifecycle::{Cycle, CycleOutcome, Module}, range::range_multiplier, registry::{Effect, EffectAttribute, EffectFlag}};
 use super::space_source::{SourceContext, SourceGuard};
-use crate::consts::{ATTR_SCAN_GRAVIMETRIC_STRENGTH, ATTR_SCAN_LADAR_STRENGTH, ATTR_SCAN_MAGNETOMETRIC_STRENGTH, ATTR_SCAN_RADAR_STRENGTH, CATEGORY_SHIP, CATEGORY_ENTITY, CATEGORY_DRONE};
+use crate::consts::{dogma::ATTR_SCAN_GRAVIMETRIC_STRENGTH, dogma::ATTR_SCAN_LADAR_STRENGTH, dogma::ATTR_SCAN_MAGNETOMETRIC_STRENGTH, dogma::ATTR_SCAN_RADAR_STRENGTH, CATEGORY_SHIP, CATEGORY_ENTITY, CATEGORY_DRONE};
 use crate::db::Db;
 use crate::messages;
 use crate::sde::Sde;

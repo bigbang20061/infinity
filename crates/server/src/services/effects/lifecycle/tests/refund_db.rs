@@ -1,5 +1,5 @@
 use super::*;
-use crate::{consts::{ATTR_CAPACITOR_CAPACITY, ATTR_RECHARGE_RATE, CATEGORY_SHIP}, dao::items::{combat, pending_reloads, creation}, services::combat::groups_health::{capacitor_snapshot, drain_capacitor}, space::{Ball, World, WarpState, MODE_STOP}};
+use crate::{consts::{dogma::ATTR_CAPACITOR_CAPACITY, dogma::ATTR_RECHARGE_RATE, CATEGORY_SHIP}, dao::items::{combat, pending_reloads, creation}, services::combat::groups_health::{capacitor_snapshot, drain_capacitor}, space::{Ball, World, WarpState, MODE_STOP}};
 use crate::services::effects::weapons::consume_charge;
 
 #[tokio::test]

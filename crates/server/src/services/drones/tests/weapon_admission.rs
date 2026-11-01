@@ -1,7 +1,7 @@
 use std::{future::Future, task::Poll, time::Duration};
 use anyhow::{anyhow, ensure, Result};
 use marshal::Value;
-use crate::{consts::*, services::{combat::ATTR_DAMAGE, effects::{registry, EffectKind, space_source::SourceGuard, weapons::{self, Missile}}, fit::{Fit, Key}}, space::drone::DroneOrder};
+use crate::{consts::{*, dogma::*}, services::{combat::ATTR_DAMAGE, effects::{registry, EffectKind, space_source::SourceGuard, weapons::{self, Missile}}, fit::{Fit, Key}}, space::drone::DroneOrder};
 use super::fixture::Fixture;
 
 async fn catch_scenario(future: impl Future<Output = Result<()>>) -> std::thread::Result<Result<()>> {

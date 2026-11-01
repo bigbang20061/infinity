@@ -3,9 +3,9 @@
 //! only their spawn-group or owner allies, never their hostile target. Server
 //! policy applies shield at cycle start and armor and hull at cycle end.
 use super::{range::range_multiplier, registry::{Effect, EffectAttribute}, repair, space_source::{SourceContext, SourceGuard}, EffectKind};
-use crate::consts::{EFFECT_NPC_BEHAVIOR_REMOTE_ARMOR, EFFECT_NPC_BEHAVIOR_REMOTE_SHIELD,
-    EFFECT_NPC_REMOTE_ARMOR_REPAIRER, EFFECT_NPC_REMOTE_SHIELD_BOOSTER,
-    EFFECT_NPC_REMOTE_HULL_REPAIRER};
+use crate::consts::{dogma::EFFECT_NPC_BEHAVIOR_REMOTE_ARMOR, dogma::EFFECT_NPC_BEHAVIOR_REMOTE_SHIELD,
+    dogma::EFFECT_NPC_REMOTE_ARMOR_REPAIRER, dogma::EFFECT_NPC_REMOTE_SHIELD_BOOSTER,
+    dogma::EFFECT_NPC_REMOTE_HULL_REPAIRER};
 use crate::services::{combat::groups_health::{npc_health_fraction, repair_npc_in_system, repair_player}, CallError};
 use crate::space::{dist, Ball, System, MODE_WARP, drone::DronePhase};
 
@@ -63,7 +63,7 @@ pub(crate) async fn apply_source(cx: &SourceContext<'_>) -> Result<(), CallError
         }
         SourceGuard::Drone { source, target, .. } => {
             if repair::applies_at_start(layer) != matches!(cx.phase, DronePhase::Begin) { return Ok(()); }
-            if cx.effect.id == i64::from(crate::consts::EFFECT_MUTADAPTIVE_REMOTE_ARMOR_REPAIRER) {
+            if cx.effect.id == i64::from(crate::consts::dogma::EFFECT_MUTADAPTIVE_REMOTE_ARMOR_REPAIRER) {
                 return Err(super::unsupported::refusal(Some(cx.effect.id as i32), "mutadaptive remote armor repair", cx.source.type_id));
             }
             let guard = cx.guard;

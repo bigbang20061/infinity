@@ -63,7 +63,7 @@ async fn kinematics_reads_the_requested_fit_key() {
     let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
     let mut fit = Fit::for_space_type(sde, 587, vec![]);
     fit.include_drone(7, 2454, vec![(ATTR_MAX_VELOCITY, 123.0), (ATTR_MASS, 456.0),
-        (crate::consts::ATTR_AGILITY, 0.75), (ATTR_SIGNATURE_RADIUS, 9.0)]);
+        (crate::consts::dogma::ATTR_AGILITY, 0.75), (ATTR_SIGNATURE_RADIUS, 9.0)]);
     let drone = kinematics(&fit, Key::Drone(7));
     assert_eq!((drone.speed, drone.mass, drone.agility, drone.signature), (123.0, 456.0, 0.75, 9.0));
     assert_ne!(kinematics(&fit, Key::Ship).speed, drone.speed);

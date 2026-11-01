@@ -5,7 +5,7 @@ use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
 use crate::{
     client::Client,
-    consts::{ATTR_CPU, ATTR_CPU_LOAD, ATTR_CPU_OUTPUT, ATTR_POWER, ATTR_POWER_LOAD, ATTR_POWER_OUTPUT, CATEGORY_SKILL, EFFECT_ONLINE, FLAG_CARGO, FLAG_HI_SLOT_FIRST},
+    consts::{dogma::ATTR_CPU, dogma::ATTR_CPU_LOAD, dogma::ATTR_CPU_OUTPUT, dogma::ATTR_POWER, dogma::ATTR_POWER_LOAD, dogma::ATTR_POWER_OUTPUT, CATEGORY_SKILL, dogma::EFFECT_ONLINE, FLAG_CARGO, FLAG_HI_SLOT_FIRST},
     dao::items::{combat as item_combat, dogma},
     sde::Sde,
     services::{self, CallError, effects::online::{self, OnlineChanged}, fit::{Fit, Key}, skills::gm::{self, Change}},

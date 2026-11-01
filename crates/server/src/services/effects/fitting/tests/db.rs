@@ -5,7 +5,7 @@ mod scenarios;
 use std::sync::Arc;
 use crate::{
     client::Client,
-    consts::{ATTR_CPU, ATTR_CPU_LOAD, ATTR_CPU_OUTPUT, ATTR_POWER, ATTR_POWER_OUTPUT, ATTR_REQUIRED_SKILLS, CATEGORY_MODULE, CATEGORY_SHIP, EFFECT_ONLINE, FLAG_HI_SLOT_FIRST, FLAG_MED_SLOT_FIRST, GM_ROLES},
+    consts::{dogma::ATTR_CPU, dogma::ATTR_CPU_LOAD, dogma::ATTR_CPU_OUTPUT, dogma::ATTR_POWER, dogma::ATTR_POWER_OUTPUT, dogma::ATTR_REQUIRED_SKILLS, CATEGORY_MODULE, CATEGORY_SHIP, dogma::EFFECT_ONLINE, FLAG_HI_SLOT_FIRST, FLAG_MED_SLOT_FIRST, GM_ROLES},
     dao::items::dogma as item_dogma,
     sde::Sde,
     services::{self, Call, CallError, fit::{Fit, Key}, inventory::{self, Container}},
@@ -19,7 +19,7 @@ fn offline_attribute(payload: &[Value], owner: i64, item: i64) -> bool {
         let Value::Tuple(row) = change else { return false };
         row.get(1) == Some(&Value::Int(owner))
             && row.get(2) == Some(&Value::Int(item))
-            && row.get(3) == Some(&Value::Int(i64::from(crate::consts::ATTR_IS_ONLINE)))
+            && row.get(3) == Some(&Value::Int(i64::from(crate::consts::dogma::ATTR_IS_ONLINE)))
             && row.get(5) == Some(&Value::Int(0))
             && row.get(6) == Some(&Value::Int(1))
     })
@@ -38,7 +38,7 @@ async fn fitting_online_priming_and_slash() {
         && t.effects().iter().any(|e| i64::from(e.effect_id) == EFFECT_ONLINE)
         && t.attribute(ATTR_CPU).is_some_and(|v| v > 0.0)
         && super::super::CAN_FIT_GROUPS.iter().chain(super::super::CAN_FIT_TYPES.iter()).all(|a| t.attribute(*a).unwrap_or(0.0) == 0.0)
-        && !t.effects().iter().any(|e| e.effect_id == crate::consts::EFFECT_TURRET_FITTED || e.effect_id == crate::consts::EFFECT_LAUNCHER_FITTED)
+        && !t.effects().iter().any(|e| e.effect_id == crate::consts::dogma::EFFECT_TURRET_FITTED || e.effect_id == crate::consts::dogma::EFFECT_LAUNCHER_FITTED)
         && t.attribute(super::super::MAX_GROUP_FITTED).unwrap_or(0.0) == 0.0
         && t.attribute(super::super::MAX_TYPE_FITTED).unwrap_or(0.0) == 0.0).expect("unrestricted high-slot online module").type_id;
     let required: Vec<_> = ATTR_REQUIRED_SKILLS.iter().filter_map(|a| sde.types.get(module_type).and_then(|t| t.attribute(*a)).filter(|v| *v > 0.0).map(|v| (v as i32, 5))).collect();
@@ -57,11 +57,11 @@ async fn fitting_online_priming_and_slash() {
         let (notify, mut events) = tokio::sync::mpsc::unbounded_channel();
         client.notify_tx = notify;
         let drone = sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(crate::consts::CATEGORY_DRONE)
-            && ATTR_REQUIRED_SKILLS.iter().zip(crate::consts::ATTR_REQUIRED_SKILL_LEVELS).any(|(&skill, level)|
+            && ATTR_REQUIRED_SKILLS.iter().zip(crate::consts::dogma::ATTR_REQUIRED_SKILL_LEVELS).any(|(&skill, level)|
                 t.attribute(skill).unwrap_or(0.0) > 0.0 && t.attribute(level).unwrap_or(0.0) > 0.0))
             .expect("published drone with skill prerequisites");
         let drone_type = drone.type_id;
-        let drone_skills = ATTR_REQUIRED_SKILLS.iter().zip(crate::consts::ATTR_REQUIRED_SKILL_LEVELS)
+        let drone_skills = ATTR_REQUIRED_SKILLS.iter().zip(crate::consts::dogma::ATTR_REQUIRED_SKILL_LEVELS)
             .filter_map(|(&skill, level)| {
                 let skill = drone.attribute(skill).unwrap_or(0.0) as i32;
                 let level = drone.attribute(level).unwrap_or(0.0) as i32;
@@ -181,7 +181,7 @@ async fn fitting_online_priming_and_slash() {
         assert_eq!(item_dogma::overrides(&test_db, f.ship).await.unwrap().iter().find(|r| r.attribute_id == ATTR_CPU_OUTPUT).unwrap().value, 15.0);
         assert!(events.try_recv().is_err());
         let rig_type = sde.types.iter().find(|t| t.published == Some(true) && t.category_id == Some(CATEGORY_MODULE)
-            && t.effects().iter().any(|e| e.effect_id == crate::consts::EFFECT_RIG_SLOT)
+            && t.effects().iter().any(|e| e.effect_id == crate::consts::dogma::EFFECT_RIG_SLOT)
             && super::super::CAN_FIT_GROUPS.iter().chain(super::super::CAN_FIT_TYPES.iter()).all(|a| t.attribute(*a).unwrap_or(0.0) == 0.0)
             && t.attribute(super::super::MAX_GROUP_FITTED).unwrap_or(0.0) == 0.0
             && t.attribute(super::super::MAX_TYPE_FITTED).unwrap_or(0.0) == 0.0).expect("unrestricted rig").type_id;
@@ -189,7 +189,7 @@ async fn fitting_online_priming_and_slash() {
         let rig_size = rig.attribute(super::super::RIG_SIZE).unwrap_or(0.0);
         let rig_skills = ATTR_REQUIRED_SKILLS.iter().filter_map(|a| rig.attribute(*a).filter(|v| *v > 0.0).map(|v| (v as i32, 5))).collect();
         services::skills::gm::apply(&mut client, f.owner, services::skills::gm::Change::Set(rig_skills)).await.ok().expect("seed rig prerequisites");
-        for (attr, value) in [(1137, 2.0), (super::super::RIG_SIZE, rig_size), (crate::consts::ATTR_UPGRADE_CAPACITY, 1_000_000.0)] {
+        for (attr, value) in [(1137, 2.0), (super::super::RIG_SIZE, rig_size), (crate::consts::dogma::ATTR_UPGRADE_CAPACITY, 1_000_000.0)] {
             assert!(item_dogma::set_override(&test_db, f.ship, attr, value).await.unwrap());
         }
         for index in 0..2 {

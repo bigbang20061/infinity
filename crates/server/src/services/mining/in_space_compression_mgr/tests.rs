@@ -1,6 +1,6 @@
 use super::*;
 use anyhow::{anyhow, ensure, Context as _};
-use crate::{consts::ATTR_COMPRESSIBLE_ITEMS_TYPE_LIST, db::outbox::{Effect, Notification}, services::drones::tests::fixture::Fixture};
+use crate::{consts::dogma::ATTR_COMPRESSIBLE_ITEMS_TYPE_LIST, db::outbox::{Effect, Notification}, services::drones::tests::fixture::Fixture};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
 fn call<'a>(method: &'a str, args: &'a [Value], kwargs: &'a Value) -> Call<'a> {

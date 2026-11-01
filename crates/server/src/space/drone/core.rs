@@ -4,7 +4,7 @@
 //! Orders and controller state are not restored after restart.
 
 use super::*;
-use crate::consts::*;
+use crate::consts::{*, dogma::*};
 use crate::space::targeting::next_generation as generation;
 
 /// Server movement policy: converge inside the action/contact boundary, not at it.

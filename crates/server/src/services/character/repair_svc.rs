@@ -7,7 +7,7 @@
 //! Payment and full-quote comparison use wallet-cent precision; zero-cent charges are refused.
 //! Structure facilities and heat generation are not modelled.
 use super::*;
-use crate::consts::{ATTR_ARMOR_DAMAGE, ATTR_ARMOR_HP, ATTR_HULL_DAMAGE, CARGO_CONTAINER_GROUPS, CATEGORY_DRONE, CATEGORY_MODULE, CATEGORY_SHIP, FLAG_HANGAR};
+use crate::consts::{dogma::ATTR_ARMOR_DAMAGE, dogma::ATTR_ARMOR_HP, dogma::ATTR_HULL_DAMAGE, CARGO_CONTAINER_GROUPS, CATEGORY_DRONE, CATEGORY_MODULE, CATEGORY_SHIP, FLAG_HANGAR};
 use crate::dao::items::{dogma, repair};
 use crate::db::{executor::Executor, outbox::{dispatch_world, Outbox}};
 use crate::services::{combat, effects::notify::attribute_change, fit::{Fit, Key}, inventory::is_fitting_flag, market, notify_error, wallets};

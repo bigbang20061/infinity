@@ -1,7 +1,7 @@
 //! Applying unallocated skill points for skillsvc.py.
 //! Uses game.characters, skills, history, queue and jobs; changes dispatch after commit.
 use super::{db_err, training, CallError};
-use crate::{client::{filetime_now, Client}, consts::MAX_SKILL_LEVEL, dao::{characters::attributes, skills::{history, queue, trading, training as skill_dao}}, db::{executor::Executor, outbox::Outbox}, messages, services::{effects::online::{self, OnlineChanged}, notify_error}};
+use crate::{client::{filetime_now, Client}, consts::dogma::MAX_SKILL_LEVEL, dao::{characters::attributes, skills::{history, queue, trading, training as skill_dao}}, db::{executor::Executor, outbox::Outbox}, messages, services::{effects::online::{self, OnlineChanged}, notify_error}};
 use marshal::Value;
 
 fn refusal() -> CallError { notify_error(messages::skills::INVALID_ECONOMY_REQUEST) }

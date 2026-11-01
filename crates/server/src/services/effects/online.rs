@@ -5,7 +5,7 @@
 use super::lifecycle::subject_core;
 use super::notify::attribute_change;
 use crate::client::{filetime_now, Client};
-use crate::consts::{ATTR_IS_ONLINE, EFFECT_ONLINE};
+use crate::consts::{dogma::ATTR_IS_ONLINE, dogma::EFFECT_ONLINE};
 use crate::db::{executor::Executor, outbox::{Effect as OutboxEffect, Outbox}};
 use crate::messages;
 use crate::sde::Sde;

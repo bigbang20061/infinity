@@ -3,7 +3,7 @@
 //! Data comes from character and item DAOs and the SDE; unmodelled systems return empty answers.
 use super::{db_err, keyval, rowset, Call, CallError, CallResult};
 use crate::client::Client;
-use crate::consts::{ATTR_STRUCTURE_HP, FILETIME_SECOND, FILETIME_UNIX_EPOCH, TYPE_CHARACTER};
+use crate::consts::{dogma::ATTR_STRUCTURE_HP, FILETIME_SECOND, FILETIME_UNIX_EPOCH, TYPE_CHARACTER};
 use marshal::Value;
 
 mod char_mgr;

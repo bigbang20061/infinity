@@ -4,7 +4,7 @@
 use super::{args::{self, Args}, slash_error, CallError, Client};
 use crate::{messages, services::skills::gm::{self, Change}};
 
-use crate::consts::MAX_SKILL_LEVEL as MAX_LEVEL;
+use crate::consts::dogma::MAX_SKILL_LEVEL as MAX_LEVEL;
 
 fn level(text: Option<&str>) -> Result<i32, CallError> {
     match text {

@@ -1,5 +1,5 @@
 use super::*;
-use crate::{consts::{CATEGORY_ENTITY, EFFECT_NPC_BEHAVIOR_SMARTBOMB, ATTR_SHIELD_CAPACITY},
+use crate::{consts::{CATEGORY_ENTITY, dogma::EFFECT_NPC_BEHAVIOR_SMARTBOMB, dogma::ATTR_SHIELD_CAPACITY},
     services::combat::groups_health::npc_health_fraction,
     space::{NpcAction, NpcBrain, NpcConfig, World, HOSTILE_TO_ALL}};
 

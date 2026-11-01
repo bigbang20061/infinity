@@ -1,7 +1,7 @@
 use std::future::Future;
 use anyhow::{anyhow, ensure, Result};
 use marshal::Value;
-use crate::{consts::*, services::{Call, effects::{registry, EffectKind, JammingType, registry::{EffectAttribute, EffectFlag}}}, space::drone::DroneOrder};
+use crate::{consts::{*, dogma::*}, services::{Call, effects::{registry, EffectKind, JammingType, registry::{EffectAttribute, EffectFlag}}}, space::drone::DroneOrder};
 use super::{fleet::form_fleet, super::fixture::Fixture};
 
 fn call_error(error: crate::services::CallError) -> anyhow::Error {
