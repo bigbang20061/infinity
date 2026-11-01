@@ -73,6 +73,8 @@ pub const GROUP_PLANET: i32 = 7;
 pub const GROUP_ASTEROID_BELT: i32 = 9;
 /// SDE invGroups: Wreck.
 pub const GROUP_WRECK: i32 = 186;
+/// SDE invGroups: Strategic Cruiser (inventorycommon/util.py:126-127).
+pub const GROUP_STRATEGIC_CRUISER: i64 = 963;
 /// SDE invGroups: Cargo Container (groupCargoContainer).
 pub const GROUP_CARGO_CONTAINER: i32 = 12;
 /// SDE invGroups: Secure Cargo Container (groupSecureCargoContainer).

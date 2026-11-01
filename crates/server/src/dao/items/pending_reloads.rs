@@ -70,6 +70,14 @@ pub(crate) async fn for_flags(ex: &(impl Executor + ?Sized), ship: i64, flags: &
     ).await?.iter().map(PendingReload::from_row).collect())
 }
 
+pub(crate) async fn for_ship(ex: &(impl Executor + ?Sized), ship: i64) -> Result<Vec<PendingReload>, Error> {
+    Ok(ex.query(
+        "SELECT reload_id, owner_id, ship_id, module_id, flag_id, type_id, quantity
+         FROM game.pending_reloads WHERE ship_id = $1 ORDER BY reload_id",
+        &[&ship],
+    ).await?.iter().map(PendingReload::from_row).collect())
+}
+
 pub(crate) async fn take(ex: &(impl Executor + ?Sized), reload_id: i64) -> Result<Option<PendingReload>, Error> {
     Ok(ex.query_opt(
         "DELETE FROM game.pending_reloads WHERE reload_id = $1

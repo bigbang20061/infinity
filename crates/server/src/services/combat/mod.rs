@@ -196,7 +196,7 @@ pub fn reset(c: &Client) {
 }
 
 
-mod reload_recovery;
+pub(in crate::services) mod reload_recovery;
 pub(crate) use reload_recovery::recover_pending_reloads;
 pub(crate) mod targeting_charges;
 pub(crate) mod jamming;

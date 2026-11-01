@@ -1,4 +1,4 @@
-//! Persistence for ship assembly, repackaging, saved fittings and blueprints.
+//! Persistence for ship assembly, guarded repackaging, saved fittings and blueprints.
 //! Client services own policy, transactions and notification ordering.
 use crate::db::{executor::Executor, Error};
 use crate::dao::items::loading::Item;
@@ -7,8 +7,6 @@ use std::collections::BTreeMap;
 use tokio_postgres::Row;
 
 use super::inventory::ItemId;
-struct Count { count: i64 }
-impl Count { fn from_row(r: &Row) -> Self { Self { count: r.get("count") } } }
 struct FittingId { fitting_id: i64 }
 impl FittingId { fn from_row(r: &Row) -> Self { Self { fitting_id: r.get("fitting_id") } } }
 pub(crate) struct Fitting { pub fitting_id: i64, pub owner_id: i64, pub name: String, pub description: String, pub ship_type_id: i32, pub fit_types: Vec<i32>, pub fit_flags: Vec<i32>, pub fit_qty: Vec<i32> }
@@ -32,11 +30,15 @@ pub(crate) async fn insert_assembled(ex: &(impl Executor + ?Sized), item: &Item,
     Ok(ItemId::from_row(&ex.query_one("INSERT INTO game.items (type_id, owner_id, location_id, flag_id, quantity, singleton, name)
                              VALUES ($1, $2, $3, $4, 1, true, $5) RETURNING item_id", &[&item.type_id, &owner, &item.location_id, &item.flag_id, name]).await?).item_id)
 }
-pub(crate) async fn fitted_count(ex: &(impl Executor + ?Sized), id: i64) -> Result<i64, Error> {
-    Ok(Count::from_row(&ex.query_one("SELECT count(*) AS count FROM game.items WHERE location_id = $1", &[&id]).await?).count)
+pub(crate) async fn lock_children(ex: &(impl Executor + ?Sized), parent: i64) -> Result<Vec<i64>, Error> {
+    Ok(ex.query("SELECT item_id FROM game.items WHERE location_id = $1 ORDER BY item_id FOR UPDATE", &[&parent]).await?
+        .iter().map(|row| ItemId::from_row(row).item_id).collect())
 }
-pub(crate) async fn repackage(ex: &(impl Executor + ?Sized), id: i64, owner: i64, station: i64) -> Result<u64, Error> {
-    ex.execute("UPDATE game.items SET singleton = false, online = false, name = NULL WHERE item_id = $1 AND owner_id = $2 AND location_id = $3 AND flag_id = $4 AND singleton", &[&id, &owner, &station, &FLAG_HANGAR]).await
+pub(crate) async fn repackage(ex: &(impl Executor + ?Sized), item: &Item) -> Result<u64, Error> {
+    ex.execute("UPDATE game.items SET singleton = false, online = false, name = NULL WHERE item_id = $1 AND owner_id = $2 AND location_id = $3 AND flag_id = $4 AND type_id = $5 AND quantity = $6 AND singleton = $7 AND singleton AND flag_id = $8", &[&item.item_id, &item.owner_id, &item.location_id, &item.flag_id, &item.type_id, &item.quantity, &item.singleton, &FLAG_HANGAR]).await
+}
+pub(crate) async fn destroy_upgrade(ex: &(impl Executor + ?Sized), item: &Item) -> Result<bool, Error> {
+    Ok(ex.execute("DELETE FROM game.items i WHERE i.item_id = $1 AND i.owner_id = $2 AND i.location_id = $3 AND i.flag_id = $4 AND i.type_id = $5 AND i.quantity = $6 AND i.singleton = $7 AND NOT EXISTS (SELECT 1 FROM game.items child WHERE child.location_id = i.item_id)", &[&item.item_id, &item.owner_id, &item.location_id, &item.flag_id, &item.type_id, &item.quantity, &item.singleton]).await? != 0)
 }
 const COLS: &str = "fitting_id, owner_id, name, description, ship_type_id, fit_types, fit_flags, fit_qty";
 pub(crate) async fn fittings(ex: &(impl Executor + ?Sized), owner: i64) -> Result<Vec<Fitting>, Error> {

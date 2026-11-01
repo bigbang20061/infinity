@@ -8,14 +8,12 @@ use crate::dao::items::loading::ItemQuery;
 use crate::services::items::load_items;
 use crate::dao::items::fitting as fitting_dao;
 use crate::client::Client;
-use crate::consts::{CATEGORY_SHIP, FLAG_CARGO, FLAG_HANGAR, IX_LOCATION_ID, IX_SINGLETON, IX_STACK_SIZE};
+use crate::consts::{CATEGORY_SHIP, FLAG_CARGO, FLAG_HANGAR, GROUP_STRATEGIC_CRUISER, IX_LOCATION_ID, IX_SINGLETON, IX_STACK_SIZE};
 use crate::db::outbox::{dispatch_client, Outbox};
 use crate::messages;
 use marshal::Value;
 use std::collections::BTreeMap;
 use tracing::info;
-/// SDE invGroups: Strategic Cruiser (inventorycommon/util.py:126-127).
-const GROUP_STRATEGIC_CRUISER: i64 = 963;
 
 /// Board(shipID, oldShipID) -> shipState: make an assembled ship in this station's hangar
 /// the active one (clientDogmaLocation.MakeShipActive).
