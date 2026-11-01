@@ -18,7 +18,7 @@ use crate::dao::items::inventory as inventory_dao;
 use crate::dao::items::quantities::{self, QuantityChange};
 use super::{db_err, keyval, notify_error, value_id_list, Call, CallError, CallResult};
 use crate::client::{short, Client};
-use crate::consts::{ATTR_CAPACITY, CATEGORY_SHIP, FLAG_CARGO, FLAG_CORP_SAG1, FLAG_FITTING_FIRST, FLAG_FITTING_LAST, FLAG_HANGAR, FLAG_PILOT, FLAG_RIG_FIRST, FLAG_RIG_LAST, FLAG_SUBSYSTEM_FIRST, FLAG_SUBSYSTEM_LAST, IX_FLAG, IX_LOCATION_ID, IX_SINGLETON, IX_STACK_SIZE, LOCATION_JUNKYARD, ROLE_DIRECTOR, TYPE_CHARACTER};
+use crate::consts::{ATTR_CAPACITY, CATEGORY_SHIP, FLAG_CARGO, FLAG_CORP_SAG1, FLAG_FITTING_FIRST, FLAG_FITTING_LAST, FLAG_HANGAR, FLAG_PILOT, FLAG_RIG_FIRST, FLAG_RIG_LAST, FLAG_SUBSYSTEM_FIRST, FLAG_SUBSYSTEM_LAST, IX_FLAG, IX_LOCATION_ID, IX_SINGLETON, IX_STACK_SIZE, LOCATION_JUNKYARD, ROLE_DIRECTOR, ROLE_HANGAR_CAN_TAKE_1, TYPE_CHARACTER};
 use crate::db::executor::Executor;
 use crate::db::outbox::{dispatch_client, Outbox};
 use crate::messages;
@@ -144,8 +144,6 @@ async fn capacity(c: &Client, container: &Container) -> Result<Value, CallError>
 // ---------------------------------------------------------------- moving items
 
 const FLAG_AUTOFIT: i32 = 0;
-/// appConst.corpRoleHangarCanTake1; divisions 2-7 are the next bits.
-const ROLE_HANGAR_CAN_TAKE_1: i64 = 8192;
 /// appConst.py:1475, maxCargoContainerTransferDistance, in metres.
 const MAX_CARGO_CONTAINER_TRANSFER_DISTANCE: f64 = 2500.0;
 

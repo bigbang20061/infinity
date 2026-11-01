@@ -707,6 +707,8 @@ pub const BLUEPRINT_INFINITE_RUNS: i32 = -1;
 pub const ROLE_DIRECTOR: i64 = 1;
 /// Client appConst.corpRoleAccountant.
 pub const ROLE_ACCOUNTANT: i64 = 256;
+/// Client appConst.corpRoleHangarCanTake1; divisions 2-7 are the next bits.
+pub const ROLE_HANGAR_CAN_TAKE_1: i64 = 8192;
 /// Client carbon/common/script/sys/serviceConst.py: ROLE_PLAYER | ROLE_LOGIN.
 pub const ROLE_PLAYER_LOGIN: i64 = 2305843009213693952 | 4611686018427387904;
 /// Client carbon serviceConst: ROLE_GML | ROLE_GMH | ROLE_LEGIONEER | ROLE_WORLDMOD.
