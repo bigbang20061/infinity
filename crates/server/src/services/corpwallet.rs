@@ -12,7 +12,6 @@ use super::wallets::{corp_balance, corp_credit, corp_debit};
 use crate::dao::wallets::characters;
 use crate::client::Client;
 use crate::consts::{ACCOUNT_CASH, ROLE_ACCOUNTANT, ROLE_DIRECTOR};
-use crate::db::Db;
 use crate::db::executor::Executor;
 use crate::db::outbox::{Outbox, dispatch_world};
 use crate::messages;
@@ -32,7 +31,7 @@ pub(super) fn valid_key(key: i32) -> bool {
 
 
 /// Whether `char_id` may pay out of `corp`'s division `key`.
-pub(super) async fn may_take(db: &Db, char_id: i64, corp: i64, key: i32) -> Result<bool, CallError> {
+pub(super) async fn may_take(db: &(impl Executor + ?Sized), char_id: i64, corp: i64, key: i32) -> Result<bool, CallError> {
     if !valid_key(key) { return Ok(false); }
     let can_take = ROLE_CAN_TAKE_1 << (key - ACCOUNT_CASH);
     has_role_or_is_ceo(db, char_id, corp, ROLE_DIRECTOR | ROLE_ACCOUNTANT | can_take).await

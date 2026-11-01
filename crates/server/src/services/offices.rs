@@ -50,7 +50,7 @@ pub(super) async fn office_at(db: &(impl Executor + ?Sized), corp: i64, station:
 }
 
 /// Whether `item` is an office, and whose.
-pub(super) async fn office_owner(db: &Db, item: i64) -> Result<Option<i64>, CallError> {
+pub(super) async fn office_owner(db: &(impl Executor + ?Sized), item: i64) -> Result<Option<i64>, CallError> {
     offices::owner(db, item).await.map_err(db_err)
 }
 /// Tell the corporation's online members its offices changed.

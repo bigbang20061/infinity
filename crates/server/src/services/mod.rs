@@ -79,7 +79,7 @@ pub(crate) fn scheduler_registrations() -> Vec<crate::scheduler::Registration> {
 use crate::client::{short, Client};
 use crate::consts::GROUP_PLANET;
 use marshal::{DbRowDescriptor, DbType, Value};
-use crate::db::Db;
+use crate::db::executor::Executor;
 use crate::messages;
 use crate::sde::Sde;
 use crate::space::V3;
@@ -211,7 +211,7 @@ pub fn value_field<'a>(v: &'a Value, name: &str) -> Option<&'a Value> {
 
 /// Accept a member of `corp_id` with any role in `role_mask` or who is its CEO.
 /// Membership and CEO lookup errors propagate; the CEO is queried only if needed.
-pub(super) async fn has_role_or_is_ceo(db: &Db, char_id: i64, corp_id: i64, role_mask: i64) -> Result<bool, CallError> {
+pub(super) async fn has_role_or_is_ceo(db: &(impl Executor + ?Sized), char_id: i64, corp_id: i64, role_mask: i64) -> Result<bool, CallError> {
     let (my_corp, roles) = corps::membership(db, char_id).await?;
     Ok(my_corp == corp_id && (roles & role_mask != 0 || corps::ceo_of(db, corp_id).await? == Some(char_id)))
 }
