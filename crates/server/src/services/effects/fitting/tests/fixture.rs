@@ -11,7 +11,7 @@ pub(super) async fn fingerprint(db: &Db) -> Result<Vec<(String, String)>, Error>
     for row in tables {
         let name: String = row.get("tablename");
         let quoted = name.replace('"', "\"\"");
-        let sql = format!("SELECT md5(COALESCE(string_agg(row_to_json(t)::text, '' ORDER BY row_to_json(t)::text), '')) AS fingerprint FROM game.\"{quoted}\" t");
+        let sql = format!("SELECT count(*)::text || ':' || md5(COALESCE(string_agg(md5(row_to_json(t)::text), '' ORDER BY md5(row_to_json(t)::text)), '')) AS fingerprint FROM game.\"{quoted}\" t");
         let hash = db.query_one(&sql, &[]).await?.get("fingerprint");
         result.push((name, hash));
     }
