@@ -105,7 +105,7 @@ async fn station_settlement_is_atomic_and_checks_context() {
     let call = Call { service: "repairSvc", method: "RepairItemsInStation", args: &args, kwargs: &kwargs, bound: true, bind_params: Some(&bind) };
     let over = [requested.clone(), Value::Float(cost * 2.0)];
     let bad_call = Call { service: "repairSvc", method: "RepairItemsInStation", args: &over, kwargs: &kwargs, bound: true, bind_params: Some(&bind) };
-    assert!(handle(&c, &bad_call).await.is_err());
+    assert!(crate::services::dispatch(&mut c, &bad_call).await.is_err());
     let wrong_bind = Value::tuple([Value::Int(station + 1), Value::Int(station), Value::Int(0)]);
     let bad_call = Call { bind_params: Some(&wrong_bind), ..bad_call };
     assert!(handle(&c, &bad_call).await.is_err());
