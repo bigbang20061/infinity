@@ -23,6 +23,8 @@
 //! Ship loss commits before its independently best-effort killmail and insurance
 //! operations. NPC workers are outside this module's scope.
 //! Completed dock, undock, jump and committed ship loss hand off lifecycle events.
+//! Successful gate and wormhole arrivals record destination jumps and visits together;
+//! a crash between arrival and the telemetry transaction can leave an arrival unrecorded.
 
 use super::{db_err, Call, CallError, CallResult};
 use crate::client::{short, Client};
@@ -268,6 +270,7 @@ pub(super) async fn jump_out_and_arrive(c: &mut Client, system: i64, ship: i64, 
             );
         });
     }
+    super::map::events::arrived(&c.db, char_id, dest_system, crate::client::filetime_now()).await;
     let mut outbox = Outbox::default();
     outbox.event(GameEvent::Jumped { char_id, ship_id: ship, from_system_id: system, to_system_id: dest_system });
     dispatch_client((), outbox, c)?;

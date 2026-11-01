@@ -17,6 +17,7 @@
 //! without extending their deadlines. Other timers and flags are lost on restart.
 //! Killmail records, kill-report notifications and security penalties commit together;
 //! damage contributions remain in memory until that transaction commits.
+//! Player ship and capsule map losses commit in the same transaction as the killmail.
 //! System security comes from the startup SDE map; character security is persisted in game data.
 mod corp_registry;
 mod crimewatch;
@@ -441,6 +442,7 @@ async fn write_killmail<X: Send>(
         final_ship_type: final_c.ship_type, final_weapon_type: final_c.weapon_type, final_damage: final_c.damage,
         final_sec, isk_lost, involved: &involved, blob: &blob,
     }).await.map_err(db_err)?;
+    super::map::events::player_lost(db, kill_id, system, ship_type == crate::consts::TYPE_CAPSULE, now).await?;
     super::wars::classification::index(db, kill_id, victim_corp, victim_alliance, &affiliations, now).await?;
     super::bounty::kill_rights::consume(db, outbox, victim, now).await?;
     if let Some(final_char) = final_char {

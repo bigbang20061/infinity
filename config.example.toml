@@ -75,6 +75,10 @@ store_value_limit_bytes = 65536     # Maximum encoded value size in the script s
 # [lua.scripts.motd]                # Arbitrary per-script TOML settings.
 
 # Game parameters have no environment overrides.
+[map]
+history_retention_hours = 48        # server event history retention; minimum 24 hours
+maintenance_secs = 3600             # server event history cleanup interval
+
 [gm]
 spawn_distance_m = 5000.0          # GM NPC and debris default distance, server policy
 clear_radius_m = 100000.0          # default GM NPC clear radius, server policy

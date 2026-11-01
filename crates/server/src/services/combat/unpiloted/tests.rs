@@ -91,6 +91,7 @@ async fn persistent_damage_repair_guard_and_death() {
         assert!(damage(&d, &w, system, ship, [1.0, 0.0, 0.0, 0.0]).await.unwrap().unwrap() > 0.0);
         let damaged = fingerprint(&d, ship).await;
         assert_ne!(initial, damaged);
+        assert!(d.query("SELECT source_id FROM game.map_events WHERE source=$1 AND source_id=$2", &[&(crate::dao::map_telemetry::EventSource::UnpilotedShip as i16), &ship]).await.unwrap().is_empty());
         repair(&d, &w, system, ship, 0, 1.0, |_| true).await.unwrap();
         let repaired = fingerprint(&d, ship).await;
         assert_ne!(damaged, repaired);
@@ -100,19 +101,28 @@ async fn persistent_damage_repair_guard_and_death() {
         assert_eq!(damage(&d, &w, system, ship, [1e30, 0.0, 0.0, 0.0]).await.unwrap(), Some(0.0));
         assert_eq!(fingerprint(&d, ship).await, before_refusal);
         assert_eq!(w.ball(system, ship).await.unwrap().health, before_health);
+        assert!(d.query("SELECT source_id FROM game.map_events WHERE source=$1 AND source_id=$2", &[&(crate::dao::map_telemetry::EventSource::UnpilotedShip as i16), &ship]).await.unwrap().is_empty());
         d.execute("UPDATE game.items SET owner_id = $2 WHERE item_id = $1", &[&ship, &owner]).await.unwrap();
         let before_rollback = fingerprint(&d, ship).await;
         let failed: Result<(), CallError> = d.transaction(|tx, _: &mut Outbox| Box::pin(async move {
             assert!(crate::dao::items::space_ships::claim_unpiloted(tx, ship, kind, owner, system).await.map_err(db_err)?);
             delete_in(tx, ship).await?;
+            crate::services::map::events::unpiloted_lost(tx, ship, system, filetime_now()).await?;
+            assert!(tx.query_opt("SELECT source_id FROM game.map_events WHERE source=$1 AND source_id=$2", &[&(crate::dao::map_telemetry::EventSource::UnpilotedShip as i16), &ship]).await.map_err(crate::db::Error::from).map_err(db_err)?.is_some());
             tx.query_one("SELECT 1 / 0 AS failure", &[]).await.map_err(crate::db::Error::from).map_err(db_err)?;
             Ok(())
         }), |value, _| async move { Ok(value) }).await;
         assert!(failed.is_err());
         assert_eq!(fingerprint(&d, ship).await, before_rollback);
+        assert!(d.query("SELECT source_id FROM game.map_events WHERE source=$1 AND source_id=$2", &[&(crate::dao::map_telemetry::EventSource::UnpilotedShip as i16), &ship]).await.unwrap().is_empty());
         assert_eq!(w.ball(system, ship).await.unwrap().health, before_health);
         damage(&d, &w, system, ship, [1e30, 0.0, 0.0, 0.0]).await.unwrap();
         assert!(w.ball(system, ship).await.is_none());
+        let events = d.query("SELECT solar_system_id, kind FROM game.map_events WHERE source=$1 AND source_id=$2", &[&(crate::dao::map_telemetry::EventSource::UnpilotedShip as i16), &ship]).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!((events[0].get::<_, i64>("solar_system_id"), events[0].get::<_, i16>("kind")), (system, crate::dao::map_telemetry::EventKind::Ship as i16));
+        assert_eq!(damage(&d, &w, system, ship, [1e30, 0.0, 0.0, 0.0]).await.unwrap(), None);
+        assert_eq!(d.query("SELECT source_id FROM game.map_events WHERE source=$1 AND source_id=$2", &[&(crate::dao::map_telemetry::EventSource::UnpilotedShip as i16), &ship]).await.unwrap().len(), 1);
         repair(&d, &w, system, ship, 2, 1e30, |_| true).await.unwrap();
         assert!(w.ball(system, ship).await.is_none());
         assert!(fingerprint(&d, ship).await.is_empty());
@@ -121,6 +131,7 @@ async fn persistent_damage_repair_guard_and_death() {
     world.remove_ball(system, ship).await;
     forget_ship(ship);
     db.transaction(|tx, _: &mut ()| Box::pin(async move {
+        tx.execute("DELETE FROM game.map_events WHERE source=$1 AND source_id=$2", &[&(crate::dao::map_telemetry::EventSource::UnpilotedShip as i16), &ship]).await?;
         tx.execute("DELETE FROM game.pending_reloads WHERE ship_id = $1", &[&ship]).await?;
         tx.execute("DELETE FROM game.insurance WHERE ship_id = $1", &[&ship]).await?;
         tx.execute("DELETE FROM game.items WHERE item_id = $1 OR location_id = $1", &[&ship]).await?;

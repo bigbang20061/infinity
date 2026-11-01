@@ -67,6 +67,28 @@ fn trade_timeout_is_parsed_and_must_be_positive() {
 }
 
 #[test]
+fn map_policy_defaults_custom_bounds_and_overflow() {
+    let fixture = Fixture::new();
+    fixture.write("");
+    let defaults = Config::load_with(&fixture.path(), |_| None).unwrap().game_config();
+    assert_eq!((defaults.map.history_retention_hours, defaults.map.maintenance_secs), (48, 3600));
+    fixture.write("[map]\nhistory_retention_hours = 24\nmaintenance_secs = 1");
+    let config = Config::load_with(&fixture.path(), |_| None).unwrap().game_config();
+    assert_eq!((config.map.history_retention_hours, config.map.maintenance_secs), (24, 1));
+    fixture.write("[map]\nhistory_retention_hours = 72\nmaintenance_secs = 120");
+    let config = Config::load_with(&fixture.path(), |_| None).unwrap().game_config();
+    assert_eq!((config.map.history_retention_hours, config.map.maintenance_secs), (72, 120));
+    for key in ["history_retention_hours", "maintenance_secs"] {
+        for value in ["0", "-1", "9223372036854775807"] {
+            let error = load_error(&format!("[map]\n{key} = {value}"));
+            assert!(error.contains(&format!("map.{key}")), "{error}");
+        }
+    }
+    assert!(load_error("[map]\nhistory_retention_hours = 23").contains("map.history_retention_hours"));
+    assert!(load_error("[map]\nunknown = 1").contains("unknown"));
+}
+
+#[test]
 fn mining_ledger_policy_defaults_parsing_and_validation() {
     let fixture = Fixture::new();
     fixture.write("");

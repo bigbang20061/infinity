@@ -154,3 +154,82 @@ async fn docking_checks_surface_range_before_accepting() {
     let packet = crate::macho::Packet::from_value(&marshal::loads(&frame.payload).unwrap()).unwrap();
     assert!(matches!(packet.destination, crate::macho::Address::Broadcast { broadcast_id, .. } if broadcast_id.as_text().as_deref() == Some("OnDockingAccepted")));
 }
+
+#[tokio::test]
+#[ignore = "requires dedicated INFINITY_TEST_DATABASE_URL with SDE; run serially"]
+async fn completed_jumps_record_only_destination_arrivals() {
+    use std::sync::Arc;
+    use crate::dao::map_telemetry::{self, EventKind, EventSource, HistoryStat};
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::deployment::DatabaseConfig { schema_on_start: false, ..crate::config::tests::test_database() }).await.unwrap();
+    let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());
+    let systems: Vec<i64> = sde.map.systems().filter(|s| s.constellation_id.is_some() && s.region_id.is_some()).take(2).map(|s| s.solar_system_id).collect();
+    let (origin, destination) = (systems[0], systems[1]);
+    let account: i64 = db.query_one("INSERT INTO game.accounts (user_name,password_hash,role) VALUES (nextval('game.accounts_user_id_seq')::text,''::bytea,0) RETURNING user_id", &[]).await.unwrap().get("user_id");
+    let character: i64 = db.query_one("INSERT INTO game.characters (user_id,name,race_id,bloodline_id,gender_id,corporation_id) VALUES ($1,nextval('game.characters_character_id_seq')::text,1,1,1,1) RETURNING character_id", &[&account]).await.unwrap().get("character_id");
+    let hull = crate::dao::items::creation::positioned(&db, TYPE_CAPSULE, character, origin, [0.0; 3]).await.unwrap();
+    let marker = map_telemetry::next_occurrence(&db).await.unwrap();
+    let start = crate::client::filetime_now();
+    let world = space::World::new(db.clone(), sde.clone(), 1);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let _peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+    let (stream, address) = listener.accept().await.unwrap();
+    let cfg = Arc::new(crate::config::Config::default());
+    let chat = crate::chat::Hub::new(&cfg.chat.domain, db.clone(), world.clone());
+    let login = crate::handshake::Login { user_id: account, user_name: account.to_string(), role: 0, client_id: character, session_id: character, language_id: "EN".into() };
+    let mut client = Client::new(crate::conn::Conn::new(stream, address), cfg, db.clone(), sde, chat, world.clone(), login);
+    client.session.apply(vec![("charid", Value::Int(character)), ("corpid", Value::Int(1)), ("shipid", Value::Int(hull)), ("solarsystemid", Value::Int(origin))]);
+    let mut vessel = ship();
+    vessel.id = hull;
+    vessel.type_id = TYPE_CAPSULE;
+    vessel.owner_id = character;
+    vessel.char_id = Some(character);
+    world.add_ship(origin, vessel).await.unwrap();
+    let w = world.clone();
+    let d = db.clone();
+    let result = tokio::spawn(async move {
+        let jump = |dest_system| Jump { through: 1, guid: "effects.JumpOut", other_type: None, dest_system, pos: [0.0; 3] };
+        assert!(jump_out_and_arrive(&mut client, origin, hull, character, jump(-1)).await.is_err());
+        w.system(destination).await.unwrap();
+        let mut blocker = ship();
+        blocker.id = -77;
+        blocker.char_id = Some(-77);
+        w.add_ship(destination, blocker).await.unwrap();
+        assert!(matches!(jump_out_and_arrive(&mut client, origin, hull, character, jump(destination)).await, Err(CallError::User { msg, .. }) if msg == "SystemCheck_JumpFailed_Queued"));
+        assert!(map_telemetry::visits(&d, character).await.unwrap().is_empty());
+        assert!(d.query("SELECT source_id FROM game.map_events WHERE source=$1 AND source_id>$2", &[&(EventSource::JumpOccurrence as i16), &marker]).await.unwrap().is_empty());
+        w.remove_ball(destination, -77).await;
+        jump_out_and_arrive(&mut client, origin, hull, character, jump(destination)).await.unwrap();
+        let visits = map_telemetry::visits(&d, character).await.unwrap();
+        assert_eq!(visits.len(), 1);
+        assert_eq!((visits[0].solar_system_id, visits[0].visits), (destination, 1));
+        let history = map_telemetry::history(&d, HistoryStat::Jumps, start, crate::client::filetime_now()).await.unwrap();
+        assert_eq!(history.iter().find(|row| row.solar_system_id == destination).map(|row| row.value1), Some(1));
+        assert!(history.iter().all(|row| row.solar_system_id != origin));
+        let events = d.query("SELECT solar_system_id,kind FROM game.map_events WHERE source=$1 AND source_id>$2", &[&(EventSource::JumpOccurrence as i16), &marker]).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!((events[0].get::<_, i64>("solar_system_id"), events[0].get::<_, i16>("kind")), (destination, EventKind::Jump as i16));
+        teleport(&mut client, origin, [0.0; 3]).await.unwrap();
+        assert_eq!(map_telemetry::visits(&d, character).await.unwrap()[0].visits, 1);
+        assert_eq!(d.query("SELECT source_id FROM game.map_events WHERE source=$1 AND source_id>$2", &[&(EventSource::JumpOccurrence as i16), &marker]).await.unwrap().len(), 1);
+        jump_out_and_arrive(&mut client, origin, hull, character, jump(destination)).await.unwrap();
+        let visits = map_telemetry::visits(&d, character).await.unwrap();
+        assert_eq!(visits.len(), 1);
+        assert_eq!((visits[0].solar_system_id, visits[0].visits), (destination, 2));
+        let events = d.query("SELECT solar_system_id FROM game.map_events WHERE source=$1 AND source_id>$2", &[&(EventSource::JumpOccurrence as i16), &marker]).await.unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|row| row.get::<_, i64>("solar_system_id") == destination));
+        let history = map_telemetry::history(&d, HistoryStat::Jumps, start, crate::client::filetime_now()).await.unwrap();
+        assert_eq!(history.iter().find(|row| row.solar_system_id == destination).map(|row| row.value1), Some(2));
+        assert!(history.iter().all(|row| row.solar_system_id != origin));
+    }).await;
+    world.remove_ball(origin, hull).await;
+    world.remove_ball(destination, hull).await;
+    db.execute("DELETE FROM game.map_events WHERE source=$1 AND source_id>$2", &[&(EventSource::JumpOccurrence as i16), &marker]).await.unwrap();
+    db.execute("DELETE FROM game.map_visits WHERE character_id=$1", &[&character]).await.unwrap();
+    db.execute("DELETE FROM game.item_attributes WHERE item_id=$1", &[&hull]).await.unwrap();
+    db.execute("DELETE FROM game.items WHERE item_id=$1", &[&hull]).await.unwrap();
+    db.execute("DELETE FROM game.characters WHERE character_id=$1", &[&character]).await.unwrap();
+    db.execute("DELETE FROM game.accounts WHERE user_id=$1", &[&account]).await.unwrap();
+    result.unwrap();
+}
