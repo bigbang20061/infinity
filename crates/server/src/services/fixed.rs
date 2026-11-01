@@ -99,8 +99,6 @@ pub(super) fn universe(call: &Call<'_>) -> Option<CallResult> {
         // A player character's corporation, or an NPC's (agents) from the SDE.
         ("corpRegistry", "GetOldApplications") | ("corpRegistry", "GetAllianceApplications") => Value::Dict(vec![]),
         ("corpRegistry", "GetPendingAutoKicks") => Value::list([]),
-        ("corpRegistry", "GetShareholders") => rowset(&["shareholderID", "shares", "shareholderCorporationID"], vec![]),
-        ("corpRegistry", "GetSharesByShareholder") => rowset(&["shareholderID", "shares", "corporationID"], vec![]),
         ("corpRegistry", "GetStructureReinforceDefault") => Value::None,
         ("corpRegistry", "DoesMyCorpAcceptStructures") | ("corpRegistry", "DoesCorpRestrictCorpMails") => Value::Bool(false),
         ("allianceRegistry", "GetDaysInAlliance") => Value::Int(0),

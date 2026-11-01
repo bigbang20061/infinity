@@ -8,6 +8,7 @@ pub(crate) mod bounty;
 pub(crate) mod chat;
 pub(crate) mod combat;
 pub(crate) mod contacts;
+pub(crate) mod corporations;
 pub(crate) mod drones;
 pub(crate) mod effects;
 pub(crate) mod dynamic_items;

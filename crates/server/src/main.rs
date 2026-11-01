@@ -58,6 +58,7 @@ async fn main() -> Result<()> {
     info!(source = cfg.source(), "configuration loaded");
     config::init_game(cfg.game_config())?;
     let db = db::Db::connect(&cfg.database).await?;
+    services::corps::shares::seed(&db).await.map_err(startup_call_error)?;
     services::standings::initialize(&db).await?;
     let sde = Arc::new(sde::Sde::load(&db).await?);
     let types = sde.types.len();

@@ -2,7 +2,7 @@
 //! `eve/client/script/ui/services/corporation`.
 //! Uses the shared corporation mechanics in `services::corps` and its DAOs,
 //! including `game.corporations`, `game.characters`, `game.corp_applications` and startup SDE corporations.
-//! Shares are not supported; alliance and organization calls have separate handlers.
+//! Share ownership uses the corporation ledger; dividends are unsupported and alliance calls have separate handlers.
 
 use super::*;
 use crate::dao::corporations::dispatch as dispatch_dao;
@@ -21,6 +21,10 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
     let int = |i: usize| call.args.get(i).and_then(|v| v.as_int());
     let (db, world) = (&c.db, &*c.world);
     let corp = bound_corp(c, call);
+    let governance_bound = match call.bind_params {
+        Some(p) => p.as_int().or_else(|| p.items().and_then(|t| t.first()?.as_int())).unwrap_or(0),
+        None => corp,
+    };
     Some(match call.method {
         "AddCorporation" => found(c, call).await,
         // GetSuggestedTickerNames(name) -> [KeyVal(tickerName)]
@@ -191,9 +195,32 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         "UpdateCorporationAbilities" => Ok(Value::Bool(true)),
         // KeyVal(corpID, allianceID, title, title1..title16): a member's titles, for show info.
         "GetInfoWindowDataForChar" => info_window_data(db, int(0).unwrap_or(me)).await,
-        // Shares aren't modelled.
-        "GetMemberIDsWithMoreThanAvgShares" => Ok(Value::list([])),
-        "PayoutDividend" | "MoveCompanyShares" | "MovePrivateShares" => Err(notify_error(messages::CORP_SHARES_UNAVAILABLE)),
+        "GetSharesByShareholder" => {
+            let company = match call.args.first() {
+                None | Some(Value::Int(0)) => false,
+                Some(Value::Int(1)) => true,
+                _ => return Some(Err(notify_error(messages::corporations::SHARE_AUTHORITY_REQUIRED))),
+            };
+            shares::holdings(db, me, governance_bound, company).await
+        }
+        "GetShareholders" => match call.args.first() {
+            Some(Value::Int(issuer)) if *issuer > 0 => shares::shareholders(db, me, governance_bound, *issuer).await,
+            _ => Err(notify_error(messages::corporations::SHARES_UNAVAILABLE)),
+        },
+        "GetMemberIDsWithMoreThanAvgShares" => match membership(db, me).await {
+            Ok((actual, _)) if actual == governance_bound => crate::dao::corporations::shares::above_average_members(db, actual).await.map(|ids| Value::list(ids.into_iter().map(Value::Int))).map_err(db_err),
+            Ok(_) => Err(notify_error(messages::corporations::SHARE_AUTHORITY_REQUIRED)),
+            Err(e) => Err(e),
+        },
+        "MoveCompanyShares" | "MovePrivateShares" => {
+            if call.args.len() != 3 { return Some(Err(notify_error(messages::corporations::INVALID_SHARE_TRANSFER))); }
+            let (issuer, to, quantity) = match (call.args.first(), call.args.get(1), call.args.get(2)) {
+                (Some(Value::Int(issuer)), Some(Value::Int(to)), Some(Value::Int(quantity))) if *issuer > 0 && *to > 0 && *quantity > 0 => (*issuer, *to, *quantity),
+                _ => return Some(Err(notify_error(messages::corporations::INVALID_SHARE_TRANSFER))),
+            };
+            shares::transfer(db, world, me, governance_bound, issuer, to, quantity, call.method == "MoveCompanyShares").await.map(|_| Value::None)
+        }
+        "PayoutDividend" => Err(notify_error(messages::CORP_SHARES_UNAVAILABLE)),
         // UpdateCorporation(description, url, taxRate, isRecruiting, lpTaxRate)
         "UpdateCorporation" => {
             let text = |i: usize| call.args.get(i).and_then(|v| v.as_text()).map(|t| t.into_owned()).unwrap_or_default();
@@ -306,6 +333,9 @@ async fn found_core(c: &Client, input: FoundInput, gm: bool) -> Result<i64, Call
                     name: &name, ticker: &ticker, description: &description, url: &url,
                     tax, ceo: me, station, recruiting, friendly, shapes, now,
                 }).await.map_err(db_err)?;
+                if !crate::dao::corporations::shares::initialize(tx, id, crate::config::game().corporations.initial_shares).await.map_err(db_err)? {
+                    return Err(CallError::Internal(anyhow::anyhow!("new corporation share issuance could not be initialized")));
+                }
                 set_corp(tx, &sde, outbox, me, id, CEO_ROLES, now).await?;
                 Ok(id)
             })

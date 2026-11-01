@@ -25,7 +25,7 @@ pub(crate) mod combat;
 mod charsel;
 mod config;
 mod contracts;
-mod corps;
+pub(crate) mod corps;
 mod corpwallet;
 pub(crate) mod crimewatch;
 pub(crate) mod dogma;

@@ -489,6 +489,25 @@ CREATE TABLE IF NOT EXISTS game.corporations (
 CREATE UNIQUE INDEX IF NOT EXISTS corporations_name_idx ON game.corporations (lower(name)) WHERE NOT deleted;
 CREATE UNIQUE INDEX IF NOT EXISTS corporations_ticker_idx ON game.corporations (upper(ticker)) WHERE NOT deleted;
 SELECT setval('game.corporations_corporation_id_seq', GREATEST((SELECT max(corporation_id) FROM game.corporations), 98000000), true);
+
+-- dao/corporations: issued shares and transfer receipts.
+ALTER TABLE game.corporations ADD COLUMN IF NOT EXISTS issued_shares bigint CHECK (issued_shares > 0);
+CREATE SEQUENCE IF NOT EXISTS game.corp_governance_operation_seq;
+CREATE TABLE IF NOT EXISTS game.corp_shares (
+    corporation_id bigint NOT NULL REFERENCES game.corporations,
+    shareholder_id bigint NOT NULL,
+    shares bigint NOT NULL CHECK (shares >= 0),
+    PRIMARY KEY (corporation_id, shareholder_id)
+);
+CREATE TABLE IF NOT EXISTS game.corp_share_transfers (
+    operation_id bigint PRIMARY KEY,
+    corporation_id bigint NOT NULL REFERENCES game.corporations,
+    from_id bigint NOT NULL,
+    to_id bigint NOT NULL,
+    quantity bigint NOT NULL CHECK (quantity > 0),
+    actor_id bigint NOT NULL,
+    created bigint NOT NULL
+);
 -- A member's corporation roles (appConst.corpRole* mask), the same at every location, the
 -- roles they may grant, their titles (game.corp_titles bits) and free-text title.
 ALTER TABLE game.characters ADD COLUMN IF NOT EXISTS corp_roles bigint NOT NULL DEFAULT 0;

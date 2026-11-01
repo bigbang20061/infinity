@@ -8,8 +8,9 @@
 //! pilot as a session change (corpid, corprole...), which also moves them to the new corp
 //! chat channel. A member's roles are one mask (game.characters.corp_roles) used for all
 //! locations. Static NPC corporations and schools come from the startup SDE. Alliances are
-//! services/alliances; titles, wallet divisions and offices are supported. Shares aren't supported.
-//! The required management skill level and corporation header shares are operator policies.
+//! services/alliances; titles, wallet divisions, offices and shares are supported.
+//! Dividends and votes are not supported.
+//! The required management skill level and initial share issuance are operator policies.
 
 use super::{db_err, keyval, notify_error, row, rowset, trimmed_arg_text, value_id_list, Call, CallError, CallResult};
 use super::alliances;
@@ -175,6 +176,8 @@ pub async fn corporation_line(db: &Db, corp: i64) -> Result<Option<Vec<Value>>, 
     let Some(r) = registry::corporation(db, corp).await.map_err(db_err)? else {
         return Ok(None);
     };
+    let issued = crate::dao::corporations::shares::issued_total(db, corp).await.map_err(db_err)?
+        .ok_or_else(|| CallError::Internal(anyhow::anyhow!("corporation share issuance has not been initialized")))?;
     let opt = |v: Option<i64>| v.map(Value::Int).unwrap_or(Value::None);
     let mut line = vec![
         Value::Int(corp),
@@ -194,7 +197,7 @@ pub async fn corporation_line(db: &Db, corp: i64) -> Result<Option<Vec<Value>>, 
         Value::None,
         opt(r.alliance_id),
         Value::None,
-        Value::Int(crate::config::game().corporations.initial_shares),
+        Value::Int(issued),
         Value::Int(r.member_count),
         Value::Int(CORPORATION_UNLIMITED_MEMBER_LIMIT),
         Value::None,
@@ -211,9 +214,12 @@ pub async fn corporation_line(db: &Db, corp: i64) -> Result<Option<Vec<Value>>, 
 
 
 pub(crate) mod corp_registry;
+pub(crate) mod shares;
 mod roles;
 use roles::{delete_title, execute_actions, info_window_data, potential_ceos, resign_ceo, rowset_lines, titles, update_member, update_titles};
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     corp_registry::dispatch(c, call).await
 }
+
+#[cfg(test)] mod tests;

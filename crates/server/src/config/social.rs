@@ -10,7 +10,8 @@ use serde::Deserialize;
 pub struct CorporationsConfig {
     /// Minimum Corporation Management skill to found or lead a corporation.
     pub min_management_skill_level: i64,
-    /// Initial corporation shares from the corporation header.
+    /// Shares issued at founding and in the one-time NULL-total startup backfill.
+    /// Later policy changes do not alter existing issued totals.
     pub initial_shares: i64,
     /// Corporation and alliance bulletin limit from base_corporation.MAX_NUM_BULLETINS.
     pub max_bulletins: i64,
