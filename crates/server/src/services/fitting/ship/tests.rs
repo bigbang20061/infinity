@@ -2,6 +2,9 @@ use super::{assembly_source_change, assembly_step};
 use crate::consts::{IX_SINGLETON, IX_STACK_SIZE};
 use marshal::Value;
 
+mod spawn;
+mod boarding;
+
 #[test]
 fn repeated_assembly_conserves_hulls_and_stops_after_conversion() {
     let first = assembly_step(3, None).unwrap();

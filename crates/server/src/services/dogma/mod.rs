@@ -13,6 +13,7 @@
 //! Brain versions are in-memory and reset when the server restarts.
 //! Ship priming reports settled runtime capacitor, rack heat and overload state;
 //! ships outside space use fitted values and no transient heat.
+//! Ship state can also be assembled after reconciliation under the lifecycle lock.
 pub(crate) mod brain;
 
 
@@ -190,6 +191,12 @@ pub(super) async fn gm_online(c: &mut Client, ship: i64) -> Result<usize, CallEr
 pub async fn ship_state(c: &Client, ship_id: i64) -> Result<Value, CallError> {
     let owner = c.session.int("charid").ok_or_else(|| crate::services::notify_error(crate::messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
     super::effects::online::reconcile_ship(c, owner, ship_id).await?;
+    ship_state_core(c, ship_id).await
+}
+
+/// Assemble reconciled ship state without acquiring the lifecycle lock.
+pub(crate) async fn ship_state_core(c: &Client, ship_id: i64) -> Result<Value, CallError> {
+    let owner = c.session.int("charid").ok_or_else(|| crate::services::notify_error(crate::messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
     let items = load_items(&c.db, &c.sde, ItemQuery::LocationExceptFlag(ship_id, FLAG_HANGAR)).await.map_err(db_err)?;
     let online = online_modules(c, ship_id).await?;
     let fit = if let Some(system) = c.session.int("solarsystemid") {

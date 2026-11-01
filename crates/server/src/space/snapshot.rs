@@ -1,6 +1,6 @@
-//! Periodic pilot position and condition persistence for destiny's ballpark (michelle.py).
-//! Uses game.items and item_attributes on the system worker, including stationary pilots
-//! and shutdown flushes; the snapshot interval is operator-configured.
+//! Periodic persistent ship and drone position and condition persistence for destiny's
+//! ballpark (michelle.py). Uses game.items and item_attributes on the system worker,
+//! including stationary hulls and shutdown flushes; the interval is operator-configured.
 //! Other ball state and persistent timers are not supported.
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -4,6 +4,7 @@ use crate::dao::items::creation;
 #[path = "../combat/groups_health/tests/fixture.rs"]
 mod fixture;
 mod capacitor_priming_db;
+mod boarding;
 
 #[test]
 fn item_attribute_union_overlays_and_adds() {

@@ -342,7 +342,7 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
         "effects" => effects::command(args),
         "hitchance" => hitchance::command(c, args).await,
         "giveskill" | "allskills" | "removeskill" | "givestarterskills" => skills::command(c, &command, args).await,
-        // eve/devtools/script/svc_slash.py:1310-1313 passes this item ID to ship.Board.
+        // eve/devtools/script/dna.py:118-124 creates and returns the item ID without boarding; the caller must board separately.
         "spawn" => return Some(items::spawn(c, args).await.map(Value::Int)),
         "ship" | "fit" | "unload" | "load" | "online" | "iteminfo" | "typeinfo" => items::command(c, &command, args).await,
         "entity" | "npc" | "npcclear" | "wreck" | "container" => npc::command(c, &command, args).await,

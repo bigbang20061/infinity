@@ -224,7 +224,7 @@ pub(crate) async fn turret_shot(db: &Db, world: &Arc<World>, system: i64, source
         }
     }
     let dealt = if multiplier > 0.0 {
-        damage(db, world, system, target_id, sampled_target.char_id, raw.map(|d| d * multiplier), shooter_pilot).await?
+        damage(db, world, system, target_id, raw.map(|d| d * multiplier), shooter_pilot).await?
     } else { 0.0 };
     report_hit(world, source_id, target_id, shooter_pilot, victim_pilot, weapon, dealt, hit_quality(multiplier));
     Ok(())
@@ -320,15 +320,15 @@ pub(crate) async fn launch_missile(db: Db, world: Arc<World>, system: i64, from:
             s.destroy_ball(missile_id);
             let application = s.sampled_ball(target_id).map(|target| {
                 (missile_applied(target_signature(&sde, &target), dist(target.vel, [0.0; 3]), aoe_cloud, aoe_velocity, drf),
-                    target.char_id, s.combat_owner(target_id))
+                    s.combat_owner(target_id))
             });
             let reached = distance <= flight_range + MISSILE_REACH_ALLOWANCE_METRES;
             s.defer(async move {
                 let Some(world) = world_ref.upgrade() else { return };
-                let (dealt, quality, victim_pilot) = if let Some((application, target_pilot, victim_pilot)) = application.filter(|_| reached) {
-                    (damage(&impact_db, &world, system, target_id, target_pilot, raw.map(|d| d * application), shooter_pilot).await.unwrap_or(0.0), HIT_NORMAL, victim_pilot)
+                let (dealt, quality, victim_pilot) = if let Some((application, victim_pilot)) = application.filter(|_| reached) {
+                    (damage(&impact_db, &world, system, target_id, raw.map(|d| d * application), shooter_pilot).await.unwrap_or(0.0), HIT_NORMAL, victim_pilot)
                 } else {
-                    (0.0, HIT_MISS, application.and_then(|(_, _, owner)| owner))
+                    (0.0, HIT_MISS, application.and_then(|(_, owner)| owner))
                 };
                 report_hit(&world, shooter_id, target_id, shooter_pilot, victim_pilot, weapon, dealt, quality);
             });

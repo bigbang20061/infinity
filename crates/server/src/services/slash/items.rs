@@ -1,7 +1,7 @@
 //! GM item, ship and fitting commands; the slash service owns the role gate.
 //! Uses inventory, fitting, combat and dogma service mechanisms and the startup SDE.
-//! Ship creation requires a docked target; `/spawn` creates an assembled hull in the
-//! caller's station hangar and returns its item ID, without boarding in space.
+//! Ship creation targets a docked character; `/spawn` creates an assembled hull
+//! in the caller's hangar or nearby in space, without boarding it.
 //! Ammunition uses the ordinary reload path.
 use super::{args::{self, Args}, slash_error, CallError, Client};
 use crate::consts::{FLAG_CARGO, FLAG_HANGAR};
@@ -41,12 +41,10 @@ fn charge_compatible(group: i32, charge_size: Option<f64>, module_attribute: imp
 
 
 pub(super) async fn spawn(c: &mut Client, args: &[String]) -> Result<i64, CallError> {
-    if c.session.int("stationid").is_none() { return Err(slash_error(messages::gm::GM_SHIP_DOCKED_REQUIRED.into())); }
     let parsed = Args::new(args);
     parsed.required(0).map_err(|_| slash_error(messages::gm::GM_ITEM_SPAWN_USAGE.into()))?;
     let (type_id, _) = parsed.type_id(c, 0).await?;
-    let owner = c.session.int("charid").ok_or_else(invalid)?;
-    ship::gm_create_ship(c, owner, type_id).await
+    ship::gm_spawn_ship(c, type_id).await
 }
 
 pub(super) async fn command(c: &mut Client, command: &str, args: &[String]) -> Result<String, CallError> {

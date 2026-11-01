@@ -7,6 +7,7 @@
 //! Policy, transactions, refusals, notifications and World are caller concerns.
 
 pub(crate) mod brain;
+pub(crate) mod boarding;
 pub(crate) mod charges;
 pub(crate) mod clones;
 pub(crate) mod combat;
@@ -27,6 +28,7 @@ pub(crate) mod quantities;
 pub(crate) mod repair;
 pub(crate) mod salvage;
 pub(crate) mod ship;
+pub(crate) mod space_ships;
 pub(crate) mod skills;
 pub(crate) mod social;
 pub(crate) mod transfers;

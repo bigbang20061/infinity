@@ -175,7 +175,10 @@ operation has completed. Supported operations are:
 
 - `notify`: `{character=id, event=name, args={wire_values...}}`, with a
   contiguous typed wire-value sequence.
-- `remove_ball`: `{id=ball_id}`.
+- `remove_ball`: `{id=ball_id}`. Scheduling raises an error for a persistent
+  ship hull. If the ball becomes a persistent ship hull before the timer runs,
+  removal is refused and a warning is logged. Temporary balls and drones remain
+  eligible; this operation does not provide durable ship destruction.
 - `spawn_npc`: `{type_id=id, corp=id, position={x,y,z}, aggro_target=id_or_nil}`.
   The type comes from the SDE and the coordinates must be finite. Spawning is
   deferred outside the actor; failures are logged asynchronously.

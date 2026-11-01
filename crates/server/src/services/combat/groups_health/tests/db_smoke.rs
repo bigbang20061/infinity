@@ -71,6 +71,50 @@ fn npc_take_replace_and_destroy_forget_combat_state_but_player_take_preserves_it
 
 #[tokio::test]
 #[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
+async fn npc_damage_rechecks_replacements_and_applies_live_damage() {
+    crate::tests::init_config();
+    let db = crate::db::Db::connect(&crate::config::deployment::DatabaseConfig { schema_on_start: false, ..crate::config::tests::test_database() }).await.unwrap();
+    let sde = crate::sde::Sde::load(&db).await.unwrap();
+    let ship_type = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_SHIP)).unwrap().type_id;
+    let npc_type = sde.types.iter().find(|t| t.category_id == Some(CATEGORY_ENTITY)).unwrap().type_id;
+    let mut system = crate::space::System::default();
+    let target = i64::MIN + 810;
+    for pilot in [Some(42), None] {
+        system.insert(ball(target, npc_type, None));
+        assert!(system.ball(target).unwrap().char_id.is_none());
+        system.take(target);
+        let replacement = ball(target, ship_type, pilot);
+        if pilot.is_some() { system.insert(replacement); } else { system.add_persistent_ship(replacement); }
+        let hp = Hp { now: [10.0; 3], max: [10.0; 3], resonance: [[1.0; 4]; 3] };
+        state().hp.insert(target, hp);
+        assert!(apply_npc_damage(&mut system, &sde, target, [100.0, 0.0, 0.0, 0.0], Some(9)).is_none());
+        assert_eq!(state().hp.remove(&target).unwrap().now, [10.0; 3]);
+        let current = system.ball(target).unwrap();
+        assert_eq!(current.char_id, pilot);
+        assert_eq!(current.health, [1.0; 3]);
+    }
+    system.insert(ball(target, npc_type, None));
+    state().hp.insert(target, Hp { now: [10.0; 3], max: [10.0; 3], resonance: [[1.0; 4]; 3] });
+    assert!(matches!(apply_npc_damage(&mut system, &sde, target, [5.0, 0.0, 0.0, 0.0], None),
+        Some(NpcDamage::Applied { dealt: 5.0, destroyed: None, .. })));
+    assert_eq!(system.ball(target).unwrap().health, [0.5, 1.0, 1.0]);
+    assert!(matches!(apply_npc_damage(&mut system, &sde, target, [30.0, 0.0, 0.0, 0.0], None),
+        Some(NpcDamage::Applied { destroyed: Some(_), .. })));
+    assert!(!system.contains(target));
+    assert!(!state().hp.contains_key(&target));
+
+    let spec = crate::space::drone::DroneSpec { type_id: npc_type, bandwidth: 1.0, scan_resolution: 1.0,
+        control_range: 1.0, max_target_range: 1.0, optimal_range: 1.0, orbit_range: 1.0,
+        duration_ms: 1.0, effect_id: None };
+    system.restore_drone(ball(target, npc_type, None), spec, Arc::new(|_| Box::pin(async {})));
+    assert!(matches!(apply_npc_damage(&mut system, &sde, target, [100.0, 0.0, 0.0, 0.0], None),
+        Some(NpcDamage::Drone { .. })));
+    assert!(system.contains(target));
+    assert!(!state().hp.contains_key(&target));
+}
+
+#[tokio::test]
+#[ignore = "requires INFINITY_TEST_DATABASE_URL pointing to an initialized dedicated test database with SDE"]
 async fn capacitor_db_smoke() {
     let db = crate::db::Db::connect(&crate::config::tests::test_database()).await.unwrap();
     let sde = Arc::new(crate::sde::Sde::load(&db).await.unwrap());

@@ -49,7 +49,7 @@ pub(crate) mod online_status;
 mod orgs;
 mod mining;
 mod missions;
-mod ship;
+pub(crate) mod ship;
 pub(crate) mod skills;
 pub(crate) mod standings;
 mod slash;

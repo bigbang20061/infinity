@@ -1,6 +1,7 @@
 //! Actor-owned, transient incoming dogma projections and target refreshes.
 //! Client dogma consumes OnEwarStart/End for projected effect kinds; SDE effect
-//! rows supply notification classification and modifiers. Projections do not survive system shutdown.
+//! rows supply notification classification and modifiers. Persistent free hull
+//! refreshes include their fitted items and overrides. Projections do not survive system shutdown.
 use super::*;
 use crate::services::{effects::{notify, projection::Projection, propulsion, registry, EffectKind}, fit::Fit};
 use crate::consts::{dogma::ATTR_MAX_TARGET_RANGE, dogma::ATTR_SCAN_RESOLUTION};
@@ -96,7 +97,7 @@ impl System {
         *revision = revision.checked_add(1).expect("projection revision exhausted");
         let revision = *revision;
         let drone = self.drone(target);
-        let incarnation = self.pilot_generation(target);
+        let incarnation = self.persistent_generation(target);
         let Some(ball) = self.ball(target) else { return };
         let character = ball.char_id;
         let type_id = ball.type_id;
@@ -116,6 +117,13 @@ impl System {
                     Err(crate::services::CallError::Internal(error)) => { tracing::warn!(%error, target, "projected fit refresh failed"); return; }
                     Err(crate::services::CallError::User { msg, .. }) => { tracing::warn!(%msg, target, "projected fit refresh failed"); return; }
                 }
+            } else if incarnation.is_some() && drone.is_none()
+                && sde.types.get(type_id).and_then(|t| t.category_id) == Some(crate::consts::CATEGORY_SHIP) {
+                match Fit::load_unpiloted_projected(&context.db, sde, target, projections).await {
+                    Ok(fit) => fit,
+                    Err(crate::services::CallError::Internal(error)) => { tracing::warn!(%error, target, "projected fit refresh failed"); return; }
+                    Err(crate::services::CallError::User { msg, .. }) => { tracing::warn!(%msg, target, "projected fit refresh failed"); return; }
+                }
             } else { Fit::for_space_type(sde, type_id, projections) };
             let values = propulsion::kinematics(&fit, Key::Ship);
             let targeting = (fit.value(Key::Ship, ATTR_SCAN_RESOLUTION),
@@ -130,7 +138,7 @@ impl System {
             if let Some(tx) = context.tx.upgrade() {
                 let _ = tx.send(Box::new(move |system| {
                     if !system.contains(target) || system.projection_revisions.get(&target) != Some(&revision)
-                        || system.pilot_generation(target) != incarnation { return; }
+                        || system.persistent_generation(target) != incarnation { return; }
                     if let Some(old) = &drone {
                         if !system.drone(target).is_some_and(|d| d.generation == old.generation && d.owner == old.owner) {
                             if system.drone(target).is_some() { system.refresh_projection_target(target); }
@@ -162,7 +170,7 @@ async fn refresh_owned_drone(context: snapshot::Context, sde: Arc<Sde>, drone: d
     let handle = actor::SystemHandle { tx, gate: context.gate.clone(), written: context.written.clone() };
     let Some(snapshot) = handle.with(move |system| {
         let current = system.drone(target)?;
-        if system.pilot_generation(target) != incarnation || system.projection_revision(target) != revision { return None; }
+        if system.persistent_generation(target) != incarnation || system.projection_revision(target) != revision { return None; }
         if current.owner != owner || current.generation != generation {
             system.refresh_projection_target(target);
             return None;
@@ -186,7 +194,7 @@ async fn refresh_owned_drone(context: snapshot::Context, sde: Arc<Sde>, drone: d
         Err(crate::services::CallError::User { msg, .. }) => { tracing::warn!(%msg, target, "projected drone spec refresh failed"); return; }
     };
     let _ = handle.send(Box::new(move |system| {
-        if system.pilot_generation(target) != incarnation || system.projection_revision(target) != revision { return; }
+        if system.persistent_generation(target) != incarnation || system.projection_revision(target) != revision { return; }
         if !system.drone(target).is_some_and(|d| d.owner == owner && d.generation == generation) {
             if system.drone(target).is_some() { system.refresh_projection_target(target); }
             return;

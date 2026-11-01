@@ -4,8 +4,8 @@
 //! destinations. The binary layout follows carbonengine destiny `Thunkers.cpp`
 //! WriteBallToStream, and warp constants refer to `Ballpark.cpp` SetupWarpConstants.
 //!
-//! Celestials come from the SDE; dynamic balls and timers are transient. Changed
-//! pilot positions are periodically saved to `game.items` and flushed at shutdown.
+//! Celestials come from the SDE; persistent unpiloted hulls are restored from
+//! game items. Changed persistent positions are saved periodically and at shutdown.
 //! Pilot presence is process-local and uses live notification channels; it does not
 //! coordinate presence across server processes.
 //! Only player-piloted ships set the explicit interactive ball field.
@@ -51,6 +51,7 @@ pub(crate) mod drone;
 mod targeting;
 mod warpin;
 mod snapshot;
+mod persistent_ships;
 mod stop;
 mod goto;
 mod follow;
@@ -589,6 +590,7 @@ impl World {
                 crate::services::CallError::Internal(error) => error,
                 crate::services::CallError::User { msg, .. } => anyhow::anyhow!(msg),
             })?;
+        let persistent_ships = self.restore_persistent_ships(system_id).await?;
         let mut systems = self.systems.lock().unwrap();
         if systems.get(&system_id).is_some_and(|h| h.is_closed()) { systems.remove(&system_id); }
         if systems.contains_key(&system_id) { return Ok(()); }
@@ -665,6 +667,9 @@ impl World {
         }
         let effects = crate::services::drones::worker::effects(self.db.clone(), self.weak.clone(), system_id);
         for (ball, spec) in restored { system.restore_drone(ball, spec, effects.clone()); }
+        for ship in persistent_ships {
+            if !system.contains(ship.ball.id) { system.add_persistent_ship(ship.install()); }
+        }
         info!("loaded solar system {system_id} with {} celestials", system.balls().count());
 
         let handle = actor::start(system, system_id, Arc::downgrade(&self.systems), self.db.clone());
@@ -676,7 +681,7 @@ impl World {
         if systems.get(&id).is_some_and(|h| h.is_closed()) { systems.remove(&id); }
         systems.get(&id).cloned()
     }
-    /// Flush changed pilots in currently running systems without loading any systems.
+    /// Flush persistent positions in running systems without loading any systems.
     pub async fn flush_positions(&self) -> Result<u64> {
         let handles: Vec<_> = self.systems.lock().unwrap().values().filter(|h| !h.is_closed()).cloned().collect();
         let mut flushes = tokio::task::JoinSet::new();

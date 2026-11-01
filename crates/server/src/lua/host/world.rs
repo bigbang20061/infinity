@@ -1,10 +1,12 @@
 //! Script access to sampled world state and fixed Rust actor operations.
 //! Notifications use the pilot registry and space mutations use the system actor.
 //! Missing systems are never loaded by these operations; Lua never runs in an actor.
+//! Scheduled removal refuses persistent ship hulls, which require durable lifecycle handling.
+//! Other balls, including persistent drones, remain eligible for scheduled removal.
 
 use std::sync::Arc;
 use mlua::{Lua, Result, Table, Value};
-use crate::{consts::CATEGORY_ENTITY, lua::value::sequence, space::World};
+use crate::{consts::{CATEGORY_ENTITY, CATEGORY_SHIP}, lua::value::sequence, sde::Sde, space::{System, World}};
 use super::Resources;
 
 fn positive(id: i64) -> Result<i64> {
@@ -27,6 +29,20 @@ enum Operation {
     Notify { character: i64, event: String, args: Vec<marshal::Value> },
     Remove { id: i64 },
     Spawn { type_id: i32, corp: i64, position: [f64; 3], target: Option<i64> },
+}
+
+fn persistent_ship(s: &System, sde: &Sde, id: i64) -> bool {
+    s.persistent_generation(id).is_some()
+        && s.ball(id).and_then(|ball| sde.types.get(ball.type_id))
+            .is_some_and(|ty| ty.category_id == Some(CATEGORY_SHIP))
+}
+
+fn remove_scheduled_ball(s: &mut System, sde: &Sde, system: i64, id: i64) {
+    if persistent_ship(s, sde, id) {
+        tracing::warn!(system, id, "refusing scheduled removal of persistent ship hull");
+    } else {
+        s.remove_ball(id);
+    }
 }
 
 fn operation(op: &str, args: Table) -> Result<Operation> {
@@ -109,10 +125,15 @@ pub(super) fn register(lua: &Lua, env: &Table, resources: &Resources) -> Result<
                 if !valid { return Err(mlua::Error::runtime("type must be an SDE entity")); }
             }
             let world = Arc::clone(&handle);
-            Ok(handle.with(system, move |s| {
+            match handle.with(system, move |s| {
+                if let Operation::Remove { id } = &operation {
+                    if persistent_ship(s, &sde, *id) {
+                        return false;
+                    }
+                }
                 s.schedule(delay, move |s| match operation {
                     Operation::Notify { character, event, args } => s.notify_pilot(character, &event, args),
-                    Operation::Remove { id } => { s.remove_ball(id); }
+                    Operation::Remove { id } => remove_scheduled_ball(s, &sde, system, id),
                     Operation::Spawn { type_id, corp, position, target } => {
                         s.defer(async move {
                             let data = sde.types.get(type_id).expect("validated immutable SDE type");
@@ -125,7 +146,12 @@ pub(super) fn register(lua: &Lua, env: &Table, resources: &Resources) -> Result<
                         });
                     }
                 });
-            }).await.is_some())
+                true
+            }).await {
+                Some(true) => Ok(true),
+                Some(false) => Err(mlua::Error::runtime("cannot schedule removal of a persistent ship hull")),
+                None => Ok(false),
+            }
         }
     })?)?;
     env.set("world", table)

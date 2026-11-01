@@ -1,7 +1,7 @@
-//! Station ship boarding and assembly, mirroring the client ship service.
-//! Uses game items and characters; corporation and structure access is unsupported.
-//! Boarding saves the previous ship's condition and loads the new ship's dogma overrides.
-use crate::services::dogma::ship_state;
+//! Owned ship boarding in stations and space, assembly, and GM hull creation.
+//! Mirrors clientDogmaLocation.MakeShipActive and uses game items, characters and the SDE.
+//! Boarding preserves both hulls and their condition; foreign custody and structure access are unsupported.
+use crate::services::dogma::ship_state_core;
 use crate::services::inventory::notify_item_change;
 use crate::services::{db_err, user_error, value_ids, Call, CallResult};
 use crate::dao::items::loading::ItemQuery;
@@ -15,27 +15,97 @@ use marshal::Value;
 use std::collections::BTreeMap;
 use tracing::info;
 
-/// Board(shipID, oldShipID) -> shipState: make an assembled ship in this station's hangar
-/// the active one (clientDogmaLocation.MakeShipActive).
-async fn board(c: &mut Client, ship_id: i64) -> CallResult {
-    let char_id = c.session.int("charid").unwrap_or(0);
-    let Some(station) = c.session.int("stationid") else { return Err(user_error(messages::MSG_CANT_BOARD_SHIP_WHILE_IN_SPACE, vec![])) };
-    let ship = load_items(&c.db, &c.sde, ItemQuery::Id(ship_id)).await.map_err(db_err)?.into_iter().next().ok_or_else(|| user_error(messages::MSG_SHIP_NOT_FOUND, vec![]))?;
-    if ship.category_id != CATEGORY_SHIP as i64 || ship.owner_id != char_id || ship.location_id != station {
-        return Err(user_error(messages::MSG_CANT_BOARD_SHIP_NOT_IN_HANGAR, vec![]));
+/// Client `appConst.maxBoardingDistance`, in metres of surface separation.
+const MAX_BOARDING_DISTANCE: f64 = 6550.0;
+
+/// Board(shipID, oldLocationID) -> shipState.
+async fn board(c: &mut Client, ship_id: i64, context: Option<i64>) -> CallResult {
+    use crate::services::{combat, effects::{fitting, online}, fit::{Fit, Key}};
+    use crate::dao::{characters::selection, items::{boarding, space_ships::FreeShip}};
+    let refusal = || crate::services::notify_error(messages::fitting::BOARD_UNAVAILABLE);
+    let char_id = c.session.int("charid").ok_or_else(refusal)?;
+    let old = c.session.int("shipid").ok_or_else(refusal)?;
+    let station = c.session.int("stationid");
+    let system = c.session.int("solarsystemid");
+    let location = station.or(system).ok_or_else(refusal)?;
+    let _lock = crate::services::market::lock().await;
+    let selected = selection::selected(&c.db, char_id, c.login.user_id).await.map_err(db_err)?.ok_or_else(refusal)?;
+    if selected.station_id != station || (station.is_none() && Some(selected.solar_system_id) != system)
+        || selection::ship_id(&c.db, char_id).await.map_err(db_err)? != Some(old) {
+        return Err(refusal());
     }
-    if !ship.singleton {
+    let ship = load_items(&c.db, &c.sde, ItemQuery::Id(ship_id)).await.map_err(db_err)?.into_iter().next()
+        .ok_or_else(|| user_error(messages::MSG_SHIP_NOT_FOUND, vec![]))?;
+    if ship.category_id != CATEGORY_SHIP as i64 || ship.owner_id != char_id || ship.location_id != location
+        || ship.flag_id != if station.is_some() { FLAG_HANGAR } else { 0 } {
+        return Err(if station.is_some() { user_error(messages::MSG_CANT_BOARD_SHIP_NOT_IN_HANGAR, vec![]) } else { refusal() });
+    }
+    if !ship.singleton || ship.quantity != 1 {
         return Err(user_error(messages::MSG_CANT_BOARD_UNASSEMBLED_SHIP, vec![]));
     }
-    if let Some(old) = c.session.int("shipid") {
-        crate::services::combat::save_condition(&c.db, old).await?;
+    if ship_id == old {
+        if context != Some(old) { return Err(refusal()); }
+        if let Some(system) = system.filter(|_| station.is_none()) {
+            if !c.world.with(system, move |s| s.pilot_ball(char_id).is_some_and(|b| b.id == old && b.owner_id == char_id && b.char_id == Some(char_id))).await.unwrap_or(false) {
+                return Err(refusal());
+            }
+        }
+        return ship_state_core(c, ship_id).await;
     }
-    crate::services::effects::online::reconcile_ship(c, char_id, ship_id).await?;
-    crate::services::combat::load_docked_condition(&c.db, &c.world, char_id, ship_id).await?;
-    crate::dao::characters::selection::set_ship(&c.db, char_id, ship_id).await.map_err(db_err)?;
-    info!(user = c.login.user_id, "character {char_id} boarded ship {ship_id}");
+    if context != Some(station.unwrap_or(old)) { return Err(refusal()); }
+    let old_ship = load_items(&c.db, &c.sde, ItemQuery::Id(old)).await.map_err(db_err)?.into_iter().next().ok_or_else(refusal)?;
+    let snapshot = if station.is_none() {
+        let system = system.ok_or_else(refusal)?;
+        Some(c.world.with(system, move |s| s.authorize_board(char_id, old, ship_id, MAX_BOARDING_DISTANCE))
+            .await.ok_or_else(refusal)?.map_err(|_| refusal())?)
+    } else { None };
+    let security = if snapshot.is_some() { crate::services::crimewatch::security_status(&c.db, char_id).await? } else { 0.0 };
+    let db = c.db.clone();
+    let sde = c.sde.clone();
+    let captured = snapshot.clone();
+    let old_type = old_ship.type_id;
+    let target_type = ship.type_id;
+    let (prepared, outbox) = db.transaction(
+        move |tx, outbox: &mut Outbox<online::OnlineChanged>| {
+            let sde = sde.clone();
+            let snapshot = captured.clone();
+            Box::pin(async move {
+                let guarded = if let Some(snap) = &snapshot {
+                    boarding::board_in_space(tx, char_id, old, ship_id, location, old_type, target_type, snap.old.pos, snap.target.pos).await
+                } else {
+                    boarding::board_in_station(tx, char_id, old, ship_id, location, old_type, target_type).await
+                }.map_err(db_err)?;
+                if !guarded { return Err(refusal()); }
+                combat::save_condition_in(tx, old).await?;
+                let fit = Fit::load(tx, sde.clone(), char_id, ship_id).await?;
+                fitting::required_skills(&fit, &sde, Key::Ship, target_type, false)?;
+                online::reconcile_core(tx, &sde, outbox, char_id, ship_id).await?;
+                if let Some(snap) = snapshot {
+                    let row = |ball: &crate::space::Ball| FreeShip {
+                        item_id: ball.id, type_id: ball.type_id, owner_id: ball.owner_id,
+                        corporation_id: ball.corp_id, alliance_id: ball.alliance_id, pos: ball.pos,
+                    };
+                    let old = crate::services::ship::balls::unpiloted(tx, sde.clone(), &row(&snap.old)).await?;
+                    let target = crate::services::ship::balls::piloted(tx, sde, &row(&snap.target), char_id, security).await?;
+                    Ok(Some((old, target)))
+                } else { Ok(None) }
+            })
+        },
+        |prepared, outbox| async move { Ok((prepared, outbox)) },
+    ).await?;
+    let notification = online::dispatch_changed((), outbox, c);
+    let publication = if let (Some(snapshot), Some((old_ball, target_ball))) = (snapshot, prepared) {
+        c.world.apply_committed_board(location, c.login.client_id, char_id, snapshot, old_ball, target_ball).await.map_err(db_err)
+    } else {
+        combat::load_docked_condition(&db, &c.world, char_id, ship_id).await.map(|_| ())
+    };
+    combat::reset(c);
     c.change_session(vec![("shipid", Value::Int(ship_id))]);
-    ship_state(c, ship_id).await
+    info!(user = c.login.user_id, "character {char_id} boarded ship {ship_id}");
+    publication?;
+    notification?;
+    if station.is_none() { crate::services::ship::send_state(c).await?; }
+    ship_state_core(c, ship_id).await
 }
 
 /// Plan one request against a packaged stack; zero in `remaining` marks conversion.
@@ -186,9 +256,43 @@ pub(in crate::services) async fn gm_create_ship(c: &mut Client, owner: i64, type
     ).await
 }
 
+/// Create a caller-owned assembled hull without changing the active ship.
+pub(in crate::services) async fn gm_spawn_ship(c: &mut Client, type_id: i32) -> Result<i64, crate::services::CallError> {
+    let owner = c.session.int("charid").ok_or_else(|| db_err(anyhow::anyhow!("missing spawn character")))?;
+    if c.session.int("stationid").is_some() { return gm_create_ship(c, owner, type_id).await; }
+    if c.sde.types.get(type_id).and_then(|t| t.category_id) != Some(CATEGORY_SHIP) {
+        return Err(crate::services::notify_error(messages::gm::GM_SHIP_TYPE_REQUIRED));
+    }
+    let system = c.session.int("solarsystemid").ok_or_else(|| db_err(anyhow::anyhow!("missing spawn system")))?;
+    let active = c.session.int("shipid").ok_or_else(|| db_err(anyhow::anyhow!("missing active ship")))?;
+    let _lock = crate::services::market::lock().await;
+    let pilot = c.world.with(system, move |s| {
+        let id = s.pilot_ball(owner)?.id;
+        if id != active { return None; }
+        s.sampled_ball(id)
+    }).await.flatten().ok_or_else(|| db_err(anyhow::anyhow!("active pilot not present in system")))?;
+    let radius = crate::services::ship::balls::radius(&c.sde, type_id)?;
+    let distance = crate::config::game().gm.spawn_distance_m + f64::from(pilot.radius) + f64::from(radius);
+    let pos = crate::space::add(pilot.pos, crate::space::scale(crate::services::rand_dir(), distance));
+    let db = c.db.clone();
+    let id = db.transaction(
+        move |tx, _: &mut Outbox| Box::pin(async move {
+            crate::dao::items::creation::positioned(tx, type_id, owner, system, pos).await.map_err(db_err)
+        }),
+        |id, _| async move { Ok(id) },
+    ).await?;
+    let row = crate::dao::items::space_ships::FreeShip {
+        item_id: id, type_id, owner_id: owner, corporation_id: pilot.corp_id,
+        alliance_id: pilot.alliance_id, pos,
+    };
+    let ball = crate::services::ship::balls::unpiloted(&db, c.sde.clone(), &row).await?;
+    c.world.add_persistent_ship(system, ball).await.map_err(db_err)?;
+    Ok(id)
+}
+
 pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     Some(match call.method {
-        "Board" => board(c, call.args.first().and_then(|v| v.as_int()).unwrap_or(0)).await,
+        "Board" => board(c, call.args.first().and_then(|v| v.as_int()).unwrap_or(0), call.args.get(1).and_then(|v| v.as_int())).await,
         "AssembleShip" => assemble(c, call).await,
         "CheckEnoughSubSystemToUndock" => Ok(Value::Bool(true)),
         _ => return None,
