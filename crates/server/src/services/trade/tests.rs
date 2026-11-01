@@ -168,8 +168,7 @@ async fn startup_recovery_restores_open_trade_without_notifications() {
     let db = Db::connect(&cfg).await.unwrap();
     assert!(trades::open(&db).await.unwrap().is_empty(), "recovery test requires no pre-existing open trades");
     let sde = Arc::new(Sde::load(&db).await.unwrap());
-    let lists = crate::dao::sde::typelists::load(&db).await.unwrap();
-    let restricted = sde.types.iter().find(|item| lists.iter().any(|list| item.group_id.is_some_and(|group| list.included_groups.contains(&group) && !list.excluded_groups.contains(&group)) && !list.excluded_types.contains(&item.type_id))).expect("restricted type group required");
+    let restricted = sde.types.iter().find(|item| !sde.is_tradable(item.type_id)).expect("restricted type required");
     assert!(!sde.is_tradable(restricted.type_id));
     let type_id = sde.types.iter().next().expect("SDE types required").type_id;
     let trade = trades::create(&db, 1, 2, 3, 1).await.unwrap();

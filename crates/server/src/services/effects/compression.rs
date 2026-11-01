@@ -4,12 +4,9 @@
 use std::sync::Arc;
 use super::lifecycle::{Cycle, CycleOutcome, Module};
 use super::registry::Effect;
-use crate::consts::ATTR_MAX_RANGE;
+use crate::consts::{ATTR_COMPRESSIBLE_ITEMS_TYPE_LIST, ATTR_MAX_RANGE};
 use crate::services::{combat::{self, Ctx}, fit::{Fit, Key}, CallError};
 use crate::space::System;
-
-/// dogma/const.py: compressibleItemsTypeList.
-const ATTR_COMPRESSIBLE_ITEMS_TYPE_LIST: i32 = 3255;
 
 fn values(fit: &Fit, module: i64) -> Result<(i64, f64), CallError> {
     let list = fit.value(Key::Module(module), ATTR_COMPRESSIBLE_ITEMS_TYPE_LIST);

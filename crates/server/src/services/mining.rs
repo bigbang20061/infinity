@@ -16,13 +16,14 @@
 //! Extraction range uses ship and rock positions sampled at the same system-actor time.
 //! Each delivered extraction appends a personal fact to game.character_mining_ledger in
 //! the caller's transaction, before post-commit notices. The client refreshes its
-//! personal ledger normally; corporate observers and compression are unsupported.
+//! personal ledger normally; corporate observers are unsupported.
 //!
 //! Reprocessing (the station's bound reprocessingSvc) turns items into their
 //! canonical SDE type materials per portion: the configured station yield, raised by Reprocessing,
 //! Reprocessing Efficiency and the item's own processing skill, less the configured ISK tax.
 //! Output that exceeds a single stack's capacity is refused without consuming inputs.
 
+mod in_space_compression_mgr;
 mod ledger;
 pub(crate) mod retention;
 mod mining_scan_mgr;
@@ -482,6 +483,7 @@ pub async fn extract(db: &Db, world: &Arc<World>, notify: &NotifyTx, char_id: i6
 
 pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResult> {
     match call.service {
+        "inSpaceCompressionMgr" => in_space_compression_mgr::dispatch(c, call).await,
         "characterMiningLedger" => ledger::dispatch(c, call).await,
         "miningScanMgr" => mining_scan_mgr::dispatch(c, call).await,
         "reprocessingSvc" => reprocessing_svc::dispatch(c, call).await,

@@ -1,4 +1,4 @@
-//! Static-data projections used to construct immutable startup datasets from typed SDE and selected native sources, including localization, schools and trade type lists.
+//! Static-data projections used to construct immutable startup datasets from typed SDE and selected native sources, including compression mappings and type lists.
 //! This DAO has no direct client mirror; consumers include
 //! `eve/common/script/dogma/baseDogmaLocation.py:1960-1967`,
 //! `dogma/effects/modifiers.py:8-140`, `dogma/const.py:7-51`,
@@ -6,6 +6,7 @@
 //! `eve/client/script/parklife/autopilot.py:260-261,329-332`.
 //! Other SDE tables remain with their existing consumers until migrated.
 pub(crate) mod characters;
+pub(crate) mod compression;
 pub(crate) mod corporations;
 pub(crate) mod dogma;
 pub(crate) mod dungeons;

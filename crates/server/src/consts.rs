@@ -241,6 +241,8 @@ pub const ATTR_AGILITY: i32 = 70;
 pub const ATTR_SIGNATURE_RADIUS: i32 = 552;
 /// SDE dgmAttributeTypes: maxRange.
 pub const ATTR_MAX_RANGE: i32 = 54;
+/// dogma/const.py: compressibleItemsTypeList.
+pub const ATTR_COMPRESSIBLE_ITEMS_TYPE_LIST: i32 = 3255;
 /// SDE dgmAttributeTypes: maxTractorVelocity.
 pub const ATTR_MAX_TRACTOR_VELOCITY: i32 = 1045;
 /// SDE dgmAttributeTypes: quantity.
