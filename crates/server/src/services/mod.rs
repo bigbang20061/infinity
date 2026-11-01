@@ -29,6 +29,7 @@ mod corpwallet;
 pub(crate) mod crimewatch;
 pub(crate) mod dogma;
 pub(crate) mod drones;
+mod dynamic_items;
 pub(crate) mod effects;
 mod exploration;
 pub(crate) mod fit;
@@ -339,6 +340,9 @@ pub async fn dispatch(c: &mut Client, call: &Call<'_>) -> CallResult {
                 if let Some(r) = inventory::broker(c, call).await {
                     return r;
                 }
+            }
+            if let Some(r) = dynamic_items::dispatch(c, call).await {
+                return r;
             }
             if let Some(r) = crimewatch::dispatch(c, call).await {
                 return r;

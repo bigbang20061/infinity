@@ -9,6 +9,7 @@ pub(crate) mod combat;
 pub(crate) mod contacts;
 pub(crate) mod drones;
 pub(crate) mod effects;
+pub(crate) mod dynamic_items;
 pub(crate) mod fitting;
 pub(crate) mod gm;
 pub(crate) mod industry;
