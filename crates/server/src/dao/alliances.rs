@@ -69,12 +69,11 @@ impl Application {
     }
 }
 const APPLICATION_SELECT: &str = "SELECT alliance_id, corporation_id, application_text, created, state FROM game.alliance_applications";
-pub(crate) enum ApplicationFilter { Corporation(i64), Alliance(i64), Other(i64, i64) }
+pub(crate) enum ApplicationFilter { Corporation(i64), Alliance(i64) }
 pub(crate) async fn applications(ex: &(impl Executor + ?Sized), filter: ApplicationFilter) -> Result<Vec<Application>, Error> {
     let rows = match filter {
         ApplicationFilter::Corporation(corp) => ex.query(&format!("{APPLICATION_SELECT} WHERE corporation_id = $1"), &[&corp]).await?,
         ApplicationFilter::Alliance(alliance) => ex.query(&format!("{APPLICATION_SELECT} WHERE alliance_id = $1"), &[&alliance]).await?,
-        ApplicationFilter::Other(corp, alliance) => ex.query(&format!("{APPLICATION_SELECT} WHERE corporation_id = $1 AND alliance_id <> $2"), &[&corp, &alliance]).await?,
     };
     Ok(rows.iter().map(Application::from_row).collect())
 }
@@ -89,7 +88,7 @@ pub(crate) async fn pilots(ex: &(impl Executor + ?Sized), alliance: Option<i64>,
              WHERE NOT ch.deleted AND (co.alliance_id = $1 OR co.corporation_id = $2)", &[&alliance, &corp]).await?.iter().map(|r| CharacterId::from_row(r).id).collect())
 }
 pub(crate) async fn set_corporation_alliance(ex: &(impl Executor + ?Sized), corp: i64, alliance: Option<i64>, now: i64) -> Result<u64, Error> {
-    ex.execute("UPDATE game.corporations SET alliance_id = $2, alliance_joined = $3, chosen_executor_id = NULL WHERE corporation_id = $1", &[&corp, &alliance, &alliance.map(|_| now)]).await
+    ex.execute("UPDATE game.corporations SET alliance_id = $2, alliance_joined = $3, chosen_executor_id = NULL WHERE corporation_id = $1 AND ($2::bigint IS NULL OR (alliance_id IS NULL AND NOT deleted))", &[&corp, &alliance, &alliance.map(|_| now)]).await
 }
 pub(crate) async fn insert_history(ex: &(impl Executor + ?Sized), corp: i64, alliance: Option<i64>, now: i64) -> Result<u64, Error> {
     ex.execute("INSERT INTO game.alliance_history (corporation_id, alliance_id, start_date) VALUES ($1, $2, $3)", &[&corp, &alliance, &now]).await
@@ -116,8 +115,8 @@ pub(crate) async fn create(ex: &(impl Executor + ?Sized), name: &str, short_name
 pub(crate) async fn delete_corp_applications(ex: &(impl Executor + ?Sized), corp: i64) -> Result<u64, Error> {
     ex.execute("DELETE FROM game.alliance_applications WHERE corporation_id = $1", &[&corp]).await
 }
-pub(crate) async fn delete_other_applications(ex: &(impl Executor + ?Sized), corp: i64, alliance: i64) -> Result<u64, Error> {
-    ex.execute("DELETE FROM game.alliance_applications WHERE corporation_id = $1 AND alliance_id <> $2", &[&corp, &alliance]).await
+pub(crate) async fn delete_other_applications(ex: &(impl Executor + ?Sized), corp: i64, alliance: i64) -> Result<Vec<Application>, Error> {
+    Ok(ex.query("DELETE FROM game.alliance_applications WHERE corporation_id = $1 AND alliance_id <> $2 RETURNING alliance_id, corporation_id, application_text, created, state", &[&corp, &alliance]).await?.iter().map(Application::from_row).collect())
 }
 
 pub(crate) struct CorporationMembership { pub alliance: i64, pub executor: Option<i64> }
@@ -172,8 +171,8 @@ pub(crate) async fn store_application(ex: &(impl Executor + ?Sized), alliance: i
 pub(crate) async fn delete_application(ex: &(impl Executor + ?Sized), alliance: i64, corp: i64) -> Result<u64, Error> {
     ex.execute("DELETE FROM game.alliance_applications WHERE alliance_id = $1 AND corporation_id = $2", &[&alliance, &corp]).await
 }
-pub(crate) async fn update_application(ex: &(impl Executor + ?Sized), alliance: i64, corp: i64, state: i32) -> Result<u64, Error> {
-    ex.execute("UPDATE game.alliance_applications SET state = $3 WHERE alliance_id = $1 AND corporation_id = $2", &[&alliance, &corp, &state]).await
+pub(crate) async fn update_application(ex: &(impl Executor + ?Sized), alliance: i64, corp: i64, state: i32, expected: i32) -> Result<u64, Error> {
+    ex.execute("UPDATE game.alliance_applications SET state = $3 WHERE alliance_id = $1 AND corporation_id = $2 AND state = $4", &[&alliance, &corp, &state, &expected]).await
 }
 pub(crate) async fn update_alliance(ex: &(impl Executor + ?Sized), alliance: i64, description: &str, url: &str) -> Result<u64, Error> {
     ex.execute("UPDATE game.alliances SET description = $2, url = $3 WHERE alliance_id = $1", &[&alliance, &description, &url]).await

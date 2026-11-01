@@ -4,6 +4,8 @@
 //! the live server's) for appConst.allianceCreationCost from the corporation's master wallet;
 //! the corporation becomes its executor. Other corporations'
 //! CEOs apply, and the executor's directors accept (the corporation joins at once) or reject.
+//! Admission commits membership, application transitions and history together, then
+//! delivers session changes before alliance row notifications.
 //! A member corporation leaves, or the executor's directors remove it; when the executor
 //! leaves, the largest remaining member takes over, and the last member leaving closes the
 //! alliance. Members back an executor (DeclareExecutorSupport); a candidate backed by
@@ -194,7 +196,7 @@ fn application_line(r: dao::Application) -> Vec<Value> {
     ]
 }
 
-async fn application_line_of(db: &Db, alliance: i64, corp: i64) -> Result<Option<Vec<Value>>, CallError> {
+async fn application_line_of(db: &(impl Executor + ?Sized), alliance: i64, corp: i64) -> Result<Option<Vec<Value>>, CallError> {
     Ok(dao::application(db, alliance, corp).await.map_err(db_err)?.map(application_line))
 }
 
@@ -212,34 +214,60 @@ async fn pilots(db: &(impl Executor + ?Sized), alliance: Option<i64>, corp: Opti
 }
 
 /// Tell the alliance's online members (and `also_corp`'s) about a change.
-async fn tell(db: &Db, world: &World, alliance: i64, also_corp: Option<i64>, event: &str, args: Vec<Value>) -> Result<(), CallError> {
+async fn queue_tell<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, alliance: i64, also_corp: Option<i64>, event: &str, args: Vec<Value>) -> Result<(), CallError> {
     for char_id in pilots(db, Some(alliance), also_corp).await? {
-        world.notify_pilot(char_id, event, args.clone());
+        outbox.notify_pilot(char_id, event, args.clone());
     }
     Ok(())
 }
 
-async fn alliance_changed(db: &Db, world: &World, alliance: i64, old: Option<Vec<Value>>) -> Result<(), CallError> {
+async fn tell(db: &Db, world: &World, alliance: i64, also_corp: Option<i64>, event: &str, args: Vec<Value>) -> Result<(), CallError> {
+    let mut outbox = Outbox::default();
+    queue_tell(db, &mut outbox, alliance, also_corp, event, args).await?;
+    dispatch_world((), outbox, world)
+}
+
+async fn queue_alliance_changed<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, alliance: i64, old: Option<Vec<Value>>) -> Result<(), CallError> {
     let new = alliance_line_of(db, alliance).await?;
     let ch = change(ALLIANCE_COLUMNS, old.as_deref(), new.as_deref());
-    tell(db, world, alliance, None, "OnAllianceChanged", vec![Value::Int(alliance), ch]).await
+    queue_tell(db, outbox, alliance, None, "OnAllianceChanged", vec![Value::Int(alliance), ch]).await
+}
+
+async fn alliance_changed(db: &Db, world: &World, alliance: i64, old: Option<Vec<Value>>) -> Result<(), CallError> {
+    let mut outbox = Outbox::default();
+    queue_alliance_changed(db, &mut outbox, alliance, old).await?;
+    dispatch_world((), outbox, world)
+}
+
+async fn queue_application_changed<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, alliance: i64, corp: i64, old: Option<Vec<Value>>) -> Result<(), CallError> {
+    let new = application_line_of(db, alliance, corp).await?;
+    let ch = change(APPLICATION_COLUMNS, old.as_deref(), new.as_deref());
+    queue_tell(db, outbox, alliance, Some(corp), "OnAllianceApplicationChanged", vec![Value::Int(alliance), Value::Int(corp), ch]).await
 }
 
 async fn application_changed(db: &Db, world: &World, alliance: i64, corp: i64, old: Option<Vec<Value>>) -> Result<(), CallError> {
-    let new = application_line_of(db, alliance, corp).await?;
-    let ch = change(APPLICATION_COLUMNS, old.as_deref(), new.as_deref());
-    tell(db, world, alliance, Some(corp), "OnAllianceApplicationChanged", vec![Value::Int(alliance), Value::Int(corp), ch]).await
+    let mut outbox = Outbox::default();
+    queue_application_changed(db, &mut outbox, alliance, corp, old).await?;
+    dispatch_world((), outbox, world)
+}
+
+async fn queue_member_changed<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, alliance: i64, corp: i64, old: Option<Vec<Value>>) -> Result<(), CallError> {
+    let new = member_lines(db, alliance).await?.into_iter().find(|(c, _)| *c == corp).map(|(_, l)| l);
+    let ch = change(MEMBER_COLUMNS, old.as_deref(), new.as_deref());
+    queue_tell(db, outbox, alliance, Some(corp), "OnAllianceMemberChanged", vec![Value::Int(alliance), Value::Int(corp), ch]).await
 }
 
 async fn member_changed(db: &Db, world: &World, alliance: i64, corp: i64, old: Option<Vec<Value>>) -> Result<(), CallError> {
-    let new = member_lines(db, alliance).await?.into_iter().find(|(c, _)| *c == corp).map(|(_, l)| l);
-    let ch = change(MEMBER_COLUMNS, old.as_deref(), new.as_deref());
-    tell(db, world, alliance, Some(corp), "OnAllianceMemberChanged", vec![Value::Int(alliance), Value::Int(corp), ch]).await
+    let mut outbox = Outbox::default();
+    queue_member_changed(db, &mut outbox, alliance, corp, old).await?;
+    dispatch_world((), outbox, world)
 }
 
 /// Put `corp` in `alliance` (or none): history, and every member's session.
 async fn set_alliance<X: Send>(db: &(impl Executor + ?Sized), outbox: &mut Outbox<X>, corp: i64, alliance: Option<i64>, now: i64) -> Result<(), CallError> {
-    dao::set_corporation_alliance(db, corp, alliance, now).await.map_err(db_err)?;
+    if dao::set_corporation_alliance(db, corp, alliance, now).await.map_err(db_err)? == 0 {
+        return Err(notify_error(messages::TARGET_CORP_ALREADY_IN_ALLIANCE));
+    }
     dao::insert_history(db, corp, alliance, now).await.map_err(db_err)?;
     let value = alliance.map(Value::Int).unwrap_or(Value::None);
     for char_id in pilots(db, None, Some(corp)).await? {
@@ -281,11 +309,7 @@ pub(super) async fn leave_alliance<X: Send>(db: &(impl Executor + ?Sized), outbo
             }
         }
     }
-    let new = alliance_line_of(db, alliance).await?;
-    let ch = change(ALLIANCE_COLUMNS, old_alliance.as_deref(), new.as_deref());
-    for char_id in pilots(db, Some(alliance), None).await? {
-        outbox.notify_pilot(char_id, "OnAllianceChanged", vec![Value::Int(alliance), ch.clone()]);
-    }
+    queue_alliance_changed(db, outbox, alliance, old_alliance).await?;
     Ok(())
 }
 
