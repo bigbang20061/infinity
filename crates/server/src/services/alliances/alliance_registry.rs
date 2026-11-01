@@ -5,25 +5,43 @@
 //! `game.alliance_history`.
 //! Wars, bills, sovereignty, capital systems and prime time are not supported.
 use super::*;
-/// Join an accepted corporation to the alliance.
-pub(super) async fn admit(db: &Db, world: &World, alliance: i64, corp: i64) -> Result<(), CallError> {
-    let allied = dao::live_corporation_alliance(db, corp).await.map_err(db_err)?
-        .ok_or_else(|| notify_error(messages::CORP_NOT_FOUND))?;
-    if allied.is_some() {
-        return Err(notify_error(messages::TARGET_CORP_ALREADY_IN_ALLIANCE));
-    }
-    let old_alliance = alliance_line_of(db, alliance).await?;
-    let mut outbox = Outbox::default();
-    set_alliance(db, &mut outbox, corp, Some(alliance), filetime_now()).await?;
-    dispatch_world((), outbox, world)?;
-    // Other applications of a corporation that joined lapse.
-    let others = dao::applications(db, dao::ApplicationFilter::Other(corp, alliance)).await.map_err(db_err)?;
-    dao::delete_other_applications(db, corp, alliance).await.map_err(db_err)?;
-    for r in others {
-        application_changed(db, world, r.alliance, corp, Some(application_line(r))).await?;
-    }
-    member_changed(db, world, alliance, corp, None).await?;
-    alliance_changed(db, world, alliance, old_alliance).await
+/// Join a corporation and, when required, make its application effective atomically.
+pub(super) async fn admit(db: &Db, world: &World, alliance: i64, corp: i64, require_application: bool) -> Result<(), CallError> {
+    let now = filetime_now();
+    db.transaction(
+        |tx, outbox| Box::pin(async move {
+            let allied = dao::live_corporation_alliance(tx, corp).await.map_err(db_err)?
+                .ok_or_else(|| notify_error(messages::CORP_NOT_FOUND))?;
+            if allied.is_some() {
+                return Err(notify_error(messages::TARGET_CORP_ALREADY_IN_ALLIANCE));
+            }
+            if !dao::exists(tx, alliance).await.map_err(db_err)? {
+                return Err(notify_error(messages::ALLIANCE_NOT_FOUND));
+            }
+            let old_alliance = alliance_line_of(tx, alliance).await?;
+            let application = if require_application {
+                Some(dao::application(tx, alliance, corp).await.map_err(db_err)?
+                    .ok_or_else(|| notify_error(messages::ALLIANCE_APPLICATION_NOT_FOUND))?)
+            } else {
+                None
+            };
+            set_alliance(tx, outbox, corp, Some(alliance), now).await?;
+            let others = dao::delete_other_applications(tx, corp, alliance).await.map_err(db_err)?;
+            if let Some(application) = application {
+                if dao::update_application(tx, alliance, corp, APP_EFFECTIVE, application.state).await.map_err(db_err)? == 0 {
+                    return Err(notify_error(messages::ALLIANCE_APPLICATION_NOT_FOUND));
+                }
+                queue_application_changed(tx, outbox, alliance, corp, Some(application_line(application))).await?;
+            }
+            for application in others {
+                let other_alliance = application.alliance;
+                queue_application_changed(tx, outbox, other_alliance, corp, Some(application_line(application))).await?;
+            }
+            queue_member_changed(tx, outbox, alliance, corp, None).await?;
+            queue_alliance_changed(tx, outbox, alliance, old_alliance).await
+        }),
+        |value, outbox| async move { dispatch_world(value, outbox, world) },
+    ).await
 }
 /// A director of the alliance's executor corporation.
 async fn executor_director(db: &Db, me: i64, alliance: i64) -> Result<bool, CallError> {
@@ -143,24 +161,22 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
             if !executor_director(db, me, alliance).await.unwrap_or(false) {
                 return Some(Err(notify_error(messages::EXECUTOR_CORP_DIRECTOR_REQUIRED_TO_HANDLE_APPLICATION)));
             }
-            let old = match application_line_of(db, alliance, corp).await {
-                Ok(Some(old)) => old,
-                Ok(None) => return Some(Err(notify_error(messages::ALLIANCE_APPLICATION_NOT_FOUND))),
-                Err(e) => return Some(Err(e)),
-            };
-            if !matches!(state, APP_ACCEPTED | APP_REJECTED) {
-                return Some(Err(notify_error(messages::ALLIANCE_APPLICATION_STATUS_INVALID)));
-            }
             if state == APP_ACCEPTED {
-                if let Err(e) = admit(db, world, alliance, corp).await {
-                    return Some(Err(e));
+                admit(db, world, alliance, corp, true).await.map(|_| Value::None)
+            } else {
+                let old = match dao::application(db, alliance, corp).await {
+                    Ok(Some(old)) => old,
+                    Ok(None) => return Some(Err(notify_error(messages::ALLIANCE_APPLICATION_NOT_FOUND))),
+                    Err(e) => return Some(Err(db_err(e))),
+                };
+                if state != APP_REJECTED {
+                    return Some(Err(notify_error(messages::ALLIANCE_APPLICATION_STATUS_INVALID)));
                 }
-            }
-            let stored = if state == APP_ACCEPTED { APP_EFFECTIVE } else { APP_REJECTED };
-            match dao::update_application(db, alliance, corp, stored).await
-            {
-                Ok(_) => application_changed(db, world, alliance, corp, Some(old)).await.map(|_| Value::None),
-                Err(e) => Err(db_err(e)),
+                match dao::update_application(db, alliance, corp, APP_REJECTED, old.state).await {
+                    Ok(0) => Err(notify_error(messages::ALLIANCE_APPLICATION_NOT_FOUND)),
+                    Ok(_) => application_changed(db, world, alliance, corp, Some(application_line(old))).await.map(|_| Value::None),
+                    Err(e) => Err(db_err(e)),
+                }
             }
         }
         "DeclareExecutorSupport" => support_executor(db, world, me, alliance, int(0)).await.map(|_| Value::None),
@@ -248,3 +264,5 @@ pub(super) async fn dispatch(c: &mut Client, call: &Call<'_>) -> Option<CallResu
         _ => return None,
     })
 }
+
+#[cfg(test)] mod tests;

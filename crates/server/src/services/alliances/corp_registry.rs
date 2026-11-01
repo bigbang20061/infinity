@@ -69,10 +69,7 @@ pub(crate) async fn gm_join(c: &mut Client, alliance: i64) -> Result<(), CallErr
     let db = &c.db;
     let me = c.session.int("charid").unwrap_or(0);
     let corp = unallied_ceo_corp(db, me).await?;
-    if !dao::exists(db, alliance).await.map_err(db_err)? {
-        return Err(notify_error(messages::ALLIANCE_NOT_FOUND));
-    }
-    super::alliance_registry::admit(db, &c.world, alliance, corp).await
+    super::alliance_registry::admit(db, &c.world, alliance, corp, false).await
 }
 /// GetSuggestedAllianceShortNames(name) -> [KeyVal(shortName)]
 fn suggested_short_names(name: &str) -> Value {
