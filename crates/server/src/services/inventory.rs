@@ -4,13 +4,7 @@
 //! Item quantities are stored in `game.items`; static item data comes from the loaded SDE.
 //! Merge plans are guarded against stale snapshots. Staged trade items and their
 //! descendants cannot be moved, split, merged, trashed, renamed or accessed here.
-//! Moves require an owned source, an authorized corporation office, or a nearby
-//! positioned wreck or cargo container, and an owned or authorized destination.
-//! Loot rights and suspect flags are not implemented.
 //! Item capacity and contents are read from one game-item statement snapshot.
-//! Successful inventory moves queue item-move events after their writes.
-//! Departing online modules are offlined transactionally; bank and cycle effects
-//! are dispatched after commit and running cycles finish normally.
 
 use crate::dao::items::loading::{Item, ItemQuery};
 use super::items::load_items;
@@ -18,7 +12,7 @@ use crate::dao::items::inventory as inventory_dao;
 use crate::dao::items::quantities::{self, QuantityChange};
 use super::{db_err, keyval, notify_error, value_id_list, Call, CallError, CallResult};
 use crate::client::{short, Client};
-use crate::consts::{ATTR_CAPACITY, CATEGORY_SHIP, CORP_HANGAR_DIVISIONS, FLAG_CARGO, FLAG_CORP_SAG1, FLAG_FITTING_FIRST, FLAG_FITTING_LAST, FLAG_HANGAR, FLAG_PILOT, FLAG_RIG_FIRST, FLAG_RIG_LAST, FLAG_SUBSYSTEM_FIRST, FLAG_SUBSYSTEM_LAST, IX_FLAG, IX_LOCATION_ID, IX_SINGLETON, IX_STACK_SIZE, LOCATION_JUNKYARD, ROLE_DIRECTOR, ROLE_HANGAR_CAN_TAKE_1, TYPE_CHARACTER};
+use crate::consts::{ATTR_CAPACITY, CATEGORY_SHIP, FLAG_CARGO, FLAG_FITTING_FIRST, FLAG_FITTING_LAST, FLAG_HANGAR, FLAG_PILOT, FLAG_RIG_FIRST, FLAG_RIG_LAST, FLAG_SUBSYSTEM_FIRST, FLAG_SUBSYSTEM_LAST, IX_LOCATION_ID, IX_STACK_SIZE, LOCATION_JUNKYARD, TYPE_CHARACTER};
 use crate::db::executor::Executor;
 use crate::db::outbox::{dispatch_client, Outbox};
 use crate::messages;
@@ -28,6 +22,7 @@ use std::collections::BTreeMap;
 use tracing::warn;
 
 pub(super) mod gm;
+pub(crate) mod movement;
 
 /// const.containerHangar: "my hangar in the current station".
 const CONTAINER_HANGAR: i64 = 10004;
@@ -141,9 +136,6 @@ async fn capacity(c: &Client, container: &Container) -> Result<Value, CallError>
 
 // ---------------------------------------------------------------- moving items
 
-const FLAG_AUTOFIT: i32 = 0;
-/// appConst.py:1475, maxCargoContainerTransferDistance, in metres.
-const MAX_CARGO_CONTAINER_TRANSFER_DISTANCE: f64 = 2500.0;
 
 /// Fitting slot flags: low, medium, high, rig and subsystem slots.
 pub fn is_fitting_flag(flag: i32) -> bool {
@@ -210,193 +202,7 @@ pub(crate) async fn trash_items(c: &mut Client, ids: &[i64]) -> Result<(), CallE
 }
 
 
-enum MoveEffect {
-    Bank(super::combat::banks::BankStop),
-    Online(super::effects::online::OnlineChanged),
-}
 
-impl From<super::effects::online::OnlineChanged> for MoveEffect {
-    fn from(change: super::effects::online::OnlineChanged) -> Self { Self::Online(change) }
-}
-
-fn dispatch_move<T>(value: T, outbox: Outbox<MoveEffect>, c: &Client, target: i64) -> Result<T, CallError> {
-    use crate::db::outbox::Effect;
-    for entry in outbox.into_entries() {
-        match entry {
-            Effect::Operation(MoveEffect::Bank(stop)) => super::combat::banks::apply_stop(stop),
-            Effect::Operation(MoveEffect::Online(change)) => super::effects::online::apply_online_changed(change),
-            Effect::Notification(notification) => super::effects::online::dispatch_notification(gm::route_target(notification, target, c.session.int("charid")), c)?,
-            Effect::Event(event) => crate::lua::on_event(event),
-        }
-    }
-    Ok(value)
-}
-
-
-async fn authorized_source(c: &Client, item: &Item, source: Option<i64>, char_id: i64) -> Result<bool, CallError> {
-    if source.is_some_and(|id| id != item.location_id) { return Ok(false); }
-    if let Some(corp) = super::offices::office_owner(&c.db, item.location_id).await? {
-        let (my_corp, roles) = super::corps::membership(&c.db, char_id).await?;
-        let take = ROLE_HANGAR_CAN_TAKE_1 << (item.flag_id - FLAG_CORP_SAG1).clamp(0, CORP_HANGAR_DIVISIONS - 1);
-        if my_corp != corp || roles & (take | ROLE_DIRECTOR) == 0 {
-            return Err(CallError::User { msg: messages::MSG_CUSTOM_NOTIFY.into(), dict: vec![("notify".into(), Value::unicode(messages::NO_CORPORATION_HANGAR_TAKE_ROLE))] });
-        }
-        return Ok(true);
-    }
-    if item.owner_id == char_id { return Ok(true); }
-    let (Some(system), Some(ship)) = (c.session.int("solarsystemid"), c.session.int("shipid")) else { return Ok(false) };
-    if c.session.int("stationid").is_some() { return Ok(false); }
-    let Some(parent) = load_items(&c.db, &c.sde, ItemQuery::Id(item.location_id)).await.map_err(db_err)?.into_iter().next() else { return Ok(false) };
-    if parent.group_id != i64::from(crate::consts::GROUP_WRECK) && !i32::try_from(parent.group_id).ok().is_some_and(|id| crate::consts::CARGO_CONTAINER_GROUPS.contains(&id)) { return Ok(false); }
-    let Some(position) = crate::dao::items::social::position(&c.db, parent.item_id).await.map_err(db_err)? else { return Ok(false) };
-    if position.location_id != system { return Ok(false); }
-    Ok(c.world.with(system, move |s| {
-        let (ship, parent) = (s.ball(ship)?, s.ball(parent.item_id)?);
-        Some(crate::space::dist(ship.position_at(s.now_ms()), parent.position_at(s.now_ms()))
-            - ship.radius as f64 - parent.radius as f64 <= MAX_CARGO_CONTAINER_TRANSFER_DISTANCE)
-    }).await.flatten().unwrap_or(false))
-}
-
-async fn authorized_destination(c: &Client, container: &Container, flag: Option<i32>, char_id: i64) -> Result<Option<(i64, i64, i32)>, CallError> {
-    match container {
-        Container::Hangar { station_id, owner_id } => {
-            if *owner_id != char_id || c.session.int("stationid") != Some(*station_id) { return Ok(None); }
-            Ok(Some((*station_id, *owner_id, flag.filter(|f| *f != FLAG_AUTOFIT).unwrap_or(FLAG_HANGAR))))
-        }
-        Container::Item(id) => {
-            if let Some(corp) = super::offices::office_owner(&c.db, *id).await? {
-                if c.session.int("corpid") != Some(corp) {
-                    return Err(CallError::User { msg: messages::MSG_CUSTOM_NOTIFY.into(), dict: vec![("notify".into(), Value::unicode(messages::NOT_YOUR_CORPORATION_HANGAR))] });
-                }
-                let sag = FLAG_CORP_SAG1;
-                return Ok(Some((*id, corp, flag.filter(|f| (sag..sag + CORP_HANGAR_DIVISIONS).contains(f)).unwrap_or(sag))));
-            }
-            let Some(item) = load_items(&c.db, &c.sde, ItemQuery::Id(*id)).await.map_err(db_err)?.into_iter().next() else { return Ok(None) };
-            if item.owner_id != char_id { return Ok(None); }
-            let default = if item.category_id == CATEGORY_SHIP as i64 { FLAG_CARGO } else { FLAG_HANGAR };
-            Ok(Some((*id, char_id, flag.unwrap_or(default))))
-        }
-    }
-}
-
-/// Move `item_id` (all of it, or `qty` split off a stack) into `container` under `flag`.
-/// Returns the ID of the item now at the destination.
-pub(crate) async fn move_item(c: &mut Client, container: &Container, item_id: i64, source: Option<i64>, flag: Option<i32>, qty: Option<i64>) -> Result<Option<i64>, CallError> {
-    let _lock = super::market::lock().await;
-    let char_id = c.session.int("charid").unwrap_or(0);
-    let Some(item) = load_items(&c.db, &c.sde, ItemQuery::Id(item_id)).await.map_err(db_err)?.into_iter().next() else { return Ok(None) };
-    let allowed_source = authorized_source(c, &item, source, char_id).await?;
-    let destination = if allowed_source { authorized_destination(c, container, flag, char_id).await? } else { None };
-    let Some((location, owner, flag)) = destination else {
-        let destination = match container { Container::Hangar { station_id, .. } => *station_id, Container::Item(id) => *id };
-        warn!(char_id, item_id, destination, "inventory move authorization refused");
-        return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
-    };
-    if Some(item_id) == c.session.int("shipid") && matches!(container, Container::Item(_)) {
-        return Err(CallError::User { msg: messages::MSG_CAN_NOT_PLACE_ACTIVE_SHIP_IN_ANOTHER_HANGAR.into(), dict: vec![] });
-    }
-    let db = c.db.clone();
-    let sde = c.sde.clone();
-    let active_ship = c.session.int("shipid");
-    let station = c.session.int("stationid");
-    let policy = super::effects::online::OnlinePolicy::from_client(c)?;
-    db.transaction(
-        move |tx, outbox: &mut Outbox<MoveEffect>| {
-            let item = item.clone();
-            let sde = sde.clone();
-            let policy = policy.clone();
-            Box::pin(async move {
-                let destination_fitting = is_fitting_flag(flag) || (flag == FLAG_AUTOFIT
-                    && (item.category_id == i64::from(crate::consts::CATEGORY_MODULE) || item.category_id == i64::from(crate::consts::CATEGORY_SUBSYSTEM)));
-                let source_fitting = is_fitting_flag(item.flag_id);
-                let mut locks = Vec::new();
-                if source_fitting { locks.push(item.location_id); }
-                if destination_fitting { locks.push(location); }
-                locks.sort_unstable();
-                locks.dedup();
-                for ship in locks {
-                    let exists = crate::dao::items::ship::lock_reload_ship(tx, ship).await.map_err(db_err)?;
-                    if ship == location && destination_fitting && !exists {
-                        return Err(notify_error(messages::INSUFFICIENT_ITEM_QUANTITY));
-                    }
-                }
-                if destination_fitting {
-                    let hull = load_items(tx, &sde, ItemQuery::Id(location)).await.map_err(db_err)?.into_iter().next().ok_or_else(|| notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION))?;
-                    if hull.owner_id != owner || hull.category_id != i64::from(CATEGORY_SHIP) || !hull.singleton
-                        || (active_ship != Some(location) && !(station == Some(hull.location_id) && hull.flag_id == FLAG_HANGAR)) {
-                        return Err(notify_error(messages::ITEM_NOT_AT_ORIGINAL_LOCATION));
-                    }
-                }
-                let flag = if flag == FLAG_AUTOFIT && destination_fitting {
-                    super::effects::fitting::free_slot(tx, sde.clone(), owner, location, item.item_id, item.type_id).await?
-                        .ok_or_else(|| notify_error(messages::fitting::SLOTS))?
-                } else if flag == FLAG_AUTOFIT { FLAG_CARGO } else { flag };
-                let take = if is_fitting_flag(flag) { Some(1) } else { qty }
-                    .filter(|q| *q > 0 && !item.singleton && (*q as i32) < item.quantity);
-                let departure = source_fitting && take.is_none() && (item.location_id != location || item.flag_id != flag || item.owner_id != owner);
-                let leaving_fit = departure && (item.location_id != location || !is_fitting_flag(flag) || item.owner_id != owner);
-                let online = leaving_fit && item.category_id == i64::from(crate::consts::CATEGORY_MODULE)
-                    && crate::dao::items::dogma::online(tx, item.location_id).await.map_err(db_err)?.iter().any(|entry| entry.item_id == item.item_id);
-                if online {
-                    super::effects::online::set_online_core(tx, &sde, &policy, outbox, item.location_id, item.item_id, false).await?;
-                }
-                let before = if departure && !online { Some(super::combat::banks::snapshot(tx, item.location_id, &[item.item_id]).await?) } else { None };
-                let master = if departure && !online { super::combat::targeting_charges::master_for_member(tx, item.location_id, item.item_id).await? } else { item.item_id };
-                let moved_id = move_core(tx, &sde, outbox, &item, owner, location, flag, take).await?;
-                if is_fitting_flag(flag) {
-                    super::effects::fitting::validate_fit(tx, sde.clone(), owner, location, moved_id).await?;
-                }
-                if let Some(before) = before {
-                    if super::combat::banks::remove_member(tx, item.location_id, item.item_id, master, false).await? {
-                        for stop in super::combat::banks::changes(tx, item.location_id, before).await? { outbox.operation(MoveEffect::Bank(stop)); }
-                        outbox.notify_client("OnWeaponBanksChanged", vec![Value::Int(item.location_id), super::combat::banks(tx, item.location_id).await?]);
-                    }
-                }
-                if departure { super::effects::online::reconcile_core(tx, &sde, outbox, item.owner_id, item.location_id).await?; }
-                if is_fitting_flag(flag) { super::effects::online::reconcile_core(tx, &sde, outbox, owner, location).await?; }
-                if take.is_some() || item.location_id != location || item.flag_id != flag || item.owner_id != owner || (is_fitting_flag(flag) && !item.singleton) {
-                    outbox.event(crate::lua::events::GameEvent::ItemsMoved {
-                        char_id, item_id: moved_id, from_location_id: item.location_id,
-                        to_location_id: location, quantity: take.map_or(item.quantity, |q| q as i32),
-                    });
-                }
-                Ok(Some(moved_id))
-            })
-        },
-        |value, outbox| async move { dispatch_move(value, outbox, c, char_id) },
-    ).await
-}
-
-async fn move_core<X: Send>(
-    tx: &(impl Executor + ?Sized), sde: &Sde, outbox: &mut Outbox<X>,
-    item: &Item, owner: i64, location: i64, flag: i32, take: Option<i64>,
-) -> Result<i64, CallError> {
-    if !crate::dao::trades::reserved(tx, &[item.item_id, location]).await.map_err(db_err)?.is_empty() {
-        return Err(notify_error(messages::trade::TRADE_ITEM_RESERVED));
-    }
-    if crate::dao::industry::has_active_blueprint_job(tx, &[item.item_id]).await.map_err(db_err)? {
-        return Err(notify_error(messages::industry::BLUEPRINT_ACTIVE));
-    }
-    let item_id = item.item_id;
-    let fitting = is_fitting_flag(flag);
-    if let Some(q) = take {
-        let id = split_stack(tx, item, q as i32, owner, location, flag, fitting).await?;
-        notify_item_change(tx, sde, outbox, item_id, vec![(IX_STACK_SIZE, Value::Int(item.quantity as i64))]).await?;
-        notify_item_change(tx, sde, outbox, id, vec![(IX_LOCATION_ID, Value::Int(item.location_id)), (IX_FLAG, Value::Int(item.flag_id as i64))]).await?;
-        Ok(id)
-    } else {
-        let singleton = item.singleton || fitting;
-        if !inventory_dao::move_item(tx, item, location, flag, owner, singleton).await.map_err(db_err)? {
-            return Err(notify_error(messages::INSUFFICIENT_ITEM_QUANTITY));
-        }
-        let mut change = vec![(IX_LOCATION_ID, Value::Int(item.location_id)), (IX_FLAG, Value::Int(item.flag_id as i64))];
-        if singleton != item.singleton {
-            change.push((IX_SINGLETON, Value::Bool(item.singleton)));
-        }
-        notify_item_change(tx, sde, outbox, item_id, change).await?;
-        Ok(item_id)
-    }
-}
 
 /// Simulate transfers in request order, retaining the original snapshots for guarded writes.
 fn plan_merges(items: &[Item], ops: &[(i64, i64, i64)]) -> Result<BTreeMap<i64, QuantityChange>, CallError> {
@@ -628,13 +434,13 @@ pub async fn inventory(c: &mut Client, call: &Call<'_>) -> CallResult {
             let item_id = call.args.first().and_then(|v| v.as_int()).unwrap_or(0);
             let flag = call.kwargs.get("flag").and_then(|v| v.as_int()).map(|f| f as i32);
             let qty = call.kwargs.get("qty").or_else(|| call.kwargs.get("quantity")).and_then(|v| v.as_int());
-            move_item(c, &container, item_id, call.args.get(1).and_then(Value::as_int), flag, qty).await.map(|id| id.map(Value::Int).unwrap_or(Value::None))
+            movement::move_item(c, &container, item_id, call.args.get(1).and_then(Value::as_int), flag, qty).await.map(|id| id.map(Value::Int).unwrap_or(Value::None))
         }
         // MultiAdd(itemIDs, sourceID, flag=)
         "MultiAdd" => {
             let flag = call.kwargs.get("flag").and_then(|v| v.as_int()).map(|f| f as i32);
             for item_id in value_id_list(call.args.first()) {
-                move_item(c, &container, item_id, call.args.get(1).and_then(Value::as_int), flag, None).await?;
+                movement::move_item(c, &container, item_id, call.args.get(1).and_then(Value::as_int), flag, None).await?;
             }
             Ok(Value::None)
         }
